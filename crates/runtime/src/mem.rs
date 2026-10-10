@@ -151,12 +151,12 @@ const MEM_WRITE_WATCH: u32 = 0x0020_0000;
 const WRITE_WATCH_FLAG_RESET: u32 = 1;
 
 /// Reserves the whole guest range. Must run before anything else allocates widely.
-/// With write watching (default; SOTC_WRITE_WATCH=0 disables it) the OS records
+/// With write watching (default; TLG_WRITE_WATCH=0 disables it) the OS records
 /// written pages, which lets the renderer skip re-validating unchanged textures.
 pub fn reserve_guest_range() -> Result<(), String> {
     let size = (GUEST_END - GUEST_BASE) as usize;
     let mut p = std::ptr::null_mut();
-    if std::env::var("SOTC_WRITE_WATCH").map(|v| v != "0").unwrap_or(true) {
+    if std::env::var("TLG_WRITE_WATCH").map(|v| v != "0").unwrap_or(true) {
         p = unsafe { VirtualAlloc(GUEST_BASE as _, size, MEM_RESERVE | MEM_WRITE_WATCH, PAGE_NOACCESS) };
         if p.is_null() {
             crate::warn!("guest range: write watching unavailable (error {}); textures are validated by hashing", last_error());
@@ -207,7 +207,7 @@ fn occupied(lo: u64, hi: u64) -> String {
 /// they were last collected, and resets their write-watch state. False when
 /// write watching is unavailable or the query failed (callers must then
 /// assume the range was written). `buf` is scratch space.
-/// Write-watch queries and pages queried (SOTC_PERF).
+/// Write-watch queries and pages queried (TLG_PERF).
 pub static HARVESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static HARVEST_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 

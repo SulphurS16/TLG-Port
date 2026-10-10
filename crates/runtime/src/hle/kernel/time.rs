@@ -17,6 +17,11 @@ static CLOCK: OnceLock<Clock> = OnceLock::new();
 /// Measures the TSC frequency against the monotonic clock (guest code may read
 /// the TSC directly with rdtsc, so the reported frequency must be the host's).
 pub fn init() {
+    // 1 ms system timer resolution for this process: timed condition/event
+    // waits (event queues, semaphores, the title's timed sleeps) otherwise
+    // round up to the 15.6 ms default tick.
+    let r = unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
+    crate::info!("timeBeginPeriod(1) -> {r}");
     CLOCK.get_or_init(|| {
         let t0 = Instant::now();
         let c0 = unsafe { core::arch::x86_64::_rdtsc() };

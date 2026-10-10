@@ -37,7 +37,7 @@ pub struct Submission {
 
 fn pm4_check() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SOTC_PM4_CHECK").is_some())
+    *ON.get_or_init(|| std::env::var_os("TLG_PM4_CHECK").is_some())
 }
 
 fn read_dwords(addr: u64, n: u32) -> Vec<u32> {
@@ -69,7 +69,7 @@ static COMPUTE: Mutex<Vec<Option<&'static ComputeQueue>>> = Mutex::new(Vec::new(
 static EOP_EVENTS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
 pub static SUBMITS: AtomicU64 = AtomicU64::new(0);
 pub static FRAMES: AtomicU64 = AtomicU64::new(0);
-/// CPU time the GPU thread has used (user + kernel, 100 ns units; SOTC_PERF):
+/// CPU time the GPU thread has used (user + kernel, 100 ns units; TLG_PERF):
 /// its work without waits, a measure that other GPU load hardly moves.
 pub static GFX_CPU_100NS: AtomicU64 = AtomicU64::new(0);
 
@@ -173,7 +173,7 @@ fn watchdog() {
         if tick % 10 == 0 {
             perf_log(&mut perf_prev);
         }
-        if tick % 20 == 0 && std::env::var_os("SOTC_PERF").is_some() {
+        if tick % 20 == 0 && std::env::var_os("TLG_PERF").is_some() {
             let v: Vec<String> = cp::OPCODES.iter().enumerate().filter_map(|(i, c)| {
                 let n = c.load(Ordering::Relaxed);
                 (n != 0).then(|| format!("{}{:#04x}:{}", if i >= 256 { "c" } else { "" }, i & 0xFF, n))
@@ -336,17 +336,17 @@ fn gfx_queue() -> &'static GfxQueue {
     })
 }
 
-/// Debug (SOTC_PM4_CAPTURE=1): execute command buffers as fetched at submit
+/// Debug (TLG_PM4_CAPTURE=1): execute command buffers as fetched at submit
 /// time instead of reading them live. Live reading is what the hardware does
 /// and is required: titles patch submitted command buffers (e.g. calls to
 /// worker command lists written into reserved slots after submission).
 /// Command buffers (and the indirect buffers they call) are snapshotted at
 /// submission and executed from the snapshot: the title rewrites its DCBs
 /// once it believes the GPU is done with them, which can happen while our
-/// command processor still lags behind. `SOTC_PM4_CAPTURE=0` executes live.
+/// command processor still lags behind. `TLG_PM4_CAPTURE=0` executes live.
 fn pm4_capture() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SOTC_PM4_CAPTURE").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| std::env::var("TLG_PM4_CAPTURE").map(|v| v != "0").unwrap_or(true))
 }
 
 pub fn submit(mut s: Submission) {
@@ -363,12 +363,12 @@ pub fn submit(mut s: Submission) {
     // far ahead of the GPU. Titles recycle per-frame memory (constants,
     // dynamic buffers) on their own schedule; with our command processor
     // lagging many submissions behind, draws would read later frames' data.
-    // SOTC_GPU_QUEUE_LIMIT (default 6, 0 = unlimited); waits at most
-    // SOTC_GPU_QUEUE_WAIT_MS (default 250) ms.
+    // TLG_GPU_QUEUE_LIMIT (default 6, 0 = unlimited); waits at most
+    // TLG_GPU_QUEUE_WAIT_MS (default 250) ms.
     static LIMIT: OnceLock<(usize, u64)> = OnceLock::new();
     let (limit, wait_ms) = *LIMIT.get_or_init(|| {
-        let n = std::env::var("SOTC_GPU_QUEUE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
-        let ms = std::env::var("SOTC_GPU_QUEUE_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(250);
+        let n = std::env::var("TLG_GPU_QUEUE_LIMIT").ok().and_then(|v| v.parse().ok()).unwrap_or(6);
+        let ms = std::env::var("TLG_GPU_QUEUE_WAIT_MS").ok().and_then(|v| v.parse().ok()).unwrap_or(250);
         (n, ms)
     });
     if limit > 0 {
@@ -451,9 +451,9 @@ fn gfx_thread() {
             if render::TRACE_REQUEST.load(Ordering::Relaxed) == ended {
                 render::traced_rehash();
                 crate::info!("FRAME end of traced frame {ended}");
-                // SOTC_TRACE_DUMP=1: the images of each traced frame (see
-                // SOTC_DUMP_BASES) as they are at its end.
-                if std::env::var_os("SOTC_TRACE_DUMP").is_some() {
+                // TLG_TRACE_DUMP=1: the images of each traced frame (see
+                // TLG_DUMP_BASES) as they are at its end.
+                if std::env::var_os("TLG_TRACE_DUMP").is_some() {
                     if let Some(r) = render::RENDERER.lock().as_mut() {
                         r.submit_batch(Vec::new());
                         r.dump_images(ended);
@@ -469,7 +469,7 @@ fn gfx_thread() {
                 r.verify_gpu_textures();
                 note_frame(FRAMES.load(Ordering::Relaxed), [r.draws, r.dispatches, r.skipped]);
                 let frame = FRAMES.load(Ordering::Relaxed);
-                if DUMP_REQUEST.swap(false, Ordering::Relaxed) || std::env::var("SOTC_DUMP_IMAGES").ok().and_then(|v| v.parse::<u64>().ok()) == Some(frame) {
+                if DUMP_REQUEST.swap(false, Ordering::Relaxed) || std::env::var("TLG_DUMP_IMAGES").ok().and_then(|v| v.parse::<u64>().ok()) == Some(frame) {
                     r.dump_images(frame);
                 }
             }
@@ -583,7 +583,7 @@ pub fn map_compute_queue(pipe: u32, queue: u32, base: u64, size_dw: u32, read_pt
 }
 
 pub fn ding_dong(vq: u32, next_dw: u32) {
-    if std::env::var_os("SOTC_COMPUTE_LOG").is_some() {
+    if std::env::var_os("TLG_COMPUTE_LOG").is_some() {
         crate::info!("DingDong vq {vq} -> {next_dw:#x}");
     }
     let c = COMPUTE.lock().get(vq as usize).copied().flatten();
@@ -630,7 +630,7 @@ fn compute_thread(cq: &'static ComputeQueue, name: String, vq: usize) {
         if let Some(r) = render::RENDERER.lock().as_mut() {
             r.submit_batch(Vec::new());
         }
-        if std::env::var_os("SOTC_COMPUTE_LOG").is_some() {
+        if std::env::var_os("TLG_COMPUTE_LOG").is_some() {
             let mut words = Vec::new();
             let mut p = from;
             while p != to && words.len() < 64 {
@@ -654,7 +654,7 @@ fn report_once(msg: &str) {
     }
 }
 
-/// Debug (SOTC_POOL_WATCH=<hex address>): every 30 flips, logs the status words
+/// Debug (TLG_POOL_WATCH=<hex address>): every 30 flips, logs the status words
 /// of a title command-chunk pool (object layout: +8 chunk qwords, +0x10 chunk
 /// count, +0x18 base; status = last qword of each chunk, 0 = free).
 /// Debug: number of buffer executions (top-level or indirect) that started
@@ -676,7 +676,7 @@ pub fn note_exec(addr: u64, compute: bool) {
 fn pool_watch(tick: u64) {
     static ADDR: OnceLock<Option<u64>> = OnceLock::new();
     static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
-    let Some(pool) = *ADDR.get_or_init(|| std::env::var("SOTC_POOL_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())) else { return };
+    let Some(pool) = *ADDR.get_or_init(|| std::env::var("TLG_POOL_WATCH").ok().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok())) else { return };
     let frame = FRAMES.load(Ordering::Relaxed);
     let queued = GFX.get().map(|q| q.pending.lock().len()).unwrap_or(0);
     let ph = PHASE.load(Ordering::Relaxed);
@@ -756,10 +756,10 @@ struct PerfSnap {
     tsc: u64,
 }
 
-/// Debug (SOTC_PERF=1): per-second GPU-thread activity.
+/// Debug (TLG_PERF=1): per-second GPU-thread activity.
 fn perf_log(prev: &mut Option<PerfSnap>) {
     static ON: OnceLock<bool> = OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var_os("SOTC_PERF").is_some()) {
+    if !*ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some()) {
         return;
     }
     let Some(g) = render::RENDERER.try_lock_for(std::time::Duration::from_millis(200)) else { return };

@@ -55,6 +55,10 @@ macro_rules! sysv {
                 core::arch::naked_asm!(
                     "push rbp",
                     "mov rbp, rsp",
+                    // The guest return address into TEB.TlsSlots[HLE_RET_SLOT] (diagnostics).
+                    "mov r11, [rbp+8]",
+                    "mov r10d, dword ptr [rip + {retslot}]",
+                    "mov qword ptr gs:[0x1480 + r10*8], r11",
                     "and rsp, -16",
                     $crate::sysv_stack_args!($( $arg ),*),
                     "call {body}",
@@ -62,6 +66,7 @@ macro_rules! sysv {
                     "pop rbp",
                     "ret",
                     body = sym $name::body,
+                    retslot = sym $crate::tls::HLE_RET_SLOT,
                 )
             }
         )*
@@ -141,11 +146,11 @@ impl<T> ArgFmt for *mut T {
     }
 }
 
-/// `SOTC_SLOW_HLE_MS=<ms>`: HLE calls taking at least that long are logged
+/// `TLG_SLOW_HLE_MS=<ms>`: HLE calls taking at least that long are logged
 /// with the calling thread (what a title thread waits on); 0 = off.
 pub static SLOW_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Only calls on threads whose name contains `SOTC_SLOW_HLE_THREAD` are
+/// Only calls on threads whose name contains `TLG_SLOW_HLE_THREAD` are
 /// reported (idle waits of worker threads would flood the log otherwise).
 #[cold]
 pub fn note_slow(name: &str, t0: std::time::Instant, slow: u64) {
@@ -154,7 +159,7 @@ pub fn note_slow(name: &str, t0: std::time::Instant, slow: u64) {
         return;
     }
     static FILTER: OnceLock<Option<String>> = OnceLock::new();
-    if let Some(f) = FILTER.get_or_init(|| std::env::var("SOTC_SLOW_HLE_THREAD").ok()) {
+    if let Some(f) = FILTER.get_or_init(|| std::env::var("TLG_SLOW_HLE_THREAD").ok()) {
         if !crate::log::thread_name().contains(f.as_str()) {
             return;
         }
@@ -163,7 +168,33 @@ pub fn note_slow(name: &str, t0: std::time::Instant, slow: u64) {
 }
 
 pub fn trace_call(name: &str, args: &[String]) {
-    crate::log::write(crate::log::Level::Debug, format_args!("hle {}({})", name, args.join(", ")));
+    let ret = crate::tls::hle_return_addr();
+    check_watch_word(name);
+    crate::log::write(crate::log::Level::Debug, format_args!("hle {}({}) <- {}", name, args.join(", "), crate::loader::describe_addr(ret)));
+}
+
+/// Debug (with `--trace`): a host word whose changes are reported at the next
+/// traced HLE call (`set_watch_word`), to find which stretch of guest code
+/// (between two calls) or which call wrote it.
+static WATCH_WORD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WATCH_LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn set_watch_word(addr: u64, label: &str) {
+    WATCH_LAST.store(unsafe { std::ptr::read_volatile(addr as *const u64) }, Ordering::SeqCst);
+    WATCH_WORD.store(addr, Ordering::SeqCst);
+    crate::info!("watching host word {addr:#x} ({label})");
+}
+
+fn check_watch_word(at: &str) {
+    let a = WATCH_WORD.load(Ordering::Relaxed);
+    if a == 0 {
+        return;
+    }
+    let v = unsafe { std::ptr::read_volatile(a as *const u64) };
+    let old = WATCH_LAST.swap(v, Ordering::SeqCst);
+    if v != old {
+        crate::warn!("watched word {a:#x} changed {old:#x} -> {v:#x} before HLE call {at}");
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -277,8 +308,8 @@ pub static UNRESOLVED: RwLock<Vec<Unresolved>> = RwLock::new(Vec::new());
 pub static LENIENT_IMPORTS: AtomicBool = AtomicBool::new(false);
 
 std::arch::global_asm!(
-    ".globl sotc_unresolved_entry",
-    "sotc_unresolved_entry:",
+    ".globl tlg_unresolved_entry",
+    "tlg_unresolved_entry:",
     "push rbp",
     "mov rbp, rsp",
     "sub rsp, 64",
@@ -300,7 +331,7 @@ std::arch::global_asm!(
 );
 
 unsafe extern "C" {
-    fn sotc_unresolved_entry();
+    fn tlg_unresolved_entry();
 }
 
 extern "sysv64" fn unresolved_handler(index: u64, args: *const u64, ret: u64) -> u64 {
@@ -333,7 +364,7 @@ extern "sysv64" fn unresolved_handler(index: u64, args: *const u64, ret: u64) ->
     crate::fatal_exit(3, "unimplemented import called");
 }
 
-/// Builds a 24-byte trap stub: `mov rax, index; jmp [rip+0]; dq sotc_unresolved_entry`.
+/// Builds a 24-byte trap stub: `mov rax, index; jmp [rip+0]; dq tlg_unresolved_entry`.
 pub fn unresolved_stub_code(index: u64) -> [u8; 24] {
     let mut c = [0u8; 24];
     c[0] = 0x48;
@@ -342,7 +373,7 @@ pub fn unresolved_stub_code(index: u64) -> [u8; 24] {
     c[10] = 0xFF;
     c[11] = 0x25;
     c[12..16].copy_from_slice(&0u32.to_le_bytes());
-    c[16..24].copy_from_slice(&(sotc_unresolved_entry as usize as u64).to_le_bytes());
+    c[16..24].copy_from_slice(&(tlg_unresolved_entry as usize as u64).to_le_bytes());
     c
 }
 

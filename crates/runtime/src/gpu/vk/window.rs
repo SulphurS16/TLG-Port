@@ -77,7 +77,7 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
         .spawn(move || unsafe {
             crate::log::set_thread_name("ui");
             let hinst = GetModuleHandleW(std::ptr::null());
-            let class = wide("sotc_window");
+            let class = wide("tlg_window");
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: CS_HREDRAW | CS_VREDRAW,

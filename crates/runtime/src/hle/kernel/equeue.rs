@@ -15,6 +15,7 @@ pub const EVFILT_DISPLAY: i16 = -13;
 pub const EVFILT_GRAPHICS: i16 = -14;
 pub const EVFILT_HRTIMER: i16 = -15;
 
+pub const EV_ONESHOT: u16 = 0x10;
 pub const EV_CLEAR: u16 = 0x20;
 
 #[repr(C)]
@@ -32,6 +33,9 @@ pub struct Kevent {
 struct Entry {
     ev: Kevent,
     triggered: bool,
+    /// Timer generation (high-resolution timers): a schedule fires only the
+    /// entry it was made for, not one deleted and added again since.
+    timer_gen: u64,
 }
 
 pub struct Equeue {
@@ -43,9 +47,26 @@ pub struct Equeue {
 
 impl Equeue {
     pub fn add(&self, ident: u64, filter: i16, flags: u16, udata: u64) {
+        self.add_timed(ident, filter, flags, udata, 0);
+    }
+    fn add_timed(&self, ident: u64, filter: i16, flags: u16, udata: u64, timer_gen: u64) {
         let mut e = self.events.lock();
         e.retain(|x| !(x.ev.ident == ident && x.ev.filter == filter));
-        e.push(Entry { ev: Kevent { ident, filter, flags, fflags: 0, data: 0, udata }, triggered: false });
+        e.push(Entry { ev: Kevent { ident, filter, flags, fflags: 0, data: 0, udata }, triggered: false, timer_gen });
+    }
+    /// Fires a high-resolution timer scheduled for generation `timer_gen`.
+    fn fire_timer(&self, ident: u64, timer_gen: u64) {
+        let mut e = self.events.lock();
+        let mut any = false;
+        for x in e.iter_mut().filter(|x| x.ev.ident == ident && x.ev.filter == EVFILT_HRTIMER && x.timer_gen == timer_gen) {
+            x.triggered = true;
+            x.ev.data = 1; // expirations
+            any = true;
+        }
+        drop(e);
+        if any {
+            self.cv.notify_all();
+        }
     }
     pub fn remove(&self, ident: u64, filter: i16) -> bool {
         let mut e = self.events.lock();
@@ -79,17 +100,7 @@ impl Equeue {
     fn wait(&self, out: &mut [Kevent], deadline: Option<Instant>) -> usize {
         let mut e = self.events.lock();
         loop {
-            let mut n = 0;
-            for x in e.iter_mut() {
-                if n == out.len() {
-                    break;
-                }
-                if x.triggered {
-                    out[n] = x.ev;
-                    n += 1;
-                    x.triggered = false;
-                }
-            }
+            let n = Self::collect(&mut e, out);
             if n > 0 {
                 return n;
             }
@@ -97,20 +108,26 @@ impl Equeue {
                 Some(d) => {
                     if self.cv.wait_until(&mut e, d).timed_out() {
                         // One last check after the timeout.
-                        let mut n = 0;
-                        for x in e.iter_mut() {
-                            if n < out.len() && x.triggered {
-                                out[n] = x.ev;
-                                n += 1;
-                                x.triggered = false;
-                            }
-                        }
-                        return n;
+                        return Self::collect(&mut e, out);
                     }
                 }
                 None => self.cv.wait(&mut e),
             }
         }
+    }
+    /// Moves triggered events into `out`; one-shot events are removed once delivered.
+    fn collect(e: &mut Vec<Entry>, out: &mut [Kevent]) -> usize {
+        let mut n = 0;
+        e.retain_mut(|x| {
+            if n == out.len() || !x.triggered {
+                return true;
+            }
+            out[n] = x.ev;
+            n += 1;
+            x.triggered = false;
+            x.ev.flags & EV_ONESHOT == 0
+        });
+        n
     }
 }
 
@@ -142,6 +159,70 @@ pub unsafe fn from_handle<'a>(h: u64) -> Option<&'a Equeue> {
     }
     let q = unsafe { &*(h as *const Equeue) };
     if q.magic == EQ_MAGIC { Some(q) } else { None }
+}
+
+// ---------------------------------------------------------------------------
+// High-resolution timers (EVFILT_HRTIMER): one-shot events, fired by one
+// host thread at their deadline (coarse condvar wait, then a high-resolution
+// sleep and a short spin for the last ~1.5 ms).
+
+struct Timer {
+    at: Instant,
+    queue: u64,
+    ident: u64,
+    timer_gen: u64,
+}
+
+static TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
+static TIMER_CV: Condvar = Condvar::new();
+static TIMER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn schedule_timer(queue: u64, ident: u64, timer_gen: u64, at: Instant) {
+    static STARTED: std::sync::Once = std::sync::Once::new();
+    STARTED.call_once(|| {
+        std::thread::Builder::new().name("hrtimer".into()).spawn(timer_thread).expect("hrtimer thread");
+    });
+    TIMERS.lock().push(Timer { at, queue, ident, timer_gen });
+    TIMER_CV.notify_one();
+}
+
+fn timer_thread() {
+    crate::log::set_thread_name("hrtimer");
+    crate::thread::raise_priority();
+    let mut g = TIMERS.lock();
+    loop {
+        let now = Instant::now();
+        if g.iter().any(|t| t.at <= now) {
+            let (due, rest): (Vec<Timer>, Vec<Timer>) = std::mem::take(&mut *g).into_iter().partition(|t| t.at <= now);
+            *g = rest;
+            drop(g);
+            for t in due {
+                if let Some(q) = unsafe { from_handle(t.queue) } {
+                    q.fire_timer(t.ident, t.timer_gen);
+                }
+            }
+            g = TIMERS.lock();
+            continue;
+        }
+        match g.iter().map(|t| t.at).min() {
+            None => TIMER_CV.wait(&mut g),
+            Some(at) => {
+                let rem = at - now;
+                if rem > Duration::from_micros(1500) {
+                    TIMER_CV.wait_for(&mut g, rem - Duration::from_millis(1));
+                } else {
+                    drop(g);
+                    if rem > Duration::from_micros(300) {
+                        std::thread::sleep(rem - Duration::from_micros(200));
+                    }
+                    while Instant::now() < at {
+                        std::hint::spin_loop();
+                    }
+                    g = TIMERS.lock();
+                }
+            }
+        }
+    }
 }
 
 sysv! {
@@ -187,6 +268,21 @@ sysv! {
         let Some(q) = from_handle(h) else { return sce(EBADF) };
         if q.remove(id as u64, EVFILT_USER) { 0 } else { sce(ENOENT) }
     }
+    /// One-shot timer firing `ts` (relative timespec) from now.
+    fn sceKernelAddHRTimerEvent(h: u64, id: i32, ts: *const i64, udata: u64) -> i32 {
+        let Some(q) = from_handle(h) else { return sce(EBADF) };
+        if ts.is_null() { return sce(EINVAL); }
+        let (sec, nsec) = (*ts, *ts.add(1));
+        if sec < 0 || !(0..1_000_000_000).contains(&nsec) { return sce(EINVAL); }
+        let timer_gen = TIMER_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        q.add_timed(id as u64, EVFILT_HRTIMER, EV_ONESHOT, udata, timer_gen);
+        schedule_timer(h, id as u64, timer_gen, Instant::now() + Duration::new(sec as u64, nsec as u32));
+        0
+    }
+    fn sceKernelDeleteHRTimerEvent(h: u64, id: i32) -> i32 {
+        let Some(q) = from_handle(h) else { return sce(EBADF) };
+        if q.remove(id as u64, EVFILT_HRTIMER) { 0 } else { sce(ENOENT) }
+    }
     fn sceKernelGetEventId(ev: *const Kevent) -> u64 { (*ev).ident }
     fn sceKernelGetEventFilter(ev: *const Kevent) -> i32 { (*ev).filter as i32 }
     fn sceKernelGetEventData(ev: *const Kevent) -> u64 { (*ev).data }
@@ -200,6 +296,6 @@ pub fn register(r: &mut Registry) {
         sceKernelCreateEqueue, sceKernelDeleteEqueue, sceKernelWaitEqueue, sceKernelAddUserEvent,
         sceKernelAddUserEventEdge, sceKernelTriggerUserEvent, sceKernelDeleteUserEvent, sceKernelGetEventId,
         sceKernelGetEventFilter, sceKernelGetEventData, sceKernelGetEventUserData, sceKernelGetEventFflags,
-        sceKernelGetEventError,
+        sceKernelGetEventError, sceKernelAddHRTimerEvent, sceKernelDeleteHRTimerEvent,
     ]);
 }

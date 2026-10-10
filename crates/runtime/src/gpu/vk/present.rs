@@ -92,12 +92,12 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
     Ok(())
 }
 
-/// The swapchain's present mode: FIFO (vsync), or `SOTC_PRESENT=mailbox`
+/// The swapchain's present mode: FIFO (vsync), or `TLG_PRESENT=mailbox`
 /// (vsync without back-pressure: the newest frame is shown, for uncapped
-/// rates above the display's) or `SOTC_PRESENT=immediate` (no vsync, tears)
+/// rates above the display's) or `TLG_PRESENT=immediate` (no vsync, tears)
 /// when the surface supports them.
 fn present_mode(surface: vk::SurfaceKHR) -> vk::PresentModeKHR {
-    let want = match std::env::var("SOTC_PRESENT").as_deref() {
+    let want = match std::env::var("TLG_PRESENT").as_deref() {
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         _ => return vk::PresentModeKHR::FIFO,

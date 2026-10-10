@@ -59,7 +59,7 @@ pub fn describe_addr(addr: u64) -> String {
     }
     let host = crate::exception::host_image();
     if addr >= host.0 && addr < host.1 {
-        return format!("sotc+{:#x}", addr - host.0);
+        return format!("tlg+{:#x}", addr - host.0);
     }
     format!("{addr:#x}")
 }
@@ -456,7 +456,7 @@ pub fn report_patch(m: &LoadedModule, s: &PatchStats) {
     for (rel, text, range) in s.fs_unknown.iter().take(8) {
         crate::info!("{}+{:#x}: unhandled FS-prefixed decode '{}' in function {:#x}..{:#x} (left unpatched)", m.name, rel, text, range.0, range.1);
     }
-    if std::env::var_os("SOTC_DUMP_FS").is_some() {
+    if std::env::var_os("TLG_DUMP_FS").is_some() {
         for (rel, _, range) in s.fs_unknown.iter().take(4) {
             crate::patch::dump_around(m.base, *range, *rel);
         }

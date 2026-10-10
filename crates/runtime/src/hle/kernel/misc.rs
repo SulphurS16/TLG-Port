@@ -273,7 +273,7 @@ sysv! {
     fn _sceKernelSetThreadDtors(f: u64) -> i32 { 0 }
     fn _sceKernelSetThreadAtexitCount(f: u64) -> i32 { 0 }
     fn _sceKernelSetThreadAtexitReport(f: u64) -> i32 { 0 }
-    fn sceKernelGetFsSandboxRandomWord() -> u64 { crate::mem::arena_cstr("sotc0000") }
+    fn sceKernelGetFsSandboxRandomWord() -> u64 { crate::mem::arena_cstr("tlg0000") }
 }
 
 pub fn register(r: &mut Registry) {

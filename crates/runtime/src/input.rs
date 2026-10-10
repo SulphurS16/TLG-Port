@@ -6,8 +6,8 @@
 //!   Enter or E = Cross · Escape or Space = Circle · R = Square · F = Triangle
 //!   U = L1 · O = R1 · Y = L2 · P = R2 · C = L3 · V = R3 · Tab = Options · T = Touchpad
 //!
-//! Scripted input (`SOTC_INPUT`): `flip:buttons[:hold]` entries separated by
-//! `;`, e.g. `SOTC_INPUT=700:cross;760:down:3;800:cross`. `buttons` joins names
+//! Scripted input (`TLG_INPUT`): `flip:buttons[:hold]` entries separated by
+//! `;`, e.g. `TLG_INPUT=700:cross;760:down:3;800:cross`. `buttons` joins names
 //! with `+` (cross, circle, square, triangle, up, down, left, right, l1, r1,
 //! l2, r2, l3, r3, options, touchpad, ls_up/down/left/right,
 //! rs_up/down/left/right). Each press lasts `hold` GPU flips (default 6).
@@ -127,14 +127,14 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
 
 fn script() -> &'static [Step] {
     static SCRIPT: OnceLock<Vec<Step>> = OnceLock::new();
-    SCRIPT.get_or_init(|| match std::env::var("SOTC_INPUT") {
+    SCRIPT.get_or_init(|| match std::env::var("TLG_INPUT") {
         Ok(s) => match parse_script(&s) {
             Ok(v) => {
                 crate::info!("input script: {} steps", v.len());
                 v
             }
             Err(e) => {
-                crate::error!("SOTC_INPUT ignored: {e}");
+                crate::error!("TLG_INPUT ignored: {e}");
                 Vec::new()
             }
         },

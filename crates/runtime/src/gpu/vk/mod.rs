@@ -37,7 +37,7 @@ pub struct Ctx {
     pub validation: bool,
     /// VK_EXT_device_fault: what the GPU was doing when the device was lost.
     pub device_fault: Option<ash::ext::device_fault::Device>,
-    /// VK_NV_device_diagnostic_checkpoints (SOTC_GPU_DIAG=1).
+    /// VK_NV_device_diagnostic_checkpoints (TLG_GPU_DIAG=1).
     pub checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
 }
 
@@ -47,7 +47,7 @@ static CTX: OnceLock<Ctx> = OnceLock::new();
 static DIAG_NOTES: Mutex<std::collections::VecDeque<(u64, String)>> = Mutex::new(std::collections::VecDeque::new());
 static DIAG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Records a checkpoint describing the next command (SOTC_GPU_DIAG=1).
+/// Records a checkpoint describing the next command (TLG_GPU_DIAG=1).
 pub fn checkpoint(cmd: vk::CommandBuffer, text: String) {
     let Some(cp) = try_ctx().and_then(|c| c.checkpoints.as_ref()) else { return };
     let seq = DIAG_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -143,18 +143,18 @@ pub fn init() -> Result<(), String> {
     }
     unsafe {
         let entry = ash::Entry::load().map_err(|e| format!("loading Vulkan: {e}"))?;
-        let app_name = c"sotc";
+        let app_name = c"tlg";
         let app = vk::ApplicationInfo::default()
             .application_name(app_name)
             .engine_name(app_name)
             .api_version(vk::API_VERSION_1_3);
         let layers_avail = entry.enumerate_instance_layer_properties().unwrap_or_default();
-        let want_validation = std::env::var_os("SOTC_VK_VALIDATION").is_some();
+        let want_validation = std::env::var_os("TLG_VK_VALIDATION").is_some();
         let validation_name = c"VK_LAYER_KHRONOS_validation";
         let has_validation = layers_avail.iter().any(|l| CStr::from_ptr(l.layer_name.as_ptr()) == validation_name);
         let validation = want_validation && has_validation;
         if want_validation && !has_validation {
-            crate::warn!("SOTC_VK_VALIDATION set but the Khronos validation layer is not installed");
+            crate::warn!("TLG_VK_VALIDATION set but the Khronos validation layer is not installed");
         }
         let layers: Vec<*const c_char> = if validation { vec![validation_name.as_ptr()] } else { vec![] };
         let mut exts = vec![ash::khr::surface::NAME.as_ptr(), ash::khr::win32_surface::NAME.as_ptr()];
@@ -290,7 +290,7 @@ pub fn init() -> Result<(), String> {
             .shader_int8(true);
         let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true);
         // Device-loss diagnostics: VK_EXT_device_fault (always, no cost) and NV
-        // checkpoints (SOTC_GPU_DIAG=1: one per recorded command).
+        // checkpoints (TLG_GPU_DIAG=1: one per recorded command).
         let has_ext = |n: &CStr| instance.enumerate_device_extension_properties(pdev).unwrap_or_default().iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
         let mut fault_supported = vk::PhysicalDeviceFaultFeaturesEXT::default();
         if has_ext(ash::ext::device_fault::NAME) {
@@ -302,7 +302,7 @@ pub fn init() -> Result<(), String> {
         if device_fault {
             dexts.push(ash::ext::device_fault::NAME.as_ptr());
         }
-        let checkpoints = std::env::var("SOTC_GPU_DIAG").is_ok_and(|v| v != "0") && has_ext(ash::nv::device_diagnostic_checkpoints::NAME);
+        let checkpoints = std::env::var("TLG_GPU_DIAG").is_ok_and(|v| v != "0") && has_ext(ash::nv::device_diagnostic_checkpoints::NAME);
         if checkpoints {
             dexts.push(ash::nv::device_diagnostic_checkpoints::NAME.as_ptr());
         }
@@ -322,7 +322,7 @@ pub fn init() -> Result<(), String> {
             dci = dci.push_next(&mut fault_features);
         }
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
-        crate::info!("Vulkan diagnostics: device fault reports {device_fault}, checkpoints {checkpoints} (SOTC_GPU_DIAG)");
+        crate::info!("Vulkan diagnostics: device fault reports {device_fault}, checkpoints {checkpoints} (TLG_GPU_DIAG)");
         crate::info!(
             "Vulkan robustness: robustBufferAccess, robustness2 {} (buffer {}, image {}, null descriptors {})",
             has_robust2,
@@ -337,11 +337,11 @@ pub fn init() -> Result<(), String> {
             win32_i: ash::khr::win32_surface::Instance::new(&entry, &instance),
             swapchain_d: ash::khr::swapchain::Device::new(&instance, &device),
             push_desc: ash::khr::push_descriptor::Device::new(&instance, &device),
-            // Imported guest memory (zero-copy) is opt-in (SOTC_ZERO_COPY=1): with it the
+            // Imported guest memory (zero-copy) is opt-in (TLG_ZERO_COPY=1): with it the
             // GPU device is lost ~20 s into Shadow of the Colossus' boot on this host (a copy
             // out of an imported range; cause not yet found). Without it every access goes
             // through staging copies.
-            ext_host: (host_import && std::env::var("SOTC_ZERO_COPY").is_ok_and(|v| v == "1"))
+            ext_host: (host_import && std::env::var("TLG_ZERO_COPY").is_ok_and(|v| v == "1"))
                 .then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
             mem_budget,
             cond_render: cond_render.then(|| ash::ext::conditional_rendering::Device::new(&instance, &device)),

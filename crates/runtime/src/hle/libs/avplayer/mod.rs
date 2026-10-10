@@ -551,7 +551,7 @@ sysv! {
         for b in vbufs { call_guest(p.cb.free_tex, &[p.cb.mem_obj, b]); }
         for (b, _) in abufs { if b != 0 { call_guest(p.cb.free, &[p.cb.mem_obj, b]); } }
         crate::info!("avplayer: Close");
-        if let Some(n) = std::env::var("SOTC_BREAKLOG_ON_CLOSE").ok().and_then(|v| v.parse().ok()) {
+        if let Some(n) = std::env::var("TLG_BREAKLOG_ON_CLOSE").ok().and_then(|v| v.parse().ok()) {
             crate::exception::BREAK_VERBOSE.store(n, std::sync::atomic::Ordering::Relaxed);
         }
         // The player record stays allocated (the controller thread may still be
@@ -565,7 +565,7 @@ fixed! {
     sceAvPlayerPostInit => 0,
 }
 
-/// Development probe (`sotc --probe-media <file>`): decodes the start of a
+/// Development probe (`tlg --probe-media <file>`): decodes the start of a
 /// movie and reports stream parameters and decode speed.
 pub fn probe(path: &std::path::Path) {
     let info = match mf::probe(path) {

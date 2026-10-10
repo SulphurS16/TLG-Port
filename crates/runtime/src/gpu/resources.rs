@@ -355,11 +355,11 @@ pub fn element_bits(dfmt: u8) -> (u32, u32) {
 }
 
 /// Mip levels our images hold for a T#: levels 0..=LAST_LEVEL of tiled
-/// 2D, cube and array textures (SOTC_MIPS=0: the base level only, as before);
+/// 2D, cube and array textures (TLG_MIPS=0: the base level only, as before);
 /// 3D, linear and MSAA textures keep their base level.
 pub fn texture_levels(t: &Tsharp) -> u32 {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ON.get_or_init(|| std::env::var("SOTC_MIPS").map(|v| v != "0").unwrap_or(true)) {
+    if !*ON.get_or_init(|| std::env::var("TLG_MIPS").map(|v| v != "0").unwrap_or(true)) {
         return 1;
     }
     let linear = tiling::tile_mode(t.tiling_index).array == tiling::ArrayMode::Linear;

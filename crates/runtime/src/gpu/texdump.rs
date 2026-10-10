@@ -1,4 +1,4 @@
-//! Debug aid: writes the first uploaded textures as PNG files (SOTC_DUMP_TEX=N).
+//! Debug aid: writes the first uploaded textures as PNG files (TLG_DUMP_TEX=N).
 
 use super::desc::Tsharp;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -173,7 +173,7 @@ pub fn to_rgba(t: &Tsharp, data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
 }
 
 pub fn maybe_dump(t: &Tsharp, data: &[u8]) {
-    let limit: u32 = std::env::var("SOTC_DUMP_TEX").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let limit: u32 = std::env::var("TLG_DUMP_TEX").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     if limit == 0 || DUMPED.load(Ordering::Relaxed) >= limit || t.width < 16 || t.height < 16 {
         return;
     }
@@ -220,7 +220,7 @@ fn element_value(dfmt: u8, e: &[u8]) -> Option<f32> {
     })
 }
 
-/// Debug (SOTC_MIP_CHECK): for each level of an uploaded mip chain (`data` as
+/// Debug (TLG_MIP_CHECK): for each level of an uploaded mip chain (`data` as
 /// `resources::read_texture` returns it), the correlation of its first slice
 /// with the previous level's first slice averaged 2x2: near 1 when the
 /// levels were read from where the hardware stores them, near 0 otherwise.

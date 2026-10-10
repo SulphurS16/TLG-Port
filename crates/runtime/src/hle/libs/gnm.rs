@@ -258,7 +258,7 @@ fn submit(count: u32, dcb: *const u64, dcb_sizes: *const u32, ccb: *const u64, c
             }
         }
     }
-    if std::env::var_os("SOTC_SUBMIT_LOG").is_some() {
+    if std::env::var_os("TLG_SUBMIT_LOG").is_some() {
         let total: u64 = s.dcb.iter().map(|d| d.1 as u64 * 4).sum();
         crate::info!("submit {} dcb(s) {} bytes{}: {:x?}", s.dcb.len(), total, if s.flip.is_some() { " +flip" } else { "" }, s.dcb.iter().take(8).map(|d| d.0).collect::<Vec<_>>());
 

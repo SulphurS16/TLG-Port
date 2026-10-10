@@ -25,10 +25,15 @@ pub fn init(root: PathBuf) {
     ROOT.set(root).ok();
 }
 
+/// Where locally recorded trophy unlocks of the running title live.
+pub fn trophy_file() -> PathBuf {
+    ROOT.get().expect("savedata root").join(format!("trophies-{}.txt", title_id()))
+}
+
 fn title_id() -> String {
     match super::app::param_sfo().get("TITLE_ID") {
         Some(super::app::SfoValue::Str(s)) => s.clone(),
-        _ => "CUSA08809".into(),
+        _ => "CUSA03627".into(),
     }
 }
 
@@ -102,6 +107,78 @@ fn read_save_param(dir: &std::path::Path) -> SaveParam {
 
 fn memory_file(user: i32) -> PathBuf {
     user_root(user, std::ptr::null()).join("sdmemory").join("memory.dat")
+}
+
+// ---------------------------------------------------------------------------
+// Save-data memory, version 2 (SDK 4: Setup/Get/Set SaveDataMemory2, Sync).
+// The image lives in RAM; every Set2 and Sync replaces `memory.dat` atomically
+// (temporary file, flushed, renamed over the old one, which is kept as
+// `memory.dat.bak`), so a crash never leaves a half-written save.
+
+struct SdMemory {
+    user: i32,
+    data: Vec<u8>,
+}
+
+static SDMEM: Mutex<Option<SdMemory>> = Mutex::new(None);
+
+fn sdmem_dir(user: i32) -> PathBuf {
+    user_root(user, std::ptr::null()).join("sdmemory")
+}
+
+fn sdmem_load(user: i32) -> Option<Vec<u8>> {
+    let f = memory_file(user);
+    match std::fs::read(&f) {
+        Ok(b) => Some(b),
+        Err(_) => {
+            let bak = f.with_extension("dat.bak");
+            let b = std::fs::read(&bak).ok()?;
+            crate::warn!("save-data memory: {} missing, using backup {}", f.display(), bak.display());
+            Some(b)
+        }
+    }
+}
+
+fn sdmem_store(user: i32, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let f = memory_file(user);
+    std::fs::create_dir_all(f.parent().unwrap())?;
+    let tmp = f.with_extension("dat.tmp");
+    {
+        let mut h = std::fs::File::create(&tmp)?;
+        h.write_all(data)?;
+        h.sync_all()?;
+    }
+    if f.exists() {
+        std::fs::copy(&f, f.with_extension("dat.bak"))?;
+    }
+    std::fs::rename(&tmp, &f)
+}
+
+/// SceSaveDataMemoryData {buf*, bufSize, offset, reserved[40]}.
+unsafe fn sdmem_data(p: *const u8) -> (*mut u8, usize, u64) {
+    unsafe { (*(p as *const u64) as *mut u8, *(p.add(8) as *const u64) as usize, *(p.add(16) as *const i64) as u64) }
+}
+
+/// SceSaveDataIcon {buf*, bufSize, dataSize}: stores the icon's data.
+unsafe fn store_icon(dir: &std::path::Path, icon: *const u64) {
+    unsafe {
+        let (buf, size) = (*icon as *const u8, *icon.add(2) as usize);
+        if !buf.is_null() && size > 0 {
+            let _ = std::fs::create_dir_all(dir.join("sce_sys"));
+            let _ = std::fs::write(dir.join("sce_sys").join("icon0.png"), std::slice::from_raw_parts(buf, size));
+        }
+    }
+}
+
+unsafe fn store_param(dir: &std::path::Path, param: *const SaveParam) {
+    unsafe {
+        let mut p: SaveParam = std::ptr::read_unaligned(param);
+        p.mtime = (crate::hle::libs::rtc::now_tick() / 1_000_000) as i64 - 62_135_596_800;
+        let bytes = std::slice::from_raw_parts(&p as *const _ as *const u8, std::mem::size_of::<SaveParam>());
+        let _ = std::fs::create_dir_all(dir.join("sce_sys"));
+        let _ = std::fs::write(dir.join("sce_sys").join("param.bin"), bytes);
+    }
 }
 
 /// Backup copies (sceSaveDataUmountWithBackup) live beside the saves:
@@ -357,6 +434,99 @@ sysv! {
         if f.seek_write(std::slice::from_raw_parts(buf, size as usize), offset as u64).is_err() { return ERR_INTERNAL; }
         0
     }
+    /// SceSaveDataMemorySetup2 {option u32, user i32, memorySize, iconMemorySize,
+    /// initParam*, initIcon*, reserved}; result {existedMemorySize, reserved} (optional).
+    fn sceSaveDataSetupSaveDataMemory2(setup: *const u8, result: *mut u64) -> i32 {
+        if setup.is_null() { return ERR_PARAMETER; }
+        let option = *(setup as *const u32);
+        let user = *(setup.add(4) as *const i32);
+        let size = *(setup.add(8) as *const u64) as usize;
+        let icon_size = *(setup.add(16) as *const u64);
+        let init_param = *(setup.add(24) as *const u64) as *const SaveParam;
+        let init_icon = *(setup.add(32) as *const u64) as *const u64;
+        if size == 0 || size > 16 << 20 { return ERR_PARAMETER; }
+        let existing = sdmem_load(user);
+        let existed = existing.as_ref().map_or(0, |d| d.len());
+        let mut data = existing.unwrap_or_default();
+        let grow = data.len() < size;
+        if grow { data.resize(size, 0); }
+        let dir = sdmem_dir(user);
+        if existed == 0 || grow {
+            if let Err(e) = sdmem_store(user, &data) {
+                crate::error!("save-data memory: writing {} failed: {e}", memory_file(user).display());
+                return ERR_INTERNAL;
+            }
+        }
+        if existed == 0 {
+            if option & 1 != 0 && !init_param.is_null() { store_param(&dir, init_param); }
+            if !init_icon.is_null() { store_icon(&dir, init_icon); }
+        }
+        crate::info!("sceSaveDataSetupSaveDataMemory2 user {user} option {option:#x} size {size:#x} icon {icon_size:#x} existed {existed:#x} ({})", memory_file(user).display());
+        *SDMEM.lock() = Some(SdMemory { user, data });
+        if !result.is_null() { *result = existed as u64; }
+        0
+    }
+    /// SceSaveDataMemoryGet2 {user i32, pad, data*, param*, icon*, reserved}.
+    fn sceSaveDataGetSaveDataMemory2(get: *const u8) -> i32 {
+        if get.is_null() { return ERR_PARAMETER; }
+        let user = *(get as *const i32);
+        let data = *(get.add(8) as *const u64) as *const u8;
+        let param = *(get.add(16) as *const u64) as *mut SaveParam;
+        let icon = *(get.add(24) as *const u64) as *mut u64;
+        let g = SDMEM.lock();
+        let Some(m) = g.as_ref().filter(|m| m.user == user) else { return ERR_NOT_FOUND };
+        if !data.is_null() {
+            let (buf, n, off) = sdmem_data(data);
+            if buf.is_null() || off as usize + n > m.data.len() { return ERR_PARAMETER; }
+            std::ptr::copy_nonoverlapping(m.data.as_ptr().add(off as usize), buf, n);
+        }
+        let dir = sdmem_dir(user);
+        if !param.is_null() { std::ptr::write_unaligned(param, read_save_param(&dir)); }
+        if !icon.is_null() {
+            let (buf, cap) = (*icon as *mut u8, *icon.add(1) as usize);
+            let d = std::fs::read(dir.join("sce_sys").join("icon0.png")).unwrap_or_default();
+            let n = d.len().min(cap);
+            if !buf.is_null() { std::ptr::copy_nonoverlapping(d.as_ptr(), buf, n); }
+            *icon.add(2) = n as u64;
+        }
+        0
+    }
+    /// SceSaveDataMemorySet2 {user i32, pad, data*, param*, icon*, reserved}.
+    fn sceSaveDataSetSaveDataMemory2(set: *const u8) -> i32 {
+        if set.is_null() { return ERR_PARAMETER; }
+        let user = *(set as *const i32);
+        let data = *(set.add(8) as *const u64) as *const u8;
+        let param = *(set.add(16) as *const u64) as *const SaveParam;
+        let icon = *(set.add(24) as *const u64) as *const u64;
+        let mut g = SDMEM.lock();
+        let Some(m) = g.as_mut().filter(|m| m.user == user) else { return ERR_NOT_FOUND };
+        if !data.is_null() {
+            let (buf, n, off) = sdmem_data(data);
+            if buf.is_null() || off as usize + n > m.data.len() { return ERR_PARAMETER; }
+            std::ptr::copy_nonoverlapping(buf, m.data.as_mut_ptr().add(off as usize), n);
+            if let Err(e) = sdmem_store(user, &m.data) {
+                crate::error!("save-data memory: writing {} failed: {e}", memory_file(user).display());
+                return ERR_INTERNAL;
+            }
+            crate::info!("save-data memory: {n:#x} bytes at {off:#x} written");
+        }
+        let dir = sdmem_dir(user);
+        if !param.is_null() { store_param(&dir, param); }
+        if !icon.is_null() { store_icon(&dir, icon); }
+        0
+    }
+    /// SceSaveDataMemorySync {user i32, reserved}: the image is already on disk
+    /// after every Set2; this rewrites it (atomically) to be sure.
+    fn sceSaveDataSyncSaveDataMemory(sync: *const u8) -> i32 {
+        if sync.is_null() { return ERR_PARAMETER; }
+        let user = *(sync as *const i32);
+        let g = SDMEM.lock();
+        let Some(m) = g.as_ref().filter(|m| m.user == user) else { return ERR_NOT_FOUND };
+        match sdmem_store(user, &m.data) {
+            Ok(()) => 0,
+            Err(e) => { crate::error!("save-data memory sync failed: {e}"); ERR_INTERNAL }
+        }
+    }
 }
 
 fixed! {
@@ -371,5 +541,7 @@ pub fn register(r: &mut Registry) {
         sceSaveDataDelete, sceSaveDataSetupSaveDataMemory, sceSaveDataGetSaveDataMemory, sceSaveDataSetSaveDataMemory,
         sceSaveDataInitialize, sceSaveDataInitialize3, sceSaveDataTerminate, sceSaveDataMount2,
         sceSaveDataUmountWithBackup, sceSaveDataCheckBackupData, sceSaveDataRestoreBackupData, sceSaveDataGetMountInfo,
+        sceSaveDataSetupSaveDataMemory2, sceSaveDataGetSaveDataMemory2, sceSaveDataSetSaveDataMemory2,
+        sceSaveDataSyncSaveDataMemory,
     ]);
 }

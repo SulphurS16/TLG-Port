@@ -388,14 +388,14 @@ fn image_dim(t: &Tsharp) -> ImageDim {
     }
 }
 
-/// Debug (`SOTC_PS_DEBUG=<shader addr>:<pc>:v<N>[:<pc2>:v<M>][;<addr>:...]`, `u<N>` converts
+/// Debug (`TLG_PS_DEBUG=<shader addr>:<pc>:v<N>[:<pc2>:v<M>][;<addr>:...]`, `u<N>` converts
 /// unsigned integers to floats divided by 255):
 /// export v[N..N+2] captured after the instruction at `pc` instead of the
 /// shader's outputs (first capture to MRT0, second to MRT1 and beyond).
 fn debug_capture(addr: u64) -> Vec<(u32, u32, bool)> {
     static SPEC: std::sync::OnceLock<Vec<(u64, Vec<(u32, u32, bool)>)>> = std::sync::OnceLock::new();
     let specs = SPEC.get_or_init(|| {
-        let Ok(v) = std::env::var("SOTC_PS_DEBUG") else { return Vec::new() };
+        let Ok(v) = std::env::var("TLG_PS_DEBUG") else { return Vec::new() };
         v.split(';')
             .filter_map(|e| {
                 let mut it = e.trim().split(':');
@@ -413,10 +413,10 @@ fn debug_capture(addr: u64) -> Vec<(u32, u32, bool)> {
     specs.iter().find(|(a, _)| *a == addr).map(|(_, c)| c.clone()).unwrap_or_default()
 }
 
-/// SOTC_VS_CAPTURE=<pc>:v<N>,... (with SOTC_VS_POS): registers of the debugged
+/// TLG_VS_CAPTURE=<pc>:v<N>,... (with TLG_VS_POS): registers of the debugged
 /// vertex shader captured after those instructions (up to 12).
 pub fn debug_vs_capture() -> Vec<(u32, u32, bool)> {
-    std::env::var("SOTC_VS_CAPTURE")
+    std::env::var("TLG_VS_CAPTURE")
         .map(|v| {
             v.split(',')
                 .filter_map(|e| {
@@ -429,10 +429,10 @@ pub fn debug_vs_capture() -> Vec<(u32, u32, bool)> {
         .unwrap_or_default()
 }
 
-/// SOTC_VS_POS=<vs addr>[,<vs addr>...]: whether `addr` is one of them.
+/// TLG_VS_POS=<vs addr>[,<vs addr>...]: whether `addr` is one of them.
 pub fn debug_vs_pos(addr: u64) -> bool {
     static A: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    A.get_or_init(|| std::env::var("SOTC_VS_POS").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
+    A.get_or_init(|| std::env::var("TLG_VS_POS").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default())
         .contains(&addr)
 }
 
@@ -606,7 +606,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         // RSRC1 FLOAT_MODE [17:16]: FP32 denormal mode (0 = flush input and
         // output; 1 and 2 flush one side: also flushed here).
         denorm_flush32: (rsrc1 >> 16) & 3 != 3 && super::vk::ctx().denorm_flush32 && crate::tune::get(crate::tune::FTZ) != 0,
-        // SOTC_VS_POS=<vs addr>: that vertex shader also stores its position
+        // TLG_VS_POS=<vs addr>: that vertex shader also stores its position
         // exports (traced frames analyse them, see `render::check_vs_positions`).
         debug_pos_store: sr.stage == Stage::Vertex && tess.role == TessRole::None && debug_vs_pos(addr),
         tess,

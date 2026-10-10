@@ -39,7 +39,21 @@ pub fn init_slot() -> Result<u32, String> {
         return Err(format!("TlsAlloc returned {s}; need a direct TEB slot (<64)"));
     }
     SLOT.store(s, Ordering::SeqCst);
+    let r = unsafe { TlsAlloc() };
+    if r == u32::MAX || r >= 64 {
+        return Err(format!("TlsAlloc returned {r}; need a direct TEB slot (<64)"));
+    }
+    HLE_RET_SLOT.store(r, Ordering::SeqCst);
     Ok(s)
+}
+
+/// TEB TLS slot receiving the guest return address of the HLE call in
+/// progress on each thread (stored by the `sysv!` entry stubs; diagnostics).
+pub static HLE_RET_SLOT: AtomicU32 = AtomicU32::new(0);
+
+/// Guest return address of the innermost HLE call on this thread.
+pub fn hle_return_addr() -> u64 {
+    unsafe { TlsGetValue(HLE_RET_SLOT.load(Ordering::Relaxed)) as u64 }
 }
 
 pub fn slot() -> u32 {
@@ -81,12 +95,21 @@ pub fn module(index: u64) -> Option<TlsModule> {
 }
 
 /// Allocates and initializes a guest TLS area; returns tp.
+///
+/// The area has its own pages with an inaccessible guard page right after
+/// the TCB, so guest code reaching beyond the TCB faults at the instruction
+/// (instead of silently overwriting whatever the host heap put next to it).
 pub fn alloc_thread_area(thread_ptr: u64) -> u64 {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualProtect};
     THREADS_STARTED.store(true, Ordering::SeqCst);
-    let layout = Layout::from_size_align((STATIC_TLS_SIZE + TCB_SIZE) as usize, 64).unwrap();
-    let base = unsafe { alloc_zeroed(layout) } as u64;
+    const PAGE: u64 = 0x1000;
+    let used = (STATIC_TLS_SIZE + TCB_SIZE + PAGE - 1) & !(PAGE - 1);
+    let base = unsafe { VirtualAlloc(std::ptr::null(), (used + PAGE) as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) } as u64;
     assert!(base != 0, "TLS area allocation failed");
-    let tp = base + STATIC_TLS_SIZE;
+    let mut old = 0u32;
+    let guarded = unsafe { VirtualProtect((base + used) as *const _, PAGE as usize, PAGE_NOACCESS, &mut old) } != 0;
+    debug_assert!(guarded);
+    let tp = base + used - TCB_SIZE;
     for m in MODULES.read().iter() {
         if m.offset == 0 || m.init_size == 0 {
             continue;

@@ -13,6 +13,8 @@ const MAP_FAILED: u64 = u64::MAX;
 
 const FLEXIBLE_TOTAL: u64 = 448 << 20;
 
+static PRT_APERTURES: parking_lot::Mutex<[(u64, u64); 3]> = parking_lot::Mutex::new([(0, 0); 3]);
+
 /// Picks a virtual address for a new mapping following PS4 hint/fixed rules.
 fn choose_addr(st: &MemState, hint: u64, size: u64, align: u64, flags: i32) -> Result<u64, i32> {
     let align = align.max(PAGE);
@@ -295,6 +297,21 @@ sysv! {
     fn madvise(addr: u64, len: u64, advice: i32) -> i32 { 0 }
     fn getpagesize() -> i32 { PAGE as i32 }
     fn sceKernelIsStack(addr: u64, start: *mut u64, end: *mut u64) -> i32 { sce(EINVAL) }
+    /// Partially-resident-texture apertures (3): recorded and reported back; the
+    /// GPU emulation does not treat their range specially (yet).
+    fn sceKernelSetPrtAperture(index: i32, addr: u64, len: u64) -> i32 {
+        if !(0..3).contains(&index) { return sce(EINVAL); }
+        PRT_APERTURES.lock()[index as usize] = (addr, len);
+        crate::info!("PRT aperture {index}: {addr:#x}+{len:#x}");
+        0
+    }
+    fn sceKernelGetPrtAperture(index: i32, addr: *mut u64, len: *mut u64) -> i32 {
+        if !(0..3).contains(&index) { return sce(EINVAL); }
+        let (a, l) = PRT_APERTURES.lock()[index as usize];
+        if !addr.is_null() { *addr = a; }
+        if !len.is_null() { *len = l; }
+        0
+    }
 }
 
 pub fn register(r: &mut Registry) {
@@ -306,7 +323,7 @@ pub fn register(r: &mut Registry) {
         sceKernelReleaseFlexibleMemory, sceKernelAvailableFlexibleMemorySize, sceKernelMunmap, sceKernelMprotect,
         sceKernelMtypeprotect, sceKernelReserveVirtualRange, sceKernelQueryMemoryProtection, sceKernelVirtualQuery,
         sceKernelBatchMap, sceKernelBatchMap2, sceKernelMmap, mmap, munmap, mprotect, msync, madvise, getpagesize,
-        sceKernelIsStack,
+        sceKernelIsStack, sceKernelSetPrtAperture, sceKernelGetPrtAperture,
     ]);
     reg!(r, "libScePosix", [mmap, munmap, mprotect, msync, madvise, getpagesize]);
 }

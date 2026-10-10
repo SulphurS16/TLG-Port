@@ -209,6 +209,7 @@ sysv! {
 
 fixed! {
     scePadInit => 0,
+    scePadResetLightBar => 0,
     scePadClose => 0,
     scePadResetOrientation => 0,
     scePadSetAngularVelocityDeadbandState => 0,
@@ -245,7 +246,7 @@ pub fn register(r: &mut Registry) {
     reg!(r, "libScePad", [
         scePadInit, scePadOpen, scePadClose, scePadReadState, scePadGetControllerInformation, scePadSetVibration,
         scePadResetOrientation, scePadSetAngularVelocityDeadbandState, scePadSetTiltCorrectionState,
-        scePadRead, scePadSetLightBar, scePadSetMotionSensorState,
+        scePadRead, scePadSetLightBar, scePadSetMotionSensorState, scePadResetLightBar,
     ]);
     reg!(r, "libSceMouse", [sceMouseInit, sceMouseOpen, sceMouseClose, sceMouseRead]);
     reg!(r, "libSceAudioIn", [sceAudioInOpen, sceAudioInClose, sceAudioInInput]);

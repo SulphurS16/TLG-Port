@@ -2,7 +2,7 @@
 //! A vblank thread executes each flip as soon as it is queued: the title's
 //! own frame limiter paces its frames and the host swapchain synchronizes
 //! with the display. (Executing them at the next 60 Hz tick of a clock
-//! unrelated to the title's limiter and to the display, `SOTC_FLIP=vblank`,
+//! unrelated to the title's limiter and to the display, `TLG_FLIP=vblank`,
 //! made frames that arrived around a tick alternate between 16.7 and 50 ms
 //! at 30 fps: in a 2-minute fight, 117 frames over 45 ms against 13, and
 //! 8 ms more latency.) Vblanks tick at 60 Hz either way.
@@ -80,15 +80,15 @@ static QUEUED_CV: Condvar = Condvar::new();
 /// Signalled at every vblank tick (sceVideoOutWaitVblank).
 static VBLANK_CV: Condvar = Condvar::new();
 
-/// Flips execute as soon as they are queued, unless `SOTC_FLIP=vblank` (not
-/// above 60 fps or uncapped, `SOTC_FPS`, which 60 Hz vblanks would cap).
+/// Flips execute as soon as they are queued, unless `TLG_FLIP=vblank` (not
+/// above 60 fps or uncapped, `TLG_FPS`, which 60 Hz vblanks would cap).
 fn immediate_flips() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
         let fast = crate::title_patches::target_fps().is_some_and(|n| n == 0 || n > 60);
-        let on = fast || !std::env::var("SOTC_FLIP").is_ok_and(|v| v == "vblank");
+        let on = fast || !std::env::var("TLG_FLIP").is_ok_and(|v| v == "vblank");
         if !on {
-            crate::info!("SOTC_FLIP=vblank: flips execute at 60 Hz vblanks");
+            crate::info!("TLG_FLIP=vblank: flips execute at 60 Hz vblanks");
         }
         on
     })
@@ -481,7 +481,7 @@ fn present_buffer(b: &DisplayBuffer) -> Option<(Duration, Duration, Option<crate
     Some((lock_wait, t1.elapsed(), prof))
 }
 
-/// SOTC_SCREENSHOT=n1,n2,... writes the displayed image of those flips as PNG.
+/// TLG_SCREENSHOT=n1,n2,... writes the displayed image of those flips as PNG.
 /// Screenshot requested through the control channel (file name stem).
 pub static SHOT_REQUEST: Mutex<Option<String>> = Mutex::new(None);
 /// Screenshot of the image a given GPU frame displays (`traceshot`): frame
@@ -503,7 +503,7 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64, frame: u64) {
         }
     }
     .or_else(|| SHOT_REQUEST.lock().take());
-    let listed = std::env::var("SOTC_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
+    let listed = std::env::var("TLG_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
     if requested.is_none() && !listed {
         return;
     }

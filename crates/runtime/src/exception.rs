@@ -63,21 +63,21 @@ fn describe(addr: u64) -> String {
     }
 }
 
-/// Debug breakpoints (`SOTC_BREAK=<eboot offsets>`): int3 patched over the
+/// Debug breakpoints (`TLG_BREAK=<eboot offsets>`): int3 patched over the
 /// first byte of a guest instruction; each hit is logged. A replaced
 /// `push rbp` is emulated; any other instruction is executed by restoring its
 /// byte and single-stepping, then the int3 is re-armed (hits on other threads
 /// during that step are missed). (address, hit count, original byte)
 pub static BREAKPOINTS: parking_lot::Mutex<Vec<(u64, u64, u8)>> = parking_lot::Mutex::new(Vec::new());
 
-/// `SOTC_BREAK_STATS=1`: hits are counted per (breakpoint, caller chain) instead
+/// `TLG_BREAK_STATS=1`: hits are counted per (breakpoint, caller chain) instead
 /// of being logged one by one (logging slows the title enough to change its
 /// behavior); `dump_break_stats` prints and resets the table.
 static BREAK_STATS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, [u64; 4]), u64>>> = parking_lot::Mutex::new(None);
 
 pub fn break_stats_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SOTC_BREAK_STATS").is_some())
+    *ON.get_or_init(|| std::env::var_os("TLG_BREAK_STATS").is_some())
 }
 
 /// Logs the breakpoint hit histogram collected since the last call.
@@ -106,7 +106,7 @@ thread_local! {
     static WATCH_STEP: std::cell::Cell<(u64, u64, [u8; 16])> = const { std::cell::Cell::new((0, 0, [0; 16])) };
 }
 
-/// Data watchpoint (`SOTC_DATA_WATCH=<hex addr>[+<hex len>]`, e.g. to find who
+/// Data watchpoint (`TLG_DATA_WATCH=<hex addr>[+<hex len>]`, e.g. to find who
 /// overwrites a buffer): the pages holding the range are write-protected
 /// whenever they are mapped or re-protected; each write into the range is
 /// logged with the writing instruction (guest module offset or host address)
@@ -116,7 +116,7 @@ thread_local! {
 pub fn data_watch() -> Option<(u64, u64)> {
     static W: OnceLock<Option<(u64, u64)>> = OnceLock::new();
     *W.get_or_init(|| {
-        let v = std::env::var("SOTC_DATA_WATCH").ok()?;
+        let v = std::env::var("TLG_DATA_WATCH").ok()?;
         let (a, n) = v.split_once('+').unwrap_or((&v, "8"));
         let a = u64::from_str_radix(a.trim().trim_start_matches("0x"), 16).ok()?;
         let n = u64::from_str_radix(n.trim().trim_start_matches("0x"), 16).ok()?.max(1);
@@ -332,7 +332,7 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
             // Return address (meaningful at function entries) and rbp chain.
             let mut key = [0u64; 4];
             key[0] = *(ctx.Rsp as *const u64);
-            let depth: usize = std::env::var("SOTC_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(3);
+            let depth: usize = std::env::var("TLG_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0).min(3);
             let mut fp = ctx.Rbp;
             for slot in key.iter_mut().skip(1).take(depth) {
                 use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, VirtualQuery};
@@ -348,10 +348,10 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
         let verbose = BREAK_VERBOSE.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)).is_ok();
         if !break_stats_enabled() && (n <= 64 || n.is_power_of_two() || verbose) {
             let ret = *(ctx.Rsp as *const u64);
-            // SOTC_BREAK_PEEK: comma-separated expressions logged with each hit.
+            // TLG_BREAK_PEEK: comma-separated expressions logged with each hit.
             let mut extra = String::new();
-            // SOTC_BREAK_DEPTH: caller frames (rbp chain) appended to each hit.
-            let depth: usize = std::env::var("SOTC_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+            // TLG_BREAK_DEPTH: caller frames (rbp chain) appended to each hit.
+            let depth: usize = std::env::var("TLG_BREAK_DEPTH").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
             if depth > 0 {
                 let mut bp_ = ctx.Rbp;
                 extra.push_str(" chain");
@@ -369,7 +369,7 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
                     bp_ = *(bp_ as *const u64);
                 }
             }
-            if let Ok(spec) = std::env::var("SOTC_BREAK_PEEK") {
+            if let Ok(spec) = std::env::var("TLG_BREAK_PEEK") {
                 let regs = [
                     ("rdi", ctx.Rdi),
                     ("rsi", ctx.Rsi),
@@ -578,9 +578,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
                     let _ = writeln!(r, "  [{name}] {a:#x}: {}", q.join(" "));
                 }
             }
-            // SOTC_CRASH_PEEK: comma-separated `base(+hex|*)*[:count]` expressions,
+            // TLG_CRASH_PEEK: comma-separated `base(+hex|*)*[:count]` expressions,
             // e.g. `rbx+b4c8*:8` (load the pointer at rbx+0xb4c8, dump 8 qwords).
-            if let Ok(spec) = std::env::var("SOTC_CRASH_PEEK") {
+            if let Ok(spec) = std::env::var("TLG_CRASH_PEEK") {
                 for item in spec.split(',').map(str::trim).filter(|s| !s.is_empty()) {
                     let (expr, count) = match item.split_once(':') {
                         Some((e, c)) => (e, u64::from_str_radix(c, 16).unwrap_or(8).min(64)),

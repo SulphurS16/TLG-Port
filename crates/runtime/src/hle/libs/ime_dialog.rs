@@ -1,6 +1,6 @@
 //! System IME dialog (libSceImeDialog): text entry such as the character
 //! name. The console's on-screen keyboard is replaced by a native Windows text
-//! box; automated runs supply the text with `SOTC_IME_TEXT` or the `ime <text>`
+//! box; automated runs supply the text with `TLG_IME_TEXT` or the `ime <text>`
 //! control command. The entered text is written to the title's UTF-16 buffer
 //! when it next polls the dialog status.
 
@@ -75,8 +75,8 @@ sysv! {
             max_len
         );
         let mut d = Dialog { buf, max_len, status: STATUS_RUNNING, end: END_CANCELED, text: None, delivered: false, hwnd: 0 };
-        if let Ok(t) = std::env::var("SOTC_IME_TEXT") {
-            crate::info!("ime dialog: text supplied by SOTC_IME_TEXT");
+        if let Ok(t) = std::env::var("TLG_IME_TEXT") {
+            crate::info!("ime dialog: text supplied by TLG_IME_TEXT");
             finish(&mut d, Some(t.encode_utf16().collect()), END_OK);
         } else {
             let init = String::from_utf16_lossy(&initial);
@@ -217,7 +217,7 @@ mod native {
         crate::log::set_thread_name("ime");
         unsafe {
             let hinst = GetModuleHandleW(std::ptr::null());
-            let class = wide("sotc_ime");
+            let class = wide("tlg_ime");
             let wc = WNDCLASSEXW {
                 cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
                 style: 0,

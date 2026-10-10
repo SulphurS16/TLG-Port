@@ -6,9 +6,9 @@
 //! call blocks while its port has `MAX_QUEUED` frames queued, so the title's
 //! mixer is paced by the audio device, as it is by the hardware.
 //!
-//! Without a device (none present, initialization failed, or SOTC_AUDIO=0) the
+//! Without a device (none present, initialization failed, or TLG_AUDIO=0) the
 //! caller paces output in real time and the audio is discarded.
-//! SOTC_AUDIO_DUMP=<dir>: each port's stereo stream is also written to
+//! TLG_AUDIO_DUMP=<dir>: each port's stereo stream is also written to
 //! `<dir>/port<N>.f32` (interleaved little-endian float32, 48 kHz).
 
 use parking_lot::{Condvar, Mutex};
@@ -38,11 +38,11 @@ static CV: Condvar = Condvar::new();
 
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("SOTC_AUDIO").map(|v| v != "0").unwrap_or(true))
+    *ON.get_or_init(|| std::env::var("TLG_AUDIO").map(|v| v != "0").unwrap_or(true))
 }
 
 pub fn open_port(idx: usize) {
-    let dump = std::env::var_os("SOTC_AUDIO_DUMP").and_then(|d| {
+    let dump = std::env::var_os("TLG_AUDIO_DUMP").and_then(|d| {
         let dir = std::path::PathBuf::from(d);
         let _ = std::fs::create_dir_all(&dir);
         std::fs::File::create(dir.join(format!("port{}.f32", idx + 1))).ok()

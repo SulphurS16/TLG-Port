@@ -376,7 +376,7 @@ pub static OPCODES: [std::sync::atomic::AtomicU64; 512] = [const { std::sync::at
 pub static EVENT_TYPES: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
 
 /// CP memory accesses that waited for GPU work (or its write-backs), by
-/// cp.rs line of the packet handler: (count, microseconds) (SOTC_PERF report).
+/// cp.rs line of the packet handler: (count, microseconds) (TLG_PERF report).
 pub static SYNC_SITES: parking_lot::Mutex<Option<HashMap<u32, (u64, u64)>>> = parking_lot::Mutex::new(None);
 
 fn note_sync(line: u32, t0: Instant) {
@@ -403,7 +403,7 @@ pub fn event_type_counts() -> String {
 }
 
 /// Logs the dwords around a malformed packet (first few occurrences only).
-/// Whether register writes are logged (SOTC_WATCH_REG); cached.
+/// Whether register writes are logged (TLG_WATCH_REG); cached.
 #[inline]
 fn reg_watching() -> bool {
     use std::sync::atomic::{AtomicU8, Ordering};
@@ -412,7 +412,7 @@ fn reg_watching() -> bool {
         1 => false,
         2 => true,
         _ => {
-            let on = std::env::var_os("SOTC_WATCH_REG").is_some();
+            let on = std::env::var_os("TLG_WATCH_REG").is_some();
             STATE.store(if on { 2 } else { 1 }, Ordering::Relaxed);
             on
         }
@@ -1027,12 +1027,12 @@ impl CommandProcessor {
 
     #[cold]
     fn write_reg_watched(&mut self, reg: u32, v: u32) {
-        // SOTC_WATCH_REG=<reg>[,<reg>...] (hex): log writes to those registers
-        // (only zero values with SOTC_WATCH_ZERO=1).
+        // TLG_WATCH_REG=<reg>[,<reg>...] (hex): log writes to those registers
+        // (only zero values with TLG_WATCH_ZERO=1).
         static WATCH: std::sync::OnceLock<Vec<u32>> = std::sync::OnceLock::new();
-        let watch = WATCH.get_or_init(|| std::env::var("SOTC_WATCH_REG").map(|v| v.split(',').filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default());
+        let watch = WATCH.get_or_init(|| std::env::var("TLG_WATCH_REG").map(|v| v.split(',').filter_map(|s| u32::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default());
         static ZERO: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !watch.is_empty() && watch.contains(&reg) && (v == 0 || !*ZERO.get_or_init(|| std::env::var_os("SOTC_WATCH_ZERO").is_some())) {
+        if !watch.is_empty() && watch.contains(&reg) && (v == 0 || !*ZERO.get_or_init(|| std::env::var_os("TLG_WATCH_ZERO").is_some())) {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 2000 {
                 crate::info!("{}: reg {:#x} = {:#x} by packet at {:#x}{}", self.name, reg, v, self.cur_packet.0, if self.cur_packet.1 { " (CE)" } else { "" });
@@ -1141,7 +1141,7 @@ impl CommandProcessor {
                 _ => true,
             }
         };
-        // (Time not met at once: per queue, SOTC_PERF.)
+        // (Time not met at once: per queue, TLG_PERF.)
         struct Timed(usize, Instant);
         impl Drop for Timed {
             fn drop(&mut self) {
@@ -1151,7 +1151,7 @@ impl CommandProcessor {
         let _timed = (!test(unsafe { rd(addr) })).then(|| Timed(self.queue, Instant::now()));
         if !test(unsafe { rd(addr) }) {
             static VIRTUAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let virtual_waits = *VIRTUAL.get_or_init(|| std::env::var("SOTC_VIRTUAL_WAITS").map(|v| v != "0").unwrap_or(true));
+            let virtual_waits = *VIRTUAL.get_or_init(|| std::env::var("TLG_VIRTUAL_WAITS").map(|v| v != "0").unwrap_or(true));
             let inbatch = crate::tune::get(crate::tune::INBATCH_WAITS) != 0;
             // The title's "end-of-pipe label, then wait for it" drain, with
             // the label write still queued here: met in GPU order by a full
@@ -1159,7 +1159,7 @@ impl CommandProcessor {
             // (committed at the next commit point, at the latest when this
             // submission ends) instead of closing the batch per drain.
             // Every path that can block commits first, so nothing waits on
-            // writes held here (SOTC_INBATCH_WAITS=0: commit at every drain).
+            // writes held here (TLG_INBATCH_WAITS=0: commit at every drain).
             if virtual_waits && inbatch && self.own_pending_value(addr).is_some_and(|v| test(v)) {
                 self.stats.inbatch_waits += 1;
                 hooks.order_barrier(self);
@@ -1171,7 +1171,7 @@ impl CommandProcessor {
             // When our in-flight end-of-pipe writes will produce a satisfying
             // value, the wait is met in GPU order: everything recorded after
             // it executes after them on the queue. Memory the CP itself reads
-            // later is synchronized where it is read (SOTC_VIRTUAL_WAITS=0:
+            // later is synchronized where it is read (TLG_VIRTUAL_WAITS=0:
             // always stall until the write happened).
             if virtual_waits && super::render::pending_label_value(addr).is_some_and(|v| test(v)) {
                 self.stats.virtual_waits += 1;
@@ -1190,7 +1190,7 @@ impl CommandProcessor {
         let mut warned = false;
         let mut spins = 0u32;
         static VIRTUAL_POLL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let virtual_waits = *VIRTUAL_POLL.get_or_init(|| std::env::var("SOTC_VIRTUAL_WAITS").map(|v| v != "0").unwrap_or(true));
+        let virtual_waits = *VIRTUAL_POLL.get_or_init(|| std::env::var("TLG_VIRTUAL_WAITS").map(|v| v != "0").unwrap_or(true));
         while !test(unsafe { rd(addr) }) {
             spins += 1;
             if spins < 64 {
@@ -1312,18 +1312,18 @@ impl CommandProcessor {
         }
     }
 
-    /// SOTC_CEDE_LOG=<from seconds>:<n>: logs n CE/DE counter packets executed
+    /// TLG_CEDE_LOG=<from seconds>:<n>: logs n CE/DE counter packets executed
     /// after that much process time (diagnostics).
     /// Debug: CP-side memory writes (and constant-RAM loads) overlapping
-    /// SOTC_CP_WATCH=<lo>-<hi> (hex), logged while a frame is traced (all the
-    /// time with SOTC_CP_WATCH_ALL=1; at most 20000 lines).
+    /// TLG_CP_WATCH=<lo>-<hi> (hex), logged while a frame is traced (all the
+    /// time with TLG_CP_WATCH_ALL=1; at most 20000 lines).
     fn mem_log(&self, what: &str, addr: u64, len: u64, head: &[u32]) {
         static CFG: std::sync::OnceLock<Option<(u64, u64, bool)>> = std::sync::OnceLock::new();
         let Some((lo, hi, all)) = *CFG.get_or_init(|| {
-            let v = std::env::var("SOTC_CP_WATCH").ok()?;
+            let v = std::env::var("TLG_CP_WATCH").ok()?;
             let (a, b) = v.split_once('-')?;
             let p = |s: &str| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok();
-            Some((p(a)?, p(b)?, std::env::var_os("SOTC_CP_WATCH_ALL").is_some()))
+            Some((p(a)?, p(b)?, std::env::var_os("TLG_CP_WATCH_ALL").is_some()))
         }) else {
             return;
         };
@@ -1336,11 +1336,11 @@ impl CommandProcessor {
         }
     }
 
-    /// Debug (SOTC_CE_TRACE=1): constant-RAM writes, loads and dumps of the
+    /// Debug (TLG_CE_TRACE=1): constant-RAM writes, loads and dumps of the
     /// traced frame (byte offsets into CE RAM).
     fn ce_log(&self, what: &str, off: usize, data: &[u32]) {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var_os("SOTC_CE_TRACE").is_some()) || !super::render::trace_frame() {
+        if !*ON.get_or_init(|| std::env::var_os("TLG_CE_TRACE").is_some()) || !super::render::trace_frame() {
             return;
         }
         crate::info!("{}: CE {} ram+{:#x} at {:#x} [{}]", self.name, what, off, self.cur_packet.0, data.iter().map(|w| format!("{w:x}")).collect::<Vec<_>>().join(" "));
@@ -1349,7 +1349,7 @@ impl CommandProcessor {
     fn cede_log(&self, what: &str, body: &[u32]) {
         static CFG: std::sync::OnceLock<Option<(f64, u32)>> = std::sync::OnceLock::new();
         let Some((from, limit)) = *CFG.get_or_init(|| {
-            let v = std::env::var("SOTC_CEDE_LOG").ok()?;
+            let v = std::env::var("TLG_CEDE_LOG").ok()?;
             let (a, b) = v.split_once(':')?;
             Some((a.parse().ok()?, b.parse().ok()?))
         }) else {

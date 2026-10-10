@@ -1,17 +1,17 @@
-//! Sampling profiler for host threads (SOTC_SAMPLE=<thread name>[,...], e.g.
+//! Sampling profiler for host threads (TLG_SAMPLE=<thread name>[,...], e.g.
 //! `GPU-gfx,GPU-complete`). About every millisecond the thread is suspended, its
 //! instruction pointer and callers (x64 unwind data of any module) are
 //! recorded, and it is resumed. Every 10 s the functions with the most
-//! samples (self and inclusive) are logged, symbolized from sotc.pdb (and
-//! exports elsewhere), plus time outside sotc (heap, driver, system calls)
-//! by the sotc function that called out. SOTC_SAMPLE_TOP=<n> lengthens the
-//! inclusive list (40); SOTC_SAMPLE_FOCUS=<name part>[,...] adds, for each
+//! samples (self and inclusive) are logged, symbolized from tlg.pdb (and
+//! exports elsewhere), plus time outside tlg (heap, driver, system calls)
+//! by the tlg function that called out. TLG_SAMPLE_TOP=<n> lengthens the
+//! inclusive list (40); TLG_SAMPLE_FOCUS=<name part>[,...] adds, for each
 //! function whose name contains one, the callees its samples spent time in.
-//! SOTC_SAMPLE_LINES=<name part>[,...] adds, for each such function, its
+//! TLG_SAMPLE_LINES=<name part>[,...] adds, for each such function, its
 //! samples by source line (self time, and time in callees at the line of the
 //! call; lines of inlined code are the inlined function's).
 //! Spikes: the last seconds of samples are kept; `spike(t0, t1, label)`
-//! (the GPU thread calls it for submissions over SOTC_SAMPLE_SPIKE_MS, default
+//! (the GPU thread calls it for submissions over TLG_SAMPLE_SPIKE_MS, default
 //! 25) logs the functions sampled in that window alone.
 //! The PDB only has public symbols (the build's debug information is DWARF):
 //! code in other functions is named after the public symbol before it. Exact
@@ -43,13 +43,13 @@ const KEEP: usize = 4096;
 /// Whether the sampler runs (spike reports are worth requesting).
 pub fn active() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SOTC_SAMPLE").is_some())
+    *ON.get_or_init(|| std::env::var_os("TLG_SAMPLE").is_some())
 }
 
-/// Spike threshold for callers (SOTC_SAMPLE_SPIKE_MS, default 25 ms).
+/// Spike threshold for callers (TLG_SAMPLE_SPIKE_MS, default 25 ms).
 pub fn spike_threshold() -> std::time::Duration {
     static T: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
-    *T.get_or_init(|| std::time::Duration::from_secs_f64(std::env::var("SOTC_SAMPLE_SPIKE_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(25.0) / 1000.0))
+    *T.get_or_init(|| std::time::Duration::from_secs_f64(std::env::var("TLG_SAMPLE_SPIKE_MS").ok().and_then(|v| v.parse::<f64>().ok()).unwrap_or(25.0) / 1000.0))
 }
 
 /// Requests a report of the samples taken in [t0, t1] (the sampled thread's
@@ -64,9 +64,9 @@ pub fn spike(t0: std::time::Instant, t1: std::time::Instant, label: String) {
 }
 
 /// Called by threads when they name themselves: starts sampling the thread
-/// SOTC_SAMPLE names.
+/// TLG_SAMPLE names.
 pub fn register_current_thread(name: &str) {
-    let Ok(want) = std::env::var("SOTC_SAMPLE") else { return };
+    let Ok(want) = std::env::var("TLG_SAMPLE") else { return };
     if !want.split(',').any(|w| w.trim() == name) {
         return;
     }
@@ -77,7 +77,7 @@ pub fn register_current_thread(name: &str) {
     std::thread::Builder::new().name("sampler".into()).spawn(move || run(h as HANDLE, name)).ok();
 }
 
-/// [start, end) of sotc.exe in memory.
+/// [start, end) of tlg.exe in memory.
 fn module_range() -> (u64, u64) {
     unsafe {
         let base = GetModuleHandleW(std::ptr::null()) as u64;
@@ -92,14 +92,14 @@ fn run(h: HANDLE, name: String) {
     let (lo, hi) = module_range();
     let mut leaf: HashMap<u64, u64> = HashMap::new();
     let mut incl: HashMap<u64, u64> = HashMap::new();
-    // Samples outside sotc: (leaf, first sotc caller).
+    // Samples outside tlg: (leaf, first tlg caller).
     let mut outside: HashMap<(u64, u64), u64> = HashMap::new();
-    // (caller frame, callee frame) pairs, once per sample (SOTC_SAMPLE_FOCUS).
-    let focus = std::env::var("SOTC_SAMPLE_FOCUS").is_ok();
+    // (caller frame, callee frame) pairs, once per sample (TLG_SAMPLE_FOCUS).
+    let focus = std::env::var("TLG_SAMPLE_FOCUS").is_ok();
     let mut edges: HashMap<(u64, u64), u64> = HashMap::new();
     // Samples per code address (callers: the call instruction), once per
-    // sample (SOTC_SAMPLE_LINES).
-    let lines = std::env::var("SOTC_SAMPLE_LINES").is_ok();
+    // sample (TLG_SAMPLE_LINES).
+    let lines = std::env::var("TLG_SAMPLE_LINES").is_ok();
     let mut at: HashMap<u64, u64> = HashMap::new();
     let mut n = 0u64;
     let mut last = std::time::Instant::now();
@@ -109,7 +109,7 @@ fn run(h: HANDLE, name: String) {
     // Distinct stacks of the whole run and their sample counts.
     let mut stacks: HashMap<Vec<u64>, u64> = HashMap::new();
     let init_sym = || {
-        // sotc.pdb sits next to the executable.
+        // tlg.pdb sits next to the executable.
         let dir: Vec<u16> = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.as_os_str().to_owned())).unwrap_or_default().encode_wide().chain([0]).collect();
         unsafe {
             SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | if lines { SYMOPT_LOAD_LINES } else { 0 });
@@ -283,8 +283,8 @@ fn write_stacks(thread: &str, stacks: &HashMap<Vec<u64>, u64>) {
     let _ = std::fs::write(dir.join(format!("samples-{name}.txt")), out);
 }
 
-/// The functions sampled in [t0, t1]: self time, inclusive time (sotc
-/// functions only, the most frequent first) and calls out of sotc.
+/// The functions sampled in [t0, t1]: self time, inclusive time (tlg
+/// functions only, the most frequent first) and calls out of tlg.
 fn report_spike(thread: &str, t0: std::time::Instant, t1: std::time::Instant, label: &str, recent: &std::collections::VecDeque<(std::time::Instant, Vec<u64>)>, (lo, hi): (u64, u64), cache: &mut HashMap<u64, String>) {
     let window: Vec<&Vec<u64>> = recent.iter().filter(|(t, _)| *t >= t0 && *t <= t1).map(|(_, f)| f).collect();
     let n = window.len();
@@ -319,9 +319,9 @@ fn report_spike(thread: &str, t0: std::time::Instant, t1: std::time::Instant, la
     );
 }
 
-/// SOTC_SAMPLE_FOCUS: per focused function, the callees its samples were in.
+/// TLG_SAMPLE_FOCUS: per focused function, the callees its samples were in.
 fn report_focus(thread: &str, n: u64, edges: &HashMap<(u64, u64), u64>, cache: &mut HashMap<u64, String>) {
-    let Ok(want) = std::env::var("SOTC_SAMPLE_FOCUS") else { return };
+    let Ok(want) = std::env::var("TLG_SAMPLE_FOCUS") else { return };
     let mut by: HashMap<(String, String), u64> = HashMap::new();
     for (&(caller, callee), &c) in edges {
         let (a, b) = (symbol(caller, cache), symbol(callee, cache));
@@ -339,9 +339,9 @@ fn report_focus(thread: &str, n: u64, edges: &HashMap<(u64, u64), u64>, cache: &
     }
 }
 
-/// SOTC_SAMPLE_LINES: per matching function, its samples by source line.
+/// TLG_SAMPLE_LINES: per matching function, its samples by source line.
 fn report_lines(thread: &str, n: u64, at: &HashMap<u64, u64>, cache: &mut HashMap<u64, String>) {
-    let Ok(want) = std::env::var("SOTC_SAMPLE_LINES") else { return };
+    let Ok(want) = std::env::var("TLG_SAMPLE_LINES") else { return };
     for part in want.split([',', ';']).map(str::trim).filter(|p| !p.is_empty()) {
         let mut by: HashMap<String, u64> = HashMap::new();
         let mut total = 0u64;
@@ -363,7 +363,7 @@ fn report_lines(thread: &str, n: u64, at: &HashMap<u64, u64>, cache: &mut HashMa
     }
 }
 
-/// `file:line` of a code address in sotc (from sotc.pdb).
+/// `file:line` of a code address in tlg (from tlg.pdb).
 fn source_line(addr: u64) -> Option<String> {
     unsafe {
         let mut l: IMAGEHLP_LINEW64 = std::mem::zeroed();
@@ -426,7 +426,7 @@ fn report(thread: &str, n: u64, leaf: &HashMap<u64, u64>, incl: &HashMap<u64, u6
         crate::info!("  {:5.1}%  {}", 100.0 * *c as f64 / n as f64, f.chars().take(150).collect::<String>());
     }
     crate::info!("sampler '{thread}': inclusive time:");
-    let top = std::env::var("SOTC_SAMPLE_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
+    let top = std::env::var("TLG_SAMPLE_TOP").ok().and_then(|v| v.parse().ok()).unwrap_or(40);
     for (f, c) in incl.iter().take(top) {
         crate::info!("  {:5.1}%  {}", 100.0 * *c as f64 / n as f64, f.chars().take(150).collect::<String>());
     }
@@ -438,7 +438,7 @@ fn report(thread: &str, n: u64, leaf: &HashMap<u64, u64>, incl: &HashMap<u64, u6
     }
     let mut out: Vec<((String, String), u64)> = out.into_iter().collect();
     out.sort_by(|a, b| b.1.cmp(&a.1));
-    crate::info!("sampler '{thread}': time outside sotc by caller:");
+    crate::info!("sampler '{thread}': time outside tlg by caller:");
     for ((callee, caller), c) in out.iter().take(30) {
         crate::info!("  {:5.1}%  {} <- {}", 100.0 * *c as f64 / n as f64, callee.chars().take(60).collect::<String>(), caller.chars().take(120).collect::<String>());
     }

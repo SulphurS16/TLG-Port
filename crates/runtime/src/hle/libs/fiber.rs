@@ -4,7 +4,7 @@
 //! current stack, records the stack pointer and the TEB stack bounds in the outgoing
 //! context, installs the incoming context's bounds (as Windows' own fibers do, so the
 //! OS exception dispatcher accepts frames on fiber stacks) and resumes it. A fiber
-//! that has never run starts in `sotc_fiber_start`, which calls its guest entry with
+//! that has never run starts in `tlg_fiber_start`, which calls its guest entry with
 //! (argOnInitialize, argOnRun); an entry must not return (fatal, as on hardware).
 //!
 //! The SceFiber object (256 bytes, title-allocated) holds this module's state:
@@ -77,8 +77,8 @@ fn tf() -> *mut ThreadFibers {
 }
 
 std::arch::global_asm!(
-    ".globl sotc_fiber_swap",
-    "sotc_fiber_swap:", // rdi = outgoing Ctx*, rsi = incoming Ctx* (sysv64)
+    ".globl tlg_fiber_swap",
+    "tlg_fiber_swap:", // rdi = outgoing Ctx*, rsi = incoming Ctx* (sysv64)
     "push rbp",
     "push rbx",
     "push r12",
@@ -108,8 +108,8 @@ std::arch::global_asm!(
     "pop rbx",
     "pop rbp",
     "ret",
-    ".globl sotc_fiber_start",
-    "sotc_fiber_start:",
+    ".globl tlg_fiber_start",
+    "tlg_fiber_start:",
     "xor ebp, ebp",
     "push rbp",
     "call {main}",
@@ -118,8 +118,8 @@ std::arch::global_asm!(
 );
 
 unsafe extern "sysv64" {
-    fn sotc_fiber_swap(out: *mut Ctx, inc: *const Ctx);
-    fn sotc_fiber_start();
+    fn tlg_fiber_swap(out: *mut Ctx, inc: *const Ctx);
+    fn tlg_fiber_start();
 }
 
 /// Entry of a fiber that runs for the first time (on its own stack).
@@ -156,7 +156,7 @@ unsafe fn valid(f: *const Fiber) -> Result<(), i32> {
 }
 
 /// Prepares the first switch into a fiber: an initial frame on its stack that
-/// `sotc_fiber_swap` "returns" from into `sotc_fiber_start`.
+/// `tlg_fiber_swap` "returns" from into `tlg_fiber_start`.
 unsafe fn prepare_start(f: *mut Fiber) -> Result<(), i32> {
     unsafe {
         if (*f).addr_context == 0 {
@@ -174,7 +174,7 @@ unsafe fn prepare_start(f: *mut Fiber) -> Result<(), i32> {
         }
         let w = |off: u64, v: u64| *((top - off) as *mut u64) = v;
         w(8, 0); // terminating return address
-        w(16, sotc_fiber_start as usize as u64);
+        w(16, tlg_fiber_start as usize as u64);
         for off in [24, 32, 40, 48, 56, 64] {
             w(off, 0); // rbp, rbx, r12..r15
         }
@@ -240,7 +240,7 @@ sysv! {
         }
         (*t).current = f as u64;
         (*t).arg_run_to = arg_run_to;
-        sotc_fiber_swap(&mut (*t).thread_ctx, &(*f).ctx);
+        tlg_fiber_swap(&mut (*t).thread_ctx, &(*f).ctx);
         // Back in thread context: the fiber returned to the thread.
         if !arg_on_return.is_null() { *arg_on_return = (*t).arg_return; }
         0
@@ -260,7 +260,7 @@ sysv! {
         (*cur).state = STATE_IDLE;
         (*t).current = f as u64;
         (*t).arg_run_to = arg_run_to;
-        sotc_fiber_swap(&mut (*cur).ctx, &(*f).ctx);
+        tlg_fiber_swap(&mut (*cur).ctx, &(*f).ctx);
         // Resumed (possibly on another thread): read that thread's state.
         let t = tf();
         if !arg_on_run.is_null() { *arg_on_run = (*t).arg_run_to; }
@@ -274,7 +274,7 @@ sysv! {
         (*cur).state = STATE_IDLE;
         (*t).arg_return = arg_on_return;
         (*t).current = 0;
-        sotc_fiber_swap(&mut (*cur).ctx, &(*t).thread_ctx);
+        tlg_fiber_swap(&mut (*cur).ctx, &(*t).thread_ctx);
         let t = tf();
         if !arg_on_run.is_null() { *arg_on_run = (*t).arg_run_to; }
         0

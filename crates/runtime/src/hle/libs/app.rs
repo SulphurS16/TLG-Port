@@ -198,6 +198,8 @@ sysv! {
 fixed! {
     scePlayGoInitialize => 0,
     scePlayGoSetInstallSpeed => 0,
+    scePlayGoClose => 0,
+    scePlayGoTerminate => 0,
     sceSystemServiceLaunchWebBrowser => 0x80A1_0002u32,
 }
 
@@ -211,7 +213,7 @@ pub fn register(r: &mut Registry) {
         sceSystemServiceGetStatus, sceSystemServiceReceiveEvent, sceSystemServiceParamGetInt,
         sceSystemServiceParamGetString, sceSystemServiceHideSplashScreen, sceSystemServiceLaunchWebBrowser,
     ]);
-    reg!(r, "libScePlayGo", [scePlayGoInitialize, scePlayGoOpen, scePlayGoGetLocus, scePlayGoGetChunkId, scePlayGoSetInstallSpeed]);
+    reg!(r, "libScePlayGo", [scePlayGoInitialize, scePlayGoOpen, scePlayGoGetLocus, scePlayGoGetChunkId, scePlayGoSetInstallSpeed, scePlayGoClose, scePlayGoTerminate]);
     let _ = cstr; // shared helper import
 }
 

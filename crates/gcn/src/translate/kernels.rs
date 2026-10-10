@@ -540,8 +540,8 @@ mod tests {
             let w = super::remap_cs(tile);
             assert_eq!(w[0], 0x0723_0203); // SPIR-V magic
             assert!(w.len() > 100);
-            // SOTC_DUMP_KERNELS=<dir>: write the binaries for spirv-val.
-            if let Ok(dir) = std::env::var("SOTC_DUMP_KERNELS") {
+            // TLG_DUMP_KERNELS=<dir>: write the binaries for spirv-val.
+            if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
                 let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
                 std::fs::write(format!("{dir}/remap_{}.spv", if tile { "tile" } else { "detile" }), bytes).unwrap();
             }
@@ -567,7 +567,7 @@ mod tests {
             assert_eq!(w[0], 0x0723_0203);
             assert!(w.len() > 100, "{name}");
             check_module(&w, name);
-            if let Ok(dir) = std::env::var("SOTC_DUMP_KERNELS") {
+            if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
                 let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
                 std::fs::write(format!("{dir}/{name}.spv"), bytes).unwrap();
             }
@@ -581,7 +581,7 @@ mod tests {
         assert!(w.len() > 100);
         check_module(&w, "indirect_args");
         check_module(&super::remap_cs(false), "remap");
-        if let Ok(dir) = std::env::var("SOTC_DUMP_KERNELS") {
+        if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(format!("{dir}/indirect_args.spv"), bytes).unwrap();
         }

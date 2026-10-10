@@ -1,4 +1,4 @@
-//! sotc: runs the PS4 Shadow of the Colossus executable natively on Windows x86-64
+//! tlg: runs the PS4 The Last Guardian executable natively on Windows x86-64
 //! with high-level emulation of the PS4 system libraries.
 
 #[macro_use]
@@ -87,6 +87,7 @@ fn parse_args() -> Config {
     let mut root = default_root();
     let mut game: Option<PathBuf> = None;
     let mut update: Option<PathBuf> = None;
+    let mut no_update = false;
     let mut seconds = None;
     let mut trace = false;
     let mut lenient = false;
@@ -108,6 +109,8 @@ fn parse_args() -> Config {
             "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
             "--game" => game = Some(PathBuf::from(args.next().expect("--game needs a path"))),
             "--update" => update = Some(PathBuf::from(args.next().expect("--update needs a path"))),
+            // The base application alone (01.00), ignoring a prepared update overlay.
+            "--no-update" => no_update = true,
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
             other => {
                 eprintln!("unknown argument {other}");
@@ -116,8 +119,16 @@ fn parse_args() -> Config {
         }
     }
     let data = root.join("local");
+    // Default baseline: the prepared update (01.03) over the base application (01.00).
+    let default_update = data.join("game").join("CUSA03627-patch");
+    if update.is_none() && !no_update && default_update.join("eboot.bin").is_file() {
+        update = Some(default_update);
+    }
+    if no_update {
+        update = None;
+    }
     let mut app_dirs: Vec<PathBuf> = update.into_iter().collect();
-    app_dirs.push(game.unwrap_or_else(|| data.join("game").join("CUSA08809")));
+    app_dirs.push(game.unwrap_or_else(|| data.join("game").join("CUSA03627")));
     Config {
         app_dirs,
         run_dir: data.join("runs").join(utc_stamp()),
@@ -404,39 +415,39 @@ fn main() {
     prune_runs(&runs, 30);
     std::fs::create_dir_all(&cfg.run_dir).expect("create run dir");
     RUN_DIR.set(cfg.run_dir.clone()).ok();
-    log::init(&cfg.run_dir.join("sotc.log")).expect("open log");
+    log::init(&cfg.run_dir.join("tlg.log")).expect("open log");
     log::set_thread_name("host");
     if cfg.debug || cfg.trace {
         log::LEVEL.store(log::Level::Debug as u8, std::sync::atomic::Ordering::Relaxed);
     }
     log::TRACE_HLE.store(cfg.trace, std::sync::atomic::Ordering::Relaxed);
-    if let Some(ms) = std::env::var("SOTC_SLOW_HLE_MS").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
+    if let Some(ms) = std::env::var("TLG_SLOW_HLE_MS").ok().and_then(|v| v.trim().parse::<f64>().ok()) {
         hle::SLOW_NS.store((ms * 1e6) as u64, std::sync::atomic::Ordering::Relaxed);
         info!("logging HLE calls of {ms} ms or more");
     }
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
-    info!("sotc {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot);
+    info!("tlg {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot);
     exception::install();
     gpu::shader_dump::DIR.set(cfg.run_dir.join("shaders")).ok();
-    if std::env::var_os("SOTC_TEST_FAULT").is_some() {
-        info!("SOTC_TEST_FAULT: writing to an invalid address from host code");
+    if std::env::var_os("TLG_TEST_FAULT").is_some() {
+        info!("TLG_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };
     }
     hle::kernel::time::init();
-    // SOTC_CPU_AFFINITY=<hex mask>: run on those logical CPUs only (e.g. 0xfff:
+    // TLG_CPU_AFFINITY=<hex mask>: run on those logical CPUs only (e.g. 0xfff:
     // six cores with SMT, to measure a smaller CPU than the host's).
-    if let Some(mask) = std::env::var("SOTC_CPU_AFFINITY").ok().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
+    if let Some(mask) = std::env::var("TLG_CPU_AFFINITY").ok().and_then(|v| usize::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) {
         use windows_sys::Win32::System::Threading::{GetCurrentProcess, SetProcessAffinityMask};
         if unsafe { SetProcessAffinityMask(GetCurrentProcess(), mask) } != 0 {
             info!("CPU affinity {mask:#x} ({} logical CPUs)", mask.count_ones());
         } else {
-            warn!("SOTC_CPU_AFFINITY {mask:#x}: SetProcessAffinityMask failed");
+            warn!("TLG_CPU_AFFINITY {mask:#x}: SetProcessAffinityMask failed");
         }
     }
     // The renderer runs whether or not frames reach a window: headless runs (and a
     // window that could not be shown) render offscreen; screenshots still work.
     if !cfg.headless {
-        if let Err(e) = gpu::vk::present::init("Shadow of the Colossus (sotc)") {
+        if let Err(e) = gpu::vk::present::init("The Last Guardian (tlg)") {
             warn!("no presentation window ({e}): rendering offscreen");
         }
     }
@@ -541,10 +552,10 @@ fn main() {
                 *(params as *mut u32) = 1;
                 *((params + 8) as *mut u64) = mem::arena_cstr("eboot.bin");
             }
-            if let Ok(list) = std::env::var("SOTC_BREAK") {
+            if let Ok(list) = std::env::var("TLG_BREAK") {
                 for tok in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
                     let Ok(off) = u64::from_str_radix(tok.trim_start_matches("0x"), 16) else {
-                        warn!("SOTC_BREAK: '{tok}' is not a hex offset: ignored");
+                        warn!("TLG_BREAK: '{tok}' is not a hex offset: ignored");
                         continue;
                     };
                     match exception::install_breakpoint(eboot2.base + off, eboot2.base) {

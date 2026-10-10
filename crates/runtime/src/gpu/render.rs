@@ -223,7 +223,7 @@ struct Slot {
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     desc_pool: vk::DescriptorPool,
-    /// Timestamp queries of the batch (SOTC_GPU_PROFILE; null otherwise).
+    /// Timestamp queries of the batch (TLG_GPU_PROFILE; null otherwise).
     queries: vk::QueryPool,
     /// Timestamps at the start and end of the batch (GPU execution time).
     exec: vk::QueryPool,
@@ -288,7 +288,7 @@ pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault
 struct VCache {
     windows: FastMap<u64, VWindow>,
     bytes: u64,
-    /// Bytes copied in, bindings served (SOTC_PERF).
+    /// Bytes copied in, bindings served (TLG_PERF).
     copied: u64,
     hits: u64,
 }
@@ -342,7 +342,7 @@ const EVICT_AGE: [u64; 4] = [5400, 600, 120, 30];
 const EVICT_PER_PASS: (usize, u64) = (64, 128 << 20);
 const RETIRE_PER_PASS: usize = 64;
 
-/// `gpu_texture_levels` outcomes (SOTC_PERF report): uploads, then declines
+/// `gpu_texture_levels` outcomes (TLG_PERF report): uploads, then declines
 /// by reason (element size or 3D, pending write-back, layout, guest memory
 /// binding, tile map, device ring, descriptor pool).
 pub static GPU_MIP_STATS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
@@ -352,7 +352,7 @@ fn mip_stat(i: usize) {
     GPU_MIP_STATS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Images uploaded by `gpu_texture_levels` to verify (SOTC_GPU_TEX_VERIFY).
+/// Images uploaded by `gpu_texture_levels` to verify (TLG_GPU_TEX_VERIFY).
 static VERIFY_QUEUE: parking_lot::Mutex<Vec<(ImageKey, Tsharp, u32)>> = parking_lot::Mutex::new(Vec::new());
 
 /// Shadow copies (`shadow_view`, `depth_shadow_view`) live at the guest
@@ -632,7 +632,7 @@ static COMPLETIONS: parking_lot::Mutex<std::collections::VecDeque<std::sync::Arc
 static COMPLETIONS_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static DONE: parking_lot::Mutex<u64> = parking_lot::Mutex::new(0);
 static DONE_CV: parking_lot::Condvar = parking_lot::Condvar::new();
-/// Diagnostics (SOTC_PERF): host-observed GPU busy time and CP waits for
+/// Diagnostics (TLG_PERF): host-observed GPU busy time and CP waits for
 /// pending guest-memory writes, in nanoseconds.
 pub static GPU_BUSY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// GPU execution time of the batches (their start/end timestamps), ns.
@@ -649,7 +649,7 @@ static LAST_FENCE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 static LAST_WB_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static LAST_WB_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Bytes written back to guest memory by completions and the time spent
-/// doing it (ns, write-watch resets included) (SOTC_PERF).
+/// doing it (ns, write-watch resets included) (TLG_PERF).
 pub static WB_BYTES_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WB_NS_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Of that: write-watch resets (calls, ns).
@@ -763,12 +763,12 @@ fn completion_thread() {
     }
 }
 
-/// GPU timestamp profiling (SOTC_GPU_PROFILE=1): a timestamp is written after
+/// GPU timestamp profiling (TLG_GPU_PROFILE=1): a timestamp is written after
 /// each recorded operation; the GPU time between consecutive timestamps is
 /// attributed to the later operation's label.
 pub fn gpu_profile_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SOTC_GPU_PROFILE").is_some())
+    *ON.get_or_init(|| std::env::var_os("TLG_GPU_PROFILE").is_some())
 }
 
 const PROFILE_QUERIES: u32 = 16384;
@@ -866,7 +866,7 @@ fn writeback_in_flight(addr: u64, len: u64) -> bool {
 /// [addr, addr+len) (end-of-pipe writes or buffer write-backs).
 #[track_caller]
 pub fn wait_overlapping(addr: u64, len: u64) {
-    // Also classify what the newest overlapping batch writes (SOTC_PERF
+    // Also classify what the newest overlapping batch writes (TLG_PERF
     // breakdown): end-of-pipe actions, device-ring write-backs, in-place
     // writes of huge (sparse scatter) bindings, other in-place writes.
     let mut kind = 0usize;
@@ -909,7 +909,7 @@ pub fn wait_overlapping(addr: u64, len: u64) {
     }
 }
 
-/// Synchronizing flushes by source line of the caller (SOTC_PERF).
+/// Synchronizing flushes by source line of the caller (TLG_PERF).
 pub static FLUSH_SITES: parking_lot::Mutex<Option<HashMap<u32, u64>>> = parking_lot::Mutex::new(None);
 
 /// Sync wait time by what the awaited batch writes in the range (see
@@ -975,7 +975,7 @@ pub struct Renderer {
     /// Accumulated GPU-thread time per activity (see PROF_NAMES).
     pub prof: [std::time::Duration; 7],
     /// Time-stamp-counter ticks spent in each phase of `draw_inner`
-    /// (`DRAW_PHASES`) and the draws timed (SOTC_PERF: µs per draw).
+    /// (`DRAW_PHASES`) and the draws timed (TLG_PERF: µs per draw).
     pub dprof: [u64; 8],
     pub dprof_draws: u64,
     /// Ticks in parts of the descriptor phase (`DESC_PARTS`).
@@ -1009,7 +1009,7 @@ pub struct Renderer {
     dirty_sets: FastMap<vk::Buffer, vk::DescriptorSet>,
     /// Device-ring dwords where shaders mark pages of untracked writes: (batch, offset).
     dirty_sink: (u64, u64),
-    /// Who asked for the next VRAM mirror binding (SOTC_PERF copy-in report).
+    /// Who asked for the next VRAM mirror binding (TLG_PERF copy-in report).
     vc_why: &'static str,
     /// Fast-clear metadata kernels (`meta_clear_on_gpu`): set layout,
     /// pipeline layout, probe and expand pipelines.
@@ -1041,11 +1041,11 @@ pub struct Renderer {
     /// Shader of the draw/dispatch being recorded (diagnostics); commands
     /// recorded in the current batch.
     cur_shader: u64,
-    /// The shader being prepared (SOTC_PERF: `GUARD_SITES`): pixel or
+    /// The shader being prepared (TLG_PERF: `GUARD_SITES`): pixel or
     /// compute shader, vertex shader.
     prep_shader: u64,
     prep_vs: u64,
-    /// SOTC_PERF: recent `note_pending_gpu_write` calls (base, len, shader,
+    /// TLG_PERF: recent `note_pending_gpu_write` calls (base, len, shader,
     /// batch).
     pending_log: Vec<(u64, u64, u64, u64)>,
     batch_cmds: u64,
@@ -1061,7 +1061,7 @@ pub struct Renderer {
     scratch: Option<(vk::Buffer, u64)>,
     /// Page write tracking for CPU-sourced textures.
     pub writes: super::writes::WriteTracker,
-    /// Labels of the timestamps written in the current batch (SOTC_GPU_PROFILE).
+    /// Labels of the timestamps written in the current batch (TLG_GPU_PROFILE).
     marks: Vec<String>,
     /// Images that may hold contents newer than guest memory (`guest_stale`;
     /// a superset, entries are dropped lazily) by guest base, for range
@@ -1113,9 +1113,9 @@ pub struct Renderer {
     pub recreated: (u64, u64),
     /// How the last elided utility kernel was performed (frame traces).
     last_elide: &'static str,
-    /// SOTC_TRACE_DEPTH: last near fraction per depth target.
+    /// TLG_TRACE_DEPTH: last near fraction per depth target.
     depth_trace: FastMap<u64, f32>,
-    /// SOTC_VS_POS: host-visible buffer receiving position exports.
+    /// TLG_VS_POS: host-visible buffer receiving position exports.
     debug_out: Option<(vk::Buffer, *mut u8)>,
     /// Occlusion counting (see `occlusion_dump`): query windows open (begin
     /// samples without their end yet), the query active in the command
@@ -1367,7 +1367,7 @@ fn tess_ring_offset(base: u64) -> Option<u64> {
     base.checked_sub(TESS_FACTOR_RING).filter(|&o| o < TESS_FACTOR_RING_BYTES)
 }
 
-/// SOTC_VS_POS buffer size.
+/// TLG_VS_POS buffer size.
 const DEBUG_OUT_BYTES: u64 = gcn::translate::DEBUG_OUT_VERTICES as u64 * gcn::translate::DEBUG_OUT_STRIDE as u64 * 4;
 
 /// Occlusion queries (see `Renderer::occlusion_dump`).
@@ -1405,38 +1405,38 @@ pub fn occlusion_write(addr: u64, queries: &[u32]) {
     }
 }
 
-/// SOTC_PERF diagnostics: buffer writes that made render targets older than
+/// TLG_PERF diagnostics: buffer writes that made render targets older than
 /// guest memory (writer and target), render-target reloads by target, and
 /// submitted batches by closing call site (count, commands recorded).
 pub static NEWER_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
 /// Shader preparations that waited for pending GPU writes to the memory they
-/// read (reader, address, covering write) (SOTC_PERF).
+/// read (reader, address, covering write) (TLG_PERF).
 pub static GUARD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
 pub static RELOAD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
-/// SOTC_PERF: texture uploads by texture (count, microseconds reading/detiling).
+/// TLG_PERF: texture uploads by texture (count, microseconds reading/detiling).
 pub static UPLOAD_SITES: parking_lot::Mutex<Option<HashMap<String, (u64, u64)>>> = parking_lot::Mutex::new(None);
 pub static BATCH_SITES: parking_lot::Mutex<Option<HashMap<(&'static str, u32), (u64, u64)>>> = parking_lot::Mutex::new(None);
 
 pub fn perf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SOTC_PERF").is_some())
+    *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some())
 }
 
-/// Full barriers by source line (SOTC_PERF).
+/// Full barriers by source line (TLG_PERF).
 pub static BARRIER_SITES: parking_lot::Mutex<Option<HashMap<u32, u64>>> = parking_lot::Mutex::new(None);
 
 /// VRAM mirror copy-ins by the binding that needed them: (count, bytes)
-/// per (base, bytes) (SOTC_PERF report).
+/// per (base, bytes) (TLG_PERF report).
 pub static VCACHE_FILL_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, &'static str), (u64, u64)>>> = parking_lot::Mutex::new(None);
 
-/// Write-backs by (base, bytes, from the mirror) (SOTC_PERF report).
+/// Write-backs by (base, bytes, from the mirror) (TLG_PERF report).
 pub static WRITEBACK_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, bool), u64>>> = parking_lot::Mutex::new(None);
 
 /// Buffer bindings uploaded through the ring, by (base, bytes, written)
-/// (SOTC_PERF report per second).
+/// (TLG_PERF report per second).
 pub static BUFFER_UPLOAD_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, bool), u64>>> = parking_lot::Mutex::new(None);
 
-/// Full barriers and render-pass begins recorded (SOTC_PERF).
+/// Full barriers and render-pass begins recorded (TLG_PERF).
 pub static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PASS_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
@@ -1444,7 +1444,7 @@ pub static PASS_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 fn global_barrier(cmd: vk::CommandBuffer) {
     BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *ON.get_or_init(|| std::env::var_os("SOTC_PERF").is_some()) {
+    if *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some()) {
         let line = std::panic::Location::caller().line();
         *BARRIER_SITES.lock().get_or_insert_with(HashMap::new).entry(line).or_default() += 1;
     }
@@ -1637,7 +1637,7 @@ impl Renderer {
     }
 
     /// `flush` with accounting of why the synchronization happened (and,
-    /// for SOTC_PERF, from which source line).
+    /// for TLG_PERF, from which source line).
     #[track_caller]
     pub fn flush_for(&mut self, why: usize) {
         if self.recording {
@@ -2912,10 +2912,10 @@ impl Renderer {
             let (written, stamp) = self.writes.changed_since(t.base, bytes, since.unwrap_or(0));
             let mut changed = false;
             let mut h = 0;
-            // SOTC_WRITE_WATCH_VERIFY=1: hash anyway and report changes the
+            // TLG_WRITE_WATCH_VERIFY=1: hash anyway and report changes the
             // write tracking did not see (they would leave stale textures).
             static VERIFY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            let verify = *VERIFY.get_or_init(|| std::env::var_os("SOTC_WRITE_WATCH_VERIFY").is_some());
+            let verify = *VERIFY.get_or_init(|| std::env::var_os("TLG_WRITE_WATCH_VERIFY").is_some());
             // Writes only in the partially covered first/last page (data next
             // to the texture) that left the texture's bytes there unchanged:
             // the texture is unchanged without hashing all of it.
@@ -3439,9 +3439,9 @@ impl Renderer {
     fn depth_shadow_view(&mut self, src: ImageKey, t: &Tsharp, vfmt: vk::Format, view_type: vk::ImageViewType) -> Result<vk::ImageView, String> {
         // Same size (e.g. shadow maps): sample the depth aspect directly; a
         // depth view returns the depth in R as the R32/R16 texture would.
-        // SOTC_DEPTH_COPY=1 always copies.
+        // TLG_DEPTH_COPY=1 always copies.
         static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if t.width == src.width && t.height == src.height && view_type == vk::ImageViewType::TYPE_2D && !*COPY.get_or_init(|| std::env::var_os("SOTC_DEPTH_COPY").is_some()) {
+        if t.width == src.width && t.height == src.height && view_type == vk::ImageViewType::TYPE_2D && !*COPY.get_or_init(|| std::env::var_os("TLG_DEPTH_COPY").is_some()) {
             let img = self.images.get_mut(&src).unwrap();
             return img.view(src.format, 0, view_type, false, 0, 1);
         }
@@ -3584,11 +3584,11 @@ impl Renderer {
         unsafe {
             ctx().device.cmd_copy_buffer_to_image(self.cmd, self.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions);
         }
-        // SOTC_MIP_CHECK=<n>: level-to-level correlations of the first n chains
+        // TLG_MIP_CHECK=<n>: level-to-level correlations of the first n chains
         // per tile mode (chains whose level 1 correlates poorly are dumped).
         static CHECK: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
         static CHECKED: [std::sync::atomic::AtomicU32; 32] = [const { std::sync::atomic::AtomicU32::new(0) }; 32];
-        let limit = *CHECK.get_or_init(|| std::env::var("SOTC_MIP_CHECK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let limit = *CHECK.get_or_init(|| std::env::var("TLG_MIP_CHECK").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         if limit > 0 && key.levels > 1 {
             static KINDS: Mutex<Option<std::collections::HashSet<(u8, u8, u8, bool, u32)>>> = Mutex::new(None);
             if KINDS.lock().get_or_insert_with(Default::default).insert((t.ty, t.dfmt, t.tiling_index, t.pow2_pad, layers.min(7))) {
@@ -3662,7 +3662,7 @@ impl Renderer {
     /// guest memory: large ranges always, and read-only ranges whose guest
     /// memory is current (no device-ring writes of this batch, no write-back
     /// in flight) -- the GPU then reads at execution time as the hardware
-    /// does, instead of a CPU copy per draw. SOTC_INPLACE_READS=0 disables the
+    /// does, instead of a CPU copy per draw. TLG_INPLACE_READS=0 disables the
     /// read-only case.
     fn in_place(&self, p: &Prepared, i: usize, base: u64, size: u64) -> bool {
         if self.zc_candidate(base, size) {
@@ -3676,7 +3676,7 @@ impl Renderer {
             return true;
         }
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("SOTC_INPLACE_READS").map(|v| v != "0").unwrap_or(true)) {
+        if !*ON.get_or_init(|| std::env::var("TLG_INPLACE_READS").map(|v| v != "0").unwrap_or(true)) {
             return false;
         }
         ctx().ext_host.is_some()
@@ -3694,7 +3694,7 @@ impl Renderer {
     /// Imported buffer covering guest [base, base+size): (buffer, offset, range).
     fn zc_binding(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64, u64)> {
         if ctx().ext_host.is_none() {
-            return None; // zero-copy disabled (SOTC_ZERO_COPY)
+            return None; // zero-copy disabled (TLG_ZERO_COPY)
         }
         let max_range = (ctx().limits.max_storage_buffer_range as u64) & !3;
         let span = match self.zc_spans.iter().find(|s| s.0 <= base && base < s.1) {
@@ -4192,7 +4192,7 @@ impl Renderer {
             Img(vk::DescriptorImageInfo),
         }
         let mut infos: smallvec::SmallVec<[(u32, vk::DescriptorType, Info); 24]> = smallvec::SmallVec::new();
-        // (SOTC_PERF timing: each binding's time is added to its kind when the
+        // (TLG_PERF timing: each binding's time is added to its kind when the
         // next one starts.)
         let mut tb = unsafe { core::arch::x86_64::_rdtsc() };
         let mut part = 4usize;
@@ -4884,12 +4884,12 @@ impl Renderer {
         phase!(7);
         self.dprof_draws += 1;
         if trace_frame() {
-            // SOTC_TRACE_ATTR=<vs addr>:<resource>:<byte>: histogram of that byte
+            // TLG_TRACE_ATTR=<vs addr>:<resource>:<byte>: histogram of that byte
             // of every record of the vertex shader's buffer resource, and of
             // the records the draw's indices reference (traced frames).
             static SPEC: std::sync::OnceLock<Option<(u64, usize, u64)>> = std::sync::OnceLock::new();
             let spec = *SPEC.get_or_init(|| {
-                let v = std::env::var("SOTC_TRACE_ATTR").ok()?;
+                let v = std::env::var("TLG_TRACE_ATTR").ok()?;
                 let mut it = v.split(':');
                 Some((u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?, it.next()?.parse().ok()?, it.next()?.parse().ok()?))
             });
@@ -4956,12 +4956,12 @@ impl Renderer {
             if let Some(p) = &ps {
                 self.dump_after(p.addr, &colors, depth);
             }
-            // SOTC_TRACE_DEPTH=<threshold, default 0.985>: how much of the depth
+            // TLG_TRACE_DEPTH=<threshold, default 0.985>: how much of the depth
             // target is nearer than the threshold after each draw of the
             // traced frame (logged on change; 0.99999 counts all geometry in
             // front of the cleared far plane).
             static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-            if let Some(d) = depth.filter(|_| *ON.get_or_init(|| std::env::var_os("SOTC_TRACE_DEPTH").is_some())) {
+            if let Some(d) = depth.filter(|_| *ON.get_or_init(|| std::env::var_os("TLG_TRACE_DEPTH").is_some())) {
                 self.end_rendering();
                 if let Some(near) = self.depth_near_fraction(d.key) {
                     let prev = self.depth_trace.insert(d.key.base, near).unwrap_or(-1.0);
@@ -4987,7 +4987,7 @@ impl Renderer {
         self.edge_skips
     }
 
-    /// SOTC_VS_POS buffer (created on first use, filled with NaNs).
+    /// TLG_VS_POS buffer (created on first use, filled with NaNs).
     fn debug_out_buffer(&mut self) -> Result<(vk::Buffer, *mut u8), String> {
         if let Some(b) = self.debug_out {
             return Ok(b);
@@ -4999,7 +4999,7 @@ impl Renderer {
         Ok((buf, ptr))
     }
 
-    /// After a traced draw of the SOTC_VS_POS shader: the clip-space positions
+    /// After a traced draw of the TLG_VS_POS shader: the clip-space positions
     /// of the vertices its indices reference; logs those far outside the
     /// view (|x|,|y| > 4w), behind or at the eye (w < 1e-4) or not finite.
     fn check_vs_positions(&mut self, cp: &CommandProcessor, vs: &Prepared, kind: &str, count: u32, index_addr: u64) {
@@ -5080,7 +5080,7 @@ impl Renderer {
         unsafe { std::ptr::write_bytes(ptr, 0xFF, DEBUG_OUT_BYTES as usize) };
     }
 
-    /// Debug: fraction of a depth image's texels nearer than SOTC_TRACE_DEPTH.
+    /// Debug: fraction of a depth image's texels nearer than TLG_TRACE_DEPTH.
     fn depth_near_fraction(&mut self, k: ImageKey) -> Option<f32> {
         let texel: u64 = match k.format {
             vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT => 4,
@@ -5103,7 +5103,7 @@ impl Renderer {
         self.flush();
         let raw = unsafe { std::slice::from_raw_parts(self.ring.ptr.add(off as usize) as *const f32, (size / 4) as usize) };
         static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
-        let t = *T.get_or_init(|| std::env::var("SOTC_TRACE_DEPTH").ok().and_then(|v| v.parse().ok()).filter(|v: &f32| *v > 0.0 && *v <= 1.0).unwrap_or(0.985));
+        let t = *T.get_or_init(|| std::env::var("TLG_TRACE_DEPTH").ok().and_then(|v| v.parse().ok()).filter(|v: &f32| *v > 0.0 && *v <= 1.0).unwrap_or(0.985));
         let near = raw.iter().filter(|&&d| d < t).count();
         Some(near as f32 / raw.len().max(1) as f32)
     }
@@ -5211,9 +5211,9 @@ impl Renderer {
             _ => vk::PrimitiveTopology::TRIANGLE_LIST,
         };
         let dctl = regs.ctx(0xA200);
-        // SOTC_NO_DEPTH_TEST=1 (diagnostic): depth testing off for all draws.
+        // TLG_NO_DEPTH_TEST=1 (diagnostic): depth testing off for all draws.
         static NO_DEPTH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let no_depth = *NO_DEPTH.get_or_init(|| std::env::var_os("SOTC_NO_DEPTH_TEST").is_some());
+        let no_depth = *NO_DEPTH.get_or_init(|| std::env::var_os("TLG_NO_DEPTH_TEST").is_some());
         // DB_DEPTH_CONTROL.DEPTH_BOUNDS_ENABLE with DB_DEPTH_BOUNDS_MIN/MAX
         // (light volumes restrict lighting to their depth range).
         let bounds_test = has_depth && dctl & 8 != 0 && !no_depth;
@@ -5652,7 +5652,7 @@ impl Renderer {
         }
         self.prof[5] += tp.elapsed();
         // Engine copy/fill kernels over whole render-target surfaces run as
-        // image operations (SOTC_ELIDE_UTILITY=0 runs them as shaders).
+        // image operations (TLG_ELIDE_UTILITY=0 runs them as shaders).
         static ELIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         // (Kernels dispatched from a start group (COMPUTE_START_X/Y/Z) cover
         // only groups [start, x): the elided operations assume group 0 on.)
@@ -5663,7 +5663,7 @@ impl Renderer {
                 crate::info!("utility kernel cs {:#x} dispatched {x}x{y}x{z} from group {start:?}: run as a shader", cs.addr);
             }
         }
-        if let Some(u) = cs.utility.filter(|_| start == (0, 0, 0) && *ELIDE.get_or_init(|| std::env::var("SOTC_ELIDE_UTILITY").map(|v| v != "0").unwrap_or(true))) {
+        if let Some(u) = cs.utility.filter(|_| start == (0, 0, 0) && *ELIDE.get_or_init(|| std::env::var("TLG_ELIDE_UTILITY").map(|v| v != "0").unwrap_or(true))) {
             if self.elide_utility(&cs, u, x as u64 * y as u64 * z as u64)? {
                 self.elided += 1;
                 self.dispatches += 1;
@@ -5791,12 +5791,12 @@ impl Renderer {
     /// copy per level. As in `gpu_texture_validate`, write tracking decides
     /// (no hash, no CPU read). Detiled on the CPU, streamed textures cost
     /// the GPU thread 3-10 ms in a frame. Returns false for the CPU path
-    /// (`SOTC_GPU_MIPS=0` always). `SOTC_GPU_TEX_VERIFY=<n>`: the first n uploads
+    /// (`TLG_GPU_MIPS=0` always). `TLG_GPU_TEX_VERIFY=<n>`: the first n uploads
     /// are read back at the next flip and compared byte by byte with the CPU
     /// detiler's result (`verify_gpu_textures`; slow).
     fn gpu_texture_levels(&mut self, key: ImageKey, t: &Tsharp, batch: u64) -> Result<bool, String> {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if !*ON.get_or_init(|| std::env::var("SOTC_GPU_MIPS").map(|v| v != "0").unwrap_or(true)) {
+        if !*ON.get_or_init(|| std::env::var("TLG_GPU_MIPS").map(|v| v != "0").unwrap_or(true)) {
             return Ok(false);
         }
         let (bpp, block) = resources::element_bits(t.dfmt);
@@ -5899,7 +5899,7 @@ impl Renderer {
         }
         static VERIFY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         static QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let verify = *VERIFY.get_or_init(|| std::env::var("SOTC_GPU_TEX_VERIFY").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+        let verify = *VERIFY.get_or_init(|| std::env::var("TLG_GPU_TEX_VERIFY").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
         if verify > 0 && QUEUED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < verify {
             VERIFY_QUEUE.lock().push((key, *t, layers));
         }
@@ -5930,7 +5930,7 @@ impl Renderer {
         Ok(true)
     }
 
-    /// `SOTC_GPU_TEX_VERIFY`: reads back the images `gpu_texture_levels`
+    /// `TLG_GPU_TEX_VERIFY`: reads back the images `gpu_texture_levels`
     /// uploaded (all levels and layers) and compares them with the CPU
     /// detiler's result for the same guest memory. Called at flips (no draw
     /// is being prepared: it submits and waits).
@@ -5985,10 +5985,10 @@ impl Renderer {
 
     /// Whether render targets with `bpp`-bit elements can be (de)tiled on the
     /// GPU (whole-dword elements; the guest surface is accessed in place).
-    /// SOTC_GPU_TILING=0 keeps the CPU paths.
+    /// TLG_GPU_TILING=0 keeps the CPU paths.
     fn gpu_remap_eligible(bpp: u32) -> bool {
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        matches!(bpp, 32 | 64 | 128) && *ON.get_or_init(|| std::env::var("SOTC_GPU_TILING").map(|v| v != "0").unwrap_or(true))
+        matches!(bpp, 32 | 64 | 128) && *ON.get_or_init(|| std::env::var("TLG_GPU_TILING").map(|v| v != "0").unwrap_or(true))
     }
 
     /// Where GPU detiling reads guest surface [base, base+bytes): the
@@ -7130,17 +7130,17 @@ impl Renderer {
 }
 
 impl Renderer {
-    /// Debug aid (SOTC_DUMP_IMAGES=<flip>): reads back every GPU-written color
+    /// Debug aid (TLG_DUMP_IMAGES=<flip>): reads back every GPU-written color
     /// image (first layer, base level), logs channel statistics and writes
     /// a viewable PNG next to the run log.
     pub fn dump_images(&mut self, flip: u64) {
         let Some(dir) = super::shader_dump::DIR.get().and_then(|d| d.parent()).map(|d| d.join(format!("images{flip:05}"))) else { return };
         let _ = std::fs::create_dir_all(&dir);
-        // SOTC_DUMP_BASES=<hex,...>: only images at those guest bases (shadow
+        // TLG_DUMP_BASES=<hex,...>: only images at those guest bases (shadow
         // copies of them included).
         static BASES: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
         let bases = BASES.get_or_init(|| {
-            std::env::var("SOTC_DUMP_BASES").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default()
+            std::env::var("TLG_DUMP_BASES").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default()
         });
         let mut keys: Vec<ImageKey> = self
             .images
@@ -7191,21 +7191,21 @@ impl Renderer {
         if let Some(px) = rgba {
             let _ = std::fs::write(dir.join(format!("{name}.png")), super::texdump::png(k.width, k.height, &px));
         }
-        // SOTC_DUMP_RAW=1: the texels too (tightly packed rows).
-        if std::env::var_os("SOTC_DUMP_RAW").is_some() {
+        // TLG_DUMP_RAW=1: the texels too (tightly packed rows).
+        if std::env::var_os("TLG_DUMP_RAW").is_some() {
             let _ = std::fs::write(dir.join(format!("{name}.bin")), &raw);
         }
     }
 
-    /// Frame trace with `SOTC_DUMP_AFTER=<ps addrs>`: dumps the color targets of
+    /// Frame trace with `TLG_DUMP_AFTER=<ps addrs>`: dumps the color targets of
     /// draws using one of the listed pixel shaders right after the draw.
     fn dump_after(&mut self, ps: u64, colors: &[Option<Attachment>], depth: Option<Attachment>) {
         let n = {
             let mut d = DUMP_AFTER.lock();
             let d = d.get_or_insert_with(|| {
-                let ps = std::env::var("SOTC_DUMP_AFTER").map(|v| parse_hex_list(&v)).unwrap_or_default();
-                // At most SOTC_DUMP_AFTER_MAX (default 6) dumps.
-                (ps, std::env::var("SOTC_DUMP_AFTER_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(6), 0)
+                let ps = std::env::var("TLG_DUMP_AFTER").map(|v| parse_hex_list(&v)).unwrap_or_default();
+                // At most TLG_DUMP_AFTER_MAX (default 6) dumps.
+                (ps, std::env::var("TLG_DUMP_AFTER_MAX").ok().and_then(|v| v.parse().ok()).unwrap_or(6), 0)
             });
             if !d.0.contains(&ps) || d.2 >= d.1 {
                 return;
@@ -7428,7 +7428,7 @@ pub struct VkHooks {
 
 /// Per command-processor queue (0: graphics, else the compute queue's
 /// virtual index): nanoseconds spent waiting for the renderer lock and
-/// holding it, and in WAIT_REG_MEM (SOTC_PERF report).
+/// holding it, and in WAIT_REG_MEM (TLG_PERF report).
 pub static QUEUE_LOCK_WAIT_NS: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
 pub static QUEUE_LOCK_HOLD_NS: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
 pub static QUEUE_WAIT_REG_NS: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
@@ -7589,13 +7589,13 @@ pub fn parse_hex_list(v: &str) -> Vec<u64> {
     v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()
 }
 
-/// True while the flip selected by SOTC_FRAME_TRACE (or a `trace` request) is being built.
+/// True while the flip selected by TLG_FRAME_TRACE (or a `trace` request) is being built.
 pub(super) fn trace_frame() -> bool {
     static WANT: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    // SOTC_TRACE_FROM=<seconds>: trace (and run synchronously) every command
+    // TLG_TRACE_FROM=<seconds>: trace (and run synchronously) every command
     // processed after that much process time, e.g. to pin down a GPU hang.
     static FROM: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
-    if let Some(from) = *FROM.get_or_init(|| std::env::var("SOTC_TRACE_FROM").ok().and_then(|v| v.parse::<f64>().ok())) {
+    if let Some(from) = *FROM.get_or_init(|| std::env::var("TLG_TRACE_FROM").ok().and_then(|v| v.parse::<f64>().ok())) {
         if crate::log::elapsed_ms() >= from * 1000.0 {
             return true;
         }
@@ -7604,7 +7604,7 @@ pub(super) fn trace_frame() -> bool {
     if TRACE_REQUEST.load(std::sync::atomic::Ordering::Relaxed) == frame {
         return true;
     }
-    match *WANT.get_or_init(|| std::env::var("SOTC_FRAME_TRACE").ok().and_then(|v| v.parse().ok())) {
+    match *WANT.get_or_init(|| std::env::var("TLG_FRAME_TRACE").ok().and_then(|v| v.parse().ok())) {
         Some(w) => frame == w,
         None => false,
     }
@@ -7642,10 +7642,10 @@ fn stage_res_summary(p: &Prepared) -> Vec<String> {
         Stage::Compute => "cs",
     };
     let ud: Vec<String> = p.sgpr_data.iter().take(16).map(|w| format!("{w:x}")).collect();
-    // SOTC_TRACE_FULL=<shader addrs>: whole buffers (up to 256 dwords) of
+    // TLG_TRACE_FULL=<shader addrs>: whole buffers (up to 256 dwords) of
     // these shaders' resources in traces.
     static FULL: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let full = FULL.get_or_init(|| std::env::var("SOTC_TRACE_FULL").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default());
+    let full = FULL.get_or_init(|| std::env::var("TLG_TRACE_FULL").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default());
     TRACE_FULL.with(|f| f.set(full.contains(&p.addr)));
     let reads: Vec<String> = p.mem_reads.iter().map(|a| format!("{a:x}")).collect();
     let out = std::iter::once(format!("{tag}ud [{}] reads [{}]", ud.join(" "), reads.join(" ")))
@@ -7665,19 +7665,19 @@ thread_local! {
 fn res_summary(r: &ResolvedRes) -> String {
     match r {
         ResolvedRes::Buffer(v) => {
-            // SOTC_TRACE_DWORDS: how many leading dwords of each buffer to show (default 4).
+            // TLG_TRACE_DWORDS: how many leading dwords of each buffer to show (default 4).
             static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-            let n = (*N.get_or_init(|| std::env::var("SOTC_TRACE_DWORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(4))).min(256);
+            let n = (*N.get_or_init(|| std::env::var("TLG_TRACE_DWORDS").ok().and_then(|v| v.parse().ok()).unwrap_or(4))).min(256);
             let n = if TRACE_FULL.with(|f| f.get()) { (v.size() as usize / 4).clamp(4, 256) } else { n };
             let mut head = vec![0u8; n * 4];
             resources::copy_from_guest(&mut head, v.base);
             let w: Vec<String> = head.chunks(4).map(|c| format!("{:08x}", u32::from_le_bytes([c[0], c[1], c[2], c[3]]))).collect();
-            // SOTC_TRACE_BUFDUMP=1: save buffers up to 1 MiB to <run>/trace_bufs/
+            // TLG_TRACE_BUFDUMP=1: save buffers up to 1 MiB to <run>/trace_bufs/
             // (contents when the command is recorded; traced commands run one
             // at a time, so earlier GPU writes have landed).
             static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
             let mut file = String::new();
-            if *DUMP.get_or_init(|| std::env::var_os("SOTC_TRACE_BUFDUMP").is_some()) && v.size() <= 1 << 20 {
+            if *DUMP.get_or_init(|| std::env::var_os("TLG_TRACE_BUFDUMP").is_some()) && v.size() <= 1 << 20 {
                 static SEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                 if let Some(dir) = super::shader_dump::DIR.get().and_then(|d| d.parent()).map(|d| d.join("trace_bufs")) {
                     let _ = std::fs::create_dir_all(&dir);

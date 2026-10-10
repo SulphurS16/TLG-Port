@@ -49,11 +49,34 @@ unsafe fn deadline_abs(ts: *const i64) -> Option<Instant> {
 // ---------------------------------------------------------------------------
 // Mutex
 
+/// The start of every guest-visible sync object (the guest variable points at
+/// it): laid out like the FreeBSD/PS4 libkernel structure the title's libc was
+/// compiled against, which it reads and writes directly -- e.g. TLG's libc.prx
+/// sets `PMUTEX_FLAG_PRIVATE` with `or dword [mutex+0x20], 0x100` right after
+/// scePthreadMutexInit (libc+0x5d81c). None of our own state lives here.
+#[repr(C)]
+pub struct GuestPrefix([u32; 32]);
+
+impl GuestPrefix {
+    const fn zero() -> Self {
+        GuestPrefix([0; 32])
+    }
+    /// `struct pthread_mutex`: `m_lock` (struct umutex, 0x20 bytes), then
+    /// `m_flags` (+0x20) whose low byte is the mutex type.
+    const fn mutex(kind: i32) -> Self {
+        let mut p = [0u32; 32];
+        p[8] = (kind as u32) & 0xff;
+        GuestPrefix(p)
+    }
+}
+
 /// Guest mutex: an atomic owner word (lock-free when uncontended), a short
 /// spin before parking (the engine's job workers take one queue lock in
 /// tight loops: parking on every contended acquisition made them spend most
 /// of their time in kernel sleeps and wake-ups), then a condition variable.
+#[repr(C)]
 pub struct GMutex {
+    guest: GuestPrefix,
     magic: u64,
     kind: i32,
     name: String,
@@ -80,6 +103,7 @@ struct MutexAttr {
 impl GMutex {
     fn new(kind: i32, name: &str) -> &'static GMutex {
         Box::leak(Box::new(GMutex {
+            guest: GuestPrefix::mutex(kind),
             magic: MUTEX_MAGIC,
             kind,
             name: name.to_string(),
@@ -108,6 +132,8 @@ impl GMutex {
             // count, or this check sees the release: both are SeqCst).
             self.waiters.fetch_add(1, Ordering::SeqCst);
             let mut g = self.park.lock();
+            let parked = Instant::now();
+            let mut reported = false;
             while self.owner.load(Ordering::SeqCst) != 0 {
                 match deadline {
                     Some(d) => {
@@ -117,7 +143,27 @@ impl GMutex {
                             return false;
                         }
                     }
-                    None => self.cv.wait(&mut g),
+                    None => {
+                        // Diagnostic: a lock held for seconds names its owner once.
+                        if self.cv.wait_for(&mut g, Duration::from_secs(5)).timed_out() && !reported {
+                            reported = true;
+                            let owner = self.owner.load(Ordering::SeqCst);
+                            let raw = unsafe { std::slice::from_raw_parts(self as *const Self as *const u64, std::mem::size_of::<Self>() / 8) };
+                            crate::warn!(
+                                "mutex '{}' ({:p}, kind {}) still held by thread {} (count {}) after {:.1} s; waiter thread {} at {}; owner at +{:#x}, object {:x?}",
+                                self.name,
+                                self,
+                                self.kind,
+                                if owner == u64::MAX { "host".to_string() } else { owner.to_string() },
+                                self.count.load(Ordering::Relaxed),
+                                parked.elapsed().as_secs_f64(),
+                                me,
+                                crate::loader::describe_addr(crate::tls::hle_return_addr()),
+                                std::ptr::addr_of!(self.owner) as usize - self as *const Self as usize,
+                                raw
+                            );
+                        }
+                    }
                 }
             }
             drop(g);
@@ -242,6 +288,10 @@ unsafe fn mutex_init(slot: *mut u64, attr: *mut u64, name: &str) -> i32 {
     }
     let m = GMutex::new(kind, name);
     unsafe { *slot = m as *const _ as u64 };
+    // Debug: TLG_WATCH_MUTEX=<slot address> watches that mutex's owner word (with --trace).
+    if std::env::var("TLG_WATCH_MUTEX").ok().and_then(|v| u64::from_str_radix(v.trim().trim_start_matches("0x"), 16).ok()) == Some(slot as u64) {
+        crate::hle::set_watch_word(std::ptr::addr_of!(m.owner) as u64, name);
+    }
     0
 }
 
@@ -268,7 +318,9 @@ unsafe fn mattr_ref<'a>(slot: *mut u64) -> Option<&'a mut MutexAttr> {
 // ---------------------------------------------------------------------------
 // Condition variable
 
+#[repr(C)]
 pub struct GCond {
+    guest: GuestPrefix,
     magic: u64,
     seq: Mutex<u64>,
     cv: Condvar,
@@ -289,7 +341,7 @@ unsafe fn cond_from(slot: *mut u64) -> Result<&'static GCond, i32> {
     if v > 0x10 {
         return Ok(unsafe { &*(v as *const GCond) });
     }
-    let c: &'static GCond = Box::leak(Box::new(GCond { magic: COND_MAGIC, seq: Mutex::new(0), cv: Condvar::new() }));
+    let c: &'static GCond = Box::leak(Box::new(GCond { guest: GuestPrefix::zero(), magic: COND_MAGIC, seq: Mutex::new(0), cv: Condvar::new() }));
     a.store(c as *const _ as u64, Ordering::Release);
     Ok(c)
 }
@@ -336,7 +388,9 @@ impl GCond {
 // ---------------------------------------------------------------------------
 // Read/write lock
 
+#[repr(C)]
 pub struct GRwLock {
+    guest: GuestPrefix,
     magic: u64,
     state: Mutex<(u32, u64)>, // (readers, writer tid)
     cv: Condvar,
@@ -357,7 +411,7 @@ unsafe fn rw_from(slot: *mut u64) -> Result<&'static GRwLock, i32> {
     if v > 0x10 {
         return Ok(unsafe { &*(v as *const GRwLock) });
     }
-    let c: &'static GRwLock = Box::leak(Box::new(GRwLock { magic: RW_MAGIC, state: Mutex::new((0, 0)), cv: Condvar::new() }));
+    let c: &'static GRwLock = Box::leak(Box::new(GRwLock { guest: GuestPrefix::zero(), magic: RW_MAGIC, state: Mutex::new((0, 0)), cv: Condvar::new() }));
     a.store(c as *const _ as u64, Ordering::Release);
     Ok(c)
 }
@@ -606,6 +660,8 @@ sysv! {
     }
     fn scePthreadCondSignal(c: *mut u64) -> i32 { match cond_from(c) { Ok(c) => { c.signal(); 0 } Err(e) => sce(e) } }
     fn scePthreadCondBroadcast(c: *mut u64) -> i32 { match cond_from(c) { Ok(c) => { c.broadcast(); 0 } Err(e) => sce(e) } }
+    fn scePthreadRwlockattrInit(attr: *mut u64) -> i32 { if !attr.is_null() { *attr = 1; } 0 }
+    fn scePthreadRwlockattrDestroy(attr: *mut u64) -> i32 { 0 }
     fn scePthreadRwlockInit(rw: *mut u64, attr: *mut u64, name: *const u8) -> i32 {
         if rw.is_null() { return sce(EINVAL); }
         *rw = 0;
@@ -817,6 +873,7 @@ pub fn register(r: &mut Registry) {
         scePthreadMutexLock, scePthreadMutexTrylock, scePthreadMutexTimedlock, scePthreadMutexUnlock,
         scePthreadCondattrInit, scePthreadCondattrDestroy, scePthreadCondInit, scePthreadCondDestroy,
         scePthreadCondWait, scePthreadCondTimedwait, scePthreadCondSignal, scePthreadCondBroadcast,
+        scePthreadRwlockattrInit, scePthreadRwlockattrDestroy,
         scePthreadRwlockInit, scePthreadRwlockDestroy, scePthreadRwlockRdlock, scePthreadRwlockWrlock,
         scePthreadRwlockTryrdlock, scePthreadRwlockTrywrlock, scePthreadRwlockTimedrdlock,
         scePthreadRwlockTimedwrlock, scePthreadRwlockUnlock, sceKernelCreateSema, sceKernelDeleteSema,

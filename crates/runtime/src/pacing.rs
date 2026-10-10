@@ -3,8 +3,8 @@
 //! each present has been queued). Reported per phase (`mark <name>` control
 //! commands start phases) and for the whole run at exit: frame-time
 //! percentiles, 1% and 0.1% lows, hitch counts and the worst frames. With
-//! `SOTC_PERF`, a `pacing/s` line per second. Each hitch (an interval over
-//! `SOTC_HITCH_MS`, default 50, or 1.5 frames of a lower `SOTC_FPS` cap) is
+//! `TLG_PERF`, a `pacing/s` line per second. Each hitch (an interval over
+//! `TLG_HITCH_MS`, default 50, or 1.5 frames of a lower `TLG_FPS` cap) is
 //! logged as it happens with what the frame
 //! spent its time on along its path: when the title submitted the frame's
 //! command buffers (relative to the previous frame's), its wait in the GPU
@@ -12,7 +12,7 @@
 //! execution (vblank ticks), the wait for the renderer lock and the present
 //! itself; plus the title's own measured frame time (its main thread) and
 //! the GPU thread's work since the previous present (shader preparation,
-//! submissions, ring slot waits, texture hashing). `SOTC_FRAMETIMES=<file>`
+//! submissions, ring slot waits, texture hashing). `TLG_FRAMETIMES=<file>`
 //! writes every frame as CSV.
 //!
 //! These are host clock times when presents are queued: the display adds its
@@ -79,19 +79,19 @@ struct State {
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-/// Hitch threshold: `SOTC_HITCH_MS`, else 50 ms or 1.5 frame periods of a
-/// lower frame-rate cap (`SOTC_FPS`), whichever is longer.
+/// Hitch threshold: `TLG_HITCH_MS`, else 50 ms or 1.5 frame periods of a
+/// lower frame-rate cap (`TLG_FPS`), whichever is longer.
 fn hitch_ms() -> f32 {
     static H: OnceLock<f32> = OnceLock::new();
     *H.get_or_init(|| {
         let cap = crate::title_patches::target_fps().filter(|&n| n > 0).unwrap_or(30);
-        std::env::var("SOTC_HITCH_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or((1500.0 / cap as f32).max(50.0))
+        std::env::var("TLG_HITCH_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or((1500.0 / cap as f32).max(50.0))
     })
 }
 
 fn perf_on() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("SOTC_PERF").is_some())
+    *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some())
 }
 
 fn ms(d: Duration) -> f32 {
@@ -100,7 +100,7 @@ fn ms(d: Duration) -> f32 {
 
 impl State {
     fn new(now: Instant) -> State {
-        let csv = std::env::var("SOTC_FRAMETIMES").ok().and_then(|p| match std::fs::File::create(&p) {
+        let csv = std::env::var("TLG_FRAMETIMES").ok().and_then(|p| match std::fs::File::create(&p) {
             Ok(f) => {
                 let mut w = std::io::BufWriter::new(f);
                 let _ = writeln!(
@@ -111,7 +111,7 @@ impl State {
                 Some(w)
             }
             Err(e) => {
-                crate::warn!("SOTC_FRAMETIMES {p}: {e}");
+                crate::warn!("TLG_FRAMETIMES {p}: {e}");
                 None
             }
         });

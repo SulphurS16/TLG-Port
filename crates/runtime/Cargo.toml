@@ -1,13 +1,13 @@
 [package]
-name = "sotc"
+name = "tlg"
 version = "0.1.0"
-description = "Native Windows x86-64 runtime for Shadow of the Colossus (PS4 HLE + native CPU execution)"
+description = "Native Windows x86-64 runtime for The Last Guardian (PS4 HLE + native CPU execution)"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "sotc"
+name = "tlg"
 path = "src/main.rs"
 
 [dependencies]
@@ -43,4 +43,5 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_Graphics_Gdi",
+    "Win32_Media",
 ] }

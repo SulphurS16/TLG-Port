@@ -32,9 +32,12 @@ if (-not (Test-Path (Join-Path $tools 'cargo\bin\cargo.exe'))) {
   $ri = Join-Path $dl 'rustup-init.exe'
   $base = 'https://static.rust-lang.org/rustup/dist/x86_64-pc-windows-msvc/rustup-init.exe'
   Invoke-WebRequest -Uri $base -OutFile $ri -UseBasicParsing
-  $want = ((Invoke-WebRequest -Uri "$base.sha256" -UseBasicParsing).Content -split '\s+')[0].Trim().ToLower()
+  $c = (Invoke-WebRequest -Uri "$base.sha256" -UseBasicParsing).Content
+  if ($c -is [byte[]]) { $c = [Text.Encoding]::ASCII.GetString($c) } # pwsh 7 returns bytes for octet-stream
+  $want = ($c -split '\s+')[0].Trim().ToLower()
   $h = (Get-FileHash -Algorithm SHA256 $ri).Hash.ToLower()
   if ($h -ne $want) { throw "rustup-init hash mismatch ($h, published $want)" }
   $env:RUSTUP_INIT_SKIP_PATH_CHECK = 'yes'
-  & $ri -y --no-modify-path --profile minimal --default-host x86_64-pc-windows-gnullvm --default-toolchain stable
+  # Pinned to the compiler the imported runtime was last built and tested with (docs/PROVENANCE.md).
+  & $ri -y --no-modify-path --profile minimal --default-host x86_64-pc-windows-gnullvm --default-toolchain 1.99.0
 } else { Write-Host "ok rust" }
