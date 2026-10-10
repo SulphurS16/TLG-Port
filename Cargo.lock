@@ -379,6 +379,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "spvstat"
+version = "0.1.0"
+dependencies = [
+ "rspirv",
+]
+
+[[package]]
 name = "spvval"
 version = "0.1.0"
 dependencies = [

@@ -7,6 +7,7 @@
 //! structured with a loop + switch dispatcher over basic blocks.
 
 mod alu;
+mod cfg;
 pub mod gs;
 pub mod kernels;
 mod mem;
@@ -329,8 +330,11 @@ pub(crate) struct T<'a> {
     pub glsl: Word,
     pub spec: &'a Spec,
     pub plan: &'a Plan,
-    pub sgpr: Word,
-    pub vgpr: Word,
+    /// One Function variable per scalar / vector register (no register-file
+    /// arrays: access chains into function-local arrays inside the dispatcher
+    /// loop kept drivers from promoting registers to SSA values).
+    pub sgpr: Vec<Word>,
+    pub vgpr: Vec<Word>,
     pub scc: Word,
     pub consts: HashMap<(Word, u32), Word>,
     pub interface: Vec<Word>,
@@ -420,15 +424,9 @@ impl<'a> T<'a> {
         *self.consts.entry((ty, v as u32)).or_insert_with(|| if v { self.b.constant_true(ty) } else { self.b.constant_false(ty) })
     }
 
-    fn reg_ptr(&mut self, file: Word, idx: u32) -> R<Word> {
-        let i = self.u(idx);
-        let pt = self.t.fn_u32;
-        e(self.b.access_chain(pt, None, file, [i]))
-    }
-
     /// Raw 32-bit value of a scalar register slot (0..127).
     pub fn sreg(&mut self, idx: u32) -> R<Word> {
-        let p = self.reg_ptr(self.sgpr, idx)?;
+        let p = self.sgpr[(idx & 127) as usize];
         e(self.b.load(self.t.u32, None, p, None, []))
     }
     pub fn set_sreg(&mut self, idx: u32, v: Word) -> R<()> {
@@ -438,16 +436,16 @@ impl<'a> T<'a> {
         if idx == crate::OP_EXEC_LO as u32 || idx == crate::OP_EXEC_LO as u32 + 1 {
             self.active_cache = None;
         }
-        let p = self.reg_ptr(self.sgpr, idx)?;
+        let p = self.sgpr[idx as usize];
         self.b.store(p, v, None, []).map_err(|x| format!("{x:?}"))
     }
     pub fn vreg(&mut self, idx: u32) -> R<Word> {
-        let p = self.reg_ptr(self.vgpr, idx & 255)?;
+        let p = self.vgpr[(idx & 255) as usize];
         e(self.b.load(self.t.u32, None, p, None, []))
     }
     /// Unconditional VGPR write (used for initialization).
     pub fn set_vreg_raw(&mut self, idx: u32, v: Word) -> R<()> {
-        let p = self.reg_ptr(self.vgpr, idx & 255)?;
+        let p = self.vgpr[(idx & 255) as usize];
         self.b.store(p, v, None, []).map_err(|x| format!("{x:?}"))
     }
     /// VGPR write predicated on this lane being active.
@@ -803,8 +801,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         glsl,
         spec,
         plan,
-        sgpr: 0,
-        vgpr: 0,
+        sgpr: Vec::new(),
+        vgpr: Vec::new(),
         scc: 0,
         consts: HashMap::default(),
         interface: Vec::new(),
@@ -920,18 +918,14 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     let fn_ty = tr.b.type_function(void, []);
     let func = e(tr.b.begin_function(void, None, spirv::FunctionControl::NONE, fn_ty))?;
     e(tr.b.begin_block(None))?;
-    let arr_s = {
-        let n = tr.u(128);
-        tr.b.type_array(tr.t.u32, n)
-    };
-    let arr_v = {
-        let n = tr.u(256);
-        tr.b.type_array(tr.t.u32, n)
-    };
-    let p_arr_s = tr.b.type_pointer(None, StorageClass::Function, arr_s);
-    let p_arr_v = tr.b.type_pointer(None, StorageClass::Function, arr_v);
-    tr.sgpr = tr.b.variable(p_arr_s, None, StorageClass::Function, None);
-    tr.vgpr = tr.b.variable(p_arr_v, None, StorageClass::Function, None);
+    for _ in 0..128 {
+        let v = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+        tr.sgpr.push(v);
+    }
+    for _ in 0..256 {
+        let v = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+        tr.vgpr.push(v);
+    }
     tr.scc = tr.b.variable(tr.t.fn_bool, None, StorageClass::Function, None);
     tr.pc_var = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
     let lds_i = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
@@ -1022,7 +1016,19 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         }
         tr.b.ret().map_err(|x| format!("{x:?}"))?;
     } else {
-        emit_dispatch_loop(&mut tr, code, &starts)?;
+        // Structured control flow when the CFG allows it (TLG_STRUCTURED=0
+        // keeps the dispatcher for every program, for A/B comparisons).
+        let ranges = block_ranges(code, &starts);
+        let want = std::env::var("TLG_STRUCTURED").map(|v| v != "0").unwrap_or(true);
+        match want.then(|| cfg::plan(code, &starts, &ranges)) {
+            Some(Ok(p)) => cfg::emit(&mut tr, code, &ranges, &p.nodes, None, None)?,
+            other => {
+                if let Some(Err(why)) = other {
+                    tr.warnings.push(format!("control flow kept as a dispatcher loop: {why}"));
+                }
+                emit_dispatch_loop(&mut tr, code, &starts)?;
+            }
+        }
     }
     tr.b.end_function().map_err(|x| format!("{x:?}"))?;
 
