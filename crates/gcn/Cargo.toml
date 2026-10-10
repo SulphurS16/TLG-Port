@@ -1,0 +1,10 @@
+[package]
+name = "gcn"
+version = "0.1.0"
+description = "AMD GCN gfx7 (PS4 Liverpool) shader instruction decoder and disassembler"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rspirv = "0.13"

@@ -1,0 +1,10 @@
+# Machine-local data: toolchains, downloads, keys, prepared game files, runs, saves, research.
+# Proprietary inputs and anything derived from the game never enter Git.
+/local/
+/target/
+*.pkg
+*.self
+*.sprx
+*.prx
+eboot.bin
+__pycache__/

@@ -1,0 +1,7 @@
+[build]
+target = "x86_64-pc-windows-gnullvm"
+
+# Self-contained executables: libunwind/libc++abi linked statically (only OS DLLs are imported).
+# A PDB next to each executable (function names for the SOTC_SAMPLE profiler via dbghelp).
+[target.x86_64-pc-windows-gnullvm]
+rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-Wl,--pdb="]

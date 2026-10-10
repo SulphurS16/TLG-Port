@@ -1,0 +1,9 @@
+[package]
+name = "sce-elf"
+version = "0.1.0"
+description = "PS4 SELF/ELF container, SCE dynamic-link metadata and NID utilities"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]

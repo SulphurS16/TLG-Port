@@ -1,0 +1,46 @@
+[package]
+name = "sotc"
+version = "0.1.0"
+description = "Native Windows x86-64 runtime for Shadow of the Colossus (PS4 HLE + native CPU execution)"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sotc"
+path = "src/main.rs"
+
+[dependencies]
+sce-elf = { path = "../sce-elf" }
+gcn = { path = "../gcn" }
+parking_lot = "0.12"
+smallvec = "1.16"
+ash = { version = "0.38", default-features = false, features = ["loaded", "std", "debug"] }
+rspirv = "0.13"
+miniz_oxide = "0.8"
+windows = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Media_MediaFoundation",
+    "Win32_Media_Audio",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Variant",
+] }
+iced-x86 = { version = "1.21", default-features = false, features = ["std", "decoder", "instr_info", "fast_fmt", "code_asm"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_SystemInformation",
+    "Win32_System_Performance",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Time",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_UI_Input_XboxController",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
+] }
