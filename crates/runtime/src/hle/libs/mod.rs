@@ -2,6 +2,7 @@
 
 pub mod ajm;
 pub mod app;
+pub mod atrac9;
 pub mod avplayer;
 pub mod devices;
 pub mod extra;

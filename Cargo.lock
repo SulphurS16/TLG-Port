@@ -414,6 +414,7 @@ name = "tlg"
 version = "0.1.0"
 dependencies = [
  "ash",
+ "cc",
  "gcn",
  "iced-x86",
  "miniz_oxide",

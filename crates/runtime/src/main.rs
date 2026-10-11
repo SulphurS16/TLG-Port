@@ -101,6 +101,17 @@ fn parse_args() -> Config {
                 hle::libs::avplayer::probe(Path::new(&args.next().expect("--probe-media needs a file")));
                 std::process::exit(0);
             }
+            "--decode-at9" => {
+                let i = args.next().expect("--decode-at9 <in.at9> <out.wav>");
+                let o = args.next().expect("--decode-at9 <in.at9> <out.wav>");
+                match hle::libs::atrac9::decode_file(Path::new(&i), Path::new(&o)) {
+                    Ok(()) => std::process::exit(0),
+                    Err(e) => {
+                        eprintln!("{e}");
+                        std::process::exit(1)
+                    }
+                }
+            }
             "--seconds" => seconds = args.next().and_then(|s| s.parse().ok()),
             "--trace" => trace = true,
             "--lenient" => lenient = true,

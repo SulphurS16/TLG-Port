@@ -32,6 +32,10 @@ fn from64(tr: &mut T, v: Word) -> R<(Word, Word)> {
     Ok((e(tr.b.composite_extract(tr.t.u32, None, p, [0]))?, e(tr.b.composite_extract(tr.t.u32, None, p, [1]))?))
 }
 
+/// Registers a v_movrel* access may reach from its base register (M0 beyond
+/// this reads 0 / writes nothing; the title's register arrays are far smaller).
+const MOVREL_SPAN: u32 = 64;
+
 fn nonzero(tr: &mut T, v: Word) -> R<Word> {
     let z = tr.u(0);
     e(tr.b.i_not_equal(tr.t.bool_, None, v, z))
@@ -863,6 +867,25 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                     _ => int_cmp(tr, a, b, 3, signed)?,
                 }
             }
+            // v_cmp(x)_*_i64 (0xA0..0xA7, 0xB0..) and _u64 (0xE0.., 0xF0..):
+            // register-pair (or constant) operands compared as 64-bit integers.
+            0xA | 0xB | 0xE | 0xF if lo < 8 => {
+                let (al, ah) = vsrc64(tr, ins, v.src[0])?;
+                let (bl, bh) = vsrc64(tr, ins, v.src[1])?;
+                let a = to64(tr, al, ah)?;
+                let b = to64(tr, bl, bh)?;
+                let signed = hi <= 0xB;
+                match lo {
+                    0 => tr.bool_c(false),
+                    7 => tr.bool_c(true),
+                    1 => int_cmp(tr, a, b, 4, signed)?,
+                    2 => int_cmp(tr, a, b, 0, signed)?,
+                    3 => int_cmp(tr, a, b, 5, signed)?,
+                    4 => int_cmp(tr, a, b, 2, signed)?,
+                    5 => int_cmp(tr, a, b, 1, signed)?,
+                    _ => int_cmp(tr, a, b, 3, signed)?,
+                }
+            }
             _ => {
                 tr.warn(format!("{:#x}: unsupported compare {}", ins.pc, ins.name()));
                 tr.bool_c(false)
@@ -1574,6 +1597,49 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             } else {
                 let m = e(tr.b.composite_extract(f, None, fr, [0]))?;
                 fout(tr, &v, m)?;
+            }
+        }
+        // v_movreld_b32 (VGPR[D + M0] = S0), v_movrels_b32 (D = VGPR[S0 + M0]),
+        // v_movrelsd_b32 (VGPR[D + M0] = VGPR[S0 + M0]): register arrays indexed by
+        // M0 (here this lane's own index: the title's waterfall loops pick each
+        // lane's value with readfirstlane). Registers are separate variables, so
+        // the access is a select chain over the MOVREL_SPAN registers from the base.
+        0x1C2..=0x1C4 => {
+            let m0 = tr.sreg(crate::OP_M0 as u32)?;
+            let src_rel = v.op != 0x1C2;
+            let dst_rel = v.op != 0x1C3;
+            let s0 = v.src[0];
+            let value = if src_rel {
+                if s0 < 256 {
+                    tr.warn(format!("{:#x}: {} with a scalar source", ins.pc, ins.name()));
+                    tr.u(0)
+                } else {
+                    let base = (s0 - 256) as u32;
+                    let mut r = tr.u(0);
+                    for k in 0..MOVREL_SPAN.min(256 - base) {
+                        let x = tr.vreg(base + k)?;
+                        let kk = tr.u(k);
+                        let hit = e(tr.b.i_equal(bt, None, m0, kk))?;
+                        r = e(tr.b.select(u, None, hit, x, r))?;
+                    }
+                    r
+                }
+            } else {
+                usrc(tr, ins, &v, 0)?
+            };
+            if dst_rel {
+                let base = v.dst as u32;
+                let act = tr.active()?;
+                for k in 0..MOVREL_SPAN.min(256 - base) {
+                    let kk = tr.u(k);
+                    let hit = e(tr.b.i_equal(bt, None, m0, kk))?;
+                    let hit = e(tr.b.logical_and(bt, None, hit, act))?;
+                    let old = tr.vreg(base + k)?;
+                    let nv = e(tr.b.select(u, None, hit, value, old))?;
+                    tr.set_vreg_raw(base + k, nv)?;
+                }
+            } else {
+                uout(tr, &v, value)?;
             }
         }
         _ => tr.warn(format!("{:#x}: unsupported {} (vop3 op {:#x})", ins.pc, ins.name(), v.op)),
