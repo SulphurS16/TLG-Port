@@ -248,6 +248,8 @@ struct State {
     voices: HashMap<u64, Voice>,
     seen_params: HashSet<(u32, u16)>,
     noted: HashSet<&'static str>,
+    /// Output peak since the last statistics line.
+    peak: f32,
 }
 
 static NGS2: Mutex<Option<State>> = Mutex::new(None);
@@ -255,6 +257,12 @@ static NGS2: Mutex<Option<State>> = Mutex::new(None);
 fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
     let mut g = NGS2.lock();
     f(g.get_or_insert_with(State::default))
+}
+
+/// TLG_NGS2_TRACE=1: sampler voice block traffic, endings and state queries.
+fn trace_voices() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TLG_NGS2_TRACE").is_some())
 }
 
 /// Logs a not-implemented behaviour once.
@@ -440,14 +448,18 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                         }
                         let b = unsafe { blocks.add(i * 8) };
                         let rd = |k: usize| unsafe { *b.add(k) };
-                        v.sampler.blocks.push_back(Block {
+                        let blk = Block {
                             addr: data + rd(0) as u64,
                             size: rd(1),
                             repeats: rd(2),
                             skip: rd(3),
                             samples: rd(4),
                             user_data: unsafe { *(b.add(6) as *const u64) },
-                        });
+                        };
+                        if trace_voices() {
+                            crate::info!("NGS2 voice {:#x}: add block {i}/{count}: {:#x}+{:#x} bytes, {} samples (skip {}, repeats {:#x}), user {:#x}, type {:#x} {} ch, queued {}", vh, blk.addr, blk.size, blk.samples, blk.skip, blk.repeats, blk.user_data, v.sampler.wf_type, v.sampler.channels, v.sampler.blocks.len());
+                        }
+                        v.sampler.blocks.push_back(blk);
                     }
                     v.flags &= !STATE_EMPTY;
                 }
@@ -700,6 +712,9 @@ fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MA
         }
     }
     if ended && sm.pcm.is_empty() && sm.blocks.is_empty() {
+        if trace_voices() {
+            crate::info!("NGS2 voice (rack {:#x} #{}) ran out of data after {} samples ({} bytes decoded)", v.rack, v.index, sm.decoded_samples, sm.decoded_bytes);
+        }
         v.flags = (v.flags & !STATE_PLAYING) | STATE_STOPPED | STATE_EMPTY;
         v.flags &= !STATE_IN_USE;
     }
@@ -923,6 +938,12 @@ sysv! {
             (v.flags, sm.decoded_samples, sm.decoded_bytes, sm.user_data, data)
         })) else { return ERR_INVALID_HANDLE };
         std::ptr::write_bytes(out, 0, size as usize);
+        if trace_voices() {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
+                crate::info!("NGS2 state of {voice:#x} ({size} bytes): flags {flags:#x}, decoded {samples} samples / {bytes} bytes, user {user:#x}, data {data:#x}");
+            }
+        }
         if size >= 4 { *(out as *mut u32) = flags; }
         if size >= 8 { *(out.add(4) as *mut f32) = if flags & STATE_PLAYING != 0 { 1.0 } else { 0.0 }; }
         if size >= 24 { *(out.add(16) as *mut u64) = samples; }
@@ -937,6 +958,24 @@ sysv! {
         let s = g.get_or_insert_with(State::default);
         let Some((grain, rate)) = s.systems.get_mut(&system).map(|y| { y.renders += 1; (y.grain as usize, y.sample_rate) }) else { return ERR_INVALID_HANDLE };
         let mix = render(s, system, grain, rate);
+        // Every ~10 s: what the mixer is doing.
+        let renders = s.systems[&system].renders;
+        let peak = mix.iter().flat_map(|f| f.iter()).fold(0f32, |m, &x| m.max(x.abs()));
+        s.peak = s.peak.max(peak);
+        if renders % (10 * rate as u64 / grain.max(1) as u64).max(1) == 0 {
+            let mut by_type: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+            let mut starved = 0;
+            for v in s.voices.values() {
+                if v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0 {
+                    *by_type.entry(v.sampler.wf_type).or_default() += 1;
+                    if v.sampler.blocks.is_empty() && v.sampler.pcm.is_empty() {
+                        starved += 1;
+                    }
+                }
+            }
+            crate::info!("NGS2: {} sampler voices playing (by waveform type {:x?}), {starved} without data; output peak {:.4} over the last 10 s", by_type.values().sum::<u32>(), by_type, s.peak);
+            s.peak = 0.0;
+        }
         for i in 0..count as usize {
             let e = infos.add(i * 24);
             let buf = *(e as *const u64) as *mut u8;

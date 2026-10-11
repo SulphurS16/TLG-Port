@@ -8,6 +8,7 @@ mod debug_mem;
 mod sampler;
 mod tune;
 mod ehframe;
+mod envmon;
 mod exception;
 mod gpu;
 mod hle;
@@ -591,6 +592,9 @@ fn main() {
     loop {
         std::thread::sleep(Duration::from_millis(250));
         ticks += 1;
+        if ticks % 40 == 1 {
+            envmon::report();
+        }
         let flip = gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         if flip != last_flip {
             (last_flip, last_flip_at, hang_reported) = (flip, Instant::now(), false);
