@@ -3148,7 +3148,10 @@ impl Renderer {
                 let (start, end) = crate::mem::MEM.lock().committed_span(base)?;
                 let slot = base >> VWIN_SHIFT << VWIN_SHIFT;
                 let (lo, hi) = (slot.max(start), (slot + VWIN_SIZE).min(end));
-                if base + size > hi || self.pressure >= 2 {
+                // (TLG_VCACHE_REFUSE=0: new windows even under VRAM pressure.)
+                static REFUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+                let refuse = *REFUSE.get_or_init(|| std::env::var("TLG_VCACHE_REFUSE").map(|v| v != "0").unwrap_or(true));
+                if base + size > hi || (refuse && self.pressure >= 2) {
                     return None;
                 }
                 // Overlapped windows (made before the mapping grew) are
@@ -7018,7 +7021,21 @@ impl Renderer {
         let age = EVICT_AGE[self.pressure as usize];
         // (Not recording: every command using these has been submitted.)
         let seq = self.last_seq;
-        let mut candidates: Vec<(u64, u64, ImageKey)> = self.images.iter().filter(|(k, i)| evictable(k, i) && i.last_used + age <= frame).map(|(k, i)| (i.last_used, i.bytes, *k)).collect();
+        // Image eviction is opt-in (TLG_EVICT_IMAGES=1): under VRAM pressure 3
+        // on the development machine (budget 2.6 GB while another process used
+        // the GPU), evicting CPU-sourced textures left the title screen's 3D
+        // background black or garbage with ~600 ms GPU stalls; keeping the
+        // images (mirror windows still released) rendered correctly. Root
+        // cause not found yet (shadow copies excluded: still black).
+        // TLG_EVICT_WINDOWS=0 keeps idle VRAM mirror windows; TLG_EVICT_SHADOWS=0
+        // keeps shadow copies when images are evicted.
+        static IMAGES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static WINDOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let evict_images = *IMAGES.get_or_init(|| std::env::var("TLG_EVICT_IMAGES").is_ok_and(|v| v == "1"));
+        let release_windows = *WINDOWS.get_or_init(|| std::env::var("TLG_EVICT_WINDOWS").map(|v| v != "0").unwrap_or(true));
+        static SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let evict_shadows = *SHADOWS.get_or_init(|| std::env::var("TLG_EVICT_SHADOWS").map(|v| v != "0").unwrap_or(true));
+        let mut candidates: Vec<(u64, u64, ImageKey)> = self.images.iter().filter(|(k, i)| evict_images && (evict_shadows || !is_shadow(k)) && evictable(k, i) && i.last_used + age <= frame).map(|(k, i)| (i.last_used, i.bytes, *k)).collect();
         if self.pressure < 2 {
             candidates.sort_unstable_by_key(|c| c.0);
             let (mut n, mut bytes) = (0usize, 0u64);
@@ -7065,7 +7082,7 @@ impl Renderer {
             crate::info!("VRAM: evicted {} images unused for {age}+ frames ({} MiB; pressure {})", victims.len(), freed >> 20, self.pressure);
         }
         let mut released = 0;
-        if self.pressure >= 2 {
+        if self.pressure >= 2 && release_windows {
             let mut gone = Vec::new();
             if let Some(vc) = self.vcache.as_mut() {
                 let idle: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.last_used + age <= frame).map(|(k, _)| *k).collect();
