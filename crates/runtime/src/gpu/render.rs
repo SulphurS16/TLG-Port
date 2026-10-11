@@ -830,7 +830,8 @@ fn wait_cpu_writebacks(addr: u64, len: u64) {
 
 /// Render target write-backs tiled on the GPU into the VRAM mirror when
 /// guest memory is not imported (`gpu_remap`); TLG_MIRROR_TILING=0: on the
-/// CPU after draining the GPU.
+/// CPU after draining the GPU. (Under VRAM pressure 3 the title screen's 3D
+/// background renders black with either path: a separate problem.)
 fn mirror_tiling_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("TLG_MIRROR_TILING").map(|v| v != "0").unwrap_or(true))
@@ -3063,11 +3064,12 @@ impl Renderer {
             return Ok(true);
         }
         // Device-ring write-backs land in guest memory on the CPU after their
-        // batch; in-place and round-trip writes are ordered on the GPU, and so
-        // are mirror-resident writes (render target tiling included) when the
-        // detiling reads the mirror.
-        let mirrored = ctx().ext_host.is_none();
-        if self.writebacks.iter().any(|w| !(mirrored && w.mirror) && w.base < t.base + bytes && t.base < w.base + w.size) {
+        // batch; in-place and round-trip writes are ordered on the GPU.
+        // (Mirror-resident writes too in principle, but the mirror copy-in
+        // counts the pages they write as changed and reloads them from guest
+        // memory before the write-back: detiling the title screen's tiled
+        // render targets from the mirror gave a black background.)
+        if self.writebacks.iter().any(|w| w.base < t.base + bytes && t.base < w.base + w.size) {
             self.report(format!("texture {:#x} {}x{}: GPU detiling declined (pending write-back)", t.base, t.width, t.height));
             return Ok(false);
         }
