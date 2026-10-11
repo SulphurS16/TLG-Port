@@ -828,6 +828,11 @@ fn wait_cpu_writebacks(addr: u64, len: u64) {
     }
 }
 
+/// Whether a submitted batch's end-of-pipe writes overlap [addr, addr+len).
+pub fn actions_in_flight(addr: u64, len: u64) -> bool {
+    COMPLETIONS.lock().iter().any(|c| c.actions.iter().any(|a| a.overlaps(addr, len)))
+}
+
 /// The 32-bit value at `addr` once the in-flight end-of-pipe writes have
 /// been performed, when one of them writes it with known data (None when
 /// none does, or a timestamp is the last write).
@@ -7560,6 +7565,16 @@ impl Hooks for VkHooks {
         if let Some(r) = RENDERER.lock().as_mut() {
             r.order_barrier();
         }
+    }
+    fn label_only(&mut self, _cp: &CommandProcessor, addr: u64, len: u64) -> bool {
+        let end = addr + len.max(1);
+        let g = RENDERER.lock();
+        let Some(r) = g.as_ref() else { return false };
+        if r.pending_write_overlaps(addr, len) || r.zc_reads.overlaps(addr, end) {
+            return false;
+        }
+        drop(g);
+        !COMPLETIONS.lock().iter().any(|c| c.writebacks.iter().any(|&(w, _, n)| w < end && addr < w + n) || c.zc_writes.iter().any(|&(w, n)| w < end && addr < w + n) || c.zc_reads.overlaps(addr, end))
     }
     fn commit(&mut self, cp: &CommandProcessor, actions: Vec<super::cp::EopAction>) {
         let mut g = TimedRenderer::lock(cp.queue);

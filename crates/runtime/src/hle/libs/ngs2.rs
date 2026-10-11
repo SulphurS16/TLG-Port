@@ -220,6 +220,10 @@ struct Voice {
     /// Input bus (submixers, mastering): `grain` frames of MAX_CH channels.
     input: Vec<[f32; MAX_CH]>,
     gain: f32,
+    /// Peak level of the voice's last rendered grain (state peakHeight).
+    peak: f32,
+    /// Flags last returned to the title (for TLG_NGS2_TRACE transitions).
+    reported: u32,
 }
 
 impl Voice {
@@ -237,6 +241,8 @@ impl Voice {
             sampler: Sampler::default(),
             input: Vec::new(),
             gain: 1.0,
+            peak: 0.0,
+            reported: 0,
         }
     }
 }
@@ -352,6 +358,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
         let mut unimpl: Option<&'static str> = None;
         {
             let Some(v) = s.voices.get_mut(&vh) else { return ERR_INVALID_HANDLE };
+            if id == PARAM_EVENT && trace_voices() && v.kind == Kind::Sampler {
+                crate::info!("NGS2 voice {vh:#x}: event {} (flags {:#x}, {} blocks queued, {} samples decoded)", u32_at(8), v.flags, v.sampler.blocks.len(), v.sampler.decoded_samples);
+            }
             match id {
                 PARAM_EVENT => match u32_at(8) {
                     EVENT_PLAY => {
@@ -457,7 +466,7 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                             user_data: unsafe { *(b.add(6) as *const u64) },
                         };
                         if trace_voices() {
-                            crate::info!("NGS2 voice {:#x}: add block {i}/{count}: {:#x}+{:#x} bytes, {} samples (skip {}, repeats {:#x}), user {:#x}, type {:#x} {} ch, queued {}", vh, blk.addr, blk.size, blk.samples, blk.skip, blk.repeats, blk.user_data, v.sampler.wf_type, v.sampler.channels, v.sampler.blocks.len());
+                            crate::info!("NGS2 voice {:#x}: add block {i}/{count} (flags {:#x}): {:#x}+{:#x} bytes, {} samples (skip {}, repeats {:#x}), user {:#x}, type {:#x} {} ch, queued {}, voice flags {:#x}", vh, u32_at(16), blk.addr, blk.size, blk.samples, blk.skip, blk.repeats, blk.user_data, v.sampler.wf_type, v.sampler.channels, v.sampler.blocks.len(), v.flags);
                         }
                         v.sampler.blocks.push_back(blk);
                     }
@@ -792,12 +801,17 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
     for vh in &all {
         let play = s.voices.get(vh).is_some_and(|v| v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0 && v.flags & STATE_PAUSED == 0);
         if !play {
+            if let Some(v) = s.voices.get_mut(vh) {
+                v.peak = 0.0;
+            }
             continue;
         }
         let ch = {
             let v = s.voices.get_mut(vh).unwrap();
             render_sampler(v, grain, rate, &mut buf);
-            v.sampler.channels as usize
+            let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
+            v.peak = buf.iter().flat_map(|f| f[..ch].iter()).fold(0f32, |m, &x| m.max(x.abs()));
+            ch
         };
         route(s, *vh, &buf, ch);
     }
@@ -932,20 +946,22 @@ sysv! {
     /// u64 numDecodedSamples, decodedDataSize; uintptr userData; const void *waveformData}.
     fn sceNgs2VoiceGetState(voice: u64, out: *mut u8, size: u64) -> i32 {
         if out.is_null() { return ERR_INVALID_OUT_ADDRESS; }
-        let Some((flags, samples, bytes, user, data)) = with(|s| s.voices.get(&voice).map(|v| {
+        let Some((flags, samples, bytes, user, data, peak, before)) = with(|s| s.voices.get_mut(&voice).map(|v| {
             let sm = &v.sampler;
             let data = sm.blocks.front().map(|b| b.addr).unwrap_or(sm.data);
-            (v.flags, sm.decoded_samples, sm.decoded_bytes, sm.user_data, data)
+            let before = std::mem::replace(&mut v.reported, v.flags);
+            (v.flags, sm.decoded_samples, sm.decoded_bytes, sm.user_data, data, v.peak, before)
         })) else { return ERR_INVALID_HANDLE };
         std::ptr::write_bytes(out, 0, size as usize);
-        if trace_voices() {
+        if trace_voices() && flags != before {
             static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 400 {
-                crate::info!("NGS2 state of {voice:#x} ({size} bytes): flags {flags:#x}, decoded {samples} samples / {bytes} bytes, user {user:#x}, data {data:#x}");
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4000 {
+                crate::info!("NGS2 state of {voice:#x} ({size} bytes): flags {before:#x} -> {flags:#x}, decoded {samples} samples / {bytes} bytes, user {user:#x}, data {data:#x}");
             }
         }
         if size >= 4 { *(out as *mut u32) = flags; }
         if size >= 8 { *(out.add(4) as *mut f32) = if flags & STATE_PLAYING != 0 { 1.0 } else { 0.0 }; }
+        if size >= 12 { *(out.add(8) as *mut f32) = peak; }
         if size >= 24 { *(out.add(16) as *mut u64) = samples; }
         if size >= 32 { *(out.add(24) as *mut u64) = bytes; }
         if size >= 40 { *(out.add(32) as *mut u64) = user; }

@@ -311,6 +311,13 @@ pub trait Hooks {
     fn order_barrier(&mut self, cp: &CommandProcessor) {
         let _ = cp;
     }
+    /// Whether guest memory [addr, addr+len) is touched only by end-of-pipe
+    /// writes (no shader or copy work recorded or in flight reads or writes
+    /// it): a CP write ordered behind those can be queued behind them.
+    fn label_only(&mut self, cp: &CommandProcessor, addr: u64, len: u64) -> bool {
+        let _ = (cp, addr, len);
+        false
+    }
     /// GDS transfer (DMA_DATA to/from GDS, end-of-shader GDS store).
     fn gds(&mut self, cp: &CommandProcessor, op: GdsOp) {
         let _ = cp;
@@ -378,6 +385,16 @@ pub static EVENT_TYPES: [std::sync::atomic::AtomicU64; 64] = [const { std::sync:
 /// CP memory accesses that waited for GPU work (or its write-backs), by
 /// cp.rs line of the packet handler: (count, microseconds) (TLG_PERF report).
 pub static SYNC_SITES: parking_lot::Mutex<Option<HashMap<u32, (u64, u64)>>> = parking_lot::Mutex::new(None);
+
+/// WRITE_DATA packets queued behind end-of-pipe writes (`defer_label_write`).
+pub static DEFERRED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// TLG_WD_TRACE=1: WRITE_DATA packets whose ordering with earlier GPU work
+/// made the CP wait (address, data, the end-of-pipe writes involved).
+fn wd_trace() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("TLG_WD_TRACE").is_some())
+}
 
 fn note_sync(line: u32, t0: Instant) {
     let us = t0.elapsed().as_micros() as u64;
@@ -696,9 +713,30 @@ impl CommandProcessor {
                 if dst_sel != 0 {
                     self.mem_log("WRITE_DATA", addr, data.len() as u64 * 4, data);
                 }
+                if matches!(dst_sel, 1 | 2 | 5) && self.defer_label_write(hooks, addr, data, one_addr) {
+                    return Step::Ok;
+                }
                 if dst_sel != 0 {
                     // Keep program order with earlier end-of-pipe writes.
+                    let t0 = Instant::now();
+                    let (own, inflight) = if wd_trace() { (self.own_pending_value(addr), super::render::pending_label_value(addr)) } else { (None, None) };
                     self.order_write(hooks, addr, data.len() as u64 * 4);
+                    if wd_trace() && t0.elapsed() > Duration::from_micros(50) {
+                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 300 {
+                            crate::info!(
+                                "{}: WRITE_DATA {:#x}+{:#x} = {:#x}.. waited {} us (own queued EOP value {:x?}, in-flight EOP value {:x?}) at packet {:#x}",
+                                self.name,
+                                addr,
+                                data.len() * 4,
+                                data.first().copied().unwrap_or(0),
+                                t0.elapsed().as_micros(),
+                                own,
+                                inflight,
+                                self.cur_packet.0
+                            );
+                        }
+                    }
                 }
                 match dst_sel {
                     0 => {
@@ -1048,6 +1086,31 @@ impl CommandProcessor {
         } else if (0x2000..0x2C00).contains(&r) {
             self.regs.config[r - 0x2000] = v;
         }
+    }
+
+    /// WRITE_DATA to memory that only end-of-pipe writes still to be
+    /// performed touch: queued behind them (performed in order once the work
+    /// recorded so far has completed) instead of the CP draining the GPU to
+    /// keep program order. TLG's compute queues signal each other this way:
+    /// RELEASE_MEM label = 1, WAIT_REG_MEM label == 1 (met in GPU order), then
+    /// WRITE_DATA label = 0x10 for the queues waiting on it; draining there
+    /// cost up to 90 ms per write. The write becomes visible when that work is
+    /// done, as on the hardware after its wait. TLG_DEFER_LABEL_WRITES=0: drain.
+    fn defer_label_write(&mut self, hooks: &mut dyn Hooks, addr: u64, data: &[u32], one_addr: bool) -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let len = data.len() as u64 * 4;
+        if !*ON.get_or_init(|| std::env::var("TLG_DEFER_LABEL_WRITES").map(|v| v != "0").unwrap_or(true)) || data.is_empty() || addr % 4 != 0 || !guest_ok(addr, len) {
+            return false;
+        }
+        if !(self.pending_overlaps(addr, len) || super::render::actions_in_flight(addr, len)) || !hooks.label_only(self, addr, len) {
+            return false;
+        }
+        for (i, &v) in data.iter().enumerate() {
+            let a = if one_addr { addr } else { addr + i as u64 * 4 };
+            self.pending.push(EopAction { addr: a, data_sel: 1, lo: v, hi: 0, interrupt: false, gfx: false, occl: None });
+        }
+        DEFERRED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        true
     }
 
     fn queue_eop(&mut self, addr: u64, data_sel: u32, lo: u32, hi: u32, interrupt: bool) {

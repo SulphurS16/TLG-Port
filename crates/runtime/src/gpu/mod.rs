@@ -500,7 +500,7 @@ fn gfx_thread() {
                 crate::info!("{}", r.vram_report());
                 crate::info!("EVENT_WRITE types: {}", cp::event_type_counts());
                 let k: Vec<u64> = render::SYNC_WAIT_KIND_NS.iter().map(|a| a.load(Ordering::Relaxed) / 1_000_000).collect();
-                crate::info!("CP sync waits (ms, total): for eop actions {}, write-backs {}, huge in-place writes {}, in-place writes {}; CP writes behind in-place reads {}; virtual waits {}, in-batch waits {}", k[0], k[1], k[2], k[3], k[4], cp.stats.virtual_waits, cp.stats.inbatch_waits);
+                crate::info!("CP sync waits (ms, total): for eop actions {}, write-backs {}, huge in-place writes {}, in-place writes {}; CP writes behind in-place reads {}; virtual waits {}, in-batch waits {}; label writes queued behind end-of-pipe writes {}", k[0], k[1], k[2], k[3], k[4], cp.stats.virtual_waits, cp.stats.inbatch_waits, cp::DEFERRED_WRITES.load(Ordering::Relaxed));
                 crate::info!("shader preparations synchronized with GPU writes: {}; scatter dispatches narrowed: {}; copy/fill kernels as image operations: {}; fast clears decided on the GPU: {}", r.prepare_syncs, r.scatters, r.elided, r.meta_gpu);
                 let mut sites: Vec<(u32, u64)> = render::FLUSH_SITES.lock().take().unwrap_or_default().into_iter().collect();
                 sites.sort_by(|a, b| b.1.cmp(&a.1));
