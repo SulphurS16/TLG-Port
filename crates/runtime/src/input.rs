@@ -621,10 +621,22 @@ fn keyboard_mouse(st: &mut PadState) {
     }
 }
 
+/// A DualShock 4 / DualSense read over HID (`padhid`): its sticks and
+/// triggers replace the XInput ones (the same physical pad when a wrapper
+/// also presents it as XInput), buttons add up.
+fn hid(st: &mut PadState) {
+    let Some(h) = crate::padhid::state() else { return };
+    st.buttons |= h.buttons;
+    (st.lx, st.ly, st.rx, st.ry) = (h.lx, h.ly, h.rx, h.ry);
+    st.l2 = st.l2.max(h.l2);
+    st.r2 = st.r2.max(h.r2);
+}
+
 /// Current combined pad state.
 pub fn pad_state() -> PadState {
     let mut st = PadState::default();
     xinput(&mut st);
+    hid(&mut st);
     keyboard_mouse(&mut st);
     scripted(&mut st, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
     if st.l2 > 30 {

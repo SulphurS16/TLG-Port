@@ -16,6 +16,7 @@ mod input;
 mod loader;
 mod mem;
 mod pacing;
+mod padhid;
 mod patch;
 mod sse4a;
 mod thread;
