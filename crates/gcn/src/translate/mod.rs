@@ -395,6 +395,16 @@ pub(crate) struct T<'a> {
     pub pc_var: Word,
     pub exit_block: Option<Word>,
     pub kill_used: bool,
+    /// Workgroup LDS accesses since the last barrier (bit 0 reads, bit 1
+    /// writes) and the nesting depth of structured constructs being emitted:
+    /// GCN lanes of a wave run in lockstep, so a wave-sized workgroup may
+    /// write LDS and read other lanes' entries without s_barrier; here lanes
+    /// are invocations, so a barrier goes where accesses switch between
+    /// reads and writes -- only at depth 0, in uniform control flow.
+    pub lds_phase: u8,
+    pub cf_depth: u32,
+    /// LDS hazards found inside control flow (left without a barrier).
+    pub lds_hazards_nested: u32,
     pub sb_struct: Option<Word>,
     /// Function variables holding the debug capture (see Spec::debug_capture).
     pub dbg_vars: Vec<Word>,
@@ -473,6 +483,31 @@ impl<'a> T<'a> {
         let w = e(self.b.i_not_equal(self.t.bool_, None, b, zero))?;
         self.active_cache = blk.map(|b| (b, w));
         Ok(w)
+    }
+    /// OpControlBarrier at workgroup scope for the workgroup's LDS (compute).
+    pub fn workgroup_barrier(&mut self) -> R<()> {
+        let wg = self.u(spirv::Scope::Workgroup as u32);
+        let mem = if self.lds_base.is_some() { spirv::MemorySemantics::UNIFORM_MEMORY } else { spirv::MemorySemantics::WORKGROUP_MEMORY };
+        let sem = self.u((spirv::MemorySemantics::ACQUIRE_RELEASE | mem).bits());
+        self.lds_phase = 0;
+        self.b.control_barrier(wg, wg, sem).map_err(|x| format!("{x:?}"))
+    }
+    /// Before an LDS access (`read`/`write`) in a compute shader's workgroup
+    /// LDS: a barrier when it would see a lockstep hazard (see `lds_phase`).
+    pub fn lds_access(&mut self, read: bool, write: bool) -> R<()> {
+        if self.spec.stage != Stage::Compute || self.lds.is_none() || self.lds_base.is_some() {
+            return Ok(());
+        }
+        let hazard = (read && self.lds_phase & 2 != 0) || (write && self.lds_phase & 1 != 0);
+        if hazard {
+            if self.cf_depth == 0 {
+                self.workgroup_barrier()?;
+            } else {
+                self.lds_hazards_nested += 1;
+            }
+        }
+        self.lds_phase |= read as u8 | ((write as u8) << 1);
+        Ok(())
     }
     pub fn get_scc(&mut self) -> R<Word> {
         e(self.b.load(self.t.bool_, None, self.scc, None, []))
@@ -845,6 +880,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         pc_var: 0,
         exit_block: None,
         kill_used: false,
+        lds_phase: 0,
+        cf_depth: 0,
+        lds_hazards_nested: 0,
         sb_struct: None,
         dbg_vars: Vec::new(),
     };
@@ -1026,9 +1064,15 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
                 if let Some(Err(why)) = other {
                     tr.warnings.push(format!("control flow kept as a dispatcher loop: {why}"));
                 }
+                // (No uniform points inside the dispatcher: no LDS barriers.)
+                tr.cf_depth = 1;
                 emit_dispatch_loop(&mut tr, code, &starts)?;
             }
         }
+    }
+    if tr.lds_hazards_nested > 0 {
+        let n = tr.lds_hazards_nested;
+        tr.warnings.push(format!("{n} LDS read/write switch(es) inside control flow left without a barrier (wave lockstep assumed)"));
     }
     tr.b.end_function().map_err(|x| format!("{x:?}"))?;
 

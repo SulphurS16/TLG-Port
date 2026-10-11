@@ -66,11 +66,8 @@ pub fn scalar(tr: &mut T, ins: &Inst) -> R<()> {
                 10 => {
                     // s_barrier
                     if tr.spec.stage == super::Stage::Compute {
-                        let wg = tr.u(rspirv::spirv::Scope::Workgroup as u32);
                         // (Tessellation stages keep their LDS in a storage buffer.)
-                        let mem = if tr.lds_base.is_some() { rspirv::spirv::MemorySemantics::UNIFORM_MEMORY } else { rspirv::spirv::MemorySemantics::WORKGROUP_MEMORY };
-                        let sem = tr.u((rspirv::spirv::MemorySemantics::ACQUIRE_RELEASE | mem).bits());
-                        tr.b.control_barrier(wg, wg, sem).map_err(|x| format!("{x:?}"))?;
+                        tr.workgroup_barrier()?;
                     }
                 }
                 _ => tr.warn(format!("{:#x}: unsupported {}", ins.pc, ins.name())),

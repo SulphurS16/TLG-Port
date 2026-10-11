@@ -1805,6 +1805,17 @@ fn lane_lds_index(tr: &mut T, byte: Word) -> R<Word> {
     e(tr.b.bitwise_and(u, None, i, mask))
 }
 
+/// Whether a DS opcode reads and/or writes LDS memory (atomics, exchanges,
+/// append/consume: both; ds_swizzle: neither, it moves VGPRs).
+pub fn ds_access_kind(op: u16) -> (bool, bool) {
+    match op {
+        13 | 14 | 15 | 30 | 31 | 77 | 78 | 79 | 222 | 223 => (false, true),
+        54..=60 | 118..=120 | 254 | 255 => (true, false),
+        53 => (false, false),
+        _ => (true, true),
+    }
+}
+
 pub fn ds(tr: &mut T, ins: &Inst) -> R<()> {
     if ins.ds_gds() {
         return gds(tr, ins);
@@ -1812,6 +1823,8 @@ pub fn ds(tr: &mut T, ins: &Inst) -> R<()> {
     if ins.op == 53 {
         return swizzle(tr, ins);
     }
+    let (r, w) = ds_access_kind(ins.op);
+    tr.lds_access(r, w)?;
     let u = tr.t.u32;
     // Graphics stages use their LDS as per-lane scratch (the shader
     // compiler's VGPR spills: slot k of lane l at k*256 + l*4): a private

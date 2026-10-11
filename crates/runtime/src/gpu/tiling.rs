@@ -293,6 +293,68 @@ pub fn tile_slice(src: &[u8], dst: &mut [u8], width: u32, height: u32, pitch: u3
     });
 }
 
+/// Slices per micro tile of a Gnm tile mode: thick modes (19..=24: 1D/2D/3D
+/// thick and their PRT variants) interleave 4 slices in each 8x8 micro tile,
+/// XThick (25, 26) 8; all others 1. Volume textures (e.g. colour-grading
+/// LUTs) use them.
+pub fn thickness(index: u8) -> u32 {
+    match index {
+        19..=24 => 4,
+        25 | 26 => 8,
+        _ => 1,
+    }
+}
+
+/// Index of element (x, y, z) (each within the tile: x, y < 8, z <
+/// thickness) in a thick micro tile, in the AMD address library's order
+/// for thick micro tiling.
+pub fn thick_micro_index(x: u32, y: u32, z: u32, bpp: u32, thickness: u32) -> u32 {
+    let (x0, x1, x2) = (bit(x, 0), bit(x, 1), bit(x, 2));
+    let (y0, y1, y2) = (bit(y, 0), bit(y, 1), bit(y, 2));
+    let (z0, z1, z2) = (bit(z, 0), bit(z, 1), bit(z, 2));
+    let b: [u32; 6] = match bpp {
+        8 | 16 => [x0, y0, x1, y1, z0, z1],
+        32 => [x0, y0, x1, z0, y1, z1],
+        _ => [x0, y0, z0, x1, y1, z1],
+    };
+    let mut v = b[0] | (b[1] << 1) | (b[2] << 2) | (b[3] << 3) | (b[4] << 4) | (b[5] << 5) | (x2 << 6) | (y2 << 7);
+    if thickness == 8 {
+        v |= z2 << 8;
+    }
+    v
+}
+
+/// Byte offset of element (x, y, z) of a 1D-thick surface (micro tiles of
+/// 8x8xthickness elements in row order; each group of `thickness` slices is
+/// `pitch * pheight * thickness` elements).
+pub fn thick_1d_offset(x: u32, y: u32, z: u32, pitch: u32, pheight: u32, bpp: u32, thickness: u32) -> u64 {
+    let eb = (bpp / 8) as u64;
+    let mt_bytes = 64 * thickness as u64 * eb;
+    let tiles_per_row = (pitch / 8).max(1) as u64;
+    let group_bytes = pitch as u64 * pheight as u64 * thickness as u64 * eb;
+    (z / thickness) as u64 * group_bytes
+        + ((y / 8) as u64 * tiles_per_row + (x / 8) as u64) * mt_bytes
+        + thick_micro_index(x % 8, y % 8, z % thickness, bpp, thickness) as u64 * eb
+}
+
+/// Detiles a 1D-thick volume of `depth` slices from `src` (the surface from
+/// its first slice) into tightly packed slices of `width` x `height`.
+#[allow(clippy::too_many_arguments)]
+pub fn detile_thick_1d(src: &[u8], dst: &mut [u8], width: u32, height: u32, depth: u32, pitch: u32, pheight: u32, bpp: u32, thickness: u32) {
+    let eb = (bpp / 8) as usize;
+    for z in 0..depth {
+        for y in 0..height {
+            for x in 0..width {
+                let t = thick_1d_offset(x, y, z, pitch, pheight, bpp, thickness) as usize;
+                let l = ((z as usize * height as usize + y as usize) * width as usize + x as usize) * eb;
+                if t + eb <= src.len() && l + eb <= dst.len() {
+                    dst[l..l + eb].copy_from_slice(&src[t..t + eb]);
+                }
+            }
+        }
+    }
+}
+
 /// Size in bytes of one slice of a surface with the given padded dimensions.
 pub fn slice_bytes(pitch: u32, pheight: u32, bpp: u32) -> u64 {
     pitch as u64 * pheight as u64 * (bpp / 8) as u64
@@ -389,6 +451,47 @@ mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn thick_micro_index_is_a_permutation() {
+        for &bpp in &[8, 16, 32, 64, 128] {
+            for &th in &[4u32, 8] {
+                let n = 64 * th as usize;
+                let mut seen = vec![false; n];
+                for z in 0..th {
+                    for y in 0..8 {
+                        for x in 0..8 {
+                            let i = thick_micro_index(x, y, z, bpp, th) as usize;
+                            assert!(i < n && !seen[i], "bpp {bpp} thickness {th} at {x},{y},{z}");
+                            seen[i] = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn thick_volume_detile_inverts_offsets() {
+        // A 16x16x8 RGBA8 volume, 1D thick: each element's tiled offset holds its index.
+        let (w, h, d, bpp) = (16u32, 16u32, 8u32, 32u32);
+        let mut tiled = vec![0u8; (w * h * d * 4) as usize];
+        for z in 0..d {
+            for y in 0..h {
+                for x in 0..w {
+                    let o = thick_1d_offset(x, y, z, w, h, bpp, 4) as usize;
+                    tiled[o..o + 4].copy_from_slice(&((z * h + y) * w + x).to_le_bytes());
+                }
+            }
+        }
+        let mut lin = vec![0u8; tiled.len()];
+        detile_thick_1d(&tiled, &mut lin, w, h, d, w, h, bpp, 4);
+        for (i, c) in lin.chunks(4).enumerate() {
+            assert_eq!(u32::from_le_bytes(c.try_into().unwrap()), i as u32);
+        }
+        // Micro tiles are 8x8x4 elements: (0,0,1) is the 9th element (x0 y0 x1 z0 order).
+        assert_eq!(thick_1d_offset(0, 0, 1, w, h, bpp, 4), 8 * 4);
+        assert_eq!(thick_1d_offset(8, 0, 0, w, h, bpp, 4), 256 * 4);
+        assert_eq!(thick_1d_offset(0, 0, 4, w, h, bpp, 4), (16 * 16 * 4 * 4) as u64);
     }
     #[test]
     fn fast_offsets_match_reference() {

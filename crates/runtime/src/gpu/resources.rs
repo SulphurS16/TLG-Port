@@ -389,6 +389,23 @@ pub fn read_texture(t: &Tsharp, layers: u32) -> Vec<u8> {
     let mut out = vec![0u8; total];
     let mut pos = 0;
     let mut src = Vec::new();
+    // Volumes in thick tile modes: groups of slices share micro tiles.
+    let thick = tiling::thickness(t.tiling_index);
+    if thick > 1 && t.ty == desc::T_3D {
+        if let Some(l) = lv.first() {
+            if t.tiling_index == 19 {
+                let groups = layers.div_ceil(thick) as u64;
+                src.resize((l.slice_bytes * thick as u64 * groups) as usize, 0);
+                copy_from_guest(&mut src, t.base + l.offset);
+                tiling::detile_thick_1d(&src, &mut out, l.width, l.height, layers, l.pitch, l.pheight, bpp, thick);
+                return out;
+            }
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::warn!("volume texture {:#x} {}x{}x{} in tile mode {} (2D/3D thick) is detiled as thin slices: not implemented", t.base, t.width, t.height, layers, t.tiling_index);
+            }
+        }
+    }
     for l in &lv {
         let per_layer = l.width as usize * l.height as usize * eb;
         src.resize(l.slice_bytes as usize, 0);

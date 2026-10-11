@@ -503,6 +503,37 @@ pub(crate) fn branch_cond(tr: &mut T, op: u16) -> R<Word> {
 /// Loop targets of the innermost enclosing loop: (continue, merge).
 type LoopLabels = Option<(Word, Word)>;
 
+/// Whether any block in `nodes` accesses workgroup LDS (DS instructions other
+/// than GDS and ds_swizzle).
+fn uses_lds(code: &[Inst], ranges: &[std::ops::Range<usize>], nodes: &[Node]) -> bool {
+    nodes.iter().any(|n| match n {
+        Node::Block(b) => ranges[*b].clone().any(|k| {
+            let i = &code[k];
+            i.enc == crate::Enc::Ds && !i.ds_gds() && super::mem::ds_access_kind(i.op) != (false, false)
+        }),
+        Node::If { then_, else_, .. } => uses_lds(code, ranges, then_) || uses_lds(code, ranges, else_),
+        Node::Loop { body, .. } => uses_lds(code, ranges, body),
+        _ => false,
+    })
+}
+
+/// At depth 0, before a construct whose blocks access LDS: a barrier if
+/// accesses are pending (their order against the construct's is unknown),
+/// and afterwards both kinds count as pending.
+fn lds_construct(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>], nodes: &[Node]) -> R<bool> {
+    if tr.spec.stage != super::Stage::Compute || tr.lds.is_none() || tr.lds_base.is_some() || !uses_lds(code, ranges, nodes) {
+        return Ok(false);
+    }
+    if tr.lds_phase != 0 {
+        if tr.cf_depth == 0 {
+            tr.workgroup_barrier()?;
+        } else {
+            tr.lds_hazards_nested += 1;
+        }
+    }
+    Ok(true)
+}
+
 /// Emits `nodes`; at the end, unless the sequence ended in a jump, branches
 /// to `after` (the enclosing construct's merge).
 pub(crate) fn emit(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>], nodes: &[Node], lp: LoopLabels, after: Option<Word>) -> R<()> {
@@ -522,12 +553,14 @@ pub(crate) fn emit(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>],
                 if then_.is_empty() && else_.is_empty() {
                     continue; // both ways lead straight to the merge
                 }
+                let lds = lds_construct(tr, code, ranges, std::slice::from_ref(node))?;
                 let c = branch_cond(tr, *op)?;
                 let m = tr.b.id();
                 let tl = if then_.is_empty() { m } else { tr.b.id() };
                 let fl = if else_.is_empty() { m } else { tr.b.id() };
                 tr.b.selection_merge(m, spirv::SelectionControl::NONE).map_err(ef)?;
                 tr.b.branch_conditional(c, tl, fl, []).map_err(ef)?;
+                tr.cf_depth += 1;
                 if !then_.is_empty() {
                     e(tr.b.begin_block(Some(tl)))?;
                     emit(tr, code, ranges, then_, lp, Some(m))?;
@@ -536,6 +569,10 @@ pub(crate) fn emit(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>],
                     e(tr.b.begin_block(Some(fl)))?;
                     emit(tr, code, ranges, else_, lp, Some(m))?;
                 }
+                tr.cf_depth -= 1;
+                if lds {
+                    tr.lds_phase = 3;
+                }
                 e(tr.b.begin_block(Some(m)))?;
                 if !*merged {
                     tr.b.unreachable().map_err(ef)?;
@@ -543,13 +580,19 @@ pub(crate) fn emit(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>],
                 }
             }
             Node::Loop { body, exits } => {
+                let lds = lds_construct(tr, code, ranges, std::slice::from_ref(node))?;
                 let (hdr, start, cont, merge) = (tr.b.id(), tr.b.id(), tr.b.id(), tr.b.id());
                 tr.b.branch(hdr).map_err(ef)?;
                 e(tr.b.begin_block(Some(hdr)))?;
                 tr.b.loop_merge(merge, cont, spirv::LoopControl::NONE, []).map_err(ef)?;
                 tr.b.branch(start).map_err(ef)?;
                 e(tr.b.begin_block(Some(start)))?;
+                tr.cf_depth += 1;
                 emit(tr, code, ranges, body, Some((cont, merge)), None)?;
+                tr.cf_depth -= 1;
+                if lds {
+                    tr.lds_phase = 3;
+                }
                 e(tr.b.begin_block(Some(cont)))?;
                 tr.b.branch(hdr).map_err(ef)?;
                 e(tr.b.begin_block(Some(merge)))?;
