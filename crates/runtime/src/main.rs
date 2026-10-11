@@ -44,10 +44,17 @@ pub struct Config {
 }
 
 static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// This run's directory (logs, screenshots, profiles).
 pub fn run_dir() -> Option<&'static Path> {
     RUN_DIR.get().map(|p| p.as_path())
+}
+
+/// The machine-local data directory (`Config::data`): user settings such as
+/// `input.txt` live there.
+pub fn data_dir() -> Option<&'static Path> {
+    DATA_DIR.get().map(|p| p.as_path())
 }
 
 fn utc_stamp() -> String {
@@ -427,6 +434,7 @@ fn main() {
     prune_runs(&runs, 30);
     std::fs::create_dir_all(&cfg.run_dir).expect("create run dir");
     RUN_DIR.set(cfg.run_dir.clone()).ok();
+    DATA_DIR.set(cfg.data.clone()).ok();
     log::init(&cfg.run_dir.join("tlg.log")).expect("open log");
     log::set_thread_name("host");
     if cfg.debug || cfg.trace {
