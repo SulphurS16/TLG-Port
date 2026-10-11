@@ -828,6 +828,14 @@ fn wait_cpu_writebacks(addr: u64, len: u64) {
     }
 }
 
+/// Render target write-backs tiled on the GPU into the VRAM mirror when
+/// guest memory is not imported (`gpu_remap`); TLG_MIRROR_TILING=0: on the
+/// CPU after draining the GPU.
+fn mirror_tiling_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_MIRROR_TILING").map(|v| v != "0").unwrap_or(true))
+}
+
 /// Whether a submitted batch's end-of-pipe writes overlap [addr, addr+len).
 pub fn actions_in_flight(addr: u64, len: u64) -> bool {
     COMPLETIONS.lock().iter().any(|c| c.actions.iter().any(|a| a.overlaps(addr, len)))
@@ -3055,8 +3063,11 @@ impl Renderer {
             return Ok(true);
         }
         // Device-ring write-backs land in guest memory on the CPU after their
-        // batch; in-place and round-trip writes are ordered on the GPU.
-        if self.writebacks.iter().any(|w| w.base < t.base + bytes && t.base < w.base + w.size) {
+        // batch; in-place and round-trip writes are ordered on the GPU, and so
+        // are mirror-resident writes (render target tiling included) when the
+        // detiling reads the mirror.
+        let mirrored = ctx().ext_host.is_none();
+        if self.writebacks.iter().any(|w| !(mirrored && w.mirror) && w.base < t.base + bytes && t.base < w.base + w.size) {
             self.report(format!("texture {:#x} {}x{}: GPU detiling declined (pending write-back)", t.base, t.width, t.height));
             return Ok(false);
         }
@@ -3995,8 +4006,10 @@ impl Renderer {
             let lin_bytes = lin_slice * key.layers.max(1) as u64;
             // Device ring: the linear copy of the image and the tiled surface.
             let need = lin_bytes + total + 8192;
-            // (Tiling into guest memory on the GPU needs the import.)
-            let gpu_tiling = Self::gpu_remap_eligible(bpp) && ctx().ext_host.is_some();
+            // (On the GPU: into the imported guest memory, or into the VRAM
+            // mirror, see `gpu_remap`.)
+            let mirrored = ctx().ext_host.is_none();
+            let gpu_tiling = Self::gpu_remap_eligible(bpp) && (!mirrored || (mirror_tiling_on() && total <= VCACHE_MAX));
             if gpu_tiling && self.dring.remaining() < need {
                 self.flushes[2] += 1;
                 self.submit_batch(Vec::new());
@@ -4022,9 +4035,12 @@ impl Renderer {
                 unsafe { ctx().device.cmd_copy_image_to_buffer(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, self.dring.buffer, &[region]) };
                 match self.gpu_remap(&key, true, lin_off) {
                     Ok(true) => {
-                        self.zc_writes.push((key.base, total));
-                        self.writes.note_gpu_write(key.base, total);
-                        self.note_pending_gpu_write(key.base, total);
+                        // (Mirror tiling registered its write-back itself.)
+                        if !mirrored {
+                            self.zc_writes.push((key.base, total));
+                            self.writes.note_gpu_write(key.base, total);
+                            self.note_pending_gpu_write(key.base, total);
+                        }
                         self.images.get_mut(&key).unwrap().guest_stale = false;
                         self.epoch += 1;
                         self.gpu_remaps[1] += 1;
@@ -6357,8 +6373,11 @@ impl Renderer {
         if !Self::gpu_remap_eligible(bpp) {
             return Ok(false);
         }
-        // (Tiling back into guest memory needs the import.)
-        if tile && ctx().ext_host.is_none() {
+        // Tiling back: into the imported guest memory, or without the import
+        // into the VRAM mirror of the surface (registered as a mirror-resident
+        // write once recorded; TLG_MIRROR_TILING=0: the CPU tiles instead).
+        let mirrored = tile && ctx().ext_host.is_none();
+        if mirrored && !mirror_tiling_on() {
             return Ok(false);
         }
         let layers = key.layers.max(1) as u64;
@@ -6366,7 +6385,18 @@ impl Renderer {
         let lin_slice = key.width as u64 * key.height as u64 * (bpp / 8) as u64;
         let (set_layout, layout, detile, tilep) = self.remap_pipes()?;
         let Some((map, n)) = self.tile_map(key, bpp, mode, idx, slice)? else { return Ok(false) };
-        let Some((zbuf, zoff)) = self.guest_surface_source(key.base, total)? else { return Ok(false) };
+        let dest = if mirrored {
+            if total > VCACHE_MAX || key.base % 16 != 0 {
+                return Ok(false);
+            }
+            // (Pages not current are copied in first: tiling leaves the
+            // surface padding as it is.)
+            self.vc_why = "render target tiling";
+            self.vcache_bind_ex(key.base, total, false, true)
+        } else {
+            self.guest_surface_source(key.base, total)?
+        };
+        let Some((zbuf, zoff)) = dest else { return Ok(false) };
         self.begin();
         self.end_rendering();
         global_barrier(self.cmd);
@@ -6419,6 +6449,19 @@ impl Renderer {
         if let Some(o) = tiled_off {
             unsafe { c.device.cmd_copy_buffer(self.cmd, self.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: total }]) };
             global_barrier(self.cmd);
+        }
+        if mirrored {
+            // The mirror now holds the tiled surface: written back to guest
+            // memory at the end of the batch like a shader's mirror-resident
+            // write (every page), current for later readers of the mirror.
+            // (Images over the range are not marked older than guest memory:
+            // the one written back stays the current copy.)
+            let (bits, words, _) = self.mirror_write_back(key.base, total, zbuf, zoff)?;
+            unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, u32::MAX) };
+            global_barrier(self.cmd);
+            self.writes.note_gpu_write(key.base, total);
+            self.note_pending_gpu_write(key.base, total);
+            self.vcache_validate(zbuf, key.base, total);
         }
         self.barrier_needed = true;
         self.mark(|| if tile { "render target tiling (GPU)".into() } else { "render target detiling (GPU)".into() });
