@@ -69,7 +69,27 @@ const EVENT_RESUME: u32 = 5;
 // Waveform types (SceNgs2WaveformType).
 const WF_PCM_I16L: u32 = 0x12;
 const WF_PCM_F32L: u32 = 0x18;
+const WF_VAG: u32 = 0x1C;
 const WF_ATRAC9: u32 = 0x40;
+
+/// Decodes one 16-byte PS-ADPCM (VAG) frame into 28 samples; `hist` holds the
+/// channel's previous two output samples (filter state, scaled to i16 range).
+fn vag_frame(fr: &[u8], hist: &mut [f32; 2]) -> [f32; 28] {
+    const COEF: [(f32, f32); 5] = [(0.0, 0.0), (60.0 / 64.0, 0.0), (115.0 / 64.0, -52.0 / 64.0), (98.0 / 64.0, -55.0 / 64.0), (122.0 / 64.0, -60.0 / 64.0)];
+    let shift = (fr[0] & 0x0F) as i32;
+    let (c1, c2) = COEF[((fr[0] >> 4) as usize).min(4)];
+    let mut out = [0f32; 28];
+    for (i, o) in out.iter_mut().enumerate() {
+        let byte = fr[2 + i / 2];
+        let nib = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
+        let raw = ((((nib as i32) << 28) >> 28) << 12) >> shift.min(12);
+        let s = (raw as f32 + hist[0] * c1 + hist[1] * c2).clamp(-32768.0, 32767.0);
+        hist[1] = hist[0];
+        hist[0] = s;
+        *o = s / 32768.0;
+    }
+    out
+}
 
 /// Channels of every mixing bus (output buffers have at most 8).
 const MAX_CH: usize = 8;
@@ -155,6 +175,7 @@ struct Sampler {
     user_data: u64,
     data: u64,
     error_logged: bool,
+    vag_hist: [[f32; 2]; MAX_CH],
 }
 
 impl Default for Sampler {
@@ -179,6 +200,7 @@ impl Default for Sampler {
             user_data: 0,
             data: 0,
             error_logged: false,
+            vag_hist: [[0.0; 2]; MAX_CH],
         }
     }
 }
@@ -363,7 +385,7 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     if !levels.is_null() {
                         let l: Vec<f32> = (0..n).map(|i| unsafe { *levels.add(i) }).collect();
                         static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                        if l.iter().any(|&x| x != 0.0) && LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                             crate::info!("NGS2 matrix {mid} ({} ch voice, {n} levels): {l:?}", v.channels);
                         }
                         v.matrices.insert(mid, l);
@@ -400,7 +422,7 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                             }
                             Err(e) => crate::warn!("NGS2: {e}"),
                         }
-                    } else if !matches!(sm.wf_type, WF_PCM_I16L | WF_PCM_F32L) {
+                    } else if !matches!(sm.wf_type, WF_PCM_I16L | WF_PCM_F32L | WF_VAG) {
                         crate::warn!("NGS2: sampler waveform type {:#x} not supported (silent)", sm.wf_type);
                     }
                     v.flags = (v.flags | STATE_IN_USE) & !STATE_EMPTY;
@@ -574,6 +596,40 @@ fn decode_more(sm: &mut Sampler) -> bool {
                         sm.byte_pos = b.size;
                     }
                 }
+                WF_VAG => {
+                    // PS-ADPCM: per channel, 16-byte frames (shift/filter byte, flags
+                    // byte, 28 4-bit samples); channels interleave frame by frame.
+                    let frame_bytes = 16 * ch;
+                    let frames_left = ((b.size - sm.byte_pos) as usize / frame_bytes).min(64);
+                    let addr = b.addr + sm.byte_pos as u64;
+                    if frames_left > 0 && crate::mem::is_guest(addr, (frames_left * frame_bytes) as u64) {
+                        for f in 0..frames_left {
+                            let mut out = [[0f32; MAX_CH]; 28];
+                            for c in 0..ch.min(MAX_CH) {
+                                let fr = unsafe { std::slice::from_raw_parts((addr + (f * frame_bytes + c * 16) as u64) as *const u8, 16) };
+                                let decoded = vag_frame(fr, &mut sm.vag_hist[c]);
+                                for (k, x) in decoded.iter().enumerate() {
+                                    out[k][c] = *x;
+                                }
+                            }
+                            for o in out {
+                                let s = sm.sample_pos;
+                                sm.sample_pos += 1;
+                                if s < b.skip || s >= b.skip + b.samples {
+                                    continue;
+                                }
+                                sm.pcm.push_back(o);
+                                sm.decoded_samples += 1;
+                            }
+                        }
+                        produced = true;
+                    }
+                    sm.byte_pos += (frames_left * frame_bytes) as u32;
+                    sm.decoded_bytes += (frames_left * frame_bytes) as u64;
+                    if frames_left == 0 {
+                        sm.byte_pos = b.size;
+                    }
+                }
                 _ => {
                     // Unsupported formats play silence of the block's length.
                     for _ in 0..b.samples.min(4096) {
@@ -658,7 +714,10 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
     let pm = v.port_matrix;
     let matrices: Vec<(i32, Vec<f32>)> = patches.iter().filter_map(|p| v.matrices.get(&pm[p.port as usize & 3]).map(|m| (pm[p.port as usize & 3], m.clone()))).collect();
     for p in patches {
-        let Some(d) = s.voices.get_mut(&p.dest) else { continue };
+        // The title patches to rack handles of one-voice racks (mastering,
+        // submixers): their first voice.
+        let dest = if s.voices.contains_key(&p.dest) { p.dest } else { match s.racks.get(&p.dest).and_then(|r| r.voices.first().copied()) { Some(v) => v, None => continue } };
+        let Some(d) = s.voices.get_mut(&dest) else { continue };
         if d.kind == Kind::Sampler {
             continue;
         }
@@ -738,7 +797,10 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
         if guard > 16 {
             return 0;
         }
-        let d = s.voices.get(&vh).map(|v| v.patches.iter().map(|p| 1 + depth_of(s, p.dest, memo, guard + 1)).max().unwrap_or(0)).unwrap_or(0);
+        let d = s.voices.get(&vh).map(|v| v.patches.iter().map(|p| {
+            let dest = s.racks.get(&p.dest).and_then(|r| r.voices.first().copied()).unwrap_or(p.dest);
+            1 + depth_of(s, dest, memo, guard + 1)
+        }).max().unwrap_or(0)).unwrap_or(0);
         memo.insert(vh, d);
         d
     }
