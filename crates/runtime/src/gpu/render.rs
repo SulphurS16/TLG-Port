@@ -468,6 +468,28 @@ enum Retired {
     Set(vk::DescriptorPool, vk::DescriptorSet),
 }
 
+/// `spans` minus the ranges `cut` (all half-open, in the same units).
+fn subtract_ranges(spans: &[(u64, u64)], cut: &[(u64, u64)]) -> Vec<(u64, u64)> {
+    let mut out: Vec<(u64, u64)> = spans.to_vec();
+    for &(c, d) in cut {
+        let mut next = Vec::with_capacity(out.len() + 1);
+        for (x, y) in out {
+            if d <= x || y <= c {
+                next.push((x, y));
+                continue;
+            }
+            if x < c {
+                next.push((x, c));
+            }
+            if d < y {
+                next.push((d, y));
+            }
+        }
+        out = next;
+    }
+    out
+}
+
 /// Bit helpers for `VWindow::valid`: set or clear bits [a, b).
 fn bits_set(v: &mut [u64], a: usize, b: usize, on: bool) {
     let mut i = a;
@@ -1186,6 +1208,9 @@ pub struct Renderer {
     pub scatters: u64,
     /// Copy/fill kernels performed as image operations.
     pub elided: u64,
+    /// Mirror copy-ins that left the window's own pending writes in place
+    /// instead of draining the GPU for them.
+    pub copyin_kept: u64,
     retired_scratch: Vec<(vk::Buffer, vk::DeviceMemory)>,
     scratch_mem: Option<vk::DeviceMemory>,
     /// VRAM copies of read-only vertex/index data (`vcache_bind`).
@@ -1412,6 +1437,7 @@ pub fn init() -> Result<(), String> {
             prepare_syncs: 0,
             scatters: 0,
             elided: 0,
+            copyin_kept: 0,
             retired_scratch: Vec::new(),
             scratch_mem: None,
             vcache: None,
@@ -3461,7 +3487,9 @@ impl Renderer {
             // CPU-performed writes (end-of-pipe actions), or from batches whose
             // device-ring segment may be reused: those are waited for.
             let abs: Vec<(u64, u64)> = runs.iter().map(|&(a, b)| (wlo + ((a as u64) << 12), (wlo + ((b as u64) << 12)).min(whi))).collect();
-            let fwd = self.mirror_forwards(&abs, vbuf);
+            // (The window's own pending writes are left out of the copy-in:
+            // the window holds their data already.)
+            let fwd = self.mirror_forwards_keep(&abs, vbuf);
             if fwd.is_none() {
                 if let Some(wb) = self.writebacks.iter().find(|wb| wb.base < hi && lo < wb.base + wb.size) {
                     if perf_on() {
@@ -3474,8 +3502,14 @@ impl Renderer {
                     wait_cpu_writebacks(lo, hi - lo);
                 }
             }
-            let spans: Vec<(u64, u64)> = runs.iter().map(|&(a, b)| ((a as u64) << 12, ((b as u64) << 12).min(whi - wlo))).collect();
-            let (src, regions) = if ctx().ext_host.is_some() {
+            let keep: Vec<(u64, u64)> = fwd.as_ref().map_or(Vec::new(), |f| f.1.iter().map(|&(a, b)| (a.saturating_sub(wlo), b.saturating_sub(wlo))).collect());
+            if !keep.is_empty() {
+                self.copyin_kept += 1;
+            }
+            let spans = subtract_ranges(&runs.iter().map(|&(a, b)| ((a as u64) << 12, ((b as u64) << 12).min(whi - wlo))).collect::<Vec<_>>(), &keep);
+            let (src, regions) = if spans.is_empty() {
+                (vbuf, Vec::new())
+            } else if ctx().ext_host.is_some() {
                 let (zbuf, zoff, _) = self.zc_binding(wlo, whi - wlo).filter(|z| z.2 >= whi - wlo)?;
                 (zbuf, spans.iter().map(|&(off, end)| vk::BufferCopy { src_offset: zoff + off, dst_offset: off, size: end - off }).collect::<Vec<_>>())
             } else {
@@ -3515,8 +3549,10 @@ impl Renderer {
             self.begin();
             self.end_rendering();
             global_barrier(self.cmd);
-            unsafe { ctx().device.cmd_copy_buffer(self.cmd, src, vbuf, &regions) };
-            for &(pbase, pbuf, poff, psize) in fwd.iter().flatten() {
+            if !regions.is_empty() {
+                unsafe { ctx().device.cmd_copy_buffer(self.cmd, src, vbuf, &regions) };
+            }
+            for &(pbase, pbuf, poff, psize) in fwd.iter().flat_map(|f| f.0.iter()) {
                 let over: Vec<vk::BufferCopy> = spans
                     .iter()
                     .filter_map(|&(off, end)| {
@@ -3566,6 +3602,14 @@ impl Renderer {
     /// from a batch whose slot may be reused, in-place or CPU-performed
     /// writes (end-of-pipe actions) -- or with the import: the caller waits.
     fn mirror_forwards(&self, spans: &[(u64, u64)], exclude: vk::Buffer) -> Option<Vec<(u64, vk::Buffer, u64, u64)>> {
+        self.mirror_forwards_keep(spans, exclude).filter(|(_, keep)| keep.is_empty()).map(|(out, _)| out)
+    }
+
+    /// `mirror_forwards` for a copy-in into the mirror window `exclude`:
+    /// writes the window already holds (its own mirror-resident writes) are
+    /// returned as guest ranges to leave out of the copy-in instead of
+    /// failing, unless a forward overlaps one (their order is not known).
+    fn mirror_forwards_keep(&self, spans: &[(u64, u64)], exclude: vk::Buffer) -> Option<(Vec<(u64, vk::Buffer, u64, u64)>, Vec<(u64, u64)>)> {
         if ctx().ext_host.is_some() || spans.is_empty() {
             return None;
         }
@@ -3586,10 +3630,15 @@ impl Renderer {
         }
         out.extend(self.writebacks.iter().filter(|p| overlaps(p.base, p.size)).map(|p| (p.base, p.dev_buf, p.dev_off, p.size)));
         let live = |b: vk::Buffer| b == self.dring.buffer || self.vcache.as_ref().is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
-        if out.iter().any(|e| e.1 == exclude || !live(e.1)) {
+        let (keep, out): (Vec<_>, Vec<_>) = out.into_iter().partition(|e| exclude != vk::Buffer::null() && e.1 == exclude);
+        if out.iter().any(|e| !live(e.1)) {
             return None;
         }
-        Some(out)
+        let keep: Vec<(u64, u64)> = keep.iter().map(|e| (e.0, e.0 + e.3)).collect();
+        if out.iter().any(|e| keep.iter().any(|&(a, b)| e.0 < b && a < e.0 + e.3)) {
+            return None;
+        }
+        Some((out, keep))
     }
 
     /// VRAM buffer cache statistics: (MiB allocated, windows, MiB copied in,
@@ -8147,5 +8196,21 @@ mod tests {
             let hi = lo + ((x >> 8) % (257 - lo as u64)) as usize;
             assert_eq!(bits_clear_runs(&w, lo, hi), reference(&w, lo, hi), "{w:x?} {lo}..{hi}");
         }
+    }
+}
+
+#[cfg(test)]
+mod range_tests {
+    use super::subtract_ranges;
+
+    #[test]
+    fn subtract() {
+        assert_eq!(subtract_ranges(&[(0, 100)], &[]), vec![(0, 100)]);
+        assert_eq!(subtract_ranges(&[(0, 100)], &[(20, 30)]), vec![(0, 20), (30, 100)]);
+        assert_eq!(subtract_ranges(&[(0, 100)], &[(0, 100)]), vec![]);
+        assert_eq!(subtract_ranges(&[(0, 100)], &[(50, 200)]), vec![(0, 50)]);
+        assert_eq!(subtract_ranges(&[(10, 20), (30, 40)], &[(15, 35)]), vec![(10, 15), (35, 40)]);
+        assert_eq!(subtract_ranges(&[(0, 4096)], &[(2816, 4096), (0, 100)]), vec![(100, 2816)]);
+        assert_eq!(subtract_ranges(&[(0, 10)], &[(10, 20)]), vec![(0, 10)]);
     }
 }

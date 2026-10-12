@@ -501,13 +501,18 @@ fn gfx_thread() {
                 crate::info!("EVENT_WRITE types: {}", cp::event_type_counts());
                 let k: Vec<u64> = render::SYNC_WAIT_KIND_NS.iter().map(|a| a.load(Ordering::Relaxed) / 1_000_000).collect();
                 crate::info!("CP sync waits (ms, total): for eop actions {}, write-backs {}, huge in-place writes {}, in-place writes {}; CP writes behind in-place reads {}; virtual waits {}, in-batch waits {}; label writes queued behind end-of-pipe writes {}", k[0], k[1], k[2], k[3], k[4], cp.stats.virtual_waits, cp.stats.inbatch_waits, cp::DEFERRED_WRITES.load(Ordering::Relaxed));
+                let mut polls: Vec<(cp::PollKey, (u64, u64))> = cp::POLLS.lock().take().unwrap_or_default().into_iter().collect();
+                polls.sort_by(|a, b| b.1.1.cmp(&a.1.1));
+                let polls: Vec<String> = polls.iter().take(12).map(|((q, f, r, b, a), (n, us))| format!("q{q} func {f} ref {r:#x} {b:#x}->{a:#x}: {n}x {} ms", us / 1000)).collect();
+                crate::info!("WAIT_REG_MEM polls over 0.5 ms since last report (queue, test, value before -> when met): {}", polls.join("; "));
                 let mut declines: Vec<(&str, u64)> = render::META_DECLINES.lock().take().unwrap_or_default().into_iter().collect();
                 declines.sort_by(|a, b| b.1.cmp(&a.1));
                 crate::info!(
-                    "shader preparations synchronized with GPU writes: {}; scatter dispatches narrowed: {}; copy/fill kernels as image operations: {}; fast clears decided on the GPU: {} (left to the CPU since last report: {:?})",
+                    "shader preparations synchronized with GPU writes: {}; scatter dispatches narrowed: {}; copy/fill kernels as image operations: {}; mirror copy-ins around the window's own writes: {}; fast clears decided on the GPU: {} (left to the CPU since last report: {:?})",
                     r.prepare_syncs,
                     r.scatters,
                     r.elided,
+                    r.copyin_kept,
                     r.meta_gpu,
                     declines
                 );

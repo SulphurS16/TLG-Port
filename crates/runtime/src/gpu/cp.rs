@@ -389,6 +389,11 @@ pub static SYNC_SITES: parking_lot::Mutex<Option<HashMap<u32, (u64, u64)>>> = pa
 /// WRITE_DATA packets queued behind end-of-pipe writes (`defer_label_write`).
 pub static DEFERRED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// WAIT_REG_MEM polls over 0.5 ms (TLG_PERF report): (queue, function,
+/// reference, value at the start, value when met) -> (count, microseconds).
+pub type PollKey = (usize, u32, u32, u32, u32);
+pub static POLLS: parking_lot::Mutex<Option<std::collections::HashMap<PollKey, (u64, u64)>>> = parking_lot::Mutex::new(None);
+
 /// TLG_WD_TRACE=1: WRITE_DATA packets whose ordering with earlier GPU work
 /// made the CP wait (address, data, the end-of-pipe writes involved).
 fn wd_trace() -> bool {
@@ -1254,7 +1259,31 @@ impl CommandProcessor {
         let mut spins = 0u32;
         static VIRTUAL_POLL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let virtual_waits = *VIRTUAL_POLL.get_or_init(|| std::env::var("TLG_VIRTUAL_WAITS").map(|v| v != "0").unwrap_or(true));
+        // (TLG_PERF: polls over 0.5 ms by queue, condition and values.)
+        struct Poll {
+            queue: usize,
+            func: u32,
+            reference: u32,
+            before: u32,
+            addr: u64,
+            start: Instant,
+            polled: std::cell::Cell<bool>,
+        }
+        impl Drop for Poll {
+            fn drop(&mut self) {
+                let us = self.start.elapsed().as_micros() as u64;
+                if self.polled.get() && us >= 500 && super::render::perf_on() {
+                    let after = unsafe { rd(self.addr) };
+                    let mut g = POLLS.lock();
+                    let e = g.get_or_insert_with(Default::default).entry((self.queue, self.func, self.reference, self.before, after)).or_default();
+                    e.0 += 1;
+                    e.1 += us;
+                }
+            }
+        }
+        let poll = Poll { queue: self.queue, func, reference, before: unsafe { rd(addr) }, addr, start, polled: std::cell::Cell::new(false) };
         while !test(unsafe { rd(addr) }) {
+            poll.polled.set(true);
             spins += 1;
             if spins < 64 {
                 std::hint::spin_loop();
