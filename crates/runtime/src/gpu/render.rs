@@ -819,7 +819,11 @@ fn completion_thread() {
             // (Write-backs of mirror-resident data are forgotten by the write
             // watch together with their copy: see `mem::WRITE_WATCH_LOCK`.)
             let _ww = (!c.mirror_writes.is_empty() || c.wb_bits.iter().any(|b| b.is_some())).then(|| crate::mem::WRITE_WATCH_LOCK.lock());
+            let probe = super::wbprobe::enabled();
             for (k, &(addr, off, size)) in c.writebacks.iter().enumerate() {
+                if probe {
+                    super::wbprobe::before_write(addr, size);
+                }
                 if let Some((bits, words)) = c.wb_bits.get(k).copied().flatten() {
                     // Marked pages only (mirror-resident data: the write watch
                     // forgets these writes too), in runs of consecutive pages:
@@ -852,11 +856,17 @@ fn completion_thread() {
                         WB_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         wb_bytes += end - start;
                     }
+                    if probe {
+                        super::wbprobe::after_write(addr, size);
+                    }
                     continue;
                 }
                 let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add(off as usize), size as usize) };
                 resources::copy_to_guest(src, addr);
                 wb_bytes += size;
+                if probe {
+                    super::wbprobe::after_write(addr, size);
+                }
             }
             for &(addr, size) in &c.mirror_writes {
                 crate::mem::reset_write_watch(addr, size);

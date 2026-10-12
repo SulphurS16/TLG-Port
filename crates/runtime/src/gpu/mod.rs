@@ -10,6 +10,7 @@ pub mod texdump;
 pub mod tiling;
 pub mod shader_dump;
 pub mod vk;
+pub mod wbprobe;
 pub mod writes;
 
 use cp::{CommandProcessor, Engine, Hooks, Stream};
@@ -517,6 +518,7 @@ fn gfx_thread() {
                     r.meta_gpu,
                     declines
                 );
+                wbprobe::report();
                 let mut sites: Vec<(u32, u64)> = render::FLUSH_SITES.lock().take().unwrap_or_default().into_iter().collect();
                 sites.sort_by(|a, b| b.1.cmp(&a.1));
                 crate::info!("synchronizing flushes by render.rs line (count; 100000+line: wait microseconds) since last report: {:?}", &sites[..sites.len().min(12)]);
