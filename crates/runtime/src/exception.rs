@@ -581,6 +581,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
         if code == 0xC0000005 && rec.NumberParameters >= 2 {
             let rip = (*(*info).ContextRecord).Rip;
+            if crate::gpu::lazywb::fault(rec.ExceptionInformation[1] as u64, rec.ExceptionInformation[0] == 8) {
+                return -1;
+            }
             if crate::gpu::wbprobe::fault(rec.ExceptionInformation[1] as u64, rec.ExceptionInformation[0] == 1, rip, || format!("{} [{}]", describe(rip), crate::log::thread_name())) {
                 return -1;
             }

@@ -117,7 +117,21 @@ pub const DEPTH_LOAD_VIEW: usize = 22;
 /// (`TLG_ELIDE_UTILITY`, 1; 0 runs them as shaders).
 pub const ELIDE_UTILITY: usize = 23;
 
-const TABLE: [(&str, &str, i64); 24] = [
+/// Written buffer bindings of at least this many KiB work in the VRAM mirror
+/// (else a device-ring copy set up per binding and written back)
+/// (`TLG_VCACHE_WRITE_MIN_KIB`, 64). Below 64 only in mirror windows that exist.
+pub const VCACHE_WRITE_MIN_KIB: usize = 24;
+
+/// Read-only bindings smaller than `vcache_read_min_kib` whose range has GPU
+/// writes not yet in guest memory bind the VRAM mirror (which holds or gets
+/// them) instead of an upload with forwards (`TLG_VCACHE_GPU_READS`, 0).
+pub const VCACHE_GPU_READS: usize = 25;
+
+/// Lazy write-back of mirror-resident GPU writes (gpu/lazywb.rs)
+/// (`TLG_LAZY_WB`, 0).
+pub const LAZY_WB: usize = 26;
+
+const TABLE: [(&str, &str, i64); 27] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -142,6 +156,9 @@ const TABLE: [(&str, &str, i64); 24] = [
     ("vcache_read_min_kib", "TLG_VCACHE_READ_MIN_KIB", 64),
     ("depth_load_view", "TLG_DEPTH_LOAD_VIEW", 1),
     ("elide_utility", "TLG_ELIDE_UTILITY", 1),
+    ("vcache_write_min_kib", "TLG_VCACHE_WRITE_MIN_KIB", 64),
+    ("vcache_gpu_reads", "TLG_VCACHE_GPU_READS", 0),
+    ("lazy_wb", "TLG_LAZY_WB", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

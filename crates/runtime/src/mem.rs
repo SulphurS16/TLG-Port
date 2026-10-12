@@ -213,7 +213,9 @@ pub static HARVEST_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Held while host code writes guest memory and then forgets those writes
 /// (`reset_write_watch`), so a harvest never sees the writes alone.
-pub static WRITE_WATCH_LOCK: Mutex<()> = Mutex::new(());
+/// (Reentrant: a lazy write-back readback may run in a fault taken while it
+/// is held, see gpu/lazywb.rs.)
+pub static WRITE_WATCH_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::const_reentrant_mutex(());
 
 pub fn harvest_writes(addr: u64, len: u64, buf: &mut Vec<usize>, out: &mut Vec<u64>) -> bool {
     if !WRITE_WATCH.load(std::sync::atomic::Ordering::Relaxed) || !is_guest(addr, len) {
@@ -323,6 +325,7 @@ impl MemState {
     /// are left reserved only if `keep_reserved`.
     pub fn unmap_range(&mut self, start: u64, end: u64) {
         note_map_change(start, end);
+        crate::gpu::lazywb::settle(start, end);
         self.split_at(start);
         self.split_at(end);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
@@ -398,6 +401,7 @@ impl MemState {
     }
 
     pub fn protect(&mut self, start: u64, end: u64, prot: u32) -> Result<(), MemError> {
+        crate::gpu::lazywb::settle(start, end);
         self.split_at(start);
         self.split_at(end);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();

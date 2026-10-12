@@ -715,6 +715,8 @@ struct Completion {
     zc_writes: Vec<(u64, u64)>,
     /// Guest ranges the batch reads in place (CP writes must wait for them).
     zc_reads: Ranges,
+    /// Per write-back: whether it is of data the VRAM mirror holds (`lazywb`).
+    wb_mirror: Vec<bool>,
     actions: Vec<super::cp::EopAction>,
     submitted: std::time::Instant,
     /// Timestamp query pool and the label of each written timestamp.
@@ -824,6 +826,7 @@ fn completion_thread() {
                 if probe {
                     super::wbprobe::before_write(addr, size);
                 }
+                super::lazywb::before_write(addr, size);
                 if let Some((bits, words)) = c.wb_bits.get(k).copied().flatten() {
                     // Marked pages only (mirror-resident data: the write watch
                     // forgets these writes too), in runs of consecutive pages:
@@ -859,6 +862,7 @@ fn completion_thread() {
                     if probe {
                         super::wbprobe::after_write(addr, size);
                     }
+                    super::lazywb::after_write(addr, size, true);
                     continue;
                 }
                 let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add(off as usize), size as usize) };
@@ -867,6 +871,7 @@ fn completion_thread() {
                 if probe {
                     super::wbprobe::after_write(addr, size);
                 }
+                super::lazywb::after_write(addr, size, c.wb_mirror.get(k).copied().unwrap_or(false));
             }
             for &(addr, size) in &c.mirror_writes {
                 crate::mem::reset_write_watch(addr, size);
@@ -1904,6 +1909,31 @@ impl Renderer {
         }
         self.batch_cmds = 0;
         let mut pending = std::mem::take(&mut self.writebacks);
+        // (In-flight forwards see the whole written ranges, lazy ones too.)
+        let dev_writes: Vec<(u64, vk::Buffer, u64, u64)> = pending.iter().map(|p| (p.base, p.dev_buf, p.dev_off, p.size)).collect();
+        // (Numbers of the skips, for `lazywb::submitted`.)
+        let mut lazy = Vec::new();
+        if self.recording && super::lazywb::enabled() {
+            // Lazy ranges: only the partial pages at their ends are copied out.
+            let mut kept = Vec::with_capacity(pending.len());
+            for p in pending.drain(..) {
+                let inner = super::lazywb::inner_pages(p.base, p.size).filter(|_| p.mirror);
+                match inner.and_then(|(lo, hi)| super::lazywb::skip_writeback(lo, hi, p.dev_buf, p.dev_off + (lo - p.base)).map(|t| (lo, hi, t))) {
+                    Some((lo, hi, t)) => {
+                        lazy.push(t);
+                        if lo > p.base {
+                            kept.push(PendingWrite { base: p.base, size: lo - p.base, host_off: p.host_off, dev_off: p.dev_off, dev_buf: p.dev_buf, mirror: true, bits: None });
+                        }
+                        let end = p.base + p.size;
+                        if end > hi {
+                            kept.push(PendingWrite { base: hi, size: end - hi, host_off: p.host_off + (hi - p.base), dev_off: p.dev_off + (hi - p.base), dev_buf: p.dev_buf, mirror: true, bits: None });
+                        }
+                    }
+                    None => kept.push(p),
+                }
+            }
+            pending = kept;
+        }
         if self.recording && !pending.is_empty() {
             // Shader-written data: device ring -> host ring, visible to the host
             // once the batch's fence signals. Ranges with a page bitmap: only
@@ -1939,8 +1969,8 @@ impl Renderer {
         }
         let writebacks: Vec<(u64, u64, u64)> = pending.iter().map(|p| (p.base, p.host_off, p.size)).collect();
         let wb_bits: Vec<Option<(u64, u32)>> = pending.iter().map(|p| p.bits.map(|(_, host, words)| (host, words))).collect();
-        let dev_writes: Vec<(u64, vk::Buffer, u64, u64)> = pending.iter().map(|p| (p.base, p.dev_buf, p.dev_off, p.size)).collect();
         let mirror_writes: Vec<(u64, u64)> = pending.iter().filter(|p| p.mirror && p.bits.is_none()).map(|p| (p.base, p.size)).collect();
+        let wb_mirror: Vec<bool> = pending.iter().map(|p| p.mirror).collect();
         let zc_writes = std::mem::take(&mut self.zc_writes);
         if self.recording && !zc_writes.is_empty() {
             // Shader writes to imported guest memory: visible to the host after the fence.
@@ -1954,7 +1984,7 @@ impl Renderer {
             }
             // Ordering-only completion (nothing new to wait for on the GPU).
             self.last_seq += 1;
-            push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: self.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads: Ranges::default(), actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
+            push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: self.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads: Ranges::default(), wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
             return self.last_seq;
         }
         self.end_rendering();
@@ -1982,11 +2012,14 @@ impl Renderer {
                 }
             }
         }
+        if let Some(&t) = lazy.last() {
+            super::lazywb::submitted(t);
+        }
         self.last_seq += 1;
         slot.seq = self.last_seq;
         let profile = (slot.queries != vk::QueryPool::null() && self.marks.len() > 1).then(|| (slot.queries, std::mem::take(&mut self.marks)));
         let zc_reads = std::mem::take(&mut self.zc_reads);
-        push_completion(Completion { seq: self.last_seq, fence: slot.fence, exec: slot.exec, ring_ptr: self.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
+        push_completion(Completion { seq: self.last_seq, fence: slot.fence, exec: slot.exec, ring_ptr: self.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
         self.recording = false;
         self.batch += 1;
         // Move to the next slot once its previous batch has completed.
@@ -3423,6 +3456,8 @@ impl Renderer {
                     let stale: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.lo >> VWIN_SHIFT == slot >> VWIN_SHIFT && w.lo < hi && lo < w.hi).map(|(k, _)| *k).collect();
                     for sk in stale {
                         let w = vc.windows.remove(&sk).unwrap();
+                        // (Lazy data there to guest memory first: the new window copies in.)
+                        super::lazywb::release_buffer(w.buf);
                         vc.bytes -= w.bytes();
                         gone.push(w.buf);
                         self.retired.push((seq, w.retire()));
@@ -4123,6 +4158,7 @@ impl Renderer {
         if let Some(vc) = self.vcache.take() {
             for (_, w) in vc.windows {
                 // (The GPU is idle: released now.)
+                super::lazywb::release_buffer(w.buf);
                 self.retire_dirty_set(w.buf, 0);
                 self.sparse_binds.retain(|(b, _)| *b != w.buf);
                 unsafe { ctx().device.destroy_buffer(w.buf, None) };
@@ -4699,7 +4735,10 @@ impl Renderer {
                         }
                         let extent = guest_extent(base, v.size() + bias);
                         let read_min = (crate::tune::get(crate::tune::VCACHE_READ_MIN_KIB).max(0) as u64) << 10;
-                        if !buffer_written(p, i) && ctx().ext_host.is_none() && extent >= read_min {
+                        // (Small ranges with GPU writes not in guest memory yet:
+                        // from the mirror, which holds or forwards them.)
+                        let gpu_pending = || self.writebacks.iter().any(|w| w.base < base + extent && base < w.base + w.size) || writeback_in_flight(base, extent);
+                        if !buffer_written(p, i) && ctx().ext_host.is_none() && (extent >= read_min || (crate::tune::get(crate::tune::VCACHE_GPU_READS) != 0 && gpu_pending())) {
                             // Large read-only data: from the VRAM mirror
                             // (copied in once, then per CPU-written page).
                             // Unbounded V#s (pools of hundreds of MiB) are
@@ -4714,13 +4753,14 @@ impl Renderer {
                                 continue;
                             }
                         }
-                        if buffer_written(p, i) && ctx().ext_host.is_none() && (VCACHE_MIN..=VCACHE_MAX).contains(&extent) && base % 16 == 0 && p.scatter.is_none_or(|(_, d)| d != i) {
+                        let write_min = ((crate::tune::get(crate::tune::VCACHE_WRITE_MIN_KIB).max(0) as u64) << 10).max(4);
+                        if buffer_written(p, i) && ctx().ext_host.is_none() && (write_min..=VCACHE_MAX).contains(&extent) && base % 16 == 0 && p.scatter.is_none_or(|(_, d)| d != i) {
                             // Large written data: the shader works on the VRAM
                             // mirror itself, which stays current for later
                             // commands; guest memory gets the range when the
                             // batch completes (copied out at its end).
                             self.vc_why = "written binding";
-                            if let Some((vb, voff)) = self.vcache_bind(base, extent) {
+                            if let Some((vb, voff)) = self.vcache_bind_ex(base, extent, false, extent < VCACHE_MIN) {
                                 let (bits, words, head) = self.mirror_write_back(base, extent, vb, voff)?;
                                 if let Some(d) = dinfo.get_mut(3 * i..3 * i + 3) {
                                     d.copy_from_slice(&[(bits / 4) as u32, head, words - 1]);
@@ -7538,6 +7578,7 @@ impl Renderer {
                 let idle: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.last_used + age <= frame).map(|(k, _)| *k).collect();
                 for k in idle {
                     let w = vc.windows.remove(&k).unwrap();
+                    super::lazywb::release_buffer(w.buf);
                     vc.bytes -= w.bytes();
                     released += w.bytes();
                     gone.push(w.buf);

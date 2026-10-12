@@ -235,6 +235,7 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
     let f = get_fd(fd).ok_or(EBADF)?;
     match &f.kind {
         Kind::File { file, .. } => {
+            crate::gpu::os_access(buf.as_ptr() as u64, buf.len() as u64);
             let mut done = 0;
             while done < buf.len() {
                 match file.seek_read(&mut buf[done..], off + done as u64) {
@@ -273,6 +274,7 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             }
             let mut pos = f.pos.lock();
             let at = off.unwrap_or(*pos);
+            crate::gpu::os_access(data.as_ptr() as u64, data.len() as u64);
             let mut done = 0;
             while done < data.len() {
                 match file.seek_write(&data[done..], at + done as u64) {

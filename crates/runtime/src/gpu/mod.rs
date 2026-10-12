@@ -2,6 +2,7 @@
 
 pub mod cp;
 pub mod desc;
+pub mod lazywb;
 pub mod pm4;
 pub mod render;
 pub mod resources;
@@ -133,6 +134,15 @@ pub mod phase {
 pub fn set_phase(p: u8, arg: u64) {
     PHASE.store(((p as u64) << 56) | (arg & ((1 << 56) - 1)), Ordering::Relaxed);
     PROGRESS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Before the OS itself reads or writes guest memory [addr, addr+len) (file
+/// I/O): GPU-written pages kept inaccessible there (lazy write-back, the
+/// write-back probe) made current and accessible - the OS fails such
+/// accesses instead of faulting.
+pub fn os_access(addr: u64, len: u64) {
+    lazywb::touch(addr, len);
+    wbprobe::touch(addr, len);
 }
 
 /// Logs what the graphics ring and every compute ring are doing (diagnosing hangs).
@@ -519,6 +529,7 @@ fn gfx_thread() {
                     declines
                 );
                 wbprobe::report();
+                lazywb::report();
                 let mut sites: Vec<(u32, u64)> = render::FLUSH_SITES.lock().take().unwrap_or_default().into_iter().collect();
                 sites.sort_by(|a, b| b.1.cmp(&a.1));
                 crate::info!("synchronizing flushes by render.rs line (count; 100000+line: wait microseconds) since last report: {:?}", &sites[..sites.len().min(12)]);

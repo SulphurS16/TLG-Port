@@ -81,6 +81,24 @@ pub fn after_write(addr: u64, size: u64) {
     }
 }
 
+/// Before the OS itself reads or writes guest memory [addr, addr+len) (file
+/// I/O: it fails on inaccessible pages instead of faulting): probed ranges
+/// there accessible again, recorded as touched.
+pub fn touch(addr: u64, len: u64) {
+    if !enabled() || len == 0 {
+        return;
+    }
+    let mut g = STATE.lock();
+    let end = addr + len;
+    let keys: Vec<u64> = g.ranges.range(..end).filter(|(_, r)| r.end > addr && r.protected).map(|(k, _)| *k).collect();
+    for lo in keys {
+        let r = g.ranges.remove(&lo).unwrap();
+        protect(lo, r.end, PAGE_READWRITE);
+        crate::info!("wb probe: GPU-written {lo:#x}-{:#x} ({} KiB, {} write-backs) touched: file I/O", r.end, (r.end - lo) >> 10, r.writes);
+        g.touched.insert((lo, r.end), ("file I/O".to_string(), r.writes));
+    }
+}
+
 /// Exception handler: an access violation at `addr` (`write`) by code at
 /// `rip`. True when it was a probed range (now accessible again).
 pub fn fault(addr: u64, write: bool, rip: u64, who: impl FnOnce() -> String) -> bool {

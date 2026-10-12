@@ -431,6 +431,7 @@ sysv! {
     fn sceSaveDataSetSaveDataMemory(user: i32, buf: *const u8, size: u64, offset: i64) -> i32 {
         use std::os::windows::fs::FileExt;
         let f = match std::fs::OpenOptions::new().write(true).open(memory_file(user)) { Ok(f) => f, Err(_) => return ERR_NOT_FOUND };
+        crate::gpu::os_access(buf as u64, size);
         if f.seek_write(std::slice::from_raw_parts(buf, size as usize), offset as u64).is_err() { return ERR_INTERNAL; }
         0
     }
