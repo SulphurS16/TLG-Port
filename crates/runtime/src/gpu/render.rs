@@ -300,6 +300,8 @@ struct VWindow {
     mem: vk::DeviceMemory,
     /// Pages holding current guest data (bit per 4 KiB page).
     valid: Vec<u64>,
+    /// Pages any binding has covered since the window was made (VRAM report).
+    touched: Vec<u64>,
     /// Per 64 KiB block: epoch of the last CPU-write check, write-tracker
     /// stamp it established.
     checked: Vec<u64>,
@@ -3202,7 +3204,7 @@ impl Renderer {
             crate::info!("VRAM mirror window {lo:#x}-{hi:#x} ({} MiB) for read-only vertex/index data", (hi - lo) >> 20);
             let pages = ((hi - lo) >> 12) as usize;
             let blocks = ((hi - lo + 0xFFFF) >> 16) as usize;
-            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0 };
+            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0 };
             let vc = self.vcache.get_or_insert_with(|| VCache { windows: FastMap::default(), bytes: 0, copied: 0, hits: 0 });
             vc.bytes += hi - lo;
             vc.windows.insert(lo, w);
@@ -3260,6 +3262,7 @@ impl Renderer {
             }
         }
         let (p0, p1) = (((base - w.lo) >> 12) as usize, ((base + size - w.lo + 0xFFF) >> 12) as usize);
+        bits_set(&mut w.touched, p0, p1, true);
         let runs = bits_clear_runs(&w.valid, p0, p1);
         let (wlo, whi, vbuf) = (w.lo, w.hi, w.buf);
         if !runs.is_empty() {
@@ -7125,14 +7128,24 @@ impl Renderer {
             }
         }
         let budget = ctx().vram().map(|(u, b)| format!("; device-local usage {} MiB of a {} MiB budget", u >> 20, b >> 20)).unwrap_or_default();
+        // Per mirror window: MiB ever bound / currently valid / allocated.
+        let mut wins: Vec<(u64, u64, u64, u64)> = self.vcache.as_ref().map_or(Vec::new(), |vc| {
+            let ones = |v: &[u64]| v.iter().map(|x| x.count_ones() as u64).sum::<u64>() << 12;
+            vc.windows.values().map(|w| (w.lo, ones(&w.touched), ones(&w.valid), w.hi - w.lo)).collect()
+        });
+        wins.sort_unstable();
+        let touched: u64 = wins.iter().map(|w| w.1).sum();
+        let wins: Vec<String> = wins.iter().map(|w| format!("{:#x} {}/{}/{}", w.0, w.1 >> 20, w.2 >> 20, w.3 >> 20)).collect();
         format!(
-            "VRAM: {} images {} MiB (textures {} MiB, GPU-written {} MiB, shadow copies {} MiB), mirrors {} MiB, element maps {} MiB; evicted {} images ({} MiB) so far, {} needed again (after {} frames on average){budget}",
+            "VRAM: {} images {} MiB (textures {} MiB, GPU-written {} MiB, shadow copies {} MiB), mirrors {} MiB ({} MiB ever bound; per window MiB bound/valid/allocated: {}), element maps {} MiB; evicted {} images ({} MiB) so far, {} needed again (after {} frames on average){budget}",
             self.images.len(),
             self.image_bytes >> 20,
             tex >> 20,
             gpu >> 20,
             shadow >> 20,
             self.vcache.as_ref().map_or(0, |v| v.bytes) >> 20,
+            touched >> 20,
+            wins.join(", "),
             self.tile_map_bytes >> 20,
             self.evicted.0,
             self.evicted.1 >> 20,

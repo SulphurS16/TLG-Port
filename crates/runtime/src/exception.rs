@@ -214,6 +214,112 @@ unsafe fn finish_watch_step(ctx: &mut CONTEXT) -> bool {
     true
 }
 
+/// Hardware data watchpoint (control `hwwatch <addr> [len] [w]`, `hwwatch
+/// off`): debug register 0 of every guest thread existing at the time watches
+/// `len` bytes (1, 2, 4 or 8, aligned) for reads and writes (`w`: writes
+/// only). The CPU traps after each access: hits are counted per trap address
+/// (the instruction after the access) and caller, the first ones of each site
+/// logged with the watched value; `hwwatch off` disarms and lists the sites.
+/// Threads created later are not watched.
+static HW_WATCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static HW_HITS: parking_lot::Mutex<Option<std::collections::HashMap<(u64, u64), u64>>> = parking_lot::Mutex::new(None);
+
+pub fn hw_watch(addr: u64, len: u64, write_only: bool) -> Result<(), String> {
+    let len_bits = match len {
+        1 => 0u64,
+        2 => 1,
+        4 => 3,
+        8 => 2,
+        _ => return Err(format!("hwwatch: length {len} (1, 2, 4 or 8)")),
+    };
+    if addr == 0 || addr % len != 0 {
+        return Err(format!("hwwatch: {addr:#x} is not {len}-byte aligned"));
+    }
+    let dr7 = 1 | (if write_only { 1u64 } else { 3 }) << 16 | len_bits << 18;
+    *HW_HITS.lock() = Some(Default::default());
+    HW_WATCH.store(addr, Ordering::SeqCst);
+    let _ = std::thread::Builder::new().name("hwwatch".into()).spawn(move || {
+        let n = set_debug_regs(addr, dr7);
+        crate::info!("hwwatch: {addr:#x}+{len} ({}) armed on {n} threads", if write_only { "writes" } else { "reads and writes" });
+    });
+    Ok(())
+}
+
+pub fn hw_watch_off() {
+    let _ = std::thread::Builder::new().name("hwwatch".into()).spawn(|| {
+        let n = set_debug_regs(0, 0);
+        let addr = HW_WATCH.swap(0, Ordering::SeqCst);
+        let mut v: Vec<_> = HW_HITS.lock().take().unwrap_or_default().into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        let mut s = format!("hwwatch {addr:#x}: disarmed on {n} threads; {} sites (trap address = the instruction after the access)", v.len());
+        for ((rip, ret), c) in v.iter().take(40) {
+            s.push_str(&format!("\n  {c:>8} after {} <{}", describe(*rip), describe(*ret)));
+        }
+        crate::info!("{s}");
+    });
+}
+
+/// Sets debug registers 0 and 7 (slot 0 bits only) of every guest thread,
+/// each suspended meanwhile; returns how many were set.
+fn set_debug_regs(dr0: u64, dr7: u64) -> usize {
+    use windows_sys::Win32::System::Diagnostics::Debug::{GetThreadContext, SetThreadContext};
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SET_CONTEXT, THREAD_SUSPEND_RESUME};
+    #[repr(C, align(16))]
+    struct Ctx(CONTEXT);
+    const CONTEXT_DEBUG_REGISTERS_AMD64: u32 = 0x0010_0010;
+    let tids: Vec<u32> = crate::thread::THREADS.lock().iter().map(|t| t.host_tid.load(Ordering::Relaxed) as u32).filter(|&t| t != 0).collect();
+    let mut n = 0;
+    for tid in tids {
+        unsafe {
+            let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, 0, tid);
+            if h.is_null() {
+                continue;
+            }
+            if SuspendThread(h) != u32::MAX {
+                let mut c: Ctx = std::mem::zeroed();
+                c.0.ContextFlags = CONTEXT_DEBUG_REGISTERS_AMD64;
+                if GetThreadContext(h, &mut c.0) != 0 {
+                    c.0.Dr0 = dr0;
+                    c.0.Dr7 = (c.0.Dr7 & !0xF_0003) | dr7;
+                    c.0.Dr6 = 0;
+                    if SetThreadContext(h, &c.0) != 0 {
+                        n += 1;
+                    }
+                }
+                ResumeThread(h);
+            }
+            windows_sys::Win32::Foundation::CloseHandle(h);
+        }
+    }
+    n
+}
+
+/// Counts (and the first times logs) a hardware watch hit.
+unsafe fn note_hw_watch(ctx: &CONTEXT) {
+    use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, VirtualQuery};
+    let fp = ctx.Rbp;
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let ret = if fp >= 0x10000 && fp % 8 == 0 && unsafe { VirtualQuery((fp + 8) as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } != 0 && mbi.State == MEM_COMMIT {
+        unsafe { std::ptr::read_volatile((fp + 8) as *const u64) }
+    } else {
+        0
+    };
+    let n = {
+        let mut g = HW_HITS.lock();
+        let c = g.get_or_insert_with(Default::default).entry((ctx.Rip, ret)).or_insert(0);
+        *c += 1;
+        *c
+    };
+    if n <= 2 {
+        let a = HW_WATCH.load(Ordering::Relaxed);
+        let v = if a != 0 { unsafe { std::ptr::read_volatile((a & !7) as *const u64) } } else { 0 };
+        crate::log::write(
+            crate::log::Level::Info,
+            format_args!("hwwatch hit #{n} after {} <{} [{}]: [{:#x}] {v:#018x}", describe(ctx.Rip), describe(ret), crate::log::thread_name(), a & !7),
+        );
+    }
+}
+
 /// Writes one code byte. The page is left writable: restoring its protection
 /// would race with other threads patching the same page.
 unsafe fn patch_code_byte(addr: u64, byte: u8) {
@@ -231,6 +337,9 @@ unsafe fn patch_code_byte(addr: u64, byte: u8) {
 }
 /// Remaining breakpoint hits to log unconditionally (control `breaklog N`).
 pub static BREAK_VERBOSE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Expressions logged with each breakpoint hit (control `breakpeek`;
+/// overrides TLG_BREAK_PEEK).
+pub static BREAK_PEEK: parking_lot::Mutex<Option<String>> = parking_lot::Mutex::new(None);
 
 /// Installs a logging breakpoint at `addr`, which must be the first byte of
 /// a guest instruction.
@@ -369,7 +478,7 @@ unsafe fn handle_breakpoint(ctx: &mut CONTEXT) -> bool {
                     bp_ = *(bp_ as *const u64);
                 }
             }
-            if let Ok(spec) = std::env::var("TLG_BREAK_PEEK") {
+            if let Some(spec) = BREAK_PEEK.lock().clone().or_else(|| std::env::var("TLG_BREAK_PEEK").ok()) {
                 let regs = [
                     ("rdi", ctx.Rdi),
                     ("rsi", ctx.Rsi),
@@ -444,11 +553,25 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
         if code == 0x80000003 && handle_breakpoint(&mut *(*info).ContextRecord) {
             return -1; // EXCEPTION_CONTINUE_EXECUTION
         }
-        if code == 0x80000004 && finish_watch_step(&mut *(*info).ContextRecord) {
-            return -1;
-        }
-        if code == 0x80000004 && handle_single_step(&mut *(*info).ContextRecord) {
-            return -1;
+        if code == 0x80000004 {
+            let ctx = &mut *(*info).ContextRecord;
+            // Hardware watch: Dr6.B0, or (should the context lack the debug
+            // registers) any single step no other mechanism claims.
+            let armed = HW_WATCH.load(Ordering::Relaxed) != 0;
+            let hw = armed && ctx.Dr6 & 1 != 0;
+            if hw {
+                note_hw_watch(ctx);
+                ctx.Dr6 = 0;
+            }
+            if finish_watch_step(ctx) || handle_single_step(ctx) {
+                return -1;
+            }
+            if armed {
+                if !hw {
+                    note_hw_watch(ctx);
+                }
+                return -1;
+            }
         }
         if code == 0xC000001D && crate::sse4a::handle_trap(&mut *(*info).ContextRecord) {
             return -1;

@@ -241,6 +241,34 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 info!("traceshot {name}: tracing frame {} (displayed at flip tag {})", flip + 2, flip + 3);
                 Ok(())
             }
+            "break" => {
+                // break <hex main-module offset>: a logging breakpoint there.
+                match (u64::from_str_radix(parts.next().unwrap_or("").trim_start_matches("0x"), 16), loader::main_module()) {
+                    (Ok(off), Some(m)) => exception::install_breakpoint(m.base + off, m.base).map(|()| info!("breakpoint at {}", loader::describe_addr(m.base + off))),
+                    (Err(_), _) => Err("break: expected a hex offset".into()),
+                    (_, None) => Err("break: no main module".into()),
+                }
+            }
+            "breakpeek" => {
+                // breakpeek <expr,...>: values logged with each breakpoint hit
+                // (TLG_BREAK_PEEK syntax: rbx, rsi+c24, rdi*+10).
+                *exception::BREAK_PEEK.lock() = Some(parts.collect::<Vec<_>>().join(","));
+                Ok(())
+            }
+            "hwwatch" => {
+                // hwwatch <addr> [len] [w] | hwwatch off (see exception.rs).
+                match parts.next().unwrap_or("") {
+                    "off" => {
+                        exception::hw_watch_off();
+                        Ok(())
+                    }
+                    a => {
+                        let len = parts.next().and_then(|v| v.parse().ok()).unwrap_or(4);
+                        let write_only = parts.next() == Some("w");
+                        debug_mem::parse_addr(a).and_then(|addr| exception::hw_watch(addr, len, write_only))
+                    }
+                }
+            }
             "breaklog" => {
                 let n = parts.next().and_then(|v| v.parse().ok()).unwrap_or(1000);
                 exception::BREAK_VERBOSE.store(n, std::sync::atomic::Ordering::Relaxed);
