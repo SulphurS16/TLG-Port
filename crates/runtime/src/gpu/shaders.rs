@@ -388,28 +388,38 @@ fn image_dim(t: &Tsharp) -> ImageDim {
     }
 }
 
-/// Debug (`TLG_PS_DEBUG=<shader addr>:<pc>:v<N>[:<pc2>:v<M>][;<addr>:...]`, `u<N>` converts
-/// unsigned integers to floats divided by 255):
+/// Shader debug captures by shader address (see `debug_capture`).
+type CaptureSpecs = Vec<(u64, Vec<(u32, u32, bool)>)>;
+
+/// Parses `<shader addr>:<pc>:v<N>[:<pc2>:v<M>][;<addr>:...]` (`u<N>`: an
+/// unsigned integer converted to float).
+pub fn parse_debug_capture(v: &str) -> CaptureSpecs {
+    v.split(';')
+        .filter_map(|e| {
+            let mut it = e.trim().split(':');
+            let a = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
+            let mut caps = Vec::new();
+            while let (Some(pc), Some(r)) = (it.next(), it.next()) {
+                // vN: raw bits; uN: unsigned integer converted to float.
+                let int = r.starts_with('u');
+                caps.push((u32::from_str_radix(pc.trim_start_matches("0x"), 16).ok()?, r.trim_start_matches(['v', 'u']).parse().ok()?, int));
+            }
+            Some((a, caps))
+        })
+        .collect()
+}
+
+/// The captures in effect: `TLG_PS_DEBUG` at start, replaced by the control
+/// command `psdebug` (the spec is part of the translation key, so the next
+/// draw with that shader retranslates it).
+pub static DEBUG_CAPTURES: Mutex<Option<CaptureSpecs>> = Mutex::new(None);
+
+/// Debug (`TLG_PS_DEBUG` / `psdebug`, syntax of `parse_debug_capture`):
 /// export v[N..N+2] captured after the instruction at `pc` instead of the
 /// shader's outputs (first capture to MRT0, second to MRT1 and beyond).
 fn debug_capture(addr: u64) -> Vec<(u32, u32, bool)> {
-    static SPEC: std::sync::OnceLock<Vec<(u64, Vec<(u32, u32, bool)>)>> = std::sync::OnceLock::new();
-    let specs = SPEC.get_or_init(|| {
-        let Ok(v) = std::env::var("TLG_PS_DEBUG") else { return Vec::new() };
-        v.split(';')
-            .filter_map(|e| {
-                let mut it = e.trim().split(':');
-                let a = u64::from_str_radix(it.next()?.trim_start_matches("0x"), 16).ok()?;
-                let mut caps = Vec::new();
-                while let (Some(pc), Some(r)) = (it.next(), it.next()) {
-                    // vN: raw bits; uN: unsigned integer converted to float.
-                    let int = r.starts_with('u');
-                    caps.push((u32::from_str_radix(pc.trim_start_matches("0x"), 16).ok()?, r.trim_start_matches(['v', 'u']).parse().ok()?, int));
-                }
-                Some((a, caps))
-            })
-            .collect()
-    });
+    let mut g = DEBUG_CAPTURES.lock();
+    let specs = g.get_or_insert_with(|| std::env::var("TLG_PS_DEBUG").map(|v| parse_debug_capture(&v)).unwrap_or_default());
     specs.iter().find(|(a, _)| *a == addr).map(|(_, c)| c.clone()).unwrap_or_default()
 }
 

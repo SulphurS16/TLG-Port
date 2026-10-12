@@ -364,6 +364,22 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 *gpu::render::SKIP_PS.lock() = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
                 Ok(())
             }
+            "skipcs" => {
+                // skipcs <cs,...>: skip dispatches of these compute shaders ("skipcs -" clears).
+                *gpu::render::SKIP_CS.lock() = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
+                Ok(())
+            }
+            "dumpraw" => {
+                // dumpraw 1|0: image dumps also write the raw texels (.bin).
+                gpu::render::DUMP_RAW.store(parts.next() == Some("1"), std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            "psdebug" => {
+                // psdebug <ps>:<pc>:v<N>[:<pc>:v<M>][;...]: that pixel shader exports
+                // v[N..N+2] as captured after pc instead of its colors ("psdebug -" clears).
+                *gpu::shaders::DEBUG_CAPTURES.lock() = Some(gpu::shaders::parse_debug_capture(parts.next().unwrap_or("")));
+                Ok(())
+            }
             "quit" => {
                 info!("control: quit at flip {flip}");
                 shutdown(0);

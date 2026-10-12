@@ -5994,7 +5994,12 @@ impl Renderer {
     /// caller then waits for its arguments and dispatches directly).
     fn dispatch_inner(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32, indirect: Option<u64>) -> Result<bool, String> {
         self.draw_targets.clear();
-        super::set_phase(super::phase::DISPATCH, ((cp.regs.sh(0x2E0C) as u64) | ((cp.regs.sh(0x2E0D) as u64) << 32)) << 8);
+        let cs_addr = ((cp.regs.sh(0x2E0C) as u64) | ((cp.regs.sh(0x2E0D) as u64) << 32)) << 8;
+        super::set_phase(super::phase::DISPATCH, cs_addr);
+        if SKIP_CS.lock().contains(&cs_addr) {
+            self.skipped += 1;
+            return Ok(true);
+        }
         if trace_frame() {
             self.flush();
         }
@@ -7675,8 +7680,8 @@ impl Renderer {
         if let Some(px) = rgba {
             let _ = std::fs::write(dir.join(format!("{name}.png")), super::texdump::png(k.width, k.height, &px));
         }
-        // TLG_DUMP_RAW=1: the texels too (tightly packed rows).
-        if std::env::var_os("TLG_DUMP_RAW").is_some() {
+        // TLG_DUMP_RAW=1 (or control `dumpraw 1`): the texels too (tightly packed rows).
+        if std::env::var_os("TLG_DUMP_RAW").is_some() || DUMP_RAW.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = std::fs::write(dir.join(format!("{name}.bin")), &raw);
         }
     }
@@ -8077,6 +8082,10 @@ pub static TRACE_REQUEST: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 /// are skipped.
 pub static DUMP_AFTER: Mutex<Option<(Vec<u64>, u32, u32)>> = Mutex::new(None);
 pub static SKIP_PS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Debug: dispatches of these compute shaders are skipped (control `skipcs`).
+pub static SKIP_CS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Debug: image dumps also write the raw texels (control `dumpraw 1`).
+pub static DUMP_RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// "0x1a2b,3c4d" -> addresses.
 pub fn parse_hex_list(v: &str) -> Vec<u64> {
