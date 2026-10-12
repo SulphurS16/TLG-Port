@@ -2562,6 +2562,34 @@ impl Renderer {
             if period >= n && n <= sv.num_records as u64 {
                 return self.elide_copy(sv, dv, bytes);
             }
+            // A period of one pixel over a whole render target (TLG: two
+            // dwords over a 1024x576 RGBA16F target): a clear to that pixel.
+            let px = period * dv.stride as u64;
+            if !modulo && px <= 16 && n % period == 0 && period <= sv.num_records as u64 {
+                if let Some(k) = self.surface_image(dv.base, bytes).filter(|k| format_class(k.format) as u64 == px) {
+                    self.guard_reads(&[sv.base, sv.base + px - 4]);
+                    let mut elem = vec![0u8; px as usize];
+                    resources::copy_from_guest(&mut elem, sv.base);
+                    // (Half floats: normal or zero ones convert exactly.)
+                    let halves_ok = !matches!(k.format, vk::Format::R16_SFLOAT | vk::Format::R16G16_SFLOAT | vk::Format::R16G16B16A16_SFLOAT)
+                        || elem.chunks(2).all(|h| {
+                            let v = u16::from_le_bytes([h[0], h[1]]);
+                            let ex = (v >> 10) & 0x1F;
+                            ex != 31 && (ex != 0 || v & 0x3FF == 0)
+                        });
+                    if halves_ok {
+                        let pdv = desc::Vsharp { stride: px as u32, ..*dv };
+                        let r = self.elide_fill(&pdv, bytes, elem.clone(), true, "pattern pixel fill");
+                        if perf_on() {
+                            static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
+                            if SEEN.lock().get_or_insert_with(Default::default).insert((dv.base, bytes)) {
+                                crate::info!("pattern pixel fill of {:#x}+{bytes:#x} ({}x{} {:?}) with {elem:02x?}: {:?} as {}", dv.base, k.width, k.height, k.format, r, self.last_elide);
+                            }
+                        }
+                        return r;
+                    }
+                }
+            }
             return Ok(false);
         }
         let ext = crate::tune::get(crate::tune::ELIDE_EXT);

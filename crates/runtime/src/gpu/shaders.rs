@@ -260,21 +260,34 @@ fn match_utility(code: &[gcn::Inst], plan: &Plan) -> Option<Utility> {
     let names: Vec<String> = insts.iter().map(|i| i.name()).collect();
     let is = |p: &[&str]| names.len() == p.len() && names.iter().zip(p).all(|(a, b)| a == b);
     let res = |k: usize| plan.inst_res.get(&insts[k].pc).map(|r| r.0);
-    // SOTC: [markers] count check, m, (t & m | t % m), load, bound check, store.
-    const PATTERN_HEAD: [&str; 9] = ["s_mov_b32", "s_mov_b32", "s_ttracedata", "s_mul_i32", "s_buffer_load_dword", "v_add_i32", "v_cmpx_gt_u32", "s_cbranch_execz", "s_buffer_load_dword"];
+    // Pattern copy: count check, m, (t & m | t % m), load, bound check, store.
+    // Heads: SOTC's (with trace markers) and TLG's; the params loads (count at
+    // offset 0, m at 4) and the group-size multiply by their position.
+    const PATTERN_HEADS: [(&[&str], usize, usize, usize); 2] = [
+        (&["s_mov_b32", "s_mov_b32", "s_ttracedata", "s_mul_i32", "s_buffer_load_dword", "v_add_i32", "v_cmpx_gt_u32", "s_cbranch_execz", "s_buffer_load_dword"], 4, 8, 3),
+        (&["s_mov_b32", "s_mul_i32", "s_buffer_load_dword", "v_add_i32", "v_cmpx_gt_u32", "s_cbranch_execz", "s_buffer_load_dword"], 2, 6, 1),
+    ];
     const PATTERN_TAIL: [&str; 4] = ["buffer_load_format_x", "v_cmpx_gt_u32", "buffer_store_format_x", "s_endpgm"];
     let n = names.len();
-    if n > 13 && names[..9].iter().zip(PATTERN_HEAD).all(|(a, b)| a == b) && names[n - 4..].iter().zip(PATTERN_TAIL).all(|(a, b)| a == b) {
-        let mid = &names[9..n - 4];
+    for (head, i0, i1, mul) in PATTERN_HEADS {
+        let h = head.len();
+        if n <= h + 4 || !names[..h].iter().zip(head).all(|(a, b)| a == b) || !names[n - 4..].iter().zip(PATTERN_TAIL).all(|(a, b)| a == b) {
+            continue;
+        }
+        // (64 threads per group: inline constant 192.)
+        if insts[mul].ssrc0() != 192 && insts[mul].ssrc1() != 192 {
+            continue;
+        }
+        let mid = &names[h..n - 4];
         let modulo = match mid.len() {
             1 if mid[0] == "v_and_b32" => Some(false),
             24 if mid.iter().any(|m| m == "v_rcp_iflag_f32") && mid.iter().filter(|m| *m == "v_mul_hi_u32").count() == 2 => Some(true),
             _ => None,
         };
-        let offs = (insts[4].smrd_const_offset(), insts[8].smrd_const_offset());
+        let offs = (insts[i0].smrd_const_offset(), insts[i1].smrd_const_offset());
         if let (Some(modulo), (Some(0), Some(4))) = (modulo, offs) {
-            let params = res(4)?;
-            if res(8)? == params {
+            let params = res(i0)?;
+            if res(i1)? == params {
                 return Some(Utility::Pattern { src: res(n - 4)?, dst: res(n - 2)?, params, modulo });
             }
         }
@@ -762,10 +775,27 @@ mod tests {
     /// V# in s[0:3] to the V# in s[4:7], bounded by s6.
     const TLG_COPY: [u32; 13] = [0; 13];
 
+    /// TLG's pattern copy kernel (cs 0x1130ffbd00): thread t below params[0]
+    /// stores element t & params[1] of the V# in s[0:3] to element t of the
+    /// V# in s[4:7]; params through the V# in s[8:11].
+    const TLG_PATTERN: [u32; 19] = [0; 19];
+
     fn utility_of(words: &[u32]) -> Option<Utility> {
+        utility_with(words, 8)
+    }
+
+    fn utility_with(words: &[u32], user_sgprs: u16) -> Option<Utility> {
         let code = gcn::decode_program(words).unwrap();
-        let plan = analysis::analyze(&code, 8, 0x1130ffec00);
+        let plan = analysis::analyze(&code, user_sgprs, 0x1130ffec00);
         match_utility(&code, &plan)
+    }
+
+    #[test]
+    fn tlg_pattern_kernel_is_a_pattern_copy() {
+        match utility_with(&TLG_PATTERN, 12) {
+            Some(Utility::Pattern { src, dst, params, modulo: false }) => assert!(src != dst && params != src && params != dst),
+            other => panic!("not recognized as a pattern copy: {other:?}"),
+        }
     }
 
     #[test]
