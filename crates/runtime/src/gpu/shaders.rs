@@ -219,6 +219,9 @@ pub struct Prepared {
     pub read_buffers: Arc<Vec<usize>>,
     /// Debug: instruction pcs using each resource (frame traces).
     pub res_pcs: Arc<Vec<Vec<u32>>>,
+    /// Per resource: images used only by image_load / image_load_mip
+    /// (integer texel coordinates, no sampler or size query).
+    pub load_only: Arc<Vec<bool>>,
     /// Guest addresses read while resolving descriptors and scalar loads
     /// (record time): they must not have pending GPU writes.
     pub mem_reads: Vec<u64>,
@@ -305,6 +308,12 @@ fn match_utility(code: &[gcn::Inst], plan: &Plan) -> Option<Utility> {
     if is(&COPY) {
         return Some(Utility::Copy { src: res(3)?, dst: res(6)? });
     }
+    // TLG's copy kernel: thread id = group * 64 (inline constant 192) + lane
+    // through v_sad_u32, then the same load, bounds test and store.
+    const COPY_TLG: [&str; 7] = ["s_mov_b32", "s_mul_i32", "v_sad_u32", "buffer_load_format_x", "v_cmpx_gt_u32", "buffer_store_format_x", "s_endpgm"];
+    if is(&COPY_TLG) && insts[1].ssrc1() == 192 {
+        return Some(Utility::Copy { src: res(3)?, dst: res(5)? });
+    }
     if is(&FILL1) {
         return Some(Utility::Fill { value: res(3)?, dst: res(8)?, per_group: 64 });
     }
@@ -320,6 +329,7 @@ struct Analyzed {
     code: Arc<Vec<gcn::Inst>>,
     plan: Plan,
     res_pcs: Arc<Vec<Vec<u32>>>,
+    load_only: Arc<Vec<bool>>,
     written_buffers: Arc<Vec<usize>>,
     read_buffers: Arc<Vec<usize>>,
     scatter: Option<(usize, usize)>,
@@ -511,6 +521,14 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
             for v in &mut res_pcs {
                 v.sort_unstable();
             }
+            let load_only: Vec<bool> = {
+                let at: std::collections::HashMap<u32, &gcn::Inst> = code.iter().map(|i| (i.pc, i)).collect();
+                plan.resources
+                    .iter()
+                    .zip(&res_pcs)
+                    .map(|(r, pcs)| r.kind == ResKind::Image && !pcs.is_empty() && pcs.iter().all(|pc| at.get(pc).is_some_and(|i| i.enc == gcn::Enc::Mimg && matches!(i.op, 0 | 1))))
+                    .collect()
+            };
             let written_buffers: Vec<usize> = plan.resources.iter().enumerate().filter(|(_, r)| r.kind == ResKind::Buffer && r.written).map(|(i, _)| i).collect();
             let read_buffers: Vec<usize> = plan.resources.iter().enumerate().filter(|(_, r)| r.kind == ResKind::Buffer && r.read).map(|(i, _)| i).collect();
             let scatter = if sr.stage == Stage::Compute { match_scatter(&code, &plan) } else { None };
@@ -526,7 +544,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
                     _ => false,
                 })
                 .collect();
-            let a = Arc::new(Analyzed { code, plan, res_pcs: Arc::new(res_pcs), written_buffers: Arc::new(written_buffers), read_buffers: Arc::new(read_buffers), scatter, utility, extra_pos, res_block });
+            let a = Arc::new(Analyzed { code, plan, res_pcs: Arc::new(res_pcs), load_only: Arc::new(load_only), written_buffers: Arc::new(written_buffers), read_buffers: Arc::new(read_buffers), scatter, utility, extra_pos, res_block });
             ANALYZED.lock().get_or_insert_with(FastMap::default).insert(akey, a.clone());
             a
         }
@@ -728,8 +746,41 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
     let written_buffers = analyzed.written_buffers.clone();
     let read_buffers = analyzed.read_buffers.clone();
     let res_pcs = analyzed.res_pcs.clone();
+    let load_only = analyzed.load_only.clone();
     let scatter = analyzed.scatter;
     let utility = analyzed.utility;
     let mem_reads = READS.with(|r| std::mem::take(&mut *r.borrow_mut()));
-    Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, mem_reads, scatter, sparse_writes: None, utility, tess: tess.role })
+    Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, load_only, mem_reads, scatter, sparse_writes: None, utility, tess: tess.role })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// TLG's buffer copy kernel (cs 0x1130ffec00, e.g. the per-frame copy of
+    /// the 2048x1152 depth buffer): thread group*64+lane copies dword t of the
+    /// V# in s[0:3] to the V# in s[4:7], bounded by s6.
+    const TLG_COPY: [u32; 13] = [0; 13];
+
+    fn utility_of(words: &[u32]) -> Option<Utility> {
+        let code = gcn::decode_program(words).unwrap();
+        let plan = analysis::analyze(&code, 8, 0x1130ffec00);
+        match_utility(&code, &plan)
+    }
+
+    #[test]
+    fn tlg_copy_kernel_is_a_copy() {
+        match utility_of(&TLG_COPY) {
+            Some(Utility::Copy { src, dst }) => assert_ne!(src, dst),
+            other => panic!("not recognized as a copy: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_group_sizes_are_not_copies() {
+        // s_mul_i32 vcc_lo, s8, 32: threads would not map to consecutive dwords.
+        let mut w = TLG_COPY;
+        w[2] = 0x936aa008;
+        assert!(utility_of(&w).is_none());
+    }
 }

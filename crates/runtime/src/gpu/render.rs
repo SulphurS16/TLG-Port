@@ -3028,7 +3028,9 @@ impl Renderer {
     }
 
     /// Image view for sampling/storing a T#.
-    fn texture(&mut self, t: &Tsharp, storage: bool) -> Result<vk::ImageView, String> {
+    /// `load_only`: the shader only loads texels by integer coordinates
+    /// (`Prepared::load_only`).
+    fn texture(&mut self, t: &Tsharp, storage: bool, load_only: bool) -> Result<vk::ImageView, String> {
         let Some(vfmt) = desc::vk_format(t.dfmt, t.nfmt) else {
             return self.dummy_texture(t, storage, "unsupported format");
         };
@@ -3096,7 +3098,7 @@ impl Renderer {
         // copy its depth values into a color image of the sampled format.
         if matches!(vfmt, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !storage {
             if let Some(src) = self.by_base.get(&t.base).and_then(|ks| ks.iter().copied().find(|k| k.depth && self.images[k].gpu_written && (k.format == vk::Format::D16_UNORM) == (vfmt == vk::Format::R16_UNORM))) {
-                return self.depth_shadow_view(src, t, vfmt, view_type);
+                return self.depth_shadow_view(src, t, vfmt, view_type, load_only);
             }
         }
         // A render target at this address with padded dimensions: copy into a
@@ -3775,12 +3777,18 @@ impl Renderer {
     /// Texture view of a depth render target's depth values: copied (depth
     /// aspect -> ring -> color image, cropped to the T# size) whenever the
     /// depth target was written since the last copy.
-    fn depth_shadow_view(&mut self, src: ImageKey, t: &Tsharp, vfmt: vk::Format, view_type: vk::ImageViewType) -> Result<vk::ImageView, String> {
+    fn depth_shadow_view(&mut self, src: ImageKey, t: &Tsharp, vfmt: vk::Format, view_type: vk::ImageViewType, load_only: bool) -> Result<vk::ImageView, String> {
         // Same size (e.g. shadow maps): sample the depth aspect directly; a
         // depth view returns the depth in R as the R32/R16 texture would.
         // TLG_DEPTH_COPY=1 always copies.
         static COPY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if t.width == src.width && t.height == src.height && view_type == vk::ImageViewType::TYPE_2D && !*COPY.get_or_init(|| std::env::var_os("TLG_DEPTH_COPY").is_some()) {
+        // Smaller T# read only by integer texel coordinates (e.g. the
+        // 1920x1080 view of a 2048x1152 depth target): the same texels.
+        let fits = (t.width == src.width && t.height == src.height) || (load_only && t.width <= src.width && t.height <= src.height && crate::tune::get(crate::tune::DEPTH_LOAD_VIEW) != 0);
+        if fits && view_type == vk::ImageViewType::TYPE_2D && !*COPY.get_or_init(|| std::env::var_os("TLG_DEPTH_COPY").is_some()) {
+            if t.width != src.width || t.height != src.height {
+                DEPTH_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let img = self.images.get_mut(&src).unwrap();
             return img.view(src.format, 0, view_type, false, 0, 1);
         }
@@ -3816,6 +3824,7 @@ impl Renderer {
             }
             self.barrier_needed = true;
             self.mark(|| "depth copy for sampling".into());
+            DEPTH_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.shadows.insert(skey, (dst_key, wgen));
             self.images.get_mut(&dst_key).unwrap().gpu_written = true;
         }
@@ -4522,7 +4531,7 @@ impl Renderer {
                                     let storage = matches!(b.kind, BindingKind::StorageImage(_));
                                     if crate::tune::get(crate::tune::EARLY_TEX) == 0 {
                                         self.flush_for(1);
-                                    } else if let Err(e) = self.texture(t, storage) {
+                                    } else if let Err(e) = self.texture(t, storage, p.load_only.get(i).copied().unwrap_or(false)) {
                                         if e.contains("ring full") {
                                             // (Validated again in a fresh batch.)
                                             self.flushes[2] += 1;
@@ -4651,7 +4660,8 @@ impl Renderer {
                             }
                         }
                         let extent = guest_extent(base, v.size() + bias);
-                        if !buffer_written(p, i) && ctx().ext_host.is_none() && extent >= VCACHE_MIN {
+                        let read_min = (crate::tune::get(crate::tune::VCACHE_READ_MIN_KIB).max(0) as u64) << 10;
+                        if !buffer_written(p, i) && ctx().ext_host.is_none() && extent >= read_min {
                             // Large read-only data: from the VRAM mirror
                             // (copied in once, then per CPU-written page).
                             // Unbounded V#s (pools of hundreds of MiB) are
@@ -4661,7 +4671,7 @@ impl Renderer {
                             let room = (base >> VWIN_SHIFT << VWIN_SHIFT) + VWIN_SIZE - base;
                             let n = extent.min(room);
                             self.vc_why = "read binding";
-                            if let Some((vb, voff)) = self.vcache_bind(base, n) {
+                            if let Some((vb, voff)) = self.vcache_bind_ex(base, n, false, n < VCACHE_MIN) {
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range: n.next_multiple_of(4) })));
                                 continue;
                             }
@@ -4754,7 +4764,7 @@ impl Renderer {
                     BindingKind::Image(i) | BindingKind::StorageImage(i) => {
                         let ResolvedRes::Image(t) = &p.resources[i] else { return Err("binding/resource mismatch".into()) };
                         let storage = matches!(b.kind, BindingKind::StorageImage(_));
-                        let view = self.texture(t, storage)?;
+                        let view = self.texture(t, storage, p.load_only.get(i).copied().unwrap_or(false))?;
                         infos.push((
                             b.binding,
                             if storage { vk::DescriptorType::STORAGE_IMAGE } else { vk::DescriptorType::SAMPLED_IMAGE },
@@ -6042,8 +6052,7 @@ impl Renderer {
         }
         self.prof[5] += tp.elapsed();
         // Engine copy/fill kernels over whole render-target surfaces run as
-        // image operations (TLG_ELIDE_UTILITY=0 runs them as shaders).
-        static ELIDE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // image operations (`tune elide_utility 0` runs them as shaders).
         // (Kernels dispatched from a start group (COMPUTE_START_X/Y/Z) cover
         // only groups [start, x): the elided operations assume group 0 on.)
         let start = (cp.regs.sh(0x2E04), cp.regs.sh(0x2E05), cp.regs.sh(0x2E06));
@@ -6053,7 +6062,7 @@ impl Renderer {
                 crate::info!("utility kernel cs {:#x} dispatched {x}x{y}x{z} from group {start:?}: run as a shader", cs.addr);
             }
         }
-        if let Some(u) = cs.utility.filter(|_| start == (0, 0, 0) && *ELIDE.get_or_init(|| std::env::var("TLG_ELIDE_UTILITY").map(|v| v != "0").unwrap_or(true))) {
+        if let Some(u) = cs.utility.filter(|_| start == (0, 0, 0) && crate::tune::get(crate::tune::ELIDE_UTILITY) != 0) {
             if self.elide_utility(&cs, u, x as u64 * y as u64 * z as u64)? {
                 self.elided += 1;
                 self.dispatches += 1;
@@ -8084,6 +8093,9 @@ pub static DUMP_AFTER: Mutex<Option<(Vec<u64>, u32, u32)>> = Mutex::new(None);
 pub static SKIP_PS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Debug: dispatches of these compute shaders are skipped (control `skipcs`).
 pub static SKIP_CS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Depth targets sampled through a smaller T#: cropped copies made, direct
+/// views for texel loads (`depth_shadow_view`).
+pub static DEPTH_VIEWS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// Debug: image dumps also write the raw texels (control `dumpraw 1`).
 pub static DUMP_RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

@@ -25,10 +25,11 @@ pub const VCACHE: usize = 3;
 pub const GPU_TEXTURES: usize = 4;
 
 /// Engine fill/copy kernels done in guest memory in place on the GPU
-/// instead of running them (bit mask, `TLG_ELIDE_EXT`, 15): 1 = fills of a
+/// instead of running them (bit mask, `TLG_ELIDE_EXT`, 11): 1 = fills of a
 /// render target that are not clears (unorm8), 2 = fills of other memory,
-/// 4 = copies that are not whole-surface image copies; 8 = array layer 0
-/// fills as layer clears.
+/// 4 = copies that are not whole-surface image copies (off: in Trico's cave
+/// they wait for in-flight write-backs, CP sync waits 59 vs 11 ms per frame);
+/// 8 = array layer 0 fills as layer clears.
 pub const ELIDE_EXT: usize = 5;
 
 /// Images unused for a while are evicted from VRAM (`TLG_EVICT`, 1; 0 keeps
@@ -102,13 +103,27 @@ pub const MIRROR_GPU_STAMPS: usize = 19;
 /// the pointer (`TLG_DYN_LOADS`, 1; 0 skips them as before).
 pub const DYN_LOADS: usize = 20;
 
-const TABLE: [(&str, &str, i64); 21] = [
+/// Read-only buffer bindings of at least this many KiB come from the VRAM
+/// mirror (copied in when the CPU changes them) rather than a copy into the
+/// host-memory upload ring per binding (`TLG_VCACHE_READ_MIN_KIB`, 64).
+/// Below 64 only in mirror windows that exist.
+pub const VCACHE_READ_MIN_KIB: usize = 21;
+
+/// Depth targets read through a smaller T# only by integer texel coordinates
+/// are bound directly instead of copied cropped (`TLG_DEPTH_LOAD_VIEW`, 1).
+pub const DEPTH_LOAD_VIEW: usize = 22;
+
+/// The engine's copy/fill kernels run as buffer or image operations
+/// (`TLG_ELIDE_UTILITY`, 1; 0 runs them as shaders).
+pub const ELIDE_UTILITY: usize = 23;
+
+const TABLE: [(&str, &str, i64); 24] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
     ("vcache", "TLG_VCACHE", 1),
     ("gpu_textures", "TLG_GPU_TEXTURES", 1),
-    ("elide_ext", "TLG_ELIDE_EXT", 15),
+    ("elide_ext", "TLG_ELIDE_EXT", 11),
     ("evict", "TLG_EVICT", 1),
     ("clipdist", "TLG_CLIP_DIST", 1),
     ("occl", "TLG_OCCL", 1),
@@ -124,6 +139,9 @@ const TABLE: [(&str, &str, i64); 21] = [
     ("pass_barrier", "TLG_PASS_BARRIER", 1),
     ("mirror_gpu_stamps", "TLG_MIRROR_GPU_STAMPS", 0),
     ("dyn_loads", "TLG_DYN_LOADS", 1),
+    ("vcache_read_min_kib", "TLG_VCACHE_READ_MIN_KIB", 64),
+    ("depth_load_view", "TLG_DEPTH_LOAD_VIEW", 1),
+    ("elide_utility", "TLG_ELIDE_UTILITY", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
