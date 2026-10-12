@@ -308,6 +308,91 @@ struct VWindow {
     stamp: Vec<u64>,
     /// Frame of the last binding served (released under VRAM pressure).
     last_used: u64,
+    /// Sparse windows (`Ctx::sparse`): `mem` is null, memory is bound block
+    /// by block on first use, so a window costs what has been bound of it.
+    sparse: Option<SparseMem>,
+}
+
+struct SparseMem {
+    /// Block size (the buffer's memory alignment: 64 KiB on NVIDIA).
+    block: u64,
+    /// Bound blocks (bit per block) and their memory.
+    resident: Vec<u64>,
+    bound: Vec<(vk::DeviceMemory, u64)>,
+}
+
+impl VWindow {
+    /// Device memory the window holds.
+    fn bytes(&self) -> u64 {
+        self.sparse.as_ref().map_or(self.hi - self.lo, |s| s.bound.len() as u64 * s.block)
+    }
+
+    /// The window's buffer and memory, to free once unused.
+    fn retire(self) -> Retired {
+        Retired::Window(self.buf, self.mem, self.sparse.map_or(Vec::new(), |s| s.bound))
+    }
+}
+
+/// Mirror windows with memory bound block by block (`Ctx::sparse`;
+/// TLG_SPARSE=0 turns sparse buffers off).
+fn sparse_mirrors() -> bool {
+    ctx().sparse
+}
+
+/// Device memory for sparse mirror windows: `SPARSE_CHUNK` allocations cut
+/// into blocks, returned to the free list when a window is released; chunks
+/// with no block in use are freed under VRAM pressure (`trim`).
+struct BlockPool {
+    block: u64,
+    /// Memory type index (device-local, allowed for the window buffers).
+    ty: u32,
+    /// Chunks (by raw handle) and how many of their blocks are free.
+    chunks: FastMap<u64, (vk::DeviceMemory, u64)>,
+    free: Vec<(vk::DeviceMemory, u64)>,
+}
+
+const SPARSE_CHUNK: u64 = 16 << 20;
+
+impl BlockPool {
+    fn take(&mut self) -> Option<(vk::DeviceMemory, u64)> {
+        if self.free.is_empty() {
+            let req = vk::MemoryRequirements { size: SPARSE_CHUNK, alignment: self.block, memory_type_bits: 1 << self.ty };
+            let mem = ctx().alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL).ok()?;
+            let n = SPARSE_CHUNK / self.block;
+            self.chunks.insert(vk::Handle::as_raw(mem), (mem, n));
+            self.free.extend((0..n).rev().map(|i| (mem, i * self.block)));
+        }
+        let b = self.free.pop()?;
+        if let Some(c) = self.chunks.get_mut(&vk::Handle::as_raw(b.0)) {
+            c.1 -= 1;
+        }
+        Some(b)
+    }
+
+    fn give(&mut self, blocks: impl IntoIterator<Item = (vk::DeviceMemory, u64)>) {
+        for b in blocks {
+            if let Some(c) = self.chunks.get_mut(&vk::Handle::as_raw(b.0)) {
+                c.1 += 1;
+            }
+            self.free.push(b);
+        }
+    }
+
+    /// Frees the chunks no window uses; returns the bytes freed.
+    fn trim(&mut self) -> u64 {
+        let n = SPARSE_CHUNK / self.block;
+        let empty: FastSet<u64> = self.chunks.iter().filter(|(_, c)| c.1 == n).map(|(k, _)| *k).collect();
+        if empty.is_empty() {
+            return 0;
+        }
+        self.free.retain(|b| !empty.contains(&vk::Handle::as_raw(b.0)));
+        for k in &empty {
+            if let Some((m, _)) = self.chunks.remove(k) {
+                ctx().free(m);
+            }
+        }
+        empty.len() as u64 * SPARSE_CHUNK
+    }
 }
 
 const VWIN_SHIFT: u32 = 28;
@@ -376,6 +461,9 @@ fn evictable(k: &ImageKey, i: &Image) -> bool {
 enum Retired {
     Image(vk::Image, vk::DeviceMemory, Vec<vk::ImageView>),
     Buffer(vk::Buffer, vk::DeviceMemory),
+    /// A mirror window: its buffer, whole memory (null when sparse), the
+    /// sparse blocks bound to it (back to the pool).
+    Window(vk::Buffer, vk::DeviceMemory, Vec<(vk::DeviceMemory, u64)>),
     /// A persistent descriptor set (pool, set).
     Set(vk::DescriptorPool, vk::DescriptorSet),
 }
@@ -1102,6 +1190,11 @@ pub struct Renderer {
     scratch_mem: Option<vk::DeviceMemory>,
     /// VRAM copies of read-only vertex/index data (`vcache_bind`).
     vcache: Option<VCache>,
+    /// Sparse mirror windows: block memory, binds queued for the next
+    /// submission and the semaphore it waits for them on.
+    sparse_pool: Option<BlockPool>,
+    sparse_binds: Vec<(vk::Buffer, Vec<vk::SparseMemoryBind>)>,
+    bind_sem: vk::Semaphore,
     /// RT image write counters for texture shadow copies.
     write_gen: FastMap<ImageKey, u64>,
     shadows: FastMap<(ImageKey, u32, u32, vk::Format), (ImageKey, u64)>,
@@ -1322,6 +1415,9 @@ pub fn init() -> Result<(), String> {
             retired_scratch: Vec::new(),
             scratch_mem: None,
             vcache: None,
+            sparse_pool: None,
+            sparse_binds: Vec::new(),
+            bind_sem: if c.sparse { c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| format!("semaphore: {e}"))? } else { vk::Semaphore::null() },
             write_gen: FastMap::default(),
             shadows: FastMap::default(),
             draw_targets: smallvec::SmallVec::new(),
@@ -1806,13 +1902,22 @@ impl Renderer {
         self.end_rendering();
         self.occl_end_query();
         let c = ctx();
+        // Memory for sparse mirror blocks this batch uses: bound first.
+        let mut waits = smallvec::SmallVec::<[(vk::Semaphore, vk::PipelineStageFlags); 1]>::new();
+        if !self.sparse_binds.is_empty() {
+            let binds = std::mem::take(&mut self.sparse_binds);
+            match c.bind_sparse(&binds, self.bind_sem) {
+                Ok(()) => waits.push((self.bind_sem, vk::PipelineStageFlags::ALL_COMMANDS)),
+                Err(e) => crate::error!("render: {e}"),
+            }
+        }
         let slot = &mut self.slots[self.cur];
         unsafe {
             if slot.exec != vk::QueryPool::null() {
                 c.device.cmd_write_timestamp(slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.exec, 1);
             }
             c.device.end_command_buffer(slot.cmd).ok();
-            if let Err(e) = c.submit(slot.cmd, &[], &[], slot.fence) {
+            if let Err(e) = c.submit(slot.cmd, &waits, &[], slot.fence) {
                 crate::error!("render submit: {e}");
                 if e.contains("lost") {
                     super::vk::report_device_lost();
@@ -3150,10 +3255,12 @@ impl Renderer {
                 let (start, end) = crate::mem::MEM.lock().committed_span(base)?;
                 let slot = base >> VWIN_SHIFT << VWIN_SHIFT;
                 let (lo, hi) = (slot.max(start), (slot + VWIN_SIZE).min(end));
-                // (TLG_VCACHE_REFUSE=0: new windows even under VRAM pressure.)
+                // (TLG_VCACHE_REFUSE=0: new windows even under VRAM pressure.
+                // Sparse windows cost only what gets bound: always allowed.
+                // Without one, data bound from there is uploaded per batch.)
                 static REFUSE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
                 let refuse = *REFUSE.get_or_init(|| std::env::var("TLG_VCACHE_REFUSE").map(|v| v != "0").unwrap_or(true));
-                if base + size > hi || (refuse && self.pressure >= 2) {
+                if base + size > hi || (refuse && self.pressure >= 2 && !sparse_mirrors()) {
                     return None;
                 }
                 // Overlapped windows (made before the mapping grew) are
@@ -3166,15 +3273,16 @@ impl Renderer {
                     let stale: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.lo >> VWIN_SHIFT == slot >> VWIN_SHIFT && w.lo < hi && lo < w.hi).map(|(k, _)| *k).collect();
                     for sk in stale {
                         let w = vc.windows.remove(&sk).unwrap();
-                        vc.bytes -= w.hi - w.lo;
-                        self.retired.push((seq, Retired::Buffer(w.buf, w.mem)));
+                        vc.bytes -= w.bytes();
                         gone.push(w.buf);
+                        self.retired.push((seq, w.retire()));
                     }
                 }
                 for b in gone {
                     self.retire_dirty_set(b, seq);
                 }
-                if self.vcache.as_ref().map_or(0, |vc| vc.bytes) + (hi - lo) > VCACHE_BUDGET {
+                let cost = if sparse_mirrors() { 0 } else { hi - lo };
+                if self.vcache.as_ref().map_or(0, |vc| vc.bytes) + cost > VCACHE_BUDGET {
                     return None;
                 }
                 self.vcache_new_window(lo, hi)?;
@@ -3194,27 +3302,95 @@ impl Renderer {
     /// Allocates the VRAM mirror window [lo, hi) (all pages not yet current).
     fn vcache_new_window(&mut self, lo: u64, hi: u64) -> Option<()> {
         {
-            let (buf, mem) = match ctx().device_buffer(hi - lo, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDEX_BUFFER) {
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::INDEX_BUFFER;
+            let made = if sparse_mirrors() {
+                // (Rounded to 1 MiB, a multiple of any block size: the last
+                // block is bound whole.)
+                ctx().sparse_buffer((hi - lo).next_multiple_of(1 << 20), usage).and_then(|(buf, req)| {
+                    let ty = ctx().memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL);
+                    match (ty, req.alignment) {
+                        (Some(ty), block) if block.is_power_of_two() && block <= SPARSE_CHUNK && (1 << 20) % block == 0 => {
+                            let pool = self.sparse_pool.get_or_insert_with(|| BlockPool { block, ty, chunks: FastMap::default(), free: Vec::new() });
+                            if pool.block != block || pool.ty != ty {
+                                unsafe { ctx().device.destroy_buffer(buf, None) };
+                                return Err(format!("sparse block {block:#x} / memory type {ty} differ from the pool's"));
+                            }
+                            let n = (hi - lo).div_ceil(block) as usize;
+                            Ok((buf, vk::DeviceMemory::null(), Some(SparseMem { block, resident: vec![0; n.div_ceil(64)], bound: Vec::new() })))
+                        }
+                        _ => {
+                            unsafe { ctx().device.destroy_buffer(buf, None) };
+                            Err(format!("sparse buffer: unusable requirements {req:?}"))
+                        }
+                    }
+                })
+            } else {
+                ctx().device_buffer(hi - lo, usage).map(|(b, m)| (b, m, None))
+            };
+            let (buf, mem, sparse) = match made {
                 Ok(b) => b,
                 Err(e) => {
                     self.report(format!("VRAM mirror of {lo:#x}-{hi:#x} unavailable: {e}"));
                     return None;
                 }
             };
-            crate::info!("VRAM mirror window {lo:#x}-{hi:#x} ({} MiB) for read-only vertex/index data", (hi - lo) >> 20);
+            crate::info!("VRAM mirror window {lo:#x}-{hi:#x} ({} MiB{}) for read-only vertex/index data", (hi - lo) >> 20, if sparse.is_some() { ", sparse" } else { "" });
             let pages = ((hi - lo) >> 12) as usize;
             let blocks = ((hi - lo + 0xFFFF) >> 16) as usize;
-            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0 };
+            let cost = if sparse.is_some() { 0 } else { hi - lo };
+            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, sparse };
             let vc = self.vcache.get_or_insert_with(|| VCache { windows: FastMap::default(), bytes: 0, copied: 0, hits: 0 });
-            vc.bytes += hi - lo;
+            vc.bytes += cost;
             vc.windows.insert(lo, w);
         }
         Some(())
     }
 
+    /// Binds memory to the blocks of sparse window `k` that [base, base+size)
+    /// covers and that lack it; the binds go out before the batch is
+    /// submitted (`submit_batch`). False when block memory is unavailable.
+    fn vcache_resident(&mut self, k: u64, base: u64, size: u64) -> bool {
+        let Some(vc) = self.vcache.as_mut() else { return false };
+        let VCache { windows, bytes, .. } = vc;
+        let Some(w) = windows.get_mut(&k) else { return false };
+        let Some(sp) = w.sparse.as_mut() else { return true };
+        let (b0, b1) = ((base - w.lo) / sp.block, (base + size - 1 - w.lo) / sp.block);
+        let mut binds = Vec::new();
+        let mut ok = true;
+        for b in b0..=b1 {
+            let (word, bit) = ((b / 64) as usize, b % 64);
+            if sp.resident[word] >> bit & 1 != 0 {
+                continue;
+            }
+            let block = (*bytes + sp.block <= VCACHE_BUDGET).then(|| self.sparse_pool.as_mut().and_then(BlockPool::take)).flatten();
+            let Some((memory, memory_offset)) = block else {
+                ok = false;
+                break;
+            };
+            binds.push(vk::SparseMemoryBind { resource_offset: b * sp.block, size: sp.block, memory, memory_offset, flags: vk::SparseMemoryBindFlags::empty() });
+            sp.bound.push((memory, memory_offset));
+            sp.resident[word] |= 1 << bit;
+            *bytes += sp.block;
+        }
+        if !binds.is_empty() {
+            let buf = w.buf;
+            match self.sparse_binds.iter_mut().find(|(b, _)| *b == buf) {
+                Some((_, v)) => v.extend(binds),
+                None => self.sparse_binds.push((buf, binds)),
+            }
+        }
+        if !ok {
+            self.report(format!("VRAM mirror: no memory for blocks of {base:#x}+{size:#x}"));
+        }
+        ok
+    }
+
     /// Copies the pages of [base, base+size) in window `k` that are not
     /// current into it; returns the binding.
     fn vcache_fill(&mut self, k: u64, base: u64, size: u64, epoch: u64, required: u64, overwrite: bool) -> Option<(vk::Buffer, u64)> {
+        if !self.vcache_resident(k, base, size) {
+            return None;
+        }
         let vc = self.vcache.as_mut().unwrap();
         let w = vc.windows.get_mut(&k)?;
         // CPU writes: checked once per epoch and 64 KiB block (runs of
@@ -3762,9 +3938,13 @@ impl Renderer {
             for (_, w) in vc.windows {
                 // (The GPU is idle: released now.)
                 self.retire_dirty_set(w.buf, 0);
-                unsafe {
-                    ctx().device.destroy_buffer(w.buf, None);
+                self.sparse_binds.retain(|(b, _)| *b != w.buf);
+                unsafe { ctx().device.destroy_buffer(w.buf, None) };
+                if w.mem != vk::DeviceMemory::null() {
                     ctx().free(w.mem);
+                }
+                if let (Some(p), Some(s)) = (self.sparse_pool.as_mut(), w.sparse) {
+                    p.give(s.bound);
                 }
             }
         }
@@ -6988,7 +7168,8 @@ impl Renderer {
         if self.retired.iter().any(|(s, _)| *s <= done) {
             let c = ctx();
             let mut budget = if self.pressure >= 2 { usize::MAX } else { RETIRE_PER_PASS };
-            self.retired.retain(|(s, r)| {
+            let mut blocks = Vec::new();
+            self.retired.retain_mut(|(s, r)| {
                 if *s > done || budget == 0 {
                     return true;
                 }
@@ -6996,7 +7177,7 @@ impl Renderer {
                 unsafe {
                     match r {
                         Retired::Image(i, m, views) => {
-                            for &v in views {
+                            for &v in views.iter() {
                                 c.device.destroy_image_view(v, None);
                             }
                             c.device.destroy_image(*i, None);
@@ -7006,6 +7187,13 @@ impl Renderer {
                             c.device.destroy_buffer(*b, None);
                             c.free(*m);
                         }
+                        Retired::Window(b, m, bound) => {
+                            c.device.destroy_buffer(*b, None);
+                            if *m != vk::DeviceMemory::null() {
+                                c.free(*m);
+                            }
+                            blocks.append(bound);
+                        }
                         Retired::Set(pool, set) => {
                             c.device.free_descriptor_sets(*pool, &[*set]).ok();
                         }
@@ -7013,6 +7201,9 @@ impl Renderer {
                 }
                 false
             });
+            if let Some(p) = self.sparse_pool.as_mut() {
+                p.give(blocks);
+            }
         }
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         if frame < self.next_trim || self.recording || self.rendering.is_some() || crate::tune::get(crate::tune::EVICT) == 0 {
@@ -7091,14 +7282,21 @@ impl Renderer {
                 let idle: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.last_used + age <= frame).map(|(k, _)| *k).collect();
                 for k in idle {
                     let w = vc.windows.remove(&k).unwrap();
-                    vc.bytes -= w.hi - w.lo;
-                    released += w.hi - w.lo;
-                    self.retired.push((seq, Retired::Buffer(w.buf, w.mem)));
+                    vc.bytes -= w.bytes();
+                    released += w.bytes();
                     gone.push(w.buf);
+                    self.retired.push((seq, w.retire()));
                 }
             }
             for b in gone {
                 self.retire_dirty_set(b, seq);
+            }
+            // (Blocks of windows released earlier are back by now.)
+            if let Some(p) = self.sparse_pool.as_mut() {
+                let freed = p.trim();
+                if freed > 0 {
+                    crate::info!("VRAM: freed {} MiB of unused mirror block memory (pressure {})", freed >> 20, self.pressure);
+                }
             }
         }
         if self.pressure >= 2 && self.pressure_reported.is_none_or(|t| t.elapsed().as_secs() >= 30) {
@@ -7133,7 +7331,7 @@ impl Renderer {
         // Per mirror window: MiB ever bound / currently valid / allocated.
         let mut wins: Vec<(u64, u64, u64, u64)> = self.vcache.as_ref().map_or(Vec::new(), |vc| {
             let ones = |v: &[u64]| v.iter().map(|x| x.count_ones() as u64).sum::<u64>() << 12;
-            vc.windows.values().map(|w| (w.lo, ones(&w.touched), ones(&w.valid), w.hi - w.lo)).collect()
+            vc.windows.values().map(|w| (w.lo, ones(&w.touched), ones(&w.valid), w.bytes())).collect()
         });
         wins.sort_unstable();
         let touched: u64 = wins.iter().map(|w| w.1).sum();
