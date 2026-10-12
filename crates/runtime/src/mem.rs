@@ -213,9 +213,13 @@ pub static HARVEST_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 
 /// Held while host code writes guest memory and then forgets those writes
 /// (`reset_write_watch`), so a harvest never sees the writes alone.
-/// (Reentrant: a lazy write-back readback may run in a fault taken while it
-/// is held, see gpu/lazywb.rs.)
-pub static WRITE_WATCH_LOCK: parking_lot::ReentrantMutex<()> = parking_lot::const_reentrant_mutex(());
+pub static WRITE_WATCH_LOCK: Mutex<()> = Mutex::new(());
+/// Held around a harvest's write-watch query only: the same guarantee for
+/// writers that must not wait for `WRITE_WATCH_LOCK` (lazy write-back
+/// readbacks run in faults, possibly taken while the memory map lock is
+/// held, which `WRITE_WATCH_LOCK` holders may wait for). Nothing is locked
+/// while it is held.
+pub static HARVEST_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn harvest_writes(addr: u64, len: u64, buf: &mut Vec<usize>, out: &mut Vec<u64>) -> bool {
     if !WRITE_WATCH.load(std::sync::atomic::Ordering::Relaxed) || !is_guest(addr, len) {
@@ -233,7 +237,10 @@ pub fn harvest_writes(addr: u64, len: u64, buf: &mut Vec<usize>, out: &mut Vec<u
     }
     let mut count = cap;
     let mut granularity = 0u32;
-    let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, lo as _, (hi - lo) as usize, buf.as_mut_ptr() as *mut *mut core::ffi::c_void, &mut count, &mut granularity) };
+    let r = {
+        let _h = HARVEST_LOCK.lock();
+        unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, lo as _, (hi - lo) as usize, buf.as_mut_ptr() as *mut *mut core::ffi::c_void, &mut count, &mut granularity) }
+    };
     if r != 0 {
         return false;
     }

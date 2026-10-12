@@ -128,7 +128,7 @@ pub const VCACHE_WRITE_MIN_KIB: usize = 24;
 pub const VCACHE_GPU_READS: usize = 25;
 
 /// Lazy write-back of mirror-resident GPU writes (gpu/lazywb.rs)
-/// (`TLG_LAZY_WB`, 0).
+/// (`TLG_LAZY_WB`, 1; 0 writes everything back after each batch).
 pub const LAZY_WB: usize = 26;
 
 const TABLE: [(&str, &str, i64); 27] = [
@@ -158,7 +158,7 @@ const TABLE: [(&str, &str, i64); 27] = [
     ("elide_utility", "TLG_ELIDE_UTILITY", 1),
     ("vcache_write_min_kib", "TLG_VCACHE_WRITE_MIN_KIB", 64),
     ("vcache_gpu_reads", "TLG_VCACHE_GPU_READS", 0),
-    ("lazy_wb", "TLG_LAZY_WB", 0),
+    ("lazy_wb", "TLG_LAZY_WB", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

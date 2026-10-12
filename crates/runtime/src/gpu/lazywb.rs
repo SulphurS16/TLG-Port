@@ -1,5 +1,5 @@
 //! Lazy write-back of GPU-written data held in VRAM mirror windows (`tune
-//! lazy_wb`, default off while it is being validated).
+//! lazy_wb`, default on; 0 for every write-back after each batch).
 //!
 //! Every batch end copies the GPU's mirror-resident writes back to guest
 //! memory. In Trico's cave most of those bytes are never looked at again:
@@ -25,9 +25,11 @@
 //! which fail instead of faulting) are preceded by `touch`, unmapping and
 //! protection changes of guest memory by `settle`.
 //!
-//! Lock order: `mem::WRITE_WATCH_LOCK` (reentrant), then `STATE`. `STATE`
-//! holders never take the memory map lock (`settle` runs under it, without
-//! the write-watch lock).
+//! Locks: callers may hold the memory map lock (faults in guest copies,
+//! `settle`), `mem::WRITE_WATCH_LOCK` (the completion thread) or the
+//! renderer lock; `STATE` holders take neither of them (a readback's copy
+//! and write-watch reset are atomic for harvests through
+//! `mem::HARVEST_LOCK`).
 
 use ash::vk;
 use std::collections::BTreeMap;
@@ -180,8 +182,11 @@ fn read_back(buf: vk::Buffer, off: u64, size: u64, dst: u64) -> Result<(), Strin
     }
     c.submit(rb.cmd, &[], &[], rb.fence)?;
     unsafe { c.device.wait_for_fences(&[rb.fence], true, 10_000_000_000) }.map_err(|e| format!("lazy write-back readback: {e}"))?;
-    // (Directly: the memory map lock may be held by this thread, see `settle`.)
+    // (Directly: the memory map lock may be held by this thread. Our copy is
+    // not a CPU write of the range: forgotten before a harvest can see it.)
+    let _h = crate::mem::HARVEST_LOCK.lock();
     unsafe { std::ptr::copy_nonoverlapping(sp, dst as *mut u8, size as usize) };
+    crate::mem::reset_write_watch(dst, size);
     Ok(())
 }
 
@@ -229,10 +234,8 @@ fn resolve(g: &mut State, lo: u64, touched: bool) {
     }
     if let Some((buf, off)) = lazy {
         let t0 = std::time::Instant::now();
-        match read_back(buf, off, hi - lo, lo) {
-            // (Our copy is not a CPU write of the range.)
-            Ok(()) => crate::mem::reset_write_watch(lo, hi - lo),
-            Err(e) => crate::error!("lazy write-back of {lo:#x}-{hi:#x}: {e}"),
+        if let Err(e) = read_back(buf, off, hi - lo, lo) {
+            crate::error!("lazy write-back of {lo:#x}-{hi:#x}: {e}");
         }
         stats.readbacks += 1;
         stats.readback_bytes += hi - lo;
@@ -253,7 +256,6 @@ pub fn before_write(addr: u64, size: u64) {
     if !active() {
         return;
     }
-    let _ww = crate::mem::WRITE_WATCH_LOCK.lock();
     let mut g = lock_submitted(addr, addr + size);
     for k in overlapping(&g, addr, addr + size) {
         resolve(&mut g, k, false);
@@ -269,7 +271,6 @@ pub fn after_write(addr: u64, size: u64, mirror: bool) {
         return;
     }
     let Some((lo, hi)) = inner_pages(addr, size) else { return };
-    let _ww = crate::mem::WRITE_WATCH_LOCK.lock();
     let mut g = lock_submitted(lo, hi);
     // (Overlapping entries of other extents give way; without tracking, all.)
     for k in overlapping(&g, lo, hi) {
@@ -300,7 +301,6 @@ pub fn release_buffer(buf: vk::Buffer) {
     if !active() {
         return;
     }
-    let _ww = crate::mem::WRITE_WATCH_LOCK.lock();
     let mut g = STATE.lock();
     let keys: Vec<u64> = g.entries.iter().filter(|(_, e)| e.lazy.is_some_and(|(b, _)| b == buf)).map(|(k, _)| *k).collect();
     for k in keys {
@@ -315,7 +315,6 @@ pub fn touch(addr: u64, len: u64) {
     if !active() || len == 0 {
         return;
     }
-    let _ww = crate::mem::WRITE_WATCH_LOCK.lock();
     let mut g = lock_submitted(addr, addr + len);
     for k in overlapping(&g, addr, addr + len) {
         if g.entries[&k].protected || g.entries[&k].lazy.is_some() {
@@ -325,8 +324,8 @@ pub fn touch(addr: u64, len: u64) {
     }
 }
 
-/// Memory map, before [lo, hi) is unmapped or its protection changes (the
-/// memory map lock held): ranges there current and no longer tracked.
+/// Memory map, before [lo, hi) is unmapped or its protection changes (its
+/// lock held): ranges there current and no longer tracked.
 pub fn settle(lo: u64, hi: u64) {
     if !active() {
         return;
@@ -347,7 +346,6 @@ pub fn fault(addr: u64, exec: bool) -> bool {
         return false;
     }
     {
-        let _ww = crate::mem::WRITE_WATCH_LOCK.lock();
         let mut g = lock_submitted(addr, addr + 1);
         if let Some((&lo, e)) = g.entries.range(..=addr).next_back() {
             if addr < e.end && e.protected {
