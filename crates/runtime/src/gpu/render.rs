@@ -1213,6 +1213,10 @@ pub struct Renderer {
     pub copyin_kept: u64,
     /// DMA_DATA copies done on the GPU through the mirror windows.
     pub dma_mirror: u64,
+    /// The last `upload_guest` queued GPU copies into its ring range, and
+    /// the copies not yet recorded (`flush_forwards`).
+    upload_forwarded: bool,
+    fwd_pending: Vec<(vk::Buffer, vk::BufferCopy)>,
     retired_scratch: Vec<(vk::Buffer, vk::DeviceMemory)>,
     scratch_mem: Option<vk::DeviceMemory>,
     /// VRAM copies of read-only vertex/index data (`vcache_bind`).
@@ -1441,6 +1445,8 @@ pub fn init() -> Result<(), String> {
             elided: 0,
             copyin_kept: 0,
             dma_mirror: 0,
+            upload_forwarded: false,
+            fwd_pending: Vec::new(),
             retired_scratch: Vec::new(),
             scratch_mem: None,
             vcache: None,
@@ -1875,6 +1881,9 @@ impl Renderer {
     /// batch's sequence number.
     #[track_caller]
     pub fn submit_batch(&mut self, actions: Vec<super::cp::EopAction>) -> u64 {
+        // (Forwards still queued belong to a command that was abandoned:
+        // their ring ranges are used by nothing.)
+        self.fwd_pending.clear();
         if self.recording && perf_on() {
             let loc = std::panic::Location::caller();
             let file = loc.file().rsplit(['/', '\\']).next().unwrap_or("");
@@ -2600,9 +2609,8 @@ impl Renderer {
         // (Pages the fill/copy covers entirely need no copy-in first.)
         self.vc_why = "fill/copy target";
         let Some((vb, voff)) = self.vcache_bind_ex(base, bytes, true, true) else { return Ok(None) };
-        let (bits, words, _) = self.mirror_write_back(base, bytes, vb, voff)?;
-        // (Every page of the range is written.)
-        unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, u32::MAX) };
+        // (Every byte of the range is written.)
+        self.mirror_write_back_full(base, bytes, vb, voff)?;
         self.writes.note_gpu_write(base, bytes);
         self.note_pending_gpu_write(base, bytes);
         self.vcache_validate(vb, base, bytes);
@@ -2639,6 +2647,23 @@ impl Renderer {
         global_barrier(self.cmd);
         self.writebacks.push(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: Some((bits, bits_host, words)) });
         Ok((bits, words, head))
+    }
+
+    /// `mirror_write_back` for GPU work that writes every byte of [base,
+    /// base+size) in the mirror window `buf` (render-target tiling, copies,
+    /// expanded fast-clear state): written back whole by a bulk copy at the
+    /// end of the batch, without a page bitmap (the bitmap kernel copied
+    /// render targets page by page: most of the 0.8 ms of write-back work per
+    /// batch in Trico's cave).
+    fn mirror_write_back_full(&mut self, base: u64, size: u64, buf: vk::Buffer, off: u64) -> Result<(), String> {
+        // (Already registered and not overtaken by a later overlapping
+        // write-back: lands with that one.)
+        if self.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size).is_some_and(|w| w.mirror && w.bits.is_none() && w.base == base && w.size == size && w.dev_buf == buf && w.dev_off == off) {
+            return Ok(());
+        }
+        let host_off = self.ring.alloc(size).ok_or_else(|| format!("ring full: {size:#x}-byte write-back of {base:#x} (segment {:#x})", self.ring.segment_size()))?;
+        self.writebacks.push(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: None });
+        Ok(())
     }
 
     /// Device-ring dwords where shaders mark the pages of written buffers
@@ -2876,15 +2901,13 @@ impl Renderer {
         self.vc_why = "DMA destination";
         let Some((dbuf, doff)) = self.vcache_bind_ex(dst, bytes, true, true) else { return declined(4) };
         // (Write-back first: when the ring cannot take it, the CP copies.)
-        let Ok((bits, words, _)) = self.mirror_write_back(dst, bytes, dbuf, doff) else { return declined(4) };
+        if self.mirror_write_back_full(dst, bytes, dbuf, doff).is_err() {
+            return declined(4);
+        }
         self.begin();
         self.end_rendering();
         global_barrier(self.cmd);
-        unsafe {
-            let c = ctx();
-            c.device.cmd_copy_buffer(self.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]);
-            c.device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, u32::MAX);
-        }
+        unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]) };
         self.barrier_needed = true;
         self.writes.note_gpu_write(dst, bytes);
         self.note_pending_gpu_write(dst, bytes);
@@ -3603,6 +3626,9 @@ impl Renderer {
             if !regions.is_empty() {
                 unsafe { ctx().device.cmd_copy_buffer(self.cmd, src, vbuf, &regions) };
             }
+            // Forwards land after the copy-in and earlier forwards they
+            // overlap (a barrier then), in program order.
+            let mut since: Vec<(u64, u64)> = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
             for &(pbase, pbuf, poff, psize) in fwd.iter().flat_map(|f| f.0.iter()) {
                 let over: Vec<vk::BufferCopy> = spans
                     .iter()
@@ -3612,8 +3638,11 @@ impl Renderer {
                     })
                     .collect();
                 if !over.is_empty() {
-                    // (After the copy-in and the earlier forwards: they overlap.)
-                    global_barrier(self.cmd);
+                    if over.iter().any(|r| since.iter().any(|&(x, y)| r.dst_offset < y && x < r.dst_offset + r.size)) {
+                        global_barrier(self.cmd);
+                        since.clear();
+                    }
+                    since.extend(over.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)));
                     unsafe { ctx().device.cmd_copy_buffer(self.cmd, pbuf, vbuf, &over) };
                     self.flushes[5] += 1;
                 }
@@ -4137,20 +4166,40 @@ impl Renderer {
                 (lo < hi).then(|| (buf, vk::BufferCopy { src_offset: dev_off + (lo - pbase), dst_offset: off + (lo - base), size: hi - lo }))
             })
             .collect();
+        self.upload_forwarded = !regions.is_empty();
         if !regions.is_empty() {
+            // Recorded by `flush_forwards` before the copy is used: the
+            // forwards of all of a draw's bindings under one barrier.
             self.flushes[5] += 1;
-            self.begin();
-            self.end_rendering();
-            let c = ctx();
-            for (buf, r) in &regions {
-                // Shader writes (and earlier forwards) before each copy.
-                global_barrier(self.cmd);
-                unsafe { c.device.cmd_copy_buffer(self.cmd, *buf, self.ring.buffer, std::slice::from_ref(r)) };
-            }
-            self.barrier_needed = true;
-            self.mark(|| "pending-write forwards".into());
+            self.fwd_pending.extend(regions);
         }
         Ok(off)
+    }
+
+    /// Records the forwards `upload_guest` queued: shader writes before the
+    /// first copy; earlier forwards before a copy only where it overlaps
+    /// them (later writes land later). Their ring ranges are fresh, used only
+    /// by the command that asked for them, which comes after this.
+    fn flush_forwards(&mut self) {
+        if self.fwd_pending.is_empty() {
+            return;
+        }
+        let regions = std::mem::take(&mut self.fwd_pending);
+        self.begin();
+        self.end_rendering();
+        let c = ctx();
+        let mut since: smallvec::SmallVec<[(u64, u64); 8]> = smallvec::SmallVec::new();
+        for (buf, r) in &regions {
+            let (a, b) = (r.dst_offset, r.dst_offset + r.size);
+            if since.is_empty() || since.iter().any(|&(x, y)| a < y && x < b) {
+                global_barrier(self.cmd);
+                since.clear();
+            }
+            since.push((a, b));
+            unsafe { c.device.cmd_copy_buffer(self.cmd, *buf, self.ring.buffer, std::slice::from_ref(r)) };
+        }
+        self.barrier_needed = true;
+        self.mark(|| "pending-write forwards".into());
     }
 
     /// Submits the batch first if the ring segments may not fit `host` and
@@ -4680,9 +4729,16 @@ impl Renderer {
                         if buffer_written(p, i) {
                             // The shader works on a device-local copy; written
                             // back to guest memory when the batch completes.
+                            // (A barrier only after GPU forwards into the ring
+                            // copy: host writes are visible at submission, the
+                            // device range is fresh.)
+                            let forwarded = self.upload_forwarded;
+                            self.flush_forwards();
                             let dev_off = self.dring.alloc(size).ok_or("device ring full")?;
                             self.end_rendering();
-                            global_barrier(self.cmd);
+                            if forwarded {
+                                global_barrier(self.cmd);
+                            }
                             let region = vk::BufferCopy { src_offset: off, dst_offset: dev_off, size };
                             unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
                             self.barrier_needed = true;
@@ -4776,6 +4832,8 @@ impl Renderer {
                 self.flushes[2] += 1;
                 self.ring_retries += 1;
                 self.gpu_wb.clear();
+                // (The failed attempt's ring copies are abandoned.)
+                self.fwd_pending.clear();
                 self.submit_batch(Vec::new());
                 self.begin();
                 let set = self.alloc_set(set_layout)?;
@@ -5122,6 +5180,8 @@ impl Renderer {
                 }
             });
         }
+        // The ring copies' forwards (descriptors, index data), then the pass.
+        self.flush_forwards();
         // Begin rendering if attachments changed.
         let same = self.rendering.as_ref().is_some_and(|r| r.colors[..] == colors[..] && r.depth == depth);
         if !same {
@@ -6045,6 +6105,7 @@ impl Renderer {
             None => None,
         };
         let (set, wb_before) = self.descriptors_with_retry(set_layout, &[&cs])?;
+        self.flush_forwards();
         self.end_rendering();
         // (The validated arguments must be visible to the indirect read.)
         if self.barrier_needed || args_slot.is_some() {
@@ -6337,6 +6398,7 @@ impl Renderer {
         let batch = self.batch;
         self.begin();
         let up = self.upload_guest(base, size)?;
+        self.flush_forwards();
         let Some(dev) = self.dring.alloc(size) else { return Ok(None) };
         if self.batch != batch {
             return Ok(None);
@@ -6754,9 +6816,7 @@ impl Renderer {
             // write (every page), current for later readers of the mirror.
             // (Images over the range are not marked older than guest memory:
             // the one written back stays the current copy.)
-            let (bits, words, _) = self.mirror_write_back(key.base, total, zbuf, zoff)?;
-            unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, u32::MAX) };
-            global_barrier(self.cmd);
+            self.mirror_write_back_full(key.base, total, zbuf, zoff)?;
             self.writes.note_gpu_write(key.base, total);
             self.note_pending_gpu_write(key.base, total);
             self.vcache_validate(zbuf, key.base, total);
@@ -7188,9 +7248,7 @@ impl Renderer {
             // The expanded state (when a clear applied) is in the mirror:
             // written back to guest memory at the end of the batch (every
             // page), current for later readers of the mirror.
-            let (bits, words, _) = self.mirror_write_back(base, span, zbuf, zoff)?;
-            unsafe { c.device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, u32::MAX) };
-            global_barrier(self.cmd);
+            self.mirror_write_back_full(base, span, zbuf, zoff)?;
             self.writes.note_gpu_write(base, span);
             self.note_pending_gpu_write(base, span);
             self.vcache_validate(zbuf, base, span);
@@ -7241,6 +7299,7 @@ impl Renderer {
                 self.reserve(n.next_multiple_of(256), 0);
                 self.begin();
                 let off = self.upload_guest(src, n)?;
+                self.flush_forwards();
                 self.end_rendering();
                 global_barrier(self.cmd);
                 let region = vk::BufferCopy { src_offset: off, dst_offset: o, size: n };
