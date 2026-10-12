@@ -1524,6 +1524,16 @@ pub static NEWER_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parki
 /// Shader preparations that waited for pending GPU writes to the memory they
 /// read (reader, address, covering write) (TLG_PERF).
 pub static GUARD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
+/// Fast clears left to the CPU path, by reason (`meta_clear_on_gpu`), and
+/// how often that path then waited for the GPU (TLG_PERF report).
+pub static META_DECLINES: parking_lot::Mutex<Option<HashMap<&'static str, u64>>> = parking_lot::Mutex::new(None);
+
+fn meta_decline(why: &'static str) -> Result<bool, String> {
+    if perf_on() {
+        *META_DECLINES.lock().get_or_insert_with(HashMap::new).entry(why).or_default() += 1;
+    }
+    Ok(false)
+}
 pub static RELOAD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
 /// TLG_PERF: texture uploads by texture (count, microseconds reading/detiling).
 pub static UPLOAD_SITES: parking_lot::Mutex<Option<HashMap<String, (u64, u64)>>> = parking_lot::Mutex::new(None);
@@ -6832,8 +6842,8 @@ impl Renderer {
             }
             // The metadata must have landed in guest memory (waits if needed)
             // unless the GPU filled all of it with a known dword.
-            if fill.is_none() {
-                self.sync_guest(mbase, msize);
+            if fill.is_none() && self.sync_guest(mbase, msize) && perf_on() {
+                *META_DECLINES.lock().get_or_insert_with(HashMap::new).entry("(CPU path waited for the GPU)").or_default() += 1;
             }
             let probe = |off: u64| -> Option<u32> {
                 if let Some(p) = fill {
@@ -6960,15 +6970,21 @@ impl Renderer {
     /// color the CPU path reports, no conditional rendering.
     fn meta_clear_on_gpu(&mut self, regs: &Regs, colors: &[Option<Attachment>], key: ImageKey, slot: Option<u32>, mbase: u64, msize: u64) -> Result<bool, String> {
         let c = ctx();
-        let Some(cond) = c.cond_render.as_ref() else { return Ok(false) };
+        let Some(cond) = c.cond_render.as_ref() else { return meta_decline("no conditional rendering") };
         if crate::tune::get(crate::tune::META_GPU) == 0 || key.layers > 1 || msize < 128 || msize % 4 != 0 || mbase % 4 != 0 || msize / 4 > u32::MAX as u64 {
-            return Ok(false);
+            return meta_decline("layered, tiny or unaligned metadata");
         }
-        if !(self.zc_overlaps(mbase, msize) || writeback_in_flight(mbase, msize)) {
-            return Ok(false);
+        // Without the import (the default) the probe reads the metadata in
+        // its VRAM mirror, which binding brings up to date on the GPU (this
+        // batch's and in-flight shader writes forwarded), so writes recorded
+        // in this batch need no drain either.
+        let mirror = c.ext_host.is_none();
+        let in_batch = self.writebacks.iter().any(|w| w.base < mbase + msize && mbase < w.base + w.size);
+        if !(self.zc_overlaps(mbase, msize) || writeback_in_flight(mbase, msize) || (mirror && in_batch)) {
+            return meta_decline("nothing pending");
         }
-        if self.writebacks.iter().any(|w| w.base < mbase + msize && mbase < w.base + w.size) || cpu_writeback_in_flight(mbase, msize) {
-            return Ok(false);
+        if (in_batch && !mirror) || cpu_writeback_in_flight(mbase, msize) {
+            return meta_decline(if cpu_writeback_in_flight(mbase, msize) { "CPU-performed writes pending" } else { "in-batch writes (zero-copy)" });
         }
         // What a clear writes (from the registers now, as the CPU path).
         enum Clear {
@@ -6984,24 +7000,33 @@ impl Renderer {
                 let r = 0xA318 + n * 0xF;
                 let att = colors.get(n as usize).copied().flatten();
                 let format = att.map(|a| a.view_format).unwrap_or(key.format);
-                let Some(value) = clear_color(format, regs.ctx(r + 11), regs.ctx(r + 12)) else { return Ok(false) };
+                let Some(value) = clear_color(format, regs.ctx(r + 11), regs.ctx(r + 12)) else { return meta_decline("clear color not supported") };
                 Clear::Color { format, layer: att.map_or(0, |a| a.layer), value }
             }
         };
         let align = c.limits.min_storage_buffer_offset_alignment.max(16);
         let base = mbase & !(align - 1);
         let span = mbase + msize - base;
-        let Some((zbuf, zoff, zrange)) = self.zc_binding(base, span) else { return Ok(false) };
-        if zrange < span || zoff % align != 0 {
-            return Ok(false);
-        }
+        let (zbuf, zoff) = if mirror {
+            self.vc_why = "fast-clear metadata";
+            match self.vcache_bind_ex(base, span, false, true) {
+                Some((b, o)) if o % align == 0 => (b, o),
+                _ => return meta_decline("no mirror binding"),
+            }
+        } else {
+            let Some((zbuf, zoff, zrange)) = self.zc_binding(base, span) else { return meta_decline("no zero-copy binding") };
+            if zrange < span || zoff % align != 0 {
+                return meta_decline("zero-copy binding unaligned");
+            }
+            (zbuf, zoff)
+        };
         let (set_layout, layout, probe, expand) = self.meta_pipes()?;
         let batch = self.batch;
         let set = self.alloc_set(set_layout)?;
         if self.batch != batch {
-            return Ok(false);
+            return meta_decline("batch closed");
         }
-        let Some(pred) = self.dring.alloc(16) else { return Ok(false) };
+        let Some(pred) = self.dring.alloc(16) else { return meta_decline("device ring full") };
         let infos = [vk::DescriptorBufferInfo { buffer: zbuf, offset: zoff, range: span }, vk::DescriptorBufferInfo { buffer: self.dring.buffer, offset: pred, range: 16 }];
         let writes: Vec<vk::WriteDescriptorSet> = (0..2)
             .map(|i| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(&infos[i])))
@@ -7057,12 +7082,24 @@ impl Renderer {
         }
         self.end_rendering();
         self.barrier_needed = true;
-        // The expanded state lands in place (when a clear applied); the probe
-        // read the metadata in place.
-        self.zc_writes.push((mbase, msize));
-        self.zc_reads.insert(mbase, mbase + msize);
-        self.writes.note_gpu_write(mbase, msize);
-        self.note_pending_gpu_write(mbase, msize);
+        if mirror {
+            // The expanded state (when a clear applied) is in the mirror:
+            // written back to guest memory at the end of the batch (every
+            // page), current for later readers of the mirror.
+            let (bits, words, _) = self.mirror_write_back(base, span, zbuf, zoff)?;
+            unsafe { c.device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, u32::MAX) };
+            global_barrier(self.cmd);
+            self.writes.note_gpu_write(base, span);
+            self.note_pending_gpu_write(base, span);
+            self.vcache_validate(zbuf, base, span);
+        } else {
+            // The expanded state lands in place (when a clear applied); the
+            // probe read the metadata in place.
+            self.zc_writes.push((mbase, msize));
+            self.zc_reads.insert(mbase, mbase + msize);
+            self.writes.note_gpu_write(mbase, msize);
+            self.note_pending_gpu_write(mbase, msize);
+        }
         // (As the CPU path's clear does; the draw that follows renders to it.)
         self.mark_stale(key);
         if let Some(i) = self.images.get_mut(&key) {
