@@ -1211,6 +1211,8 @@ pub struct Renderer {
     /// Mirror copy-ins that left the window's own pending writes in place
     /// instead of draining the GPU for them.
     pub copyin_kept: u64,
+    /// DMA_DATA copies done on the GPU through the mirror windows.
+    pub dma_mirror: u64,
     retired_scratch: Vec<(vk::Buffer, vk::DeviceMemory)>,
     scratch_mem: Option<vk::DeviceMemory>,
     /// VRAM copies of read-only vertex/index data (`vcache_bind`).
@@ -1438,6 +1440,7 @@ pub fn init() -> Result<(), String> {
             scatters: 0,
             elided: 0,
             copyin_kept: 0,
+            dma_mirror: 0,
             retired_scratch: Vec::new(),
             scratch_mem: None,
             vcache: None,
@@ -2820,6 +2823,9 @@ impl Renderer {
         if crate::tune::get(crate::tune::DMA_GPU) == 0 || bytes == 0 || bytes % 4 != 0 || src % 4 != 0 || dst % 4 != 0 || bytes > SURFACE_WRITE_MAX || (src < dst + bytes && dst < src + bytes) {
             return declined(0);
         }
+        if ctx().ext_host.is_none() {
+            return self.dma_via_mirror(src, dst, bytes);
+        }
         let Some((sbuf, soff)) = self.gpu_source(src, bytes) else {
             // (Nothing pending: the CP copies now without waiting.)
             let pending = self.writebacks.iter().any(|p| p.base < src + bytes && src < p.base + p.size) || cpu_writeback_in_flight(src, bytes) || self.zc_overlaps(src, bytes) || writeback_in_flight(src, bytes);
@@ -2845,6 +2851,51 @@ impl Renderer {
         self.barrier_needed = true;
         self.note_inplace_gpu_write(dst, bytes);
         self.mark(|| "DMA_DATA copy (GPU)".into());
+        true
+    }
+
+    /// `dma_on_gpu` without the import (the default): the source is read
+    /// through its VRAM mirror, which binding brings up to date on the GPU
+    /// (this batch's and in-flight writes forwarded, see `vcache_fill`), and
+    /// the copy lands in the destination's mirror, written back to guest
+    /// memory at the end of the batch like a shader's mirror-resident write
+    /// -- in completion order, after earlier batches' CPU-performed writes.
+    /// False (the CP copies) when nothing is pending on the source or a
+    /// range has no mirror window.
+    fn dma_via_mirror(&mut self, src: u64, dst: u64, bytes: u64) -> bool {
+        let declined = |why: usize| {
+            DMA_DECLINED[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        };
+        let pending = self.writebacks.iter().any(|p| p.base < src + bytes && src < p.base + p.size) || cpu_writeback_in_flight(src, bytes) || writeback_in_flight(src, bytes);
+        if !pending {
+            return declined(5);
+        }
+        self.vc_why = "DMA source";
+        let Some((sbuf, soff)) = self.vcache_bind_ex(src, bytes, false, true) else { return declined(1) };
+        self.vc_why = "DMA destination";
+        let Some((dbuf, doff)) = self.vcache_bind_ex(dst, bytes, true, true) else { return declined(4) };
+        // (Write-back first: when the ring cannot take it, the CP copies.)
+        let Ok((bits, words, _)) = self.mirror_write_back(dst, bytes, dbuf, doff) else { return declined(4) };
+        self.begin();
+        self.end_rendering();
+        global_barrier(self.cmd);
+        unsafe {
+            let c = ctx();
+            c.device.cmd_copy_buffer(self.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]);
+            c.device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, u32::MAX);
+        }
+        self.barrier_needed = true;
+        self.writes.note_gpu_write(dst, bytes);
+        self.note_pending_gpu_write(dst, bytes);
+        self.vcache_validate(dbuf, dst, bytes);
+        if bytes <= SURFACE_WRITE_MAX {
+            self.note_meta_write(dst, bytes);
+            self.note_buffer_write(dst, bytes);
+        }
+        self.epoch += 1;
+        self.dma_mirror += 1;
+        self.mark(|| "DMA_DATA copy (GPU, mirror)".into());
         true
     }
 
@@ -7032,8 +7083,10 @@ impl Renderer {
         if !(self.zc_overlaps(mbase, msize) || writeback_in_flight(mbase, msize) || (mirror && in_batch)) {
             return meta_decline("nothing pending");
         }
-        if (in_batch && !mirror) || cpu_writeback_in_flight(mbase, msize) {
-            return meta_decline(if cpu_writeback_in_flight(mbase, msize) { "CPU-performed writes pending" } else { "in-batch writes (zero-copy)" });
+        // (In-flight write-backs: the mirror binding forwards them, or waits
+        // where it cannot, e.g. for end-of-pipe writes.)
+        if !mirror && (in_batch || cpu_writeback_in_flight(mbase, msize)) {
+            return meta_decline(if in_batch { "in-batch writes (zero-copy)" } else { "CPU-performed writes pending (zero-copy)" });
         }
         // What a clear writes (from the registers now, as the CPU path).
         enum Clear {

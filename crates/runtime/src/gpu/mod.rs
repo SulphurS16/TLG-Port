@@ -508,11 +508,12 @@ fn gfx_thread() {
                 let mut declines: Vec<(&str, u64)> = render::META_DECLINES.lock().take().unwrap_or_default().into_iter().collect();
                 declines.sort_by(|a, b| b.1.cmp(&a.1));
                 crate::info!(
-                    "shader preparations synchronized with GPU writes: {}; scatter dispatches narrowed: {}; copy/fill kernels as image operations: {}; mirror copy-ins around the window's own writes: {}; fast clears decided on the GPU: {} (left to the CPU since last report: {:?})",
+                    "shader preparations synchronized with GPU writes: {}; scatter dispatches narrowed: {}; copy/fill kernels as image operations: {}; mirror copy-ins around the window's own writes: {}; DMA copies on the GPU through mirrors: {}; fast clears decided on the GPU: {} (left to the CPU since last report: {:?})",
                     r.prepare_syncs,
                     r.scatters,
                     r.elided,
                     r.copyin_kept,
+                    r.dma_mirror,
                     r.meta_gpu,
                     declines
                 );
