@@ -124,6 +124,35 @@ impl<'a> Patcher<'a> {
         Some(at)
     }
 
+    /// Detours the single instruction at module offset `off`, whose bytes
+    /// must be exactly `expect` (at least 5), through a trampoline: `body`
+    /// assembles what runs instead (given that instruction, which it may
+    /// re-emit) and must end in a jump. Returns the trampoline's address.
+    pub fn detour(&mut self, off: usize, expect: &[u8], body: impl FnOnce(&mut iced_x86::code_asm::CodeAssembler, &Instruction) -> Result<(), iced_x86::IcedError>) -> Result<u64, String> {
+        if expect.len() < 5 || self.image.get(off..off + expect.len()) != Some(expect) {
+            return Err(format!("+{off:#x}: unexpected code bytes"));
+        }
+        let ip = self.base + off as u64;
+        let ins = Decoder::with_ip(64, &self.image[off..off + expect.len()], ip, DecoderOptions::NONE).decode();
+        if ins.is_invalid() || ins.len() != expect.len() {
+            return Err(format!("+{off:#x}: not one instruction of {} bytes", expect.len()));
+        }
+        let at = self.next_trampoline();
+        let mut a = iced_x86::code_asm::CodeAssembler::new(64).map_err(|e| e.to_string())?;
+        body(&mut a, &ins).map_err(|e| format!("+{off:#x}: {e}"))?;
+        let code = a.assemble(at).map_err(|e| format!("+{off:#x}: {e}"))?;
+        let t = self.emit_trampoline(&code).ok_or("trampoline space exhausted")?;
+        if t != at {
+            return Err(format!("trampoline placed at {t:#x}, assembled for {at:#x}"));
+        }
+        let j = enc_jmp(ip, t).ok_or("trampoline out of rel32 range")?;
+        self.image[off..off + 5].copy_from_slice(&j);
+        for b in &mut self.image[off + 5..off + expect.len()] {
+            *b = 0xCC; // never executed: the trampoline jumps elsewhere
+        }
+        Ok(t)
+    }
+
     fn handle_fs(&mut self, ins: &Instruction, range: (u64, u64), stats: &mut PatchStats, fmt: &mut iced_x86::FastFormatter) {
         let rel = ins.ip() - self.base;
         let off = rel as usize;

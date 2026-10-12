@@ -53,6 +53,33 @@ pub fn take_mouse() -> (i64, i64, i32) {
     (MOUSE_DX.swap(0, Ordering::Relaxed), MOUSE_DY.swap(0, Ordering::Relaxed), WHEEL.swap(0, Ordering::Relaxed))
 }
 
+/// Until when (process ms) injected motion counts as captured mouse input.
+static INJECTED_UNTIL: AtomicI64 = AtomicI64::new(0);
+
+/// Debug (control `mouse <dx> <dy> [ms]`): raw counts as if the captured
+/// mouse had moved, spread evenly over `ms` (5 ms steps).
+pub fn inject_mouse(dx: i64, dy: i64, ms: u64) {
+    let steps = (ms / 5).max(1) as i64;
+    INJECTED_UNTIL.store(crate::log::elapsed_ms() as i64 + ms as i64 + 500, Ordering::Relaxed);
+    let _ = std::thread::Builder::new().name("mouse-inject".into()).spawn(move || {
+        let (mut sx, mut sy) = (0i64, 0i64);
+        for i in 1..=steps {
+            let (tx, ty) = (dx * i / steps, dy * i / steps);
+            MOUSE_DX.fetch_add(tx - sx, Ordering::Relaxed);
+            MOUSE_DY.fetch_add(ty - sy, Ordering::Relaxed);
+            (sx, sy) = (tx, ty);
+            if i < steps {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+    });
+}
+
+/// Mouse input is live: captured, or injected motion pending.
+pub fn mouse_live() -> bool {
+    CAPTURED.load(Ordering::Relaxed) || crate::log::elapsed_ms() as i64 <= INJECTED_UNTIL.load(Ordering::Relaxed)
+}
+
 const VK_SHIFT: usize = 0x10;
 const VK_CONTROL: usize = 0x11;
 const VK_MENU: usize = 0x12;

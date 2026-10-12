@@ -255,6 +255,17 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 *exception::BREAK_PEEK.lock() = Some(parts.collect::<Vec<_>>().join(","));
                 Ok(())
             }
+            "mouse" => {
+                // mouse <dx> <dy> [ms]: raw counts as if the captured mouse moved.
+                let mut n = || parts.next().and_then(|v| v.parse::<i64>().ok());
+                match (n(), n(), n()) {
+                    (Some(dx), Some(dy), ms) => {
+                        gpu::vk::window::inject_mouse(dx, dy, ms.unwrap_or(0).max(0) as u64);
+                        Ok(())
+                    }
+                    _ => Err("mouse: expected <dx> <dy> [ms]".into()),
+                }
+            }
             "hwwatch" => {
                 // hwwatch <addr> [len] [w] | hwwatch off (see exception.rs).
                 match parts.next().unwrap_or("") {

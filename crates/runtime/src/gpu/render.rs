@@ -3764,7 +3764,7 @@ impl Renderer {
                 self.retire_dirty_set(w.buf, 0);
                 unsafe {
                     ctx().device.destroy_buffer(w.buf, None);
-                    ctx().device.free_memory(w.mem, None);
+                    ctx().free(w.mem);
                 }
             }
         }
@@ -3772,7 +3772,7 @@ impl Renderer {
         for (start, end, buf, mem) in self.zc_spans.drain(..) {
             unsafe {
                 c.device.destroy_buffer(buf, None);
-                c.device.free_memory(mem, None);
+                c.free(mem);
             }
             crate::debug!("zero-copy: released {start:#x}-{end:#x} (guest mappings changed)");
         }
@@ -6354,7 +6354,7 @@ impl Renderer {
                 let Ok((sb, sm, sp)) = staged else {
                     unsafe {
                         ctx().device.destroy_buffer(buf, None);
-                        ctx().device.free_memory(mem, None);
+                        ctx().free(mem);
                     }
                     return Ok(None);
                 };
@@ -7000,11 +7000,11 @@ impl Renderer {
                                 c.device.destroy_image_view(v, None);
                             }
                             c.device.destroy_image(*i, None);
-                            c.device.free_memory(*m, None);
+                            c.free(*m);
                         }
                         Retired::Buffer(b, m) => {
                             c.device.destroy_buffer(*b, None);
-                            c.device.free_memory(*m, None);
+                            c.free(*m);
                         }
                         Retired::Set(pool, set) => {
                             c.device.free_descriptor_sets(*pool, &[*set]).ok();
@@ -7127,7 +7127,9 @@ impl Renderer {
                 tex += i.bytes;
             }
         }
-        let budget = ctx().vram().map(|(u, b)| format!("; device-local usage {} MiB of a {} MiB budget", u >> 20, b >> 20)).unwrap_or_default();
+        let (tracked, sites) = ctx().local_allocations();
+        let sites: Vec<String> = sites.iter().take(8).map(|(at, b, n)| format!("{at} {} MiB in {n}", b >> 20)).collect();
+        let budget = ctx().vram().map(|(u, b)| format!("; device-local usage {} MiB of a {} MiB budget; allocated by us {} MiB ({})", u >> 20, b >> 20, tracked >> 20, sites.join(", "))).unwrap_or_default();
         // Per mirror window: MiB ever bound / currently valid / allocated.
         let mut wins: Vec<(u64, u64, u64, u64)> = self.vcache.as_ref().map_or(Vec::new(), |vc| {
             let ones = |v: &[u64]| v.iter().map(|x| x.count_ones() as u64).sum::<u64>() << 12;

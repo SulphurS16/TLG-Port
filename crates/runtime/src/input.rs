@@ -9,9 +9,10 @@
 //!   R = Square · F = Triangle · U = L1 · O = R1 · Y = L2 · P = R2 · C = L3 ·
 //!   V = R3 · Tab = Options · T = Touchpad.
 //! Mouse: a click into the window captures it (raw counts, no pointer
-//! acceleration); F1 or leaving the window releases it. Mouse look drives
-//! the right stick for now (interim: the game's stick response applies;
-//! raw input straight into the game camera is the goal).
+//! acceleration); F1 or leaving the window releases it. Mouse look turns the
+//! game camera by the raw counts (`title_patches` camera hook: no dead zone,
+//! response curve or smoothing); while that camera is not updating it drives
+//! the right stick instead.
 //!
 //! Scripted input (`TLG_INPUT`): `flip:buttons[:hold]` entries separated by
 //! `;`, e.g. `TLG_INPUT=700:cross;760:down:3;800:cross`. `buttons` joins names
@@ -366,8 +367,10 @@ rs_right = L
 walk = LCtrl
 
 # Mouse: a click into the window captures the mouse, release_mouse (or
-# leaving the window) frees it. Mouse look turns the camera (for now through
-# the right stick, so the game's stick response applies).
+# leaving the window) frees it. Mouse look turns the game camera directly by
+# the raw motion (no acceleration, smoothing or dead zone; sensitivity 1.0 is
+# 0.04 degrees per count); where the game camera is not in charge (other
+# camera modes) it moves the right stick instead.
 mouse_look = on
 mouse_sensitivity = 1.0
 mouse_invert_x = off
@@ -538,8 +541,12 @@ struct MouseState {
 static MOUSE: parking_lot::Mutex<MouseState> = parking_lot::Mutex::new(MouseState { last: 0.0, rs: (0.0, 0.0), wheel_up_until: 0.0, wheel_down_until: 0.0 });
 
 /// Raw counts per second that give a full right-stick deflection at
-/// sensitivity 1 (interim mouse look).
+/// sensitivity 1 (mouse look where the game camera hook does not apply).
 const FULL_RATE: f32 = 2500.0;
+
+/// Camera turn per raw count at sensitivity 1 (degrees; 9,000 counts per
+/// full turn, e.g. 29 cm at 800 counts per inch).
+const DEG_PER_COUNT: f32 = 0.04;
 
 /// Samples the mouse for one pad read: the right-stick deflection the motion
 /// since the previous read amounts to, and the wheel presses active now.
@@ -547,19 +554,23 @@ fn mouse_sample(s: &Settings) -> ((f32, f32), bool, bool) {
     use crate::gpu::vk::window;
     let now = crate::log::elapsed_ms();
     let mut m = MOUSE.lock();
-    let captured = window::CAPTURED.load(std::sync::atomic::Ordering::Relaxed);
+    let captured = window::mouse_live();
     let dt = now - m.last;
     // (Reads within a few milliseconds of each other share one sample.)
     if dt >= 4.0 || !captured {
         let (dx, dy, wheel) = window::take_mouse();
         m.last = now;
+        let sx = if s.invert_x { -1.0 } else { 1.0 };
+        let sy = if s.invert_y { -1.0 } else { 1.0 };
+        let rad = (s.sensitivity * DEG_PER_COUNT).to_radians();
         if !captured || !s.mouse_look {
+            m.rs = (0.0, 0.0);
+        } else if crate::title_patches::add_camera_turn(-(dx as f32) * rad * sx, -(dy as f32) * rad * sy) {
+            // Straight into the game camera (right: turn right; forward: look up).
             m.rs = (0.0, 0.0);
         } else {
             let secs = (dt.min(250.0) / 1000.0) as f32;
             let k = s.sensitivity / FULL_RATE / secs.max(1e-3);
-            let sx = if s.invert_x { -1.0 } else { 1.0 };
-            let sy = if s.invert_y { -1.0 } else { 1.0 };
             m.rs = ((dx as f32 * k * sx).clamp(-1.0, 1.0), (dy as f32 * k * sy).clamp(-1.0, 1.0));
         }
         if wheel > 0 {

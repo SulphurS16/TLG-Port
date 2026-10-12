@@ -1,8 +1,29 @@
 //! Title code patches for The Last Guardian (CUSA03627, update 01.03, main
 //! module `launch_tricom`).
 //!
-//! No behaviour patches: the title's code runs unmodified apart from the
-//! generic load-time patches in `patch.rs` (TLS, syscalls, SSE4a).
+//! Raw mouse look (TLG_MOUSE_CAMERA=0 turns it off): the game camera
+//! (`GameCamera`, object `cam`) turns from the right stick in three stages:
+//! the input stage (eboot 0x67b0c6) maps the deflection past a dead zone
+//! through x*|x| and the camera-speed options to targets at [input+0x170]
+//! (pitch) and [input+0x174] (yaw); a smoothing stage (0x6a5f4f) eases
+//! [cam+0x2490]/[cam+0x2494] toward them (it zeroes them at 0x6a5980 when
+//! no input is present or camera input is locked: speed 0, lock flags and
+//! timers); the integrator (0x706225) turns them into this frame's angle
+//! changes in radians (degrees/s parameter * pi/180 * dt), pitch limited
+//! against [cam+0x2240], yaw [cam+0x2244]. Mouse motion is added there
+//! instead, as radians: no dead zone, response curve, smoothing or
+//! acceleration, the game's pitch limits and input locks still applying.
+//! The integrator also stores the turn as angular velocities ([cam+0x2530]
+//! pitch, [cam+0x2534] yaw, delta/dt) which the idle path keeps applying,
+//! halved each frame, after input stops (momentum: +30% overshoot measured
+//! for a mouse flick); on frames with mouse motion they are zeroed.
+//! Hooks: 0x6a58b1 lets pending mouse motion into the lock checks, 0x6a5fae
+//! (checks passed) and 0x6a5980 (failed or no input: pending motion is
+//! dropped) count camera updates, 0x70617e sends a frame with pending
+//! motion to the integrator, 0x70625f and 0x706272 add it to the pitch and
+//! yaw changes, 0x706943 drops the momentum. Stick right gives a negative
+//! yaw change, stick up a positive pitch change (looks up). Applied only
+//! when all seven sites hold the expected bytes.
 //!
 //! Diagnostics (opt-in): TLG_LUA_LOG=1 restores the game scripts' logging.
 //! Every `log(fmt, ...)` and `GaPrint(...)` in the Lua (Havok Script) game
@@ -40,6 +61,194 @@ pub fn apply(p: &mut Patcher, name: &str) {
     if std::env::var("TLG_LUA_LOG").is_ok_and(|v| v == "1") {
         patch_gaprint(p, name);
     }
+    if !std::env::var("TLG_MOUSE_CAMERA").is_ok_and(|v| v == "0") {
+        match patch_mouse_camera(p) {
+            Ok(slots) => {
+                CAM_SLOTS.store(slots, Ordering::Relaxed);
+                crate::info!("mouse camera: raw mouse look hooked into the game camera ({name}, slots {slots:#x})");
+            }
+            Err(e) => crate::warn!("mouse camera: {name}: {e}; mouse look drives the right stick instead"),
+        }
+    }
+}
+
+/// Mouse-look data next to the module: pending pitch and yaw change
+/// (radians, f32) at +0 and +4, camera update count at +8, the pitch and
+/// yaw change applied in the current integrator pass at +12 and +16 (0 =
+/// no hook).
+static CAM_SLOTS: AtomicU64 = AtomicU64::new(0);
+
+/// (camera update count last seen, when it changed: process ms and flip).
+static CAM_SEEN: parking_lot::Mutex<(u32, f64, u64)> = parking_lot::Mutex::new((0, 0.0, 0));
+
+/// Hook sites: module offset, the instruction's bytes.
+const CAM_GATE: (usize, &[u8]) = (0x6a58b1, &[0xC5, 0xFA, 0x10, 0x80, 0x74, 0x01, 0x00, 0x00]); // vmovss xmm0,[rax+174h]
+const CAM_PASSED: (usize, &[u8]) = (0x6a5fae, &[0xC4, 0xC1, 0x7A, 0x11, 0x8F, 0x94, 0x24, 0x00, 0x00]); // vmovss [r15+2494h],xmm1
+const CAM_IDLE: (usize, &[u8]) = (0x6a5980, &[0x49, 0xC7, 0x87, 0x90, 0x24, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]); // mov qword [r15+2490h],0
+const CAM_ROUTE: (usize, &[u8]) = (0x70617e, &[0xC4, 0xC1, 0x7A, 0x10, 0x87, 0x90, 0x24, 0x00, 0x00]); // vmovss xmm0,[r15+2490h]
+const CAM_PITCH: (usize, &[u8]) = (0x70625f, &[0xC5, 0xFA, 0x59, 0x5A, 0x0C]); // vmulss xmm3,xmm0,[rdx+0Ch]
+const CAM_YAW: (usize, &[u8]) = (0x706272, &[0xC4, 0xC1, 0x72, 0x59, 0xAF, 0x94, 0x24, 0x00, 0x00]); // vmulss xmm5,xmm1,[r15+2494h]
+const CAM_MOMENTUM: (usize, &[u8]) = (0x706943, &[0xC4, 0xC1, 0x7A, 0x11, 0x97, 0x34, 0x25, 0x00, 0x00]); // vmovss [r15+2534h],xmm2
+/// Where those continue: lock checks, after the store, after the zeroing,
+/// the integrator (with eax = [cam+0x2444]), after the original instructions.
+const CAM_GATE_CHECKS: u64 = 0x6a58cf;
+const CAM_INTEGRATE: u64 = 0x7061fb;
+
+/// Installs the raw mouse-look hooks (module docs); returns the data slots.
+fn patch_mouse_camera(p: &mut Patcher) -> Result<u64, String> {
+    use iced_x86::code_asm::*;
+    let sites = [CAM_GATE, CAM_PASSED, CAM_IDLE, CAM_ROUTE, CAM_PITCH, CAM_YAW, CAM_MOMENTUM];
+    if let Some((off, _)) = sites.iter().find(|(off, b)| p.image.get(*off..*off + b.len()) != Some(*b)) {
+        return Err(format!("unexpected code at +{off:#x} (not update 01.03?)"));
+    }
+    let slots = p.alloc_data(&[0u8; 32]).ok_or("no data space")?;
+    let base = p.base;
+    let next = |site: (usize, &[u8])| base + (site.0 + site.1.len()) as u64;
+    // Stubs keep every register and the flags except where noted (the yaw
+    // site sits between a compare and the branch using it).
+    p.detour(CAM_GATE.0, CAM_GATE.1, |a, ins| {
+        a.add_instruction(*ins)?;
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.push(rcx)?;
+        a.mov(rcx, slots)?;
+        a.cmp(qword_ptr(rcx), 0)?; // (flags are dead here)
+        a.pop(rcx)?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.jne(base + CAM_GATE_CHECKS)?;
+        a.jmp(next(CAM_GATE))
+    })?;
+    // Camera update counter (+8), and on the idle/locked path the pending
+    // motion dropped.
+    let count = |a: &mut CodeAssembler| -> Result<(), IcedError> {
+        a.mov(eax, dword_ptr(rcx + 8))?;
+        a.lea(eax, ptr(rax + 1))?;
+        a.mov(dword_ptr(rcx + 8), eax)
+    };
+    p.detour(CAM_PASSED.0, CAM_PASSED.1, |a, ins| {
+        a.add_instruction(*ins)?;
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.push(rax)?;
+        a.push(rcx)?;
+        a.mov(rcx, slots)?;
+        count(a)?;
+        a.pop(rcx)?;
+        a.pop(rax)?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.jmp(next(CAM_PASSED))
+    })?;
+    p.detour(CAM_IDLE.0, CAM_IDLE.1, |a, ins| {
+        a.add_instruction(*ins)?;
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.push(rax)?;
+        a.push(rcx)?;
+        a.mov(rcx, slots)?;
+        a.mov(eax, 0)?;
+        a.xchg(dword_ptr(rcx), eax)?;
+        a.mov(eax, 0)?;
+        a.xchg(dword_ptr(rcx + 4), eax)?;
+        count(a)?;
+        a.pop(rcx)?;
+        a.pop(rax)?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.jmp(next(CAM_IDLE))
+    })?;
+    p.detour(CAM_ROUTE.0, CAM_ROUTE.1, |a, ins| {
+        let mut idle = a.create_label();
+        a.add_instruction(*ins)?;
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.push(rcx)?;
+        a.mov(rcx, slots)?;
+        a.cmp(qword_ptr(rcx), 0)?; // (flags are dead here)
+        a.pop(rcx)?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.je(idle)?;
+        a.mov(eax, dword_ptr(r15 + 0x2444))?; // (what the integrator path tests)
+        a.jmp(base + CAM_INTEGRATE)?;
+        a.set_label(&mut idle)?;
+        a.jmp(next(CAM_ROUTE))
+    })?;
+    // Pending pitch (+0) / yaw (+4) taken atomically, added to xmm3 / xmm5
+    // and noted as applied (+12 / +16).
+    let add = |a: &mut CodeAssembler, ins: &iced_x86::Instruction, slot: i32, x: AsmRegisterXmm, back: u64| -> Result<(), IcedError> {
+        a.add_instruction(*ins)?;
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.push(rax)?;
+        a.push(rcx)?;
+        a.mov(rcx, slots)?;
+        a.mov(eax, 0)?;
+        a.xchg(dword_ptr(rcx + slot), eax)?;
+        a.mov(dword_ptr(rcx + slot + 12), eax)?;
+        a.push(rax)?;
+        a.vaddss(x, x, dword_ptr(rsp))?;
+        a.pop(rax)?;
+        a.pop(rcx)?;
+        a.pop(rax)?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.jmp(back)
+    };
+    p.detour(CAM_PITCH.0, CAM_PITCH.1, |a, ins| add(a, ins, 0, xmm3, next(CAM_PITCH)))?;
+    p.detour(CAM_YAW.0, CAM_YAW.1, |a, ins| add(a, ins, 4, xmm5, next(CAM_YAW)))?;
+    // After the velocities are stored: none when mouse motion was applied.
+    p.detour(CAM_MOMENTUM.0, CAM_MOMENTUM.1, |a, ins| {
+        let mut done = a.create_label();
+        a.add_instruction(*ins)?;
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.push(rcx)?;
+        a.mov(rcx, slots)?;
+        a.cmp(qword_ptr(rcx + 12), 0)?; // (flags are dead here)
+        a.je(done)?;
+        a.mov(qword_ptr(rcx + 12), 0)?;
+        a.mov(dword_ptr(r15 + 0x2530), 0)?;
+        a.mov(dword_ptr(r15 + 0x2534), 0)?;
+        a.set_label(&mut done)?;
+        a.pop(rcx)?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.jmp(next(CAM_MOMENTUM))
+    })?;
+    Ok(slots)
+}
+
+/// Adds mouse motion to the game camera's pending turn (radians; positive
+/// yaw turns left, positive pitch looks up). Returns false when the game
+/// camera has not updated for over 1.5 s and 3 frames (another camera mode,
+/// a menu, or no hook): the motion is then not kept, so it cannot land all
+/// at once later.
+pub fn add_camera_turn(yaw: f32, pitch: f32) -> bool {
+    use std::sync::atomic::AtomicU32;
+    let s = CAM_SLOTS.load(Ordering::Relaxed);
+    if s == 0 {
+        return false;
+    }
+    // SAFETY: the slots are 32 bytes of the module's data page, mapped for
+    // the process lifetime; the stubs access them with atomic exchanges.
+    let slot = |o: u64| unsafe { &*((s + o) as *const AtomicU32) };
+    let now = crate::log::elapsed_ms();
+    let flip = crate::gpu::FRAMES.load(Ordering::Relaxed);
+    let updates = slot(8).load(Ordering::Relaxed);
+    let mut seen = CAM_SEEN.lock();
+    if updates != seen.0 || seen.1 == 0.0 {
+        *seen = (updates, now, flip);
+    }
+    if now - seen.1 > 1500.0 && flip >= seen.2 + 3 {
+        slot(0).store(0, Ordering::Relaxed);
+        slot(4).store(0, Ordering::Relaxed);
+        return false;
+    }
+    for (o, v) in [(0, pitch), (4, yaw)] {
+        if v == 0.0 {
+            continue;
+        }
+        let a = slot(o);
+        let mut cur = a.load(Ordering::Relaxed);
+        loop {
+            let new = (f32::from_bits(cur) + v).clamp(-1.0, 1.0).to_bits();
+            match a.compare_exchange_weak(cur, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+    }
+    true
 }
 
 fn patch_gaprint(p: &mut Patcher, name: &str) {
@@ -97,5 +306,96 @@ sysv! {
     fn tlg_lua_print(l: u64) -> i32 {
         lua_print(l);
         0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+    /// Decodes the trampoline a site's `jmp rel32` leads to, up to and
+    /// including its final unconditional jump.
+    fn stub(image: &[u8], tramp: &[u8], base: u64, tbase: u64, off: usize) -> Vec<iced_x86::Instruction> {
+        assert_eq!(image[off], 0xE9, "site +{off:#x} is not detoured");
+        let rel = i32::from_le_bytes(image[off + 1..off + 5].try_into().unwrap()) as i64;
+        let t = (base as i64 + off as i64 + 5 + rel) as u64;
+        let mut d = Decoder::with_ip(64, &tramp[(t - tbase) as usize..], t, DecoderOptions::NONE);
+        let mut v = Vec::new();
+        loop {
+            let i = d.decode();
+            assert!(!i.is_invalid());
+            v.push(i);
+            if i.flow_control() == FlowControl::UnconditionalBranch {
+                return v;
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_camera_stubs() {
+        let base = 0x6000_0000u64;
+        let sites = [CAM_GATE, CAM_PASSED, CAM_IDLE, CAM_ROUTE, CAM_PITCH, CAM_YAW, CAM_MOMENTUM];
+        let mut image = vec![0x90u8; 0x71_0000];
+        for (off, b) in sites {
+            image[off..off + b.len()].copy_from_slice(b);
+        }
+        let mut tramp = vec![0u8; 0x1_0000];
+        let tbase = base + 0x80_0000;
+        let slots = {
+            let mut p = Patcher { image: &mut image, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp, tramp_used: 0, data_used: 0 };
+            patch_mouse_camera(&mut p).unwrap()
+        };
+        assert!(slots >= tbase && slots < tbase + 0x1_0000);
+        let next = |s: (usize, &[u8])| base + (s.0 + s.1.len()) as u64;
+        for site in sites {
+            let v = stub(&image, &tramp, base, tbase, site.0);
+            // The original instruction first, its bytes unchanged.
+            let first = &tramp[(v[0].ip() - tbase) as usize..][..v[0].len()];
+            assert_eq!(first, site.1, "site +{:#x}", site.0);
+            // Stack balanced: what is pushed is popped, the red zone skipped.
+            let pushes = v.iter().filter(|i| i.mnemonic() == iced_x86::Mnemonic::Push).count();
+            let pops = v.iter().filter(|i| i.mnemonic() == iced_x86::Mnemonic::Pop).count();
+            assert_eq!(pushes, pops, "site +{:#x}", site.0);
+            // Back after the replaced instruction (the route stub's first exit
+            // is the integrator; its fall-back jump follows).
+            let last = v.last().unwrap();
+            let want = if site.0 == CAM_ROUTE.0 { base + CAM_INTEGRATE } else { next(site) };
+            assert_eq!(last.near_branch_target(), want, "site +{:#x}", site.0);
+            if site.0 == CAM_ROUTE.0 {
+                let after = Decoder::with_ip(64, &tramp[(last.next_ip() - tbase) as usize..], last.next_ip(), DecoderOptions::NONE).decode();
+                assert_eq!(after.near_branch_target(), next(CAM_ROUTE));
+                let cond = v.iter().find(|i| i.flow_control() == FlowControl::ConditionalBranch).unwrap();
+                assert_eq!(cond.near_branch_target(), last.next_ip(), "route: the idle exit");
+            }
+        }
+        // The yaw site lies between a compare and the branch on it: its stub
+        // must leave the flags alone (the pitch stub too, for good measure).
+        for site in [CAM_YAW, CAM_PITCH, CAM_PASSED, CAM_IDLE] {
+            for i in stub(&image, &tramp, base, tbase, site.0) {
+                assert_eq!(i.rflags_modified(), 0, "site +{:#x}: {i} modifies flags", site.0);
+            }
+        }
+        // Pending motion takes the gate stub to the lock checks.
+        let gate = stub(&image, &tramp, base, tbase, CAM_GATE.0);
+        assert!(gate.iter().any(|i| i.flow_control() == FlowControl::ConditionalBranch && i.near_branch_target() == base + CAM_GATE_CHECKS));
+        // The pitch / yaw stubs note what they applied (+12 / +16), which the
+        // momentum stub tests and clears along with the two velocities.
+        let stores = |site: (usize, &[u8])| -> Vec<u64> {
+            stub(&image, &tramp, base, tbase, site.0).iter().filter(|i| i.mnemonic() == iced_x86::Mnemonic::Mov && i.op0_kind() == iced_x86::OpKind::Memory).map(|i| i.memory_displacement64()).collect()
+        };
+        assert_eq!(stores(CAM_PITCH), vec![12]);
+        assert_eq!(stores(CAM_YAW), vec![16]);
+        assert_eq!(stores(CAM_MOMENTUM), vec![12, 0x2530, 0x2534]);
+        // Wrong bytes at any site: nothing patched.
+        let mut image2 = vec![0x90u8; 0x71_0000];
+        for (off, b) in &sites[..6] {
+            image2[*off..*off + b.len()].copy_from_slice(b);
+        }
+        let mut tramp2 = vec![0u8; 0x1_0000];
+        let mut p = Patcher { image: &mut image2, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp2, tramp_used: 0, data_used: 0 };
+        assert!(patch_mouse_camera(&mut p).is_err());
+        assert_eq!(p.tramp_used, 0);
+        assert_eq!(p.image[CAM_GATE.0], CAM_GATE.1[0]);
     }
 }

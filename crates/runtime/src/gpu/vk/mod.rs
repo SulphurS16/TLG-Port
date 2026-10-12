@@ -8,6 +8,11 @@ use parking_lot::Mutex;
 use std::ffi::{CStr, c_char};
 use std::sync::OnceLock;
 
+/// Live `Ctx::alloc` allocations: memory handle -> (bytes, device-local,
+/// allocating source location).
+type AllocMap = std::collections::HashMap<u64, (u64, bool, &'static std::panic::Location<'static>)>;
+static ALLOCS: std::sync::LazyLock<Mutex<AllocMap>> = std::sync::LazyLock::new(|| Mutex::new(AllocMap::new()));
+
 pub struct Ctx {
     pub entry: ash::Entry,
     pub instance: ash::Instance,
@@ -39,6 +44,9 @@ pub struct Ctx {
     pub device_fault: Option<ash::ext::device_fault::Device>,
     /// VK_NV_device_diagnostic_checkpoints (TLG_GPU_DIAG=1).
     pub checkpoints: Option<ash::nv::device_diagnostic_checkpoints::Device>,
+    /// sparseBinding + sparseResidencyBuffer on the queue's family: buffers
+    /// whose memory is bound block by block (`bind_sparse`; TLG_SPARSE=0 off).
+    pub sparse: bool,
 }
 
 static CTX: OnceLock<Ctx> = OnceLock::new();
@@ -255,7 +263,13 @@ pub fn init() -> Result<(), String> {
         };
         let clip_cull = (have.shader_clip_distance != 0, have.shader_cull_distance != 0);
         let occl_precise = have.occlusion_query_precise != 0;
+        let sparse = have.sparse_binding != 0
+            && have.sparse_residency_buffer != 0
+            && instance.get_physical_device_queue_family_properties(pdev)[qf as usize].queue_flags.contains(vk::QueueFlags::SPARSE_BINDING)
+            && !std::env::var("TLG_SPARSE").is_ok_and(|v| v == "0");
         let features = vk::PhysicalDeviceFeatures::default()
+            .sparse_binding(sparse)
+            .sparse_residency_buffer(sparse)
             .occlusion_query_precise(occl_precise)
             .shader_clip_distance(clip_cull.0)
             .shader_cull_distance(clip_cull.1)
@@ -347,6 +361,7 @@ pub fn init() -> Result<(), String> {
             cond_render: cond_render.then(|| ash::ext::conditional_rendering::Device::new(&instance, &device)),
             device_fault: device_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             checkpoints: checkpoints.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
+            sparse,
             clip_cull,
             occl_precise,
             denorm_flush32,
@@ -361,7 +376,7 @@ pub fn init() -> Result<(), String> {
             device_name,
             validation,
         };
-        crate::info!("Vulkan device: {} (queue family {qf}, validation {})", ctx.device_name, validation);
+        crate::info!("Vulkan device: {} (queue family {qf}, validation {}, sparse buffers {})", ctx.device_name, validation, ctx.sparse);
         for i in 0..mem_props.memory_heap_count as usize {
             let h = mem_props.memory_heaps[i];
             let types: Vec<String> = (0..mem_props.memory_type_count as usize).filter(|&t| mem_props.memory_types[t].heap_index as usize == i).map(|t| format!("{:?}", mem_props.memory_types[t].property_flags)).collect();
@@ -415,13 +430,46 @@ impl Ctx {
             .find(|&i| bits & (1 << i) != 0 && self.mem_props.memory_types[i as usize].property_flags.contains(want))
     }
 
+    /// Allocates memory (recorded with the caller's source location for the
+    /// VRAM report; release it with `free`).
+    #[track_caller]
     pub fn alloc(&self, req: vk::MemoryRequirements, want: vk::MemoryPropertyFlags) -> Result<vk::DeviceMemory, String> {
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty);
-        unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))
+        let mem = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))?;
+        let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
+        let local = self.mem_props.memory_heaps[heap].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        ALLOCS.lock().insert(vk::Handle::as_raw(mem), (req.size, local, std::panic::Location::caller()));
+        Ok(mem)
+    }
+
+    /// Frees memory from `alloc` (or imported).
+    pub fn free(&self, mem: vk::DeviceMemory) {
+        ALLOCS.lock().remove(&vk::Handle::as_raw(mem));
+        unsafe { self.device.free_memory(mem, None) };
+    }
+
+    /// Device-local memory this process holds through `alloc`, by allocating
+    /// source location: (total bytes, [(location, bytes, allocations)]
+    /// largest first).
+    pub fn local_allocations(&self) -> (u64, Vec<(String, u64, usize)>) {
+        let mut by: std::collections::HashMap<String, (u64, usize)> = std::collections::HashMap::new();
+        let mut total = 0;
+        for &(size, local, at) in ALLOCS.lock().values() {
+            if local {
+                total += size;
+                let e = by.entry(format!("{}:{}", at.file().rsplit(['/', '\\']).next().unwrap_or("?"), at.line())).or_default();
+                e.0 += size;
+                e.1 += 1;
+            }
+        }
+        let mut v: Vec<(String, u64, usize)> = by.into_iter().map(|(k, (b, n))| (k, b, n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        (total, v)
     }
 
     /// Device-local buffer (not host-visible).
+    #[track_caller]
     pub fn device_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory), String> {
         unsafe {
             let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -477,6 +525,7 @@ impl Ctx {
     }
 
     /// Host-visible, coherent buffer (staging / per-draw data).
+    #[track_caller]
     pub fn host_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::DeviceMemory, *mut u8), String> {
         unsafe {
             let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -490,6 +539,30 @@ impl Ctx {
             let ptr = self.device.map_memory(mem, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
             Ok((buf, mem, ptr))
         }
+    }
+
+    /// A buffer whose memory is bound later block by block (`bind_sparse`):
+    /// the buffer and the block size (its memory alignment).
+    pub fn sparse_buffer(&self, size: u64, usage: vk::BufferUsageFlags) -> Result<(vk::Buffer, vk::MemoryRequirements), String> {
+        let bi = vk::BufferCreateInfo::default()
+            .size(size)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .flags(vk::BufferCreateFlags::SPARSE_BINDING | vk::BufferCreateFlags::SPARSE_RESIDENCY);
+        unsafe {
+            let buf = self.device.create_buffer(&bi, None).map_err(|e| format!("vkCreateBuffer (sparse): {e}"))?;
+            Ok((buf, self.device.get_buffer_memory_requirements(buf)))
+        }
+    }
+
+    /// Binds memory blocks into sparse buffers on the queue; `signal` is
+    /// signalled once bound (the next submission waits for it).
+    pub fn bind_sparse(&self, binds: &[(vk::Buffer, Vec<vk::SparseMemoryBind>)], signal: vk::Semaphore) -> Result<(), String> {
+        let infos: Vec<vk::SparseBufferMemoryBindInfo> = binds.iter().map(|(b, v)| vk::SparseBufferMemoryBindInfo::default().buffer(*b).binds(v)).collect();
+        let sig = [signal];
+        let bi = vk::BindSparseInfo::default().buffer_binds(&infos).signal_semaphores(&sig);
+        let q = self.queue.lock();
+        unsafe { self.device.queue_bind_sparse(*q, &[bi], vk::Fence::null()) }.map_err(|e| format!("vkQueueBindSparse: {e}"))
     }
 
     pub fn submit(&self, cmd: vk::CommandBuffer, wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
