@@ -5027,19 +5027,25 @@ impl Renderer {
         if trace_frame() {
             let res: Vec<String> = std::iter::once(&vs).chain(ps.iter()).flat_map(|p| stage_res_summary(p)).collect();
             crate::info!(
-                "FRAME draw {} n={} prim {:#x} vs {:#x} ps {:#x} rt {:?} depth {:?} ds [dctl {:#x} sctl {:#x} ref {:#x}/{:#x} rc {:#x}] blend [{:#x} mask {:#x} cc {:#x}] vp [vte {:#x} x {}/{} y {}/{} z {}/{} clip {:#x} sc {:#x}/{:#x}] res [{}]",
+                "FRAME draw {} n={} prim {:#x} vs {:#x} ps {:#x} rt {:?} depth {:?} ds [dctl {:#x} sctl {:#x} ref {:#x}/{:#x} rc {:#x} su {:#x} bias {}/{}/{}/{} dbfmt {:#x}] blend [{:#x} mask {:#x} cc {:#x}] vp [vte {:#x} x {}/{} y {}/{} z {}/{} clip {:#x} sc {:#x}/{:#x}] res [{}]",
                 kind,
                 count,
                 prim,
                 vs.addr,
                 ps.as_ref().map(|p| p.addr).unwrap_or(0),
                 colors.iter().map(|c| c.map(|a| format!("{:#x}:{}x{}:{:?}{}", a.key.base, a.key.width, a.key.height, a.view_format, if a.key.layers > 1 { format!(":layer {}/{}", a.layer, a.key.layers) } else { String::new() }))).collect::<Vec<_>>(),
-                depth.map(|d| format!("{:#x}", d.key.base)),
+                depth.map(|d| format!("{:#x} {}x{} {:?}", d.key.base, d.key.width, d.key.height, d.key.format)),
                 regs.ctx(0xA200),
                 regs.ctx(0xA10B),
                 regs.ctx(0xA10C),
                 regs.ctx(0xA10D),
                 regs.ctx(0xA000),
+                regs.ctx(0xA205),
+                f32r(regs.ctx(0xA2DF)),
+                f32r(regs.ctx(0xA2E0)),
+                f32r(regs.ctx(0xA2E1)),
+                f32r(regs.ctx(0xA2E3)),
+                regs.ctx(0xA2DE),
                 regs.ctx(0xA1E0),
                 regs.ctx(0xA08E),
                 regs.ctx(0xA202),
@@ -8192,7 +8198,7 @@ fn res_summary(r: &ResolvedRes) -> String {
             let sel: String = (0..4).map(|c| ['0', '1', '?', '?', 'r', 'g', 'b', 'a'][((t.dst_sel >> (c * 3)) & 7) as usize]).collect();
             format!("T#{:#x} {}x{}x{} f{}/{} t{} ty{} arr{}..{} d{} lv{}..{} sel {}", t.base, t.width, t.height, t.layers(), t.dfmt, t.nfmt, t.tiling_index, t.ty, t.base_array, t.last_array, t.depth, t.base_level, t.last_level, sel)
         }
-        ResolvedRes::Sampler(_) => "S#".into(),
+        ResolvedRes::Sampler(s) => format!("S#[{:08x} {:08x} {:08x} {:08x}] cmp {}", s.0[0], s.0[1], s.0[2], s.0[3], s.compare_func()),
     }
 }
 
