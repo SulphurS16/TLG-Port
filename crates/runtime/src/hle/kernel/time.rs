@@ -22,6 +22,16 @@ pub fn init() {
     // round up to the 15.6 ms default tick.
     let r = unsafe { windows_sys::Win32::Media::timeBeginPeriod(1) };
     crate::info!("timeBeginPeriod(1) -> {r}");
+    // Windows 11 may ignore that request and run the process in its
+    // efficiency mode (EcoQoS) while no window of it is visible (headless
+    // runs, a minimized game): this process opts out of both
+    // (TLG_POWER_THROTTLING=1 keeps the system's choice).
+    if std::env::var("TLG_POWER_THROTTLING").map_or(true, |v| v != "1") {
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, ProcessPowerThrottling, SetProcessInformation, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED, PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, PROCESS_POWER_THROTTLING_STATE};
+        let st = PROCESS_POWER_THROTTLING_STATE { Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION, ControlMask: PROCESS_POWER_THROTTLING_EXECUTION_SPEED | PROCESS_POWER_THROTTLING_IGNORE_TIMER_RESOLUTION, StateMask: 0 };
+        let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st as *const _ as *const core::ffi::c_void, std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) };
+        crate::info!("power throttling opt-out (execution speed, timer resolution) -> {ok}");
+    }
     CLOCK.get_or_init(|| {
         let t0 = Instant::now();
         let c0 = unsafe { core::arch::x86_64::_rdtsc() };

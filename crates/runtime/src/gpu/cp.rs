@@ -755,6 +755,7 @@ impl CommandProcessor {
                                 let a = if one_addr { addr } else { addr + i as u64 * 4 };
                                 unsafe { std::ptr::write_volatile(a as *mut u32, v) };
                             }
+                            super::render::labels_changed();
                         } else {
                             crate::error!("{}: WRITE_DATA to invalid address {:#x}", self.name, addr);
                         }
@@ -1282,13 +1283,17 @@ impl CommandProcessor {
             }
         }
         let poll = Poll { queue: self.queue, func, reference, before: unsafe { rd(addr) }, addr, start, polled: std::cell::Cell::new(false) };
+        let mut seen = super::render::label_gen();
         while !test(unsafe { rd(addr) }) {
             poll.polled.set(true);
             spins += 1;
             if spins < 64 {
                 std::hint::spin_loop();
             } else {
-                std::thread::sleep(Duration::from_micros(100));
+                // Until a batch is submitted or completes or a CP writes
+                // memory; the title's CPU writes are polled for every 100 us.
+                super::render::wait_labels(seen, Duration::from_micros(100));
+                seen = super::render::label_gen();
                 // Another queue may meanwhile have recorded the end-of-pipe
                 // write that satisfies the wait: met in GPU order from then
                 // on (as above), without waiting for that work to execute.
@@ -1334,6 +1339,7 @@ impl CommandProcessor {
                 } else {
                     sem.fetch_add(1, Ordering::SeqCst);
                 }
+                super::render::labels_changed();
             }
             7 => {
                 // Our own queued end-of-pipe work may be what signals it.
@@ -1342,13 +1348,15 @@ impl CommandProcessor {
                 }
                 let start = Instant::now();
                 let mut warned = false;
+                let mut seen = super::render::label_gen();
                 loop {
                     let v = sem.load(Ordering::SeqCst);
                     if v != 0 && sem.compare_exchange(v, v - 1, Ordering::SeqCst, Ordering::SeqCst).is_ok() {
                         break;
                     }
                     if v == 0 {
-                        std::thread::sleep(Duration::from_micros(100));
+                        super::render::wait_labels(seen, Duration::from_micros(100));
+                        seen = super::render::label_gen();
                     }
                     if !warned && start.elapsed() > Duration::from_millis(250) {
                         warned = true;

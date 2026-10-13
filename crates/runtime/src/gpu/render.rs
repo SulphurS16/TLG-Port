@@ -775,6 +775,71 @@ fn push_completion(mut c: Completion) {
     c.cpu_span = spans.reduce(|x, y| (x.0.min(y.0), x.1.max(y.1)));
     COMPLETIONS.lock().push_back(std::sync::Arc::new(c));
     COMPLETIONS_CV.notify_one();
+    // (Its end-of-pipe writes now meet waits in GPU order: `pending_label_value`.)
+    labels_changed();
+}
+
+/// Generation of the memory that command-processor waits poll: bumped when a
+/// batch is submitted (its end-of-pipe writes become pending values) or
+/// completes (they and its write-backs land), and when a CP writes memory.
+/// WAIT_REG_MEM and MEM_SEMAPHORE waits sleep until it changes or a poll
+/// interval passes, on a per-thread event and high-resolution timer (each
+/// `thread::sleep` of the old 100 us polls created and closed a timer: ~12%
+/// of the graphics CP in the cave).
+static LABEL_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Events of the threads blocked in `wait_labels`.
+static LABEL_WAITERS: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+
+pub fn labels_changed() {
+    LABEL_GEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    for &e in LABEL_WAITERS.lock().iter() {
+        unsafe { windows_sys::Win32::System::Threading::SetEvent(e as _) };
+    }
+}
+
+/// The current generation (read before testing a wait's condition).
+pub fn label_gen() -> u64 {
+    LABEL_GEN.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Waits until the generation moves past `seen`, at most `timeout` (memory
+/// the title's CPU threads write is only seen by polling).
+pub fn wait_labels(seen: u64, timeout: std::time::Duration) {
+    use windows_sys::Win32::System::Threading::*;
+    if crate::tune::get(crate::tune::CP_WAIT_NOTIFY) == 0 {
+        std::thread::sleep(std::time::Duration::from_micros(100));
+        return;
+    }
+    thread_local! {
+        // (Auto-reset event, synchronization timer; kept for the thread's life.)
+        static HANDLES: (usize, usize) = unsafe {
+            let ev = CreateEventW(std::ptr::null(), 0, 0, std::ptr::null());
+            let tm = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+            (ev as usize, tm as usize)
+        };
+    }
+    HANDLES.with(|&(ev, tm)| {
+        if ev == 0 || tm == 0 {
+            std::thread::sleep(timeout);
+            return;
+        }
+        LABEL_WAITERS.lock().push(ev);
+        if label_gen() == seen {
+            // (Relative due time in 100 ns units.)
+            let due = -((timeout.as_nanos() / 100).max(1) as i64);
+            unsafe {
+                SetWaitableTimer(tm as _, &due, 0, None, std::ptr::null(), 0);
+                let hs = [ev as _, tm as _];
+                WaitForMultipleObjects(2, hs.as_ptr(), 0, INFINITE);
+            }
+        }
+        let mut w = LABEL_WAITERS.lock();
+        if let Some(i) = w.iter().position(|&x| x == ev) {
+            w.swap_remove(i);
+        }
+        // (An event set after this returns makes the next wait return at
+        // once: one extra test.)
+    });
 }
 
 /// Waits for submitted batches, then performs their buffer write-backs and
@@ -884,6 +949,7 @@ fn completion_thread() {
         for a in &c.actions {
             a.perform();
         }
+        labels_changed();
         COMPLETIONS.lock().pop_front();
         *DONE.lock() = c.seq;
         DONE_CV.notify_all();

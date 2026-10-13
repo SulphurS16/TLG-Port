@@ -131,7 +131,12 @@ pub const VCACHE_GPU_READS: usize = 25;
 /// (`TLG_LAZY_WB`, 1; 0 writes everything back after each batch).
 pub const LAZY_WB: usize = 26;
 
-const TABLE: [(&str, &str, i64); 27] = [
+/// CP waits (WAIT_REG_MEM, MEM_SEMAPHORE) sleep until submissions,
+/// completions or CP writes change memory (`TLG_CP_WAIT_NOTIFY`, 1; 0 polls
+/// with 100 us sleeps).
+pub const CP_WAIT_NOTIFY: usize = 27;
+
+const TABLE: [(&str, &str, i64); 28] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -159,6 +164,7 @@ const TABLE: [(&str, &str, i64); 27] = [
     ("vcache_write_min_kib", "TLG_VCACHE_WRITE_MIN_KIB", 64),
     ("vcache_gpu_reads", "TLG_VCACHE_GPU_READS", 0),
     ("lazy_wb", "TLG_LAZY_WB", 1),
+    ("cp_wait_notify", "TLG_CP_WAIT_NOTIFY", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
