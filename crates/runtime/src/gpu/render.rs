@@ -233,6 +233,8 @@ const SLOTS: usize = 6;
 
 struct Slot {
     cmd: vk::CommandBuffer,
+    /// The batch's prologue (`Renderer::prologue_cmd`), submitted before `cmd`.
+    pro: vk::CommandBuffer,
     fence: vk::Fence,
     desc_pool: vk::DescriptorPool,
     /// Timestamp queries of the batch (TLG_GPU_PROFILE; null otherwise).
@@ -320,6 +322,9 @@ struct VWindow {
     stamp: Vec<u64>,
     /// Frame of the last binding served (released under VRAM pressure).
     last_used: u64,
+    /// Changes whenever pages of the window stop being current (unique
+    /// across windows: `Renderer::vgen`), for `Renderer::vbind`.
+    wgen: u64,
     /// Sparse windows (`Ctx::sparse`): `mem` is null, memory is bound block
     /// by block on first use, so a window costs what has been bound of it.
     sparse: Option<SparseMem>,
@@ -440,6 +445,11 @@ const EVICT_AGE: [u64; 4] = [5400, 600, 120, 30];
 const SMALL_IMAGE_BYTES: u64 = 64 << 10;
 const SMALL_IMAGE_AGE: u64 = 600;
 const SMALL_PER_PASS: usize = 256;
+/// Small images kept for reuse at most (`Renderer::image_pool`).
+const IMAGE_POOL_MAX: usize = 512;
+/// Image bounds (`Renderer::img_bases`) up to this are "near": a buffer
+/// write is checked against them within this distance.
+const IMG_NEAR_BYTES: u64 = 4 << 20;
 
 /// Without VRAM pressure (levels 0 and 1), a housekeeping pass evicts at
 /// most this many images / bytes (the oldest first) and destroys at most
@@ -477,10 +487,25 @@ fn evictable(k: &ImageKey, i: &Image) -> bool {
     (!i.gpu_written || is_shadow(k)) && !i.guest_stale
 }
 
+/// An indirect draw recorded with GPU-read arguments: their device copy
+/// (buffer, offset), indexed (5 dwords) or not (4), the vertex stage's SGPR
+/// data dwords that receive the base vertex and start instance, and the
+/// index buffer's size in indices.
+struct IndirectDraw {
+    buf: vk::Buffer,
+    off: u64,
+    indexed: bool,
+    vtx: Option<u32>,
+    inst: Option<u32>,
+    indices: u32,
+}
+
 /// Vulkan objects released by the caches, destroyed once the batches that
 /// may use them have completed.
 enum Retired {
     Image(vk::Image, vk::DeviceMemory, Vec<vk::ImageView>),
+    /// A small evicted image for the pool once the GPU is done with it.
+    Pooled(ImageKey, resources::PooledImage),
     Buffer(vk::Buffer, vk::DeviceMemory),
     /// A mirror window: its buffer, whole memory (null when sparse), the
     /// sparse blocks bound to it (back to the pool).
@@ -864,6 +889,8 @@ pub fn wait_labels(seen: u64, timeout: std::time::Duration) {
             let tm = CreateWaitableTimerExW(std::ptr::null(), std::ptr::null(), CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
             (ev as usize, tm as usize)
         };
+        // When the armed timer fires (None: not armed, or it fired).
+        static TIMER_DUE: std::cell::Cell<Option<std::time::Instant>> = const { std::cell::Cell::new(None) };
     }
     HANDLES.with(|&(ev, tm)| {
         if ev == 0 || tm == 0 {
@@ -872,12 +899,22 @@ pub fn wait_labels(seen: u64, timeout: std::time::Duration) {
         }
         LABEL_WAITERS.lock().push(ev);
         if label_gen() == seen {
-            // (Relative due time in 100 ns units.)
-            let due = -((timeout.as_nanos() / 100).max(1) as i64);
+            // A timer still armed by an earlier wait that a label change
+            // ended fires within the poll interval anyway: kept rather than
+            // re-armed per wake-up (`tune wait_timer_keep`).
+            let now = std::time::Instant::now();
+            let keep = crate::tune::get(crate::tune::WAIT_TIMER_KEEP) != 0 && TIMER_DUE.get().is_some_and(|t| t > now);
             unsafe {
-                SetWaitableTimer(tm as _, &due, 0, None, std::ptr::null(), 0);
+                if !keep {
+                    // (Relative due time in 100 ns units.)
+                    let due = -((timeout.as_nanos() / 100).max(1) as i64);
+                    SetWaitableTimer(tm as _, &due, 0, None, std::ptr::null(), 0);
+                    TIMER_DUE.set(Some(now + timeout));
+                }
                 let hs = [ev as _, tm as _];
-                WaitForMultipleObjects(2, hs.as_ptr(), 0, INFINITE);
+                if WaitForMultipleObjects(2, hs.as_ptr(), 0, INFINITE) == windows_sys::Win32::Foundation::WAIT_OBJECT_0 + 1 {
+                    TIMER_DUE.set(None);
+                }
             }
         }
         let mut w = LABEL_WAITERS.lock();
@@ -932,9 +969,17 @@ fn completion_thread() {
         {
             // (Write-backs of mirror-resident data are forgotten by the write
             // watch together with their copy: see `mem::WRITE_WATCH_LOCK`.)
-            let _ww = (!c.mirror_writes.is_empty() || c.wb_bits.iter().any(|b| b.is_some())).then(|| crate::mem::WRITE_WATCH_LOCK.lock());
+            let mut ww = (!c.mirror_writes.is_empty() || c.wb_bits.iter().any(|b| b.is_some())).then(|| crate::mem::WRITE_WATCH_LOCK.lock());
             let probe = super::wbprobe::enabled();
+            // (`tune wb_lock_bump`: waiting write-watch queries go first
+            // between entries; each entry's copy and reset stay together.)
+            let bump = crate::tune::get(crate::tune::WB_LOCK_BUMP) != 0;
             for (k, &(addr, off, size)) in c.writebacks.iter().enumerate() {
+                if bump && k > 0 {
+                    if let Some(g) = ww.as_mut() {
+                        parking_lot::MutexGuard::bump(g);
+                    }
+                }
                 if probe {
                     super::wbprobe::before_write(addr, size);
                 }
@@ -983,10 +1028,17 @@ fn completion_thread() {
                 if probe {
                     super::wbprobe::after_write(addr, size);
                 }
-                super::lazywb::after_write(addr, size, c.wb_mirror.get(k).copied().unwrap_or(false));
+                let mirror = c.wb_mirror.get(k).copied().unwrap_or(false);
+                super::lazywb::after_write(addr, size, mirror);
+                if bump && mirror {
+                    // (One of `mirror_writes`.)
+                    crate::mem::reset_write_watch(addr, size);
+                }
             }
-            for &(addr, size) in &c.mirror_writes {
-                crate::mem::reset_write_watch(addr, size);
+            if !bump {
+                for &(addr, size) in &c.mirror_writes {
+                    crate::mem::reset_write_watch(addr, size);
+                }
             }
         }
         LAST_WB_NS.store(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1321,6 +1373,9 @@ pub struct Renderer {
     /// one's guest surface size, and the largest bound.
     img_bases: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
     img_max_bytes: u64,
+    /// The images of `img_bases` whose bound exceeds IMG_NEAR_BYTES (few):
+    /// writes are checked against the others within that distance only.
+    img_bases_large: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
     /// Shader of the draw/dispatch being recorded (diagnostics); commands
     /// recorded in the current batch.
     cur_shader: u64,
@@ -1427,6 +1482,36 @@ pub struct Renderer {
     /// whether eviction ages fit the title's reuse.
     evicted_keys: FastMap<ImageKey, u64>,
     pub recreated: (u64, u64),
+    /// Evicted small images kept for reuse (`tune image_pool`), by their
+    /// creation parameters (the key with base 0), and how many there are.
+    image_pool: FastMap<ImageKey, Vec<resources::PooledImage>>,
+    image_pool_n: usize,
+    /// The indirect draw being recorded with GPU-read arguments
+    /// (`draw_indirect_gpu`), and the vertex stage's SGPR data of the draw
+    /// being recorded (buffer, offset, bytes; `write_descriptors`).
+    indirect_draw: Option<IndirectDraw>,
+    vs_sgpr: Option<(vk::Buffer, u64, u64)>,
+    /// VRAM-mirror bindings served (`tune vbind_cache`): (base, size) ->
+    /// (window, its generation then, the oldest CPU-check epoch of the
+    /// blocks, buffer, offset); and the generation counter of the windows.
+    vbind: FastMap<(u64, u64), (u64, u64, u64, vk::Buffer, u64)>,
+    vgen: u64,
+    /// The window `note_mirror_write` writes (its generation is kept).
+    vgen_keep: vk::Buffer,
+    /// The current slot's prologue is being recorded; operations put there.
+    pro_recording: bool,
+    /// Shader stages the CP prepared before taking the lock for the next
+    /// dispatch / draw (`tune prepare_unlocked`).
+    pre_cs: Option<Result<shaders::Prepared, String>>,
+    pre_draw: Option<(Result<shaders::Prepared, String>, Option<Result<shaders::Prepared, String>>)>,
+    pub pro_ops: u64,
+    /// The indirect draw kernel (set layout, layout, pipeline), its
+    /// diagnostics buffer (buffer, memory, mapping) and the rejections seen.
+    indirect_draw_pipe: Option<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline)>,
+    indirect_draw_diag: Option<(vk::Buffer, vk::DeviceMemory, usize)>,
+    indirect_draw_rejected: u32,
+    /// Images created and taken from the pool (TLG_PERF).
+    pub image_reuse: (u64, u64),
     /// How the last elided utility kernel was performed (frame traces).
     last_elide: &'static str,
     /// TLG_TRACE_DEPTH: last near fraction per depth target.
@@ -1483,7 +1568,8 @@ pub fn init() -> Result<(), String> {
             .device
             .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(c.queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
             .map_err(|e| e.to_string())?;
-        let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(SLOTS as u32)).map_err(|e| e.to_string())?;
+        // (Each slot's batch and prologue command buffers.)
+        let cmds = c.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(2 * SLOTS as u32)).map_err(|e| e.to_string())?;
         let sizes = [
             vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 32768 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLED_IMAGE, descriptor_count: 32768 },
@@ -1491,9 +1577,10 @@ pub fn init() -> Result<(), String> {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::SAMPLER, descriptor_count: 32768 },
         ];
         let mut slots = Vec::with_capacity(SLOTS);
-        for &cmd in &cmds {
+        for (i, &cmd) in cmds[..SLOTS].iter().enumerate() {
             slots.push(Slot {
                 cmd,
+                pro: cmds[SLOTS + i],
                 fence: c.device.create_fence(&vk::FenceCreateInfo::default(), None).map_err(|e| e.to_string())?,
                 desc_pool: c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(8192).pool_sizes(&sizes), None).map_err(|e| e.to_string())?,
                 queries: if gpu_profile_on() {
@@ -1615,6 +1702,7 @@ pub fn init() -> Result<(), String> {
             required_epoch: 0,
             img_bases: std::collections::BTreeMap::new(),
             img_max_bytes: 0,
+            img_bases_large: std::collections::BTreeMap::new(),
             cur_shader: 0,
             prep_shader: 0,
             prep_vs: 0,
@@ -1663,6 +1751,21 @@ pub fn init() -> Result<(), String> {
             pressure_reported: None,
             evicted_keys: FastMap::default(),
             recreated: (0, 0),
+            image_pool: FastMap::default(),
+            image_pool_n: 0,
+            indirect_draw: None,
+            vs_sgpr: None,
+            vbind: FastMap::default(),
+            vgen: 0,
+            vgen_keep: vk::Buffer::null(),
+            pro_recording: false,
+            pre_cs: None,
+            pre_draw: None,
+            pro_ops: 0,
+            indirect_draw_pipe: None,
+            indirect_draw_diag: None,
+            indirect_draw_rejected: 0,
+            image_reuse: (0, 0),
             last_elide: "",
             depth_trace: FastMap::default(),
             debug_out: None,
@@ -1756,6 +1859,9 @@ pub static NEWER_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parki
 /// Shader preparations that waited for pending GPU writes to the memory they
 /// read (reader, address, covering write) (TLG_PERF).
 pub static GUARD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
+/// Upload copies that needed forwards of pending GPU writes: (read range,
+/// reader, written range, where the write is) -> count (TLG_PERF report).
+pub static FORWARD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
 /// Fast clears left to the CPU path, by reason (`meta_clear_on_gpu`), and
 /// how often that path then waited for the GPU (TLG_PERF report).
 pub static META_DECLINES: parking_lot::Mutex<Option<HashMap<&'static str, u64>>> = parking_lot::Mutex::new(None);
@@ -1801,6 +1907,18 @@ const BITS_ARENA_BYTES: u64 = 64 << 10;
 /// Full barriers and render-pass begins recorded (TLG_PERF).
 pub static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PASS_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A full barrier in a batch prologue: orders the prologue against earlier
+/// batches and the batch after it, not commands of the batch against each
+/// other, so `BARRIERS` (the hazard-tracking generation) stays.
+fn prologue_barrier(cmd: vk::CommandBuffer) {
+    PRO_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    unsafe { ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
+}
+
+/// Prologue barriers recorded (TLG_PERF).
+pub static PRO_BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 #[track_caller]
 fn global_barrier(cmd: vk::CommandBuffer) {
@@ -2040,6 +2158,23 @@ impl Renderer {
         }
     }
 
+    /// The current batch's prologue command buffer (begun on first use,
+    /// after a barrier behind earlier batches: ring segments they read are
+    /// overwritten). It is submitted ahead of the batch with a barrier
+    /// after it: for operations writing device-ring ranges nothing used yet
+    /// from data fixed at record time (`tune prologue`).
+    fn prologue_cmd(&mut self) -> vk::CommandBuffer {
+        self.begin();
+        let pro = self.slots[self.cur].pro;
+        if !self.pro_recording {
+            unsafe { ctx().device.begin_command_buffer(pro, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok() };
+            prologue_barrier(pro);
+            self.pro_recording = true;
+        }
+        self.pro_ops += 1;
+        pro
+    }
+
     /// Orders work recorded after this point behind all work recorded before
     /// it (the next command starts with a full barrier). Across batches the
     /// batch-start barrier does this already.
@@ -2211,7 +2346,15 @@ impl Renderer {
                 c.device.cmd_write_timestamp(slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.exec, 1);
             }
             c.device.end_command_buffer(slot.cmd).ok();
-            if let Err(e) = c.submit(slot.cmd, &waits, &[], slot.fence) {
+            let r = if self.pro_recording {
+                prologue_barrier(slot.pro);
+                c.device.end_command_buffer(slot.pro).ok();
+                c.submit_cmds(&[slot.pro, slot.cmd], &waits, &[], slot.fence)
+            } else {
+                c.submit(slot.cmd, &waits, &[], slot.fence)
+            };
+            self.pro_recording = false;
+            if let Err(e) = r {
                 crate::error!("render submit: {e}");
                 if e.contains("lost") {
                     super::vk::report_device_lost();
@@ -2246,6 +2389,7 @@ impl Renderer {
             unsafe {
                 c.device.reset_fences(&[next.fence]).ok();
                 c.device.reset_command_buffer(next.cmd, vk::CommandBufferResetFlags::empty()).ok();
+                c.device.reset_command_buffer(next.pro, vk::CommandBufferResetFlags::empty()).ok();
                 c.device.reset_descriptor_pool(next.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
             }
         }
@@ -2324,6 +2468,9 @@ impl Renderer {
         };
         let bytes = (linear * k.layers.max(1) as u64 * 2).max(256 << 10);
         self.img_bases.entry(k.base).or_default().push((k, bytes));
+        if bytes > IMG_NEAR_BYTES {
+            self.img_bases_large.entry(k.base).or_default().push((k, bytes));
+        }
         self.img_max_bytes = self.img_max_bytes.max(bytes);
         self.image_bytes += img.bytes;
         self.images.insert(k, img);
@@ -2341,7 +2488,19 @@ impl Renderer {
                 crate::info!("VRAM: evicted image needed again after {gap} frames: {:#x} {}x{}x{} {:?}", key.base, key.width, key.height, key.layers, key.format);
             }
         }
-        let img = resources::create_image(key)?;
+        let pooled = if crate::tune::get(crate::tune::IMAGE_POOL) != 0 { self.image_pool.get_mut(&ImageKey { base: 0, ..key }).and_then(|v| v.pop()) } else { None };
+        let img = match pooled {
+            Some(p) => {
+                // (Same creation parameters; cleared below like a new one.)
+                self.image_pool_n -= 1;
+                self.image_reuse.1 += 1;
+                resources::reuse_image(key, p)
+            }
+            None => {
+                self.image_reuse.0 += 1;
+                resources::create_image(key)?
+            }
+        };
         if perf_on() {
             let mut g = NEW_IMAGES.lock();
             let e = g.get_or_insert_with(HashMap::new).entry((key.width, key.height, key.layers, key.levels, key.format)).or_default();
@@ -2545,6 +2704,9 @@ impl Renderer {
         if let Some(v) = self.img_bases.get_mut(&old.base) {
             v.retain(|x| x.0 != old);
         }
+        if let Some(v) = self.img_bases_large.get_mut(&old.base) {
+            v.retain(|x| x.0 != old);
+        }
         if let Some(g) = self.write_gen.remove(&old) {
             self.write_gen.insert(new, g);
         }
@@ -2648,6 +2810,17 @@ impl Renderer {
         for p in (base >> 12)..=((base + len.max(1) - 1) >> 12) {
             self.gpu_pending_pages.insert(p, seq);
         }
+    }
+
+    /// GPU work of this batch writes guest [base, base+len) in the mirror
+    /// window `buf` itself: copies elsewhere are stale (`note_pending_gpu_write`),
+    /// `buf` holds the newest data, and bindings it served stay current (its
+    /// generation is kept, `vbind`).
+    fn note_mirror_write(&mut self, buf: vk::Buffer, base: u64, len: u64) {
+        self.vgen_keep = buf;
+        self.note_pending_gpu_write(base, len);
+        self.vgen_keep = vk::Buffer::null();
+        self.vcache_validate(buf, base, len);
     }
 
     /// Before record-time reads of guest memory by shader preparation
@@ -2913,8 +3086,7 @@ impl Renderer {
         // (Every byte of the range is written.)
         self.mirror_write_back_full(base, bytes, vb, voff)?;
         self.writes.note_gpu_write(base, bytes);
-        self.note_pending_gpu_write(base, bytes);
-        self.vcache_validate(vb, base, bytes);
+        self.note_mirror_write(vb, base, bytes);
         if bytes <= SURFACE_WRITE_MAX {
             self.note_meta_write(base, bytes);
             self.note_buffer_write(base, bytes);
@@ -2949,9 +3121,14 @@ impl Renderer {
             arena_off + 4 * used
         } else {
             let bits = self.dring.alloc(words as u64 * 4).ok_or("device ring full: page bitmap")?;
-            self.end_rendering();
-            unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, 0) };
-            global_barrier(self.cmd);
+            if crate::tune::get(crate::tune::PROLOGUE) != 0 {
+                let pro = self.prologue_cmd();
+                unsafe { ctx().device.cmd_fill_buffer(pro, self.dring.buffer, bits, words as u64 * 4, 0) };
+            } else {
+                self.end_rendering();
+                unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, 0) };
+                global_barrier(self.cmd);
+            }
             bits
         };
         self.push_writeback(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: Some((bits, bits_host, words)) });
@@ -3219,8 +3396,7 @@ impl Renderer {
         unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]) };
         unordered!(self);
         self.writes.note_gpu_write(dst, bytes);
-        self.note_pending_gpu_write(dst, bytes);
-        self.vcache_validate(dbuf, dst, bytes);
+        self.note_mirror_write(dbuf, dst, bytes);
         if bytes <= SURFACE_WRITE_MAX {
             self.note_meta_write(dst, bytes);
             self.note_buffer_write(dst, bytes);
@@ -3659,6 +3835,21 @@ impl Renderer {
         if size == 0 || size > VWIN_SIZE || (size < VCACHE_MIN && !small) || crate::tune::get(crate::tune::VCACHE) == 0 {
             return None;
         }
+        // Served before, and nothing of it stopped being current since: no
+        // page invalidated in its window (CPU writes found, GPU writes
+        // elsewhere, CP writes), its blocks' CPU-write checks still count.
+        if !overwrite && crate::tune::get(crate::tune::VBIND_CACHE) != 0 {
+            if let Some(&(k, wgen, checked, buf, off)) = self.vbind.get(&(base, size)) {
+                let required = self.required_epoch;
+                if let Some(vc) = self.vcache.as_mut() {
+                    if let Some(w) = vc.windows.get_mut(&k).filter(|w| w.wgen == wgen && checked != u64::MAX && checked >= required) {
+                        w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+                        vc.hits += 1;
+                        return Some((buf, off));
+                    }
+                }
+            }
+        }
         // Windows are keyed by their start: a 256 MiB slot can hold windows
         // of separate mappings, and a window is replaced when its mapping
         // has grown past it.
@@ -3762,7 +3953,8 @@ impl Renderer {
             let pages = ((hi - lo) >> 12) as usize;
             let blocks = ((hi - lo + 0xFFFF) >> 16) as usize;
             let cost = if sparse.is_some() { 0 } else { hi - lo };
-            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, sparse };
+            self.vgen += 1;
+            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, wgen: self.vgen, sparse };
             let vc = self.vcache.get_or_insert_with(|| VCache { windows: FastMap::default(), bytes: 0, copied: 0, hits: 0 });
             vc.bytes += cost;
             vc.windows.insert(lo, w);
@@ -3847,6 +4039,8 @@ impl Renderer {
                 for (a, b) in runs {
                     bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, false);
                 }
+                self.vgen += 1;
+                w.wgen = self.vgen;
             }
             for x in i..j {
                 w.checked[x] = epoch;
@@ -3984,7 +4178,18 @@ impl Renderer {
             }
             self.mark(|| "vertex/index data to VRAM".into());
         }
-        self.vcache.as_mut().unwrap().hits += 1;
+        let vc = self.vcache.as_mut().unwrap();
+        vc.hits += 1;
+        if !overwrite {
+            if let Some(w) = vc.windows.get(&k) {
+                let (b0, b1) = (((base - w.lo) >> 16) as usize, ((base + size - 1 - w.lo) >> 16) as usize);
+                let checked = w.checked[b0..=b1].iter().copied().min().unwrap_or(u64::MAX);
+                if self.vbind.len() >= 1 << 16 {
+                    self.vbind.clear();
+                }
+                self.vbind.insert((base, size), (k, w.wgen, checked, vbuf, base - wlo));
+            }
+        }
         Some((vbuf, base - wlo))
     }
 
@@ -4064,6 +4269,11 @@ impl Renderer {
             let (a, b) = (lo.max(w.lo), hi.min(w.hi));
             if a < b {
                 bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, false);
+                // (Not the window a GPU write lands in: `note_mirror_write`.)
+                if w.buf != self.vgen_keep {
+                    self.vgen += 1;
+                    w.wgen = self.vgen;
+                }
             }
         }
     }
@@ -4593,6 +4803,18 @@ impl Renderer {
             })
             .collect();
         self.upload_forwarded = !regions.is_empty();
+        if perf_on() && !regions.is_empty() {
+            let mut g = FORWARD_SITES.lock();
+            let m = g.get_or_insert_with(HashMap::new);
+            let over = |w: u64, n: u64| w < base + size && base < w + n;
+            let shader = self.cur_shader;
+            for &(pbase, _, _, psize) in inflight.iter().filter(|e| over(e.0, e.3)) {
+                *m.entry(format!("{base:#x}+{size:#x} read by {shader:#x}: {pbase:#x}+{psize:#x} written in a batch in flight")).or_default() += 1;
+            }
+            for p in self.writebacks.iter().filter(|p| over(p.base, p.size)) {
+                *m.entry(format!("{base:#x}+{size:#x} read by {shader:#x}: {:#x}+{:#x} written in this batch ({})", p.base, p.size, if p.mirror { "mirror" } else { "device-ring copy" })).or_default() += 1;
+            }
+        }
         if !regions.is_empty() {
             // Recorded by `flush_forwards` before the copy is used: the
             // forwards of all of a draw's bindings under one barrier.
@@ -5102,10 +5324,15 @@ impl Renderer {
                                 (self.ring.buffer, off)
                             }
                         };
+                        if p.stage == Stage::Vertex {
+                            self.vs_sgpr = Some((buffer, off, bytes.len() as u64));
+                        }
                         infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer, offset: off, range: bytes.len() as u64 })));
                     }
                     BindingKind::Buffer(i) => {
                         let ResolvedRes::Buffer(v) = &p.resources[i] else { return Err("binding/resource mismatch".into()) };
+                        // (This binding is the resource's: `buffer_written` reduced.)
+                        let written = p.written_buffers.contains(&i);
                         bpath = 0;
                         if let Some(off) = tess_ring_offset(v.base) {
                             // The tessellation factor ring (HS stores).
@@ -5119,12 +5346,12 @@ impl Renderer {
                         }
                         // Read-only buffers are bound at the 16-byte-aligned
                         // address; shaders add the bias (base & 15).
-                        let bias = if buffer_written(p, i) { 0 } else { v.base & 15 };
+                        let bias = if written { 0 } else { v.base & 15 };
                         let base = v.base - bias;
                         if self.in_place(p, i, v.base, v.size().max(4)) {
                             if let Some((buf, off, range)) = self.zc_binding(base, v.size().max(4) + bias) {
                                 bpath = 1;
-                                if buffer_written(p, i) {
+                                if written {
                                     bpath = 2;
                                     // The scatter kernel's records name the
                                     // few dwords it writes in its 2 GB binding.
@@ -5144,7 +5371,7 @@ impl Renderer {
                                         }
                                     }
                                 }
-                                if !buffer_written(p, i) && range <= VCACHE_MAX {
+                                if !written && range <= VCACHE_MAX {
                                     if let Some((vb, voff)) = self.vcache_bind(base, range) {
                                         bpath = 3;
                                         infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range })));
@@ -5161,7 +5388,7 @@ impl Renderer {
                         // (Small ranges with GPU writes not in guest memory yet:
                         // from the mirror, which holds or forwards them.)
                         let gpu_pending = || self.writebacks.iter().any(|w| w.base < base + extent && base < w.base + w.size) || writeback_in_flight(base, extent);
-                        if !buffer_written(p, i) && ctx().ext_host.is_none() && (extent >= read_min || (crate::tune::get(crate::tune::VCACHE_GPU_READS) != 0 && gpu_pending())) {
+                        if !written && ctx().ext_host.is_none() && (extent >= read_min || (crate::tune::get(crate::tune::VCACHE_GPU_READS) != 0 && gpu_pending())) {
                             // Large read-only data: from the VRAM mirror
                             // (copied in once, then per CPU-written page).
                             // Unbounded V#s (pools of hundreds of MiB) are
@@ -5178,7 +5405,7 @@ impl Renderer {
                             }
                         }
                         let write_min = ((crate::tune::get(crate::tune::VCACHE_WRITE_MIN_KIB).max(0) as u64) << 10).max(4);
-                        if buffer_written(p, i) && ctx().ext_host.is_none() && (write_min..=VCACHE_MAX).contains(&extent) && base % 16 == 0 && p.scatter.is_none_or(|(_, d)| d != i) {
+                        if written && ctx().ext_host.is_none() && (write_min..=VCACHE_MAX).contains(&extent) && base % 16 == 0 && p.scatter.is_none_or(|(_, d)| d != i) {
                             // Large written data: the shader works on the VRAM
                             // mirror itself, which stays current for later
                             // commands; guest memory gets the range when the
@@ -5195,8 +5422,7 @@ impl Renderer {
                                     self.note_buffer_write(base, extent);
                                 }
                                 self.writes.note_gpu_write(base, extent);
-                                self.note_pending_gpu_write(base, extent);
-                                self.vcache_validate(vb, base, extent);
+                                self.note_mirror_write(vb, base, extent);
                                 self.end_rendering();
                                 // (A dispatch's own write: tracked as its access.)
                                 if p.stage == Stage::Compute {
@@ -5209,14 +5435,14 @@ impl Renderer {
                             }
                         }
                         let size = extent.clamp(4, 64 << 20);
-                        if !buffer_written(p, i) && crate::tune::get(crate::tune::UPLOAD_REUSE) != 0 {
+                        if !written && crate::tune::get(crate::tune::UPLOAD_REUSE) != 0 {
                             if let Some((buf, off)) = self.reused_upload(base, size) {
                                 bpath = 5;
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
                                 continue;
                             }
                         }
-                        let cause = if buffer_written(p, i) { 0 } else if bias != 0 { 1 } else { 2 };
+                        let cause = if written { 0 } else if bias != 0 { 1 } else { 2 };
                         self.upload_bytes[cause] += size;
                         if perf_on() {
                             let mut g = BUFFER_UPLOAD_SITES.lock();
@@ -5226,11 +5452,11 @@ impl Renderer {
                             }
                             *m.entry((base, size, cause == 0)).or_default() += 1;
                         }
-                        if buffer_written(p, i) && v.size() <= SURFACE_WRITE_MAX {
+                        if written && v.size() <= SURFACE_WRITE_MAX {
                             self.note_meta_write(base, size);
                             self.note_buffer_write(base, size);
                         }
-                        if buffer_written(p, i) {
+                        if written {
                             if let Some((zbuf, zoff, _)) = self.zc_binding(base, size).filter(|z| z.2 >= size) {
                                 // Guest memory -> device ring (the shader's
                                 // working copy) now and back right after the
@@ -5251,7 +5477,7 @@ impl Renderer {
                                 continue;
                             }
                         }
-                        if !buffer_written(p, i) {
+                        if !written {
                             bpath = 6;
                             let (buf, off) = self.upload_guest_ro(base, size)?;
                             self.note_upload(base, size, buf, off);
@@ -5268,13 +5494,20 @@ impl Renderer {
                         let forwarded = self.upload_forwarded;
                         self.flush_forwards();
                         let dev_off = self.dring.alloc(size).ok_or("device ring full")?;
-                        self.end_rendering();
-                        if forwarded {
-                            global_barrier(self.cmd);
-                        }
                         let region = vk::BufferCopy { src_offset: off, dst_offset: dev_off, size };
-                        unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
-                        unordered!(self);
+                        if !forwarded && crate::tune::get(crate::tune::PROLOGUE) != 0 {
+                            // (The guest data as copied now, into a range
+                            // nothing used yet: ahead of the batch.)
+                            let pro = self.prologue_cmd();
+                            unsafe { ctx().device.cmd_copy_buffer(pro, self.ring.buffer, self.dring.buffer, &[region]) };
+                        } else {
+                            self.end_rendering();
+                            if forwarded {
+                                global_barrier(self.cmd);
+                            }
+                            unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
+                            unordered!(self);
+                        }
                         self.push_writeback(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
                         self.writes.note_gpu_write(base, size);
                         self.note_pending_gpu_write(base, size);
@@ -5433,6 +5666,7 @@ impl Renderer {
     // Draw
 
     fn draw_inner(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) -> Result<(), String> {
+        let pre = self.pre_draw.take();
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
         self.drain_cp_writes();
@@ -5527,8 +5761,12 @@ impl Renderer {
             return Ok(());
         }
         let ds = tess.as_ref().map(|t| t.ds).unwrap_or_default();
-        let mut vs = shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, ds)?;
-        let mut ps = if ps_addr != 0 { Some(shaders::prepare(&StageRegs { stage: Stage::Fragment, regs })?) } else { None };
+        // (Prepared before the lock: not for tessellated draws, whose
+        // vertex stage is the domain shader.)
+        let (mut vs, mut ps) = match pre.filter(|_| tess.is_none()) {
+            Some((v, p)) => (v?, p.transpose()?),
+            None => (shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, ds)?, if ps_addr != 0 { Some(shaders::prepare(&StageRegs { stage: Stage::Fragment, regs })?) } else { None }),
+        };
         // Descriptors and scalar loads were read from guest memory just now:
         // pending GPU writes there must land first.
         self.prep_shader = ps.as_ref().map(|p| p.addr).unwrap_or(vs.addr);
@@ -5700,7 +5938,22 @@ impl Renderer {
         self.begin();
         // Uploads end any active rendering; record them first.
         phase!(4);
-        let (set, wb_before) = self.descriptors_with_retry(set_layout, &stages)?;
+        self.vs_sgpr = None;
+        let (mut set, mut wb_before) = self.descriptors_with_retry(set_layout, &stages)?;
+        // GPU-read indirect arguments: the kernel's descriptor set from this
+        // batch's pool, as the draw's (a full pool starts a new batch: the
+        // draw's descriptors are written again in it).
+        let mut fixup_set = None;
+        if self.indirect_draw.is_some() {
+            let (fl, _, _) = self.indirect_draw_pipe()?;
+            let batch = self.batch;
+            let mut fs = self.alloc_set(fl)?;
+            if self.batch != batch {
+                (set, wb_before) = self.descriptors_with_retry(set_layout, &stages)?;
+                fs = self.alloc_set(fl)?;
+            }
+            fixup_set = Some(fs);
+        }
         phase!(5);
         // Index data.
         let mut indexed = None;
@@ -5760,6 +6013,12 @@ impl Renderer {
         }
         // The ring copies' forwards (descriptors, index data), then the pass.
         self.flush_forwards();
+        // GPU-read indirect arguments: the draw command and the vertex
+        // stage's offsets prepared on the GPU, outside the pass.
+        let indirect_slot = match (self.indirect_draw.take(), fixup_set) {
+            (Some(d), Some(fs)) => Some(self.indirect_draw_fixup(&d, fs, regs.ctx(0xA102))?),
+            _ => None,
+        };
         // Begin rendering if attachments changed.
         let same = self.rendering.as_ref().is_some_and(|r| r.colors[..] == colors[..] && r.depth == depth);
         if !same {
@@ -5832,10 +6091,18 @@ impl Renderer {
                 _ if tess.is_some() => c.device.cmd_draw(cmd, tess.as_ref().map_or(0, |t| t.patches), 1, 0, 0),
                 Some((buf, off, ty)) => {
                     c.device.cmd_bind_index_buffer(cmd, buf, off, ty);
-                    let base_vertex = regs.ctx(0xA102) as i32;
-                    c.device.cmd_draw_indexed(cmd, count, instances, 0, base_vertex, 0);
+                    match indirect_slot {
+                        Some(slot) => c.device.cmd_draw_indexed_indirect(cmd, self.dring.buffer, slot, 1, 20),
+                        None => {
+                            let base_vertex = regs.ctx(0xA102) as i32;
+                            c.device.cmd_draw_indexed(cmd, count, instances, 0, base_vertex, 0);
+                        }
+                    }
                 }
-                None => c.device.cmd_draw(cmd, count, instances, 0, 0),
+                None => match indirect_slot {
+                    Some(slot) => c.device.cmd_draw_indirect(cmd, self.dring.buffer, slot, 1, 16),
+                    None => c.device.cmd_draw(cmd, count, instances, 0, 0),
+                },
             }
         }
         phase!(7);
@@ -6565,6 +6832,7 @@ impl Renderer {
     /// Ok(false): the indirect form is not possible for this dispatch (the
     /// caller then waits for its arguments and dispatches directly).
     fn dispatch_inner(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32, indirect: Option<u64>) -> Result<bool, String> {
+        let pre = self.pre_cs.take();
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
         self.drain_cp_writes();
@@ -6585,7 +6853,10 @@ impl Renderer {
         self.gpu_wb.clear();
         self.set_required_epoch(cp.queue != 0);
         let tp = std::time::Instant::now();
-        let mut cs = shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs })?;
+        let mut cs = match pre {
+            Some(p) => p?,
+            None => shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs })?,
+        };
         self.prep_shader = cs.addr;
         self.prep_vs = 0;
         for _ in 0..3 {
@@ -6767,7 +7038,11 @@ impl Renderer {
     /// of a rendered image: guest memory is now newer than the image.
     /// (Callers skip bindings larger than SURFACE_WRITE_MAX.)
     fn note_buffer_write(&mut self, base: u64, size: u64) {
-        for (k, _) in self.img_bases.range(base.saturating_sub(self.img_max_bytes)..base + size).flat_map(|(_, ks)| ks.iter()).filter(|(k, bound)| k.base + bound > base) {
+        // (Images starting up to IMG_NEAR_BYTES below the write, and the
+        // large ones further below; one found twice is marked twice.)
+        let near = self.img_bases.range(base.saturating_sub(self.img_max_bytes.min(IMG_NEAR_BYTES))..base + size);
+        let far = self.img_bases_large.range(base.saturating_sub(self.img_max_bytes)..base + size);
+        for (k, _) in near.chain(far).flat_map(|(_, ks)| ks.iter()).filter(|(k, bound)| k.base + bound > base) {
             let Some(img) = self.images.get_mut(k) else { continue };
             if !img.gpu_written || k.ty3d {
                 continue;
@@ -7263,6 +7538,125 @@ impl Renderer {
         Ok(Some(slot))
     }
 
+    fn indirect_draw_pipe(&mut self) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline), String> {
+        if let Some(p) = self.indirect_draw_pipe {
+            return Ok(p);
+        }
+        let c = ctx();
+        let (dbuf, dmem, dptr) = c.host_buffer(16, vk::BufferUsageFlags::STORAGE_BUFFER)?;
+        unsafe { std::ptr::write_bytes(dptr, 0, 16) };
+        self.indirect_draw_diag = Some((dbuf, dmem, dptr as usize));
+        let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..4)
+            .map(|i| vk::DescriptorSetLayoutBinding::default().binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
+            .collect();
+        let set_layout = unsafe { c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }.map_err(|e| e.to_string())?;
+        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 32 }];
+        let sls = [set_layout];
+        let layout = unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sls).push_constant_ranges(&pcr), None) }.map_err(|e| e.to_string())?;
+        let m = self.module(0x494E_4452_4157_0000, &gcn::translate::kernels::indirect_draw_cs())?;
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main");
+        let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+        let pipeline = unsafe { c.device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None) }.map_err(|(_, e)| format!("indirect draw pipeline: {e}"))?[0];
+        self.indirect_draw_pipe = Some((set_layout, layout, pipeline));
+        Ok((set_layout, layout, pipeline))
+    }
+
+    /// An indirect draw whose arguments at guest `addr` earlier GPU work is
+    /// still writing (this batch's write-backs, batches in flight): recorded
+    /// with the arguments read on the GPU from that work's device copy
+    /// (`kernels::indirect_draw_cs` turns them into the Vulkan command and
+    /// the vertex stage's offsets, see `indirect_draw_fixup`) instead of the
+    /// CP waiting for them to land in guest memory. False (nothing recorded)
+    /// when the arguments are not pending on the GPU (the CP reads them
+    /// without waiting) or the draw needs the CP's path: tessellation, rect
+    /// lists, offsets in registers outside the vertex stage's user data, no
+    /// device copy covering the arguments.
+    fn draw_indirect_gpu(&mut self, cp: &CommandProcessor, addr: u64, indexed: bool, vtx_loc: u32, inst_loc: u32) -> Result<bool, String> {
+        let len = if indexed { 20 } else { 16 };
+        if !self.pending_write_overlaps(addr, len) && !writeback_in_flight(addr, len) {
+            return Ok(false);
+        }
+        let prim = cp.regs.uconfig[(0xC242 - 0xC000) as usize];
+        if !matches!(prim, 1..=6) {
+            return Ok(false);
+        }
+        // SPI_SHADER_USER_DATA_VS_0..15 (SH offsets 0x4C..0x5B): the vertex
+        // stage's user SGPRs, dwords 0..15 of its SGPR data.
+        let user = |loc: u32| match loc {
+            0 => Some(None),
+            0x4C..=0x5B => Some(Some(loc - 0x4C)),
+            _ => None,
+        };
+        let (Some(vtx), Some(inst)) = (user(vtx_loc), user(inst_loc)) else { return Ok(false) };
+        let isz = if cp.index_type == 1 { 4 } else { 2 };
+        // (The index binding covers the whole index buffer: small ones only.)
+        if indexed && (cp.index_size == 0 || cp.index_size as u64 * isz > 1 << 20 || cp.index_base % isz != 0) {
+            return Ok(false);
+        }
+        let Some((buf, off)) = self.device_copy_of(addr, len) else { return Ok(false) };
+        if off % 4 != 0 {
+            return Ok(false);
+        }
+        self.indirect_draw = Some(IndirectDraw { buf, off, indexed, vtx, inst, indices: cp.index_size });
+        // (The index binding covers the whole index buffer.)
+        let r = self.draw_inner(cp, if indexed { "index2" } else { "auto" }, if indexed { cp.index_size } else { 0 }, cp.index_base);
+        self.indirect_draw = None;
+        r.map(|_| true)
+    }
+
+    /// Records the indirect draw kernel for `d` (after the work that wrote
+    /// the arguments, before the pass): the Vulkan draw command goes to a
+    /// device-ring slot (returned), the base vertex / start instance into the
+    /// vertex stage's SGPR data. `vofs`: VGT_INDX_OFFSET (the vertex offset
+    /// of indexed draws).
+    fn indirect_draw_fixup(&mut self, d: &IndirectDraw, set: vk::DescriptorSet, vofs: u32) -> Result<u64, String> {
+        let c = ctx();
+        // Rejections since the last look (the kernel counts them).
+        if let Some((_, _, p)) = self.indirect_draw_diag {
+            let r = |i: usize| unsafe { std::ptr::read_volatile((p as *const u32).add(i)) };
+            let n = r(0);
+            if n != self.indirect_draw_rejected {
+                if n <= 16 || n.is_power_of_two() {
+                    crate::error!("indirect draws: {n} with implausible arguments or past their index buffer drawn as nothing on the GPU so far (last count {} instances {} start {})", r(1), r(2), r(3));
+                }
+                self.indirect_draw_rejected = n;
+            }
+        }
+        let (_, layout, pipeline) = self.indirect_draw_pipe()?;
+        let Some((diag, _, _)) = self.indirect_draw_diag else { return Err("indirect draw diagnostics missing".into()) };
+        let Some((sbuf, soff, slen)) = self.vs_sgpr else { return Err("indirect draw without vertex stage SGPR data".into()) };
+        let align = c.limits.min_storage_buffer_offset_alignment.max(16);
+        let len = if d.indexed { 20 } else { 16 };
+        let at = d.off & !(align - 1);
+        // (The user dwords are the SGPR data's first 16.)
+        let field = |k: Option<u32>| k.filter(|&k| (k as u64 + 1) * 4 <= slen).unwrap_or(u32::MAX);
+        let Some(slot) = self.dring.alloc(20) else { return Err("device ring full: indirect draw command".into()) };
+        let infos = [
+            vk::DescriptorBufferInfo { buffer: d.buf, offset: at, range: d.off + len - at },
+            vk::DescriptorBufferInfo { buffer: self.dring.buffer, offset: slot, range: 20 },
+            vk::DescriptorBufferInfo { buffer: sbuf, offset: soff, range: slen },
+            vk::DescriptorBufferInfo { buffer: diag, offset: 0, range: 16 },
+        ];
+        let writes: Vec<vk::WriteDescriptorSet> = (0..4)
+            .map(|i| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(std::slice::from_ref(&infos[i])))
+            .collect();
+        let pc = [((d.off - at) / 4) as u32, d.indexed as u32, field(d.vtx), field(d.inst), d.indices, 1 << 26, 1 << 20, vofs];
+        let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.end_rendering();
+        // (After the writers of the arguments; before the draw's reads.)
+        global_barrier(self.cmd);
+        unsafe {
+            c.device.update_descriptor_sets(&writes, &[]);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            c.device.cmd_dispatch(self.cmd, 1, 1, 1);
+        }
+        global_barrier(self.cmd);
+        self.mark(|| "indirect draw arguments".into());
+        Ok(slot)
+    }
+
     /// Where the newest GPU-written copy of guest [addr, addr+len) is on the
     /// device while it has not reached guest memory: a write-back of this
     /// batch or of a batch in flight (device ring segments stay intact until
@@ -7442,8 +7836,7 @@ impl Renderer {
             // the one written back stays the current copy.)
             self.mirror_write_back_full(key.base, total, zbuf, zoff)?;
             self.writes.note_gpu_write(key.base, total);
-            self.note_pending_gpu_write(key.base, total);
-            self.vcache_validate(zbuf, key.base, total);
+            self.note_mirror_write(zbuf, key.base, total);
         }
         unordered!(self);
         self.mark(|| if tile { "render target tiling (GPU)".into() } else { "render target detiling (GPU)".into() });
@@ -7874,8 +8267,7 @@ impl Renderer {
             // page), current for later readers of the mirror.
             self.mirror_write_back_full(base, span, zbuf, zoff)?;
             self.writes.note_gpu_write(base, span);
-            self.note_pending_gpu_write(base, span);
-            self.vcache_validate(zbuf, base, span);
+            self.note_mirror_write(zbuf, base, span);
         } else {
             // The expanded state lands in place (when a clear applied); the
             // probe read the metadata in place.
@@ -7991,6 +8383,7 @@ impl Renderer {
             let c = ctx();
             let mut budget = if self.pressure >= 2 { usize::MAX } else { RETIRE_PER_PASS };
             let mut blocks = Vec::new();
+            let mut pooled: Vec<(ImageKey, resources::PooledImage)> = Vec::new();
             self.retired.retain_mut(|(s, r)| {
                 if *s > done || budget == 0 {
                     return true;
@@ -8019,12 +8412,23 @@ impl Renderer {
                         Retired::Set(pool, set) => {
                             c.device.free_descriptor_sets(*pool, &[*set]).ok();
                         }
+                        Retired::Pooled(k, p) => {
+                            pooled.push((*k, std::mem::take(p)));
+                        }
                     }
                 }
                 false
             });
             if let Some(p) = self.sparse_pool.as_mut() {
                 p.give(blocks);
+            }
+            for (k, p) in pooled {
+                if self.image_pool_n < IMAGE_POOL_MAX && self.pressure < 2 {
+                    self.image_pool.entry(k).or_default().push(p);
+                    self.image_pool_n += 1;
+                } else {
+                    p.destroy();
+                }
             }
         }
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -8034,6 +8438,13 @@ impl Renderer {
         self.next_trim = frame + 30;
         let (usage, budget) = ctx().vram().unwrap_or((0, 0));
         self.pressure = vram_pressure(usage, budget);
+        if self.pressure >= 2 && self.image_pool_n > 0 {
+            // (Pooled images are idle: the GPU finished with them.)
+            for (_, v) in self.image_pool.drain() {
+                v.into_iter().for_each(resources::PooledImage::destroy);
+            }
+            self.image_pool_n = 0;
+        }
         let age = EVICT_AGE[self.pressure as usize];
         // (Not recording: every command using these has been submitted.)
         let seq = self.last_seq;
@@ -8099,6 +8510,12 @@ impl Renderer {
                     self.img_bases.remove(&k.base);
                 }
             }
+            if let Some(v) = self.img_bases_large.get_mut(&k.base) {
+                v.retain(|x| x.0 != *k);
+                if v.is_empty() {
+                    self.img_bases_large.remove(&k.base);
+                }
+            }
             self.write_gen.remove(k);
             if self.evicted_keys.len() >= 1 << 16 {
                 self.evicted_keys.clear();
@@ -8106,7 +8523,11 @@ impl Renderer {
             self.evicted_keys.insert(*k, frame);
             freed += img.bytes;
             self.image_bytes -= img.bytes;
-            self.retired.push((seq, Retired::Image(img.image, img.memory, img.views.values().copied().collect())));
+            if img.bytes <= SMALL_IMAGE_BYTES && crate::tune::get(crate::tune::IMAGE_POOL) != 0 {
+                self.retired.push((seq, Retired::Pooled(ImageKey { base: 0, ..*k }, resources::PooledImage::of(img))));
+            } else {
+                self.retired.push((seq, Retired::Image(img.image, img.memory, img.views.values().copied().collect())));
+            }
         }
         if !victims.is_empty() {
             let gone: std::collections::HashSet<ImageKey> = victims.iter().copied().collect();
@@ -8558,7 +8979,7 @@ pub static QUEUE_WAIT_REG_NS: [std::sync::atomic::AtomicU64; 64] = [const { std:
 
 /// The renderer lock taken for queue `q`, timed (see `QUEUE_LOCK_WAIT_NS`).
 struct TimedRenderer {
-    g: parking_lot::MutexGuard<'static, Option<Renderer>>,
+    g: std::mem::ManuallyDrop<parking_lot::MutexGuard<'static, Option<Renderer>>>,
     q: usize,
     since: std::time::Instant,
 }
@@ -8569,13 +8990,21 @@ impl TimedRenderer {
         let g = RENDERER.lock();
         let since = std::time::Instant::now();
         QUEUE_LOCK_WAIT_NS[q & 63].fetch_add((since - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-        TimedRenderer { g, q, since }
+        TimedRenderer { g: std::mem::ManuallyDrop::new(g), q, since }
     }
 }
 
 impl Drop for TimedRenderer {
     fn drop(&mut self) {
         QUEUE_LOCK_HOLD_NS[self.q & 63].fetch_add(self.since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        // SAFETY: `g` is not used after this.
+        let g = unsafe { std::mem::ManuallyDrop::take(&mut self.g) };
+        // (`tune lock_fair`: the graphics CP lets a waiting compute CP in.)
+        if self.q == 0 && crate::tune::get(crate::tune::LOCK_FAIR) != 0 {
+            parking_lot::MutexGuard::unlock_fair(g);
+        } else {
+            drop(g);
+        }
     }
 }
 
@@ -8594,8 +9023,19 @@ impl std::ops::DerefMut for TimedRenderer {
 
 impl Hooks for VkHooks {
     fn draw(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) {
+        // Shader preparation reads registers and guest memory only: before
+        // the lock (its reads are checked under it). Not for patches.
+        let prim = cp.regs.uconfig[(0xC242 - 0xC000) as usize];
+        let pre = (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0 && prim != 9).then(|| {
+            let regs = &cp.regs;
+            let ps_addr = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64) << 32)) << 8;
+            let vs = shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, Default::default());
+            let ps = (ps_addr != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Fragment, regs }));
+            (vs, ps)
+        });
         let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return self.fallback.draw(cp, kind, count, index_addr) };
+        r.pre_draw = pre;
         if let Err(e) = r.draw_inner(cp, kind, count, index_addr) {
             r.skipped += 1;
             r.report(format!("draw skipped: {e}"));
@@ -8603,8 +9043,10 @@ impl Hooks for VkHooks {
         r.maybe_submit();
     }
     fn dispatch(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32) {
+        let pre = (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs }));
         let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return self.fallback.dispatch(cp, x, y, z) };
+        r.pre_cs = pre;
         if let Err(e) = r.dispatch_inner(cp, x, y, z, None) {
             r.skipped += 1;
             r.report(format!("dispatch skipped: {e}"));
@@ -8622,6 +9064,23 @@ impl Hooks for VkHooks {
             Err(e) => {
                 r.report(format!("indirect dispatch with GPU-read arguments failed (dispatched after waiting for them instead): {e}"));
                 false
+            }
+        };
+        if done {
+            r.maybe_submit();
+        }
+        done
+    }
+    fn draw_indirect_gpu(&mut self, cp: &CommandProcessor, addr: u64, indexed: bool, vtx_loc: u32, inst_loc: u32) -> bool {
+        let mut g = TimedRenderer::lock(cp.queue);
+        let Some(r) = g.as_mut() else { return false };
+        let done = match r.draw_indirect_gpu(cp, addr, indexed, vtx_loc, inst_loc) {
+            Ok(done) => done,
+            Err(e) => {
+                // (Recorded up to the failure, as other draws that fail.)
+                r.skipped += 1;
+                r.report(format!("indirect draw with GPU-read arguments skipped: {e}"));
+                true
             }
         };
         if done {

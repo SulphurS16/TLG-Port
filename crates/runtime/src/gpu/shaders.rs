@@ -40,7 +40,44 @@ fn hash_words(w: &[u32]) -> u64 {
     super::resources::hash_slice(w.len() as u64, bytes)
 }
 
+/// Vectors of finished `Prepared`s and specializations, kept per thread for
+/// the next `prepare` (heap allocations and frees of them per stage and
+/// draw were ~4% of the graphics CP).
+#[derive(Default)]
+struct VecPool {
+    res: Vec<Vec<ResolvedRes>>,
+    specs: Vec<Vec<ResSpec>>,
+    u32s: Vec<Vec<u32>>,
+    u64s: Vec<Vec<u64>>,
+    inputs: Vec<Vec<PsInput>>,
+}
+
+fn pool_take<T>(v: &mut Vec<Vec<T>>) -> Vec<T> {
+    v.pop().unwrap_or_default()
+}
+
+fn pool_give<T>(v: &mut Vec<Vec<T>>, mut x: Vec<T>) {
+    if v.len() < 32 && x.capacity() != 0 && x.capacity() <= 4096 {
+        x.clear();
+        v.push(x);
+    }
+}
+
+impl Drop for Prepared {
+    fn drop(&mut self) {
+        let (res, sgpr, reads) = (std::mem::take(&mut self.resources), std::mem::take(&mut self.sgpr_data), std::mem::take(&mut self.mem_reads));
+        // (Also at thread exit, when the pool may be gone already.)
+        let _ = POOL.try_with(|p| {
+            let mut p = p.borrow_mut();
+            pool_give(&mut p.res, res);
+            pool_give(&mut p.u32s, sgpr);
+            pool_give(&mut p.u64s, reads);
+        });
+    }
+}
+
 thread_local! {
+    static POOL: std::cell::RefCell<VecPool> = std::cell::RefCell::new(VecPool::default());
     /// Guest addresses read while preparing a shader (see `Prepared::mem_reads`).
     static READS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Last mapping a read was validated against: (start, end, MAP_GEN).
@@ -582,9 +619,13 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
     }
     // Resolve descriptors.
     let mut memo = PtrMemo::new();
-    let mut resources = Vec::with_capacity(plan.resources.len());
-    let mut specs = Vec::with_capacity(plan.resources.len());
-    let mut strides = Vec::with_capacity(plan.resources.len());
+    let (mut resources, mut specs, mut strides, mut ps_inputs, mut sgpr_data, mut mem_reads) = POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        (pool_take(&mut p.res), pool_take(&mut p.specs), pool_take(&mut p.u32s), pool_take(&mut p.inputs), pool_take(&mut p.u32s), pool_take(&mut p.u64s))
+    });
+    resources.reserve(plan.resources.len());
+    specs.reserve(plan.resources.len());
+    strides.reserve(plan.resources.len());
     for (i, res) in plan.resources.iter().enumerate() {
         let mut w = [0u32; 8];
         let block = analyzed.res_block[i]
@@ -652,7 +693,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         debug_pos_store: sr.stage == Stage::Vertex && tess.role == TessRole::None && debug_vs_pos(addr),
         tess,
         ps_input_addr: 0,
-        ps_inputs: Vec::new(),
+        ps_inputs: std::mem::take(&mut ps_inputs),
         mrt: [MrtSpec::default(); 8],
         cs_local_size: [1, 1, 1],
         cs_rsrc2: 0,
@@ -736,7 +777,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         }
     };
     // Scalar-load data (resolved now, per draw).
-    let mut sgpr_data = Vec::with_capacity(translate::SGPR_DATA_USER as usize + plan.loads.iter().map(|l| l.dwords as usize).sum::<usize>() + resources.len());
+    sgpr_data.reserve(translate::SGPR_DATA_USER as usize + plan.loads.iter().map(|l| l.dwords as usize).sum::<usize>() + resources.len());
     sgpr_data.extend_from_slice(&user);
     sgpr_data.resize(translate::SGPR_DATA_USER as usize, 0);
     for l in &plan.loads {
@@ -762,7 +803,14 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
     let load_only = analyzed.load_only.clone();
     let scatter = analyzed.scatter;
     let utility = analyzed.utility;
-    let mem_reads = READS.with(|r| std::mem::take(&mut *r.borrow_mut()));
+    // (A pooled vector takes the reads' place in READS.)
+    READS.with(|r| std::mem::swap(&mut *r.borrow_mut(), &mut mem_reads));
+    POOL.with(|p| {
+        let mut p = p.borrow_mut();
+        pool_give(&mut p.specs, std::mem::take(&mut spec.resources));
+        pool_give(&mut p.u32s, std::mem::take(&mut spec.buffer_strides));
+        pool_give(&mut p.inputs, std::mem::take(&mut spec.ps_inputs));
+    });
     Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, load_only, mem_reads, scatter, sparse_writes: None, utility, tess: tess.role })
 }
 

@@ -566,10 +566,14 @@ impl Ctx {
     }
 
     pub fn submit(&self, cmd: vk::CommandBuffer, wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
-        let cmds = [cmd];
+        self.submit_cmds(&[cmd], wait, signal, fence)
+    }
+
+    /// `submit` of several command buffers, executed in order.
+    pub fn submit_cmds(&self, cmds: &[vk::CommandBuffer], wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
         let ws: Vec<vk::Semaphore> = wait.iter().map(|w| w.0).collect();
         let wst: Vec<vk::PipelineStageFlags> = wait.iter().map(|w| w.1).collect();
-        let si = vk::SubmitInfo::default().command_buffers(&cmds).wait_semaphores(&ws).wait_dst_stage_mask(&wst).signal_semaphores(signal);
+        let si = vk::SubmitInfo::default().command_buffers(cmds).wait_semaphores(&ws).wait_dst_stage_mask(&wst).signal_semaphores(signal);
         let q = self.queue.lock();
         unsafe { self.device.queue_submit(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit: {e}"))
     }

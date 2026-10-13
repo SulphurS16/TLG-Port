@@ -273,6 +273,42 @@ pub fn create_image(key: ImageKey) -> Result<Image, String> {
     }
 }
 
+/// An evicted image kept for reuse by a later image with the same creation
+/// parameters (`Renderer::image_pool`): its views stay valid.
+#[derive(Default)]
+pub struct PooledImage {
+    image: vk::Image,
+    memory: vk::DeviceMemory,
+    views: super::render::FastMap<(vk::Format, u16, bool, u32, u32), vk::ImageView>,
+    bytes: u64,
+    storage_ok: bool,
+}
+
+impl PooledImage {
+    pub fn of(img: Image) -> PooledImage {
+        PooledImage { image: img.image, memory: img.memory, views: img.views, bytes: img.bytes, storage_ok: img.storage_ok }
+    }
+
+    /// (The GPU no longer uses it.)
+    pub fn destroy(self) {
+        let c = ctx();
+        unsafe {
+            for (_, v) in self.views {
+                c.device.destroy_image_view(v, None);
+            }
+            c.device.destroy_image(self.image, None);
+        }
+        c.free(self.memory);
+    }
+}
+
+/// A pooled image as a new image for `key` (same creation parameters): the
+/// state of a newly created one; its contents are undefined until cleared.
+pub fn reuse_image(key: ImageKey, p: PooledImage) -> Image {
+    let last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+    Image { key, image: p.image, memory: p.memory, views: p.views, gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok: p.storage_ok, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_listed: false, guest_newer: false, bytes: p.bytes, last_used }
+}
+
 pub fn aspect(f: vk::Format) -> vk::ImageAspectFlags {
     match f {
         vk::Format::D16_UNORM | vk::Format::D32_SFLOAT => vk::ImageAspectFlags::DEPTH,

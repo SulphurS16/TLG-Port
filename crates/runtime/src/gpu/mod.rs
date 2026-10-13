@@ -515,7 +515,7 @@ fn gfx_thread() {
                 crate::info!("{}", r.vram_report());
                 crate::info!("EVENT_WRITE types: {}", cp::event_type_counts());
                 let k: Vec<u64> = render::SYNC_WAIT_KIND_NS.iter().map(|a| a.load(Ordering::Relaxed) / 1_000_000).collect();
-                crate::info!("CP sync waits (ms, total): for eop actions {}, write-backs {}, huge in-place writes {}, in-place writes {}; CP writes behind in-place reads {}; virtual waits {}, in-batch waits {}; label writes queued behind end-of-pipe writes {}", k[0], k[1], k[2], k[3], k[4], cp.stats.virtual_waits, cp.stats.inbatch_waits, cp::DEFERRED_WRITES.load(Ordering::Relaxed));
+                crate::info!("CP sync waits (ms, total): for eop actions {}, write-backs {}, huge in-place writes {}, in-place writes {}; CP writes behind in-place reads {}; virtual waits {}, in-batch waits {}, waits met by other queues' queued writes {}; label writes queued behind end-of-pipe writes {}", k[0], k[1], k[2], k[3], k[4], cp.stats.virtual_waits, cp.stats.inbatch_waits, cp.stats.cross_waits, cp::DEFERRED_WRITES.load(Ordering::Relaxed));
                 let mut polls: Vec<(cp::PollKey, (u64, u64))> = cp::POLLS.lock().take().unwrap_or_default().into_iter().collect();
                 polls.sort_by(|a, b| b.1.1.cmp(&a.1.1));
                 let polls: Vec<String> = polls.iter().take(12).map(|((q, f, r, b, a), (n, us))| format!("q{q} func {f} ref {r:#x} {b:#x}->{a:#x}: {n}x {} ms", us / 1000)).collect();
@@ -567,6 +567,7 @@ fn gfx_thread() {
                         ("render targets made older than guest memory by buffer writes (writer, range, target)", &render::NEWER_SITES),
                         ("render-target reloads (target, at shader)", &render::RELOAD_SITES),
                         ("shader preparations that waited for pending GPU writes (reader, address, write)", &render::GUARD_SITES),
+                        ("upload copies with forwards of pending GPU writes (read range, reader, write)", &render::FORWARD_SITES),
                     ] {
                         let mut v: Vec<(String, u64)> = m.lock().take().unwrap_or_default().into_iter().collect();
                         v.sort_by(|x, y| y.1.cmp(&x.1));
@@ -794,6 +795,9 @@ struct PerfSnap {
     dsub: [u64; 6],
     bsub: [u64; 9],
     bcnt: [u64; 9],
+    image_reuse: (u64, u64),
+    pro_ops: u64,
+    pro_barriers: u64,
     tsc: u64,
 }
 
@@ -830,6 +834,9 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         dsub: r.dsub,
         bsub: r.bsub,
         bcnt: r.bcnt,
+        image_reuse: r.image_reuse,
+        pro_ops: r.pro_ops,
+        pro_barriers: render::PRO_BARRIERS.load(Ordering::Relaxed),
         tsc: unsafe { core::arch::x86_64::_rdtsc() },
     };
     drop(g);
@@ -857,7 +864,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 format!("{n} {c} x {:.1} us", now.bsub[i].wrapping_sub(p.bsub[i]) as f64 / hz * 1e6 / c as f64)
             })
             .collect();
-        crate::info!("buffer bindings/s by path: {}", bp.join(", "));
+        crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {})", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers);
         crate::info!(
             "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages, {} ms; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
             now.frames - p.frames,
@@ -887,7 +894,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             ni.sort_by_key(|e| std::cmp::Reverse(e.1 .0));
             let n: u64 = ni.iter().map(|e| e.1 .0).sum();
             let top: Vec<String> = ni.iter().take(6).map(|((w, h, l, m, f), (c, b))| format!("{c} x {w}x{h}x{l} {m} levels {f:?} (last at {b:#x})")).collect();
-            crate::info!("images created/s: {n}; {}", top.join(", "));
+            let pooled = now.image_reuse.1 - p.image_reuse.1;
+            crate::info!("images created/s: {n} ({pooled} from the pool of small evicted images); {}", top.join(", "));
         }
         // The largest buffer uploads of the second (base, bytes, written).
         let mut ups: Vec<((u64, u64, bool), u64)> = render::BUFFER_UPLOAD_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();

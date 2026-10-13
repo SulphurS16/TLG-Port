@@ -363,6 +363,144 @@ pub fn indirect_args_cs() -> Vec<u32> {
     b.module().assemble()
 }
 
+/// Prepares an indirect draw whose arguments earlier GPU work wrote (their
+/// device copy) for vkCmdDraw(Indexed)Indirect without the CP reading them:
+/// the title's {count, instances, start, [base vertex,] start instance}
+/// become the Vulkan command {count, instances, first index (indexed; first
+/// vertex 0 otherwise), vertex offset (VGT_INDX_OFFSET, indexed), first
+/// instance 0}, and the base vertex / start instance go to the vertex stage's user-data dwords the CP
+/// passes them in (what the CP does when it reads the arguments itself).
+/// Implausible counts (more than the maximum instances, or count x instances
+/// over the maximum work) and indexed draws past the index buffer draw
+/// nothing (instance count 0) and are counted for the log.
+///
+/// Bindings (set 0): 0 = source dwords, 1 = destination command (5 dwords),
+/// 2 = the vertex stage's SGPR data, 3 = diagnostics (rejections, last
+/// rejected count, instances, start). Push constants (8 x u32): source dword
+/// index, indexed (0/1), SGPR data dword of the base vertex and of the start
+/// instance (u32::MAX: none), index buffer size in indices, maximum count x
+/// instances, maximum instances, vertex offset of indexed draws. One
+/// invocation.
+pub fn indirect_draw_cs() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(spirv::Capability::Shader);
+    b.extension("SPV_KHR_storage_buffer_storage_class");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let boolt = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let rta = b.type_runtime_array(u32t);
+    b.decorate(rta, Decoration::ArrayStride, [Operand::LiteralBit32(4)]);
+    let st = b.type_struct([rta]);
+    b.decorate(st, Decoration::Block, []);
+    b.member_decorate(st, 0, Decoration::Offset, [Operand::LiteralBit32(0)]);
+    let p_st = b.type_pointer(None, StorageClass::StorageBuffer, st);
+    let p_sb_u = b.type_pointer(None, StorageClass::StorageBuffer, u32t);
+    let bufs: Vec<u32> = (0..4)
+        .map(|i| {
+            let v = global(&mut b, p_st, StorageClass::StorageBuffer);
+            b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+            b.decorate(v, Decoration::Binding, [Operand::LiteralBit32(i)]);
+            v
+        })
+        .collect();
+    let (src, dst, sgpr, diag) = (bufs[0], bufs[1], bufs[2], bufs[3]);
+    let pcs = b.type_struct([u32t; 8]);
+    b.decorate(pcs, Decoration::Block, []);
+    for m in 0..8 {
+        b.member_decorate(pcs, m, Decoration::Offset, [Operand::LiteralBit32(m * 4)]);
+    }
+    let p_pcs = b.type_pointer(None, StorageClass::PushConstant, pcs);
+    let p_pc_u = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let pc = global(&mut b, p_pcs, StorageClass::PushConstant);
+
+    let fn_ty = b.type_function(void, []);
+    let func = b.begin_function(void, None, spirv::FunctionControl::NONE, fn_ty).unwrap();
+    b.begin_block(None).unwrap();
+    let c: Vec<u32> = (0..5).map(|k| b.constant_bit32(u32t, k)).collect();
+    let none = b.constant_bit32(u32t, u32::MAX);
+    // (Scope Device, relaxed semantics.)
+    let scope = b.constant_bit32(u32t, 1);
+    let relaxed = b.constant_bit32(u32t, 0);
+    let pc_field = |b: &mut Builder, m: u32| {
+        let idx = b.constant_bit32(u32t, m);
+        let p = b.access_chain(p_pc_u, None, pc, [idx]).unwrap();
+        b.load(u32t, None, p, None, []).unwrap()
+    };
+    let at = pc_field(&mut b, 0);
+    let indexed_u = pc_field(&mut b, 1);
+    let (vk, ik, nidx, maxw, maxi) = (pc_field(&mut b, 2), pc_field(&mut b, 3), pc_field(&mut b, 4), pc_field(&mut b, 5), pc_field(&mut b, 6));
+    let vofs = pc_field(&mut b, 7);
+    let indexed = b.i_not_equal(boolt, None, indexed_u, c[0]).unwrap();
+    let load_at = |b: &mut Builder, k: u32| {
+        let i = b.i_add(u32t, None, at, k).unwrap();
+        let p = b.access_chain(p_sb_u, None, src, [c[0], i]).unwrap();
+        b.load(u32t, None, p, None, []).unwrap()
+    };
+    let (count, inst, w2, w3) = (load_at(&mut b, c[0]), load_at(&mut b, c[1]), load_at(&mut b, c[2]), load_at(&mut b, c[3]));
+    // (Non-indexed arguments are 4 dwords: their fifth is not read.)
+    let k4 = b.select(u32t, None, indexed, c[4], c[3]).unwrap();
+    let w4 = load_at(&mut b, k4);
+    let base_vertex = b.select(u32t, None, indexed, w3, w2).unwrap();
+    let start_inst = b.select(u32t, None, indexed, w4, w3).unwrap();
+    // instances <= max, count x instances <= max work (without overflow).
+    let ok_i = b.u_less_than_equal(boolt, None, inst, maxi).unwrap();
+    let count0 = b.i_equal(boolt, None, count, c[0]).unwrap();
+    let d = b.select(u32t, None, count0, c[1], count).unwrap();
+    let q = b.u_div(u32t, None, maxw, d).unwrap();
+    let le = b.u_less_than_equal(boolt, None, inst, q).unwrap();
+    let ok_w = b.logical_or(boolt, None, count0, le).unwrap();
+    // Indexed: start + count within the index buffer.
+    let in1 = b.u_less_than_equal(boolt, None, w2, nidx).unwrap();
+    let rem = b.i_sub(u32t, None, nidx, w2).unwrap();
+    let in2 = b.u_less_than_equal(boolt, None, count, rem).unwrap();
+    let in_ib = b.logical_and(boolt, None, in1, in2).unwrap();
+    let not_indexed = b.logical_not(boolt, None, indexed).unwrap();
+    let ok_ib = b.logical_or(boolt, None, not_indexed, in_ib).unwrap();
+    let ok_iw = b.logical_and(boolt, None, ok_i, ok_w).unwrap();
+    let ok = b.logical_and(boolt, None, ok_iw, ok_ib).unwrap();
+    let out_inst = b.select(u32t, None, ok, inst, c[0]).unwrap();
+    let first = b.select(u32t, None, indexed, w2, c[0]).unwrap();
+    // (Non-indexed: dword 3 is the first instance.)
+    let d3 = b.select(u32t, None, indexed, vofs, c[0]).unwrap();
+    for (k, v) in [(c[0], count), (c[1], out_inst), (c[2], first), (c[3], d3), (c[4], c[0])] {
+        let p = b.access_chain(p_sb_u, None, dst, [c[0], k]).unwrap();
+        b.store(p, v, None, []).unwrap();
+    }
+    // The user-data dwords (when the draw passes them).
+    for (k, v) in [(vk, base_vertex), (ik, start_inst)] {
+        let has = b.i_not_equal(boolt, None, k, none).unwrap();
+        let then = b.id();
+        let merge = b.id();
+        b.selection_merge(merge, spirv::SelectionControl::NONE).unwrap();
+        b.branch_conditional(has, then, merge, []).unwrap();
+        b.begin_block(Some(then)).unwrap();
+        let p = b.access_chain(p_sb_u, None, sgpr, [c[0], k]).unwrap();
+        b.store(p, v, None, []).unwrap();
+        b.branch(merge).unwrap();
+        b.begin_block(Some(merge)).unwrap();
+    }
+    let rejected = b.id();
+    let merge = b.id();
+    b.selection_merge(merge, spirv::SelectionControl::NONE).unwrap();
+    b.branch_conditional(ok, merge, rejected, []).unwrap();
+    b.begin_block(Some(rejected)).unwrap();
+    let p = b.access_chain(p_sb_u, None, diag, [c[0], c[0]]).unwrap();
+    b.atomic_i_add(u32t, None, p, scope, relaxed, c[1]).unwrap();
+    for (k, v) in [(c[1], count), (c[2], inst), (c[3], w2)] {
+        let p = b.access_chain(p_sb_u, None, diag, [c[0], k]).unwrap();
+        b.store(p, v, None, []).unwrap();
+    }
+    b.branch(merge).unwrap();
+    b.begin_block(Some(merge)).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, func, "main", []);
+    b.execution_mode(func, ExecutionMode::LocalSize, [1, 1, 1]);
+    b.module().assemble()
+}
+
 /// Common setup of the metadata kernels: two storage buffers (0 = metadata
 /// dwords, 1 = predicates) and four u32 push constants, loaded at the start
 /// of `main` (the builder is left in its first block).
@@ -670,10 +808,13 @@ mod tests {
         assert_eq!(w[0], 0x0723_0203);
         assert!(w.len() > 100);
         check_module(&w, "indirect_args");
+        check_module(&super::indirect_draw_cs(), "indirect_draw");
         check_module(&super::remap_cs(false), "remap");
         if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(format!("{dir}/indirect_args.spv"), bytes).unwrap();
+            let bytes: Vec<u8> = super::indirect_draw_cs().iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/indirect_draw.spv"), bytes).unwrap();
         }
     }
 }

@@ -193,7 +193,65 @@ pub const BITS_ARENA: usize = 35;
 /// makes them writable and queried again (`TLG_CPU_WATCH`, 1; cpuwatch.rs).
 pub const CPU_WATCH: usize = 36;
 
-const TABLE: [(&str, &str, i64); 37] = [
+/// Evicted small images (<= 64 KiB) are kept for reuse by later images with
+/// the same creation parameters (`TLG_IMAGE_POOL`, 1): ~3 small textures per
+/// frame at fresh addresses each cost a vkAllocateMemory and later a
+/// vkFreeMemory (2.5% of the graphics CP in the cave).
+pub const IMAGE_POOL: usize = 37;
+
+/// Memory waits keep their poll timer armed across wake-ups by label changes
+/// (`TLG_WAIT_TIMER_KEEP`, 1) instead of re-arming it per wake-up (0;
+/// SetWaitableTimer was 3.2% of the graphics CP in the cave).
+pub const WAIT_TIMER_KEEP: usize = 38;
+
+/// The completion thread lets write-watch queries in between a batch's
+/// write-back entries (`TLG_WB_LOCK_BUMP`, 1; each mirror-resident full
+/// write-back forgets its pages right after its copy) instead of holding the
+/// write-watch lock for all of them (0; the graphics CP's queries waited 1.8%).
+pub const WB_LOCK_BUMP: usize = 39;
+
+/// The graphics CP hands the renderer lock to a waiting compute CP after each
+/// command (`TLG_LOCK_FAIR`, 0) instead of usually taking it again at once.
+pub const LOCK_FAIR: usize = 40;
+
+/// A memory wait met by another queue's queued (not yet committed)
+/// end-of-pipe or label write is met in GPU order by a full barrier
+/// (`TLG_CROSS_WAITS`, 0): all queues record into one batch, so work recorded
+/// after the barrier runs after the work before that write. 0: such a wait
+/// lasts until the writing queue commits (submits) its writes. Measured
+/// worse in the cave (run 20261013-133752: -7% fps at full clock, -12% at
+/// 31%): the graphics CP's label waits shrink, but the CPs then interleave
+/// on the renderer lock (its waits 142 -> ~190 ms/s) and each command costs
+/// more.
+pub const CROSS_WAITS: usize = 41;
+
+/// Indirect draws whose arguments earlier GPU work is still writing read
+/// them on the GPU (`TLG_INDIRECT_DRAW_GPU`, 1; `kernels::indirect_draw_cs`)
+/// instead of the CP waiting for that work to complete and land (~3 ms per
+/// frame in the cave, with the GPU idle meanwhile).
+pub const INDIRECT_DRAW_GPU: usize = 42;
+
+/// VRAM-mirror bindings validated before are served again without walking
+/// their blocks and pages while their window has had no pages invalidated
+/// and their CPU-write checks still count (`TLG_VBIND_CACHE`, 1).
+pub const VBIND_CACHE: usize = 43;
+
+/// GPU work that only fills device-ring ranges nothing used yet from data
+/// fixed at record time - written buffers' setup copies (guest data from the
+/// upload ring), page-bitmap clears of mirror write-backs - goes into a
+/// prologue command buffer submitted ahead of the batch, under one barrier
+/// (`TLG_PROLOGUE`, 1), instead of each with a full barrier in the batch (0;
+/// ~350 setup-copy and ~135 bitmap barriers per frame in the cave).
+pub const PROLOGUE: usize = 44;
+
+/// Shader preparation of a draw/dispatch (decoding its descriptors from
+/// registers and guest memory) runs before the CP takes the renderer lock
+/// (`TLG_PREPARE_UNLOCKED`, 1); under the lock its guest reads are checked
+/// against pending GPU writes as before (prepared again when one is
+/// pending). 0: prepared under the lock.
+pub const PREPARE_UNLOCKED: usize = 45;
+
+const TABLE: [(&str, &str, i64); 46] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -231,6 +289,15 @@ const TABLE: [(&str, &str, i64); 37] = [
     ("dispatch_hazards", "TLG_DISPATCH_HAZARDS", 1),
     ("bits_arena", "TLG_BITS_ARENA", 0),
     ("cpu_watch", "TLG_CPU_WATCH", 1),
+    ("image_pool", "TLG_IMAGE_POOL", 1),
+    ("wait_timer_keep", "TLG_WAIT_TIMER_KEEP", 1),
+    ("wb_lock_bump", "TLG_WB_LOCK_BUMP", 1),
+    ("lock_fair", "TLG_LOCK_FAIR", 0),
+    ("cross_waits", "TLG_CROSS_WAITS", 0),
+    ("indirect_draw_gpu", "TLG_INDIRECT_DRAW_GPU", 1),
+    ("vbind_cache", "TLG_VBIND_CACHE", 1),
+    ("prologue", "TLG_PROLOGUE", 1),
+    ("prepare_unlocked", "TLG_PREPARE_UNLOCKED", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

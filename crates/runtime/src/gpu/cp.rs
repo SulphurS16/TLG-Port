@@ -39,11 +39,15 @@ pub struct Stats {
     /// Memory waits met by this CP's own queued (not yet committed)
     /// end-of-pipe writes: ordered by a barrier within the current batch.
     pub inbatch_waits: u64,
+    /// Memory waits met by another CP's queued end-of-pipe writes (same).
+    pub cross_waits: u64,
     pub unknown: u64,
     /// Memory-to-memory DMA_DATA recorded as GPU copies (see `Hooks::dma_on_gpu`).
     pub dma_gpu: u64,
     /// DISPATCH_INDIRECT with arguments read on the GPU (`Hooks::dispatch_indirect`).
     pub indirect_on_gpu: u64,
+    /// Indirect draws with arguments read on the GPU (`Hooks::draw_indirect_gpu`).
+    pub indirect_draws_gpu: u64,
 }
 
 /// Command words fetched at submission time, keyed by guest start address.
@@ -278,6 +282,14 @@ pub trait Hooks {
     fn dispatch_indirect(&mut self, _cp: &CommandProcessor, _addr: u64) -> bool {
         false
     }
+    /// An indirect draw whose arguments at guest `addr` (`indexed`: 5
+    /// dwords, else 4) earlier GPU work is still writing: drawn with the
+    /// arguments read on the GPU, the base vertex / start instance going to
+    /// the user-data registers at `vtx_loc` / `inst_loc` (0: none). False
+    /// when the renderer cannot or need not (the CP reads them itself).
+    fn draw_indirect_gpu(&mut self, _cp: &CommandProcessor, _addr: u64, _indexed: bool, _vtx_loc: u32, _inst_loc: u32) -> bool {
+        false
+    }
     /// Completes all outstanding GPU work and end-of-pipe actions (blocking).
     fn flush(&mut self, cp: &CommandProcessor);
     /// Hands end-of-pipe actions over to be performed after all work recorded
@@ -388,6 +400,31 @@ pub static SYNC_SITES: parking_lot::Mutex<Option<HashMap<u32, (u64, u64)>>> = pa
 
 /// WRITE_DATA packets queued behind end-of-pipe writes (`defer_label_write`).
 pub static DEFERRED_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Each CP's queued end-of-pipe writes with known data, by queue: (addr,
+/// data_sel, lo, hi) as in `CommandProcessor::pending` (`queued_label_value`).
+static QUEUED: parking_lot::Mutex<Vec<(usize, Vec<(u64, u32, u32, u32)>)>> = parking_lot::Mutex::new(Vec::new());
+
+/// The value another queue's queued (not yet committed) end-of-pipe writes
+/// leave at `addr` (the last one covering it), if any. Their CPs recorded
+/// the work before them already: in the one batch all queues record into,
+/// work recorded after a full barrier from now on runs after it.
+pub fn queued_label_value(addr: u64, except_queue: usize) -> Option<u32> {
+    let mut val = None;
+    for (q, writes) in QUEUED.lock().iter() {
+        if *q == except_queue {
+            continue;
+        }
+        for &(a, data_sel, lo, hi) in writes {
+            let n = if data_sel == 1 { 4 } else { 8 };
+            if addr < a || addr + 4 > a + n {
+                continue;
+            }
+            val = Some(if data_sel == 1 || addr == a { lo } else { hi });
+        }
+    }
+    val
+}
 
 /// WAIT_REG_MEM polls over 0.5 ms (TLG_PERF report): (queue, function,
 /// reference, value at the start, value when met) -> (count, microseconds).
@@ -1116,6 +1153,7 @@ impl CommandProcessor {
             self.pending.push(EopAction { addr: a, data_sel: 1, lo: v, hi: 0, interrupt: false, gfx: false, occl: None });
         }
         DEFERRED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.publish_pending();
         true
     }
 
@@ -1123,6 +1161,28 @@ impl CommandProcessor {
         self.stats.eops += 1;
         let gfx = self.watch;
         self.pending.push(EopAction { addr, data_sel, lo, hi, interrupt, gfx, occl: None });
+        if matches!(data_sel, 1 | 2) {
+            self.publish_pending();
+        }
+    }
+
+    /// Makes this CP's queued writes with known data visible to the other
+    /// queues' waits (`queued_label_value`) and wakes waiters.
+    fn publish_pending(&self) {
+        if crate::tune::get(crate::tune::CROSS_WAITS) == 0 {
+            return;
+        }
+        let writes = self.pending.iter().filter(|p| matches!(p.data_sel, 1 | 2)).map(|p| (p.addr, p.data_sel, p.lo, p.hi));
+        let mut g = QUEUED.lock();
+        match g.iter_mut().find(|(q, _)| *q == self.queue) {
+            Some((_, v)) => {
+                v.clear();
+                v.extend(writes);
+            }
+            None => g.push((self.queue, writes.collect())),
+        }
+        drop(g);
+        super::render::labels_changed();
     }
 
     /// Orders a direct memory access by the CP with end-of-pipe writes that
@@ -1181,6 +1241,10 @@ impl CommandProcessor {
         }
         let actions = std::mem::take(&mut self.pending);
         hooks.commit(self, actions);
+        // (In flight now: `pending_label_value` sees them.)
+        if let Some((_, v)) = QUEUED.lock().iter_mut().find(|(q, _)| *q == self.queue) {
+            v.clear();
+        }
     }
 
     fn wait_reg_mem(&mut self, body: &[u32], hooks: &mut dyn Hooks) {
@@ -1231,6 +1295,12 @@ impl CommandProcessor {
             // writes held here (TLG_INBATCH_WAITS=0: commit at every drain).
             if virtual_waits && inbatch && self.own_pending_value(addr).is_some_and(|v| test(v)) {
                 self.stats.inbatch_waits += 1;
+                hooks.order_barrier(self);
+                return;
+            }
+            // Another queue's queued writes: the same, without committing ours.
+            if virtual_waits && crate::tune::get(crate::tune::CROSS_WAITS) != 0 && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
+                self.stats.cross_waits += 1;
                 hooks.order_barrier(self);
                 return;
             }
@@ -1299,6 +1369,11 @@ impl CommandProcessor {
                 // on (as above), without waiting for that work to execute.
                 if virtual_waits && super::render::pending_label_value(addr).is_some_and(|v| test(v)) {
                     self.stats.virtual_waits += 1;
+                    return;
+                }
+                if virtual_waits && crate::tune::get(crate::tune::CROSS_WAITS) != 0 && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
+                    self.stats.cross_waits += 1;
+                    hooks.order_barrier(self);
                     return;
                 }
             }
@@ -1472,6 +1547,11 @@ impl CommandProcessor {
     fn draw_indirect(&mut self, hooks: &mut dyn Hooks, addr: u64, indexed: bool, vtx_loc: u32, inst_loc: u32) {
         self.stats.draws += 1;
         let len = if indexed { 20 } else { 16 };
+        // (Not behind this CP's own queued end-of-pipe writes of them.)
+        if crate::tune::get(crate::tune::INDIRECT_DRAW_GPU) != 0 && guest_ok(addr, len) && !self.pending_overlaps(addr, len) && hooks.draw_indirect_gpu(self, addr, indexed, vtx_loc, inst_loc) {
+            self.stats.indirect_draws_gpu += 1;
+            return;
+        }
         self.order_access(hooks, addr, len);
         if !guest_ok(addr, len) {
             crate::error!("{}: indirect draw arguments at invalid address {:#x}", self.name, addr);
