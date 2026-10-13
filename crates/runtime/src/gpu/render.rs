@@ -1316,6 +1316,8 @@ pub struct Renderer {
     /// Read-only copies into the BAR ring (`upload_guest_ro`): count, bytes,
     /// and copies that went to the host ring for want of room.
     pub bar_uploads: (u64, u64, u64),
+    /// Index data bound from the VRAM mirror (`tune index_mirror`): draws, bytes.
+    pub index_mirrored: (u64, u64),
     retired_scratch: Vec<(vk::Buffer, vk::DeviceMemory)>,
     scratch_mem: Option<vk::DeviceMemory>,
     /// VRAM copies of read-only vertex/index data (`vcache_bind`).
@@ -1552,6 +1554,7 @@ pub fn init() -> Result<(), String> {
             cmd_queue: 0,
             upload_reused: (0, 0),
             bar_uploads: (0, 0, 0),
+            index_mirrored: (0, 0),
             retired_scratch: Vec::new(),
             scratch_mem: None,
             vcache: None,
@@ -5509,8 +5512,23 @@ impl Renderer {
                     None => (buf, off + (index_addr & 15), ty),
                 },
                 None => {
-                    self.upload_bytes[3] += n;
-                    (self.ring.buffer, self.upload_guest(index_addr, n)?, ty)
+                    let mirrored = if current && index_addr % isz == 0 && crate::tune::get(crate::tune::INDEX_MIRROR) != 0 {
+                        self.vc_why = "index data";
+                        self.vcache_bind_ex(index_addr & !15, n + (index_addr & 15), false, true)
+                    } else {
+                        None
+                    };
+                    match mirrored {
+                        Some((vb, voff)) => {
+                            self.index_mirrored.0 += 1;
+                            self.index_mirrored.1 += n;
+                            (vb, voff + (index_addr & 15), ty)
+                        }
+                        None => {
+                            self.upload_bytes[3] += n;
+                            (self.ring.buffer, self.upload_guest(index_addr, n)?, ty)
+                        }
+                    }
                 }
             });
         }

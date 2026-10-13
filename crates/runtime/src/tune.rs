@@ -148,11 +148,17 @@ pub const UPLOAD_REUSE: usize = 29;
 
 /// Read-only bindings of up to `BAR_UPLOAD_MAX` bytes that need no GPU
 /// forwards are copied into the device-local BAR ring (when its segment has
-/// room) instead of host memory the GPU reads over PCIe
-/// (`TLG_BAR_UPLOADS`, 0 for now: under test; 0: host ring).
+/// room) instead of host memory the GPU reads over PCIe (`TLG_BAR_UPLOADS`,
+/// 0: host ring. Cave A/B with upload reuse, run 20261013-030209: GPU busy
+/// 129 vs 110 ms per frame with it, same fps; no BAR fallbacks).
 pub const BAR_UPLOADS: usize = 30;
 
-const TABLE: [(&str, &str, i64); 31] = [
+/// Index data whose guest memory is current is fetched from the VRAM mirror
+/// (copied in once, then per CPU-written page) instead of a host-ring copy
+/// per draw (`TLG_INDEX_MIRROR`, 0 for now: under test).
+pub const INDEX_MIRROR: usize = 31;
+
+const TABLE: [(&str, &str, i64); 32] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -184,6 +190,7 @@ const TABLE: [(&str, &str, i64); 31] = [
     ("depth_copy_cs", "TLG_DEPTH_COPY_CS", 1),
     ("upload_reuse", "TLG_UPLOAD_REUSE", 1),
     ("bar_uploads", "TLG_BAR_UPLOADS", 0),
+    ("index_mirror", "TLG_INDEX_MIRROR", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
