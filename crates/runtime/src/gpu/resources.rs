@@ -28,6 +28,8 @@ pub struct Ring {
     pub align: u64,
     pub seg_lo: u64,
     pub seg_hi: u64,
+    /// Highest use of a segment (bytes) since the last `take_peak`.
+    pub peak: u64,
 }
 
 unsafe impl Send for Ring {}
@@ -41,7 +43,7 @@ impl Ring {
             | vk::BufferUsageFlags::UNIFORM_BUFFER;
         let (buffer, memory, ptr) = c.host_buffer(size, usage)?;
         let align = c.limits.min_storage_buffer_offset_alignment.max(16);
-        Ok(Ring { buffer, memory, ptr, size, used: 0, align, seg_lo: 0, seg_hi: size })
+        Ok(Ring { buffer, memory, ptr, size, used: 0, align, seg_lo: 0, seg_hi: size, peak: 0 })
     }
     /// Device-local ring the CPU writes through the BAR window (write-combined:
     /// for data the GPU reads, written once by the CPU).
@@ -55,7 +57,7 @@ impl Ring {
             c.device.bind_buffer_memory(buffer, memory, 0).map_err(|e| format!("bind buffer: {e}"))?;
             let ptr = c.device.map_memory(memory, 0, size, vk::MemoryMapFlags::empty()).map_err(|e| format!("map: {e}"))? as *mut u8;
             let align = c.limits.min_storage_buffer_offset_alignment.max(16);
-            Ok(Ring { buffer, memory, ptr, size, used: 0, align, seg_lo: 0, seg_hi: size })
+            Ok(Ring { buffer, memory, ptr, size, used: 0, align, seg_lo: 0, seg_hi: size, peak: 0 })
         }
     }
     /// Device-local ring (no CPU mapping: `write*` must not be used).
@@ -66,7 +68,7 @@ impl Ring {
         }
         let (buffer, memory) = c.device_buffer(size, usage)?;
         let align = c.limits.min_storage_buffer_offset_alignment.max(16);
-        Ok(Ring { buffer, memory, ptr: std::ptr::null_mut(), size, used: 0, align, seg_lo: 0, seg_hi: size })
+        Ok(Ring { buffer, memory, ptr: std::ptr::null_mut(), size, used: 0, align, seg_lo: 0, seg_hi: size, peak: 0 })
     }
     /// Allocates `n` bytes in the current segment; returns the offset or None
     /// if the segment is full.
@@ -76,7 +78,12 @@ impl Ring {
             return None;
         }
         self.used = off + n.max(4);
+        self.peak = self.peak.max(self.used - self.seg_lo);
         Some(off)
+    }
+    /// The highest segment use since the last call, and the segment size.
+    pub fn take_peak(&mut self) -> (u64, u64) {
+        (std::mem::take(&mut self.peak), self.seg_hi - self.seg_lo)
     }
     /// Makes segment `i` of `count` current (its previous contents must no
     /// longer be in use by the GPU).

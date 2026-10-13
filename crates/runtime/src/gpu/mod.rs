@@ -497,11 +497,13 @@ fn gfx_thread() {
         let n = processed;
         if n <= 3 || n % 600 == 0 || REPORT_REQUEST.swap(false, Ordering::Relaxed) {
             crate::info!("gfx: submission {} done; busy {:.1}s of {:.1}s; queued {}; stats {:?}", n, busy.as_secs_f64(), started.elapsed().as_secs_f64(), q.pending.lock().len(), cp.stats);
-            if let Some(r) = render::RENDERER.lock().as_ref() {
+            if let Some(r) = render::RENDERER.lock().as_mut() {
                 crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}", r.draws, r.dispatches, r.skipped, r.image_count(), r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed));
                 let ub = r.upload_bytes;
                 crate::info!("buffer copies: written {} MiB, misaligned {} MiB, pending writes {} MiB, indices {} MiB", ub[0] >> 20, ub[1] >> 20, ub[2] >> 20, ub[3] >> 20);
                 crate::info!("render targets (de)tiled on the GPU: reloads {}, write-backs {}; textures detiled on the GPU {}; ring-full retries {}", r.gpu_remaps[0], r.gpu_remaps[1], r.gpu_tex_uploads, r.ring_retries);
+                let ((hp, hs), (dp, ds)) = r.ring_peaks();
+                crate::info!("rings since last report: host peak {} of {} MiB per segment, device peak {} of {} MiB", hp >> 20, hs >> 20, dp >> 20, ds >> 20);
                 let mips: Vec<String> = render::GPU_MIP_STAT_NAMES.iter().zip(render::GPU_MIP_STATS.iter()).map(|(n, v)| format!("{n} {}", v.load(Ordering::Relaxed))).collect();
                 crate::info!("GPU mip-chain/BC texture path: {}", mips.join(", "));
                 crate::info!("texture validations: {} unwritten, {} hashed ({} MiB hashed in total)", r.writes.clean, r.writes.dirty, r.hashed_bytes >> 20);

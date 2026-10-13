@@ -3983,6 +3983,11 @@ impl Renderer {
         img.view(vfmt, t.dst_sel, view_type, false, 0, 1)
     }
 
+    /// Peak segment use of the host and device rings since the last call.
+    pub fn ring_peaks(&mut self) -> ((u64, u64), (u64, u64)) {
+        (self.ring.take_peak(), self.dring.take_peak())
+    }
+
     /// The depth-copy kernel's pipeline (created on first use).
     fn depth_copy_pipe(&mut self) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline), String> {
         if let Some(p) = self.depth_copy_pipe {
