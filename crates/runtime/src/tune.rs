@@ -183,13 +183,15 @@ pub const DISPATCH_HAZARDS: usize = 34;
 
 /// Page bitmaps of mirror write-backs come from a device-ring area zeroed
 /// once per batch (`TLG_BITS_ARENA`, 1) instead of a fill and a full
-/// barrier per registration (0, default). Off: with it the device was lost
-/// reproducibly ~1 s after the cave stage started (4 of 4 runs, the zero
-/// fill placed before or after the batch-start barrier, even with the area
-/// unused), never without it (3 runs); cause not found yet (docs/LOG.md).
+/// barrier per registration (0).
 pub const BITS_ARENA: usize = 35;
 
-const TABLE: [(&str, &str, i64); 36] = [
+/// Cold 64 KiB blocks (unwritten in consecutive write-watch queries) are made
+/// read-only instead of being queried every CPU epoch; a CPU write faults and
+/// makes them writable and queried again (`TLG_CPU_WATCH`, 1; cpuwatch.rs).
+pub const CPU_WATCH: usize = 36;
+
+const TABLE: [(&str, &str, i64); 37] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -226,6 +228,7 @@ const TABLE: [(&str, &str, i64); 36] = [
     ("evict_small", "TLG_EVICT_SMALL", 1),
     ("dispatch_hazards", "TLG_DISPATCH_HAZARDS", 1),
     ("bits_arena", "TLG_BITS_ARENA", 0),
+    ("cpu_watch", "TLG_CPU_WATCH", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -1,6 +1,7 @@
 //! GPU emulation front end: submission queues, compute rings and events.
 
 pub mod cp;
+pub mod cpuwatch;
 pub mod desc;
 pub mod lazywb;
 pub mod pm4;
@@ -143,6 +144,7 @@ pub fn set_phase(p: u8, arg: u64) {
 pub fn os_access(addr: u64, len: u64) {
     lazywb::touch(addr, len);
     wbprobe::touch(addr, len);
+    cpuwatch::touch(addr, len);
 }
 
 /// Logs what the graphics ring and every compute ring are doing (diagnosing hangs).
@@ -532,6 +534,7 @@ fn gfx_thread() {
                 );
                 wbprobe::report();
                 lazywb::report();
+                cpuwatch::report();
                 let mut sites: Vec<(u32, u64)> = render::FLUSH_SITES.lock().take().unwrap_or_default().into_iter().collect();
                 sites.sort_by(|a, b| b.1.cmp(&a.1));
                 crate::info!("synchronizing flushes by render.rs line (count; 100000+line: wait microseconds) since last report: {:?}", &sites[..sites.len().min(12)]);

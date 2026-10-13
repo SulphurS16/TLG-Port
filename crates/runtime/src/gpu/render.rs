@@ -2942,11 +2942,11 @@ impl Renderer {
         let host_off = self.ring.alloc(size).ok_or_else(|| format!("ring full: {size:#x}-byte write-back of {base:#x} (segment {:#x})", self.ring.segment_size()))?;
         let bits_host = self.ring.alloc(words as u64 * 4).ok_or("ring full: page bitmap")?;
         self.begin();
-        let (b, off, used, cap) = self.bits_arena;
-        let bits = if b == self.batch && used + words as u64 <= cap && crate::tune::get(crate::tune::BITS_ARENA) != 0 {
+        let (arena_batch, arena_off, used, cap) = self.bits_arena;
+        let bits = if arena_batch == self.batch && used + words as u64 <= cap && crate::tune::get(crate::tune::BITS_ARENA) != 0 {
             // (Pre-zeroed words of this batch: see `begin`.)
             self.bits_arena.2 += words as u64;
-            off + 4 * used
+            arena_off + 4 * used
         } else {
             let bits = self.dring.alloc(words as u64 * 4).ok_or("device ring full: page bitmap")?;
             self.end_rendering();

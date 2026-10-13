@@ -104,6 +104,17 @@ fn protect(st: &mut Stats, lo: u64, hi: u64, prot: u32) -> bool {
     unsafe { VirtualProtect(lo as _, (hi - lo) as usize, prot, &mut old) != 0 }
 }
 
+/// Runs `f` with the state locked when no tracked range overlaps [lo, hi):
+/// the write protection of cold blocks (cpuwatch.rs) arms blocks under it,
+/// so its protection changes and ours never interleave. None when one does.
+pub fn without_ranges<R>(lo: u64, hi: u64, f: impl FnOnce() -> R) -> Option<R> {
+    let g = STATE.lock();
+    if !overlapping(&g, lo, hi).is_empty() {
+        return None;
+    }
+    Some(f())
+}
+
 /// Keys of the entries overlapping [lo, hi) (entries are disjoint).
 fn overlapping(g: &State, lo: u64, hi: u64) -> Vec<u64> {
     g.entries.range(..hi).rev().take_while(|(_, e)| e.end > lo).map(|(k, _)| *k).collect()
@@ -291,6 +302,8 @@ pub fn after_write(addr: u64, size: u64, mirror: bool) {
     }
     e.quiet = e.quiet.saturating_add(1);
     if !e.protected {
+        // (Armed cold blocks there writable first: cpuwatch.rs.)
+        super::cpuwatch::touch(lo, hi - lo);
         e.protected = protect(stats, lo, hi, PAGE_NOACCESS);
     }
 }

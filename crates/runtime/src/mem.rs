@@ -338,6 +338,7 @@ impl MemState {
     pub fn unmap_range(&mut self, start: u64, end: u64) {
         note_map_change(start, end);
         crate::gpu::lazywb::settle(start, end);
+        crate::gpu::cpuwatch::touch(start, end - start);
         self.split_at(start);
         self.split_at(end);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();
@@ -414,6 +415,7 @@ impl MemState {
 
     pub fn protect(&mut self, start: u64, end: u64, prot: u32) -> Result<(), MemError> {
         crate::gpu::lazywb::settle(start, end);
+        crate::gpu::cpuwatch::touch(start, end - start);
         self.split_at(start);
         self.split_at(end);
         let keys: Vec<u64> = self.vmas.range(start..end).map(|(k, _)| *k).collect();

@@ -17,6 +17,7 @@
 //! ranges in a block read the page stamps instead of calling into the
 //! kernel (~0.43 us per call; textures and vertex data share blocks).
 
+use super::cpuwatch;
 use super::render::FastMap;
 use crate::mem;
 
@@ -27,6 +28,17 @@ const CHUNK_PAGES: usize = 1 << (CHUNK_SHIFT - PAGE_SHIFT);
 /// Write-watch queries cover 64 KiB blocks (64 per chunk).
 const BLOCK_SHIFT: u32 = 16;
 const CHUNK_BLOCKS: usize = 1 << (CHUNK_SHIFT - BLOCK_SHIFT);
+/// Consecutive unwritten queries after which a block is armed (made
+/// read-only, cpuwatch.rs), doubled for each time it was written while armed.
+const ARM_AFTER: u32 = 8;
+
+/// Per chunk: blocks armed (one bit each), and per block its consecutive
+/// unwritten queries and how often it was written while armed.
+struct Watch {
+    armed: u64,
+    clean: [u16; CHUNK_BLOCKS],
+    strikes: [u8; CHUNK_BLOCKS],
+}
 
 struct Chunk {
     /// Highest stamp of any page in the chunk.
@@ -67,11 +79,16 @@ pub struct WriteTracker {
     pub required: u64,
     /// Validation queries answered from this epoch's block queries alone.
     pub cached: u64,
+    /// Write protection of cold blocks (cpuwatch.rs).
+    watch: FastMap<u64, Watch>,
+    disarmed: Vec<u64>,
+    /// Block queries left out because the block was armed (TLG_PERF).
+    pub armed_skips: u64,
 }
 
 impl WriteTracker {
     pub fn new() -> WriteTracker {
-        WriteTracker { seq: 1, chunks: FastMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: FastMap::default(), epoch: 0, required: 0, cached: 0 }
+        WriteTracker { seq: 1, chunks: FastMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: FastMap::default(), epoch: 0, required: 0, cached: 0, watch: FastMap::default(), disarmed: Vec::new(), armed_skips: 0 }
     }
 
     /// Collects the OS's records of [addr, addr+len) for a validation: the
@@ -108,23 +125,103 @@ impl WriteTracker {
                 return false;
             }
         }
+        if cpuwatch::enabled() {
+            self.arm_cold(&runs);
+        }
         self.stamp_harvest();
         true
+    }
+
+    /// After the queries of `runs` (blocks [first, end)): counts the blocks
+    /// found unwritten and arms those quiet long enough (in runs); their
+    /// writes since these queries are collected once more after the
+    /// protection (later ones fault).
+    fn arm_cold(&mut self, runs: &[(u64, u64)]) {
+        let mut dirty: smallvec::SmallVec<[u64; 16]> = self.pages.iter().map(|&p| p >> BLOCK_SHIFT).collect();
+        dirty.sort_unstable();
+        dirty.dedup();
+        let mut arm: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
+        for &(lo, hi) in runs {
+            for b in lo..hi {
+                let i = b as usize & (CHUNK_BLOCKS - 1);
+                let w = self.watch.entry(b >> (CHUNK_SHIFT - BLOCK_SHIFT)).or_insert_with(|| Watch { armed: 0, clean: [0; CHUNK_BLOCKS], strikes: [0; CHUNK_BLOCKS] });
+                if dirty.binary_search(&b).is_ok() {
+                    w.clean[i] = 0;
+                    continue;
+                }
+                w.clean[i] = w.clean[i].saturating_add(1);
+                if w.armed >> i & 1 == 0 && w.clean[i] as u32 >= ARM_AFTER << w.strikes[i] {
+                    match arm.last_mut() {
+                        Some(r) if r.1 == b => r.1 = b + 1,
+                        _ => arm.push((b, b + 1)),
+                    }
+                }
+            }
+        }
+        for (lo, hi) in arm {
+            if !cpuwatch::arm(lo << BLOCK_SHIFT, hi << BLOCK_SHIFT) {
+                // (Not armable: counted from zero again.)
+                for b in lo..hi {
+                    if let Some(w) = self.watch.get_mut(&(b >> (CHUNK_SHIFT - BLOCK_SHIFT))) {
+                        w.clean[b as usize & (CHUNK_BLOCKS - 1)] = 0;
+                    }
+                }
+                continue;
+            }
+            for b in lo..hi {
+                if let Some(w) = self.watch.get_mut(&(b >> (CHUNK_SHIFT - BLOCK_SHIFT))) {
+                    w.armed |= 1 << (b as usize & (CHUNK_BLOCKS - 1));
+                }
+            }
+            mem::harvest_writes(lo << BLOCK_SHIFT, (hi - lo) << BLOCK_SHIFT, &mut self.buf, &mut self.pages);
+        }
+    }
+
+    /// Blocks made writable again by writes or protection changes since
+    /// the last look: queried again (and armed later only after a longer
+    /// quiet period).
+    fn take_disarmed(&mut self) {
+        let mut d = std::mem::take(&mut self.disarmed);
+        cpuwatch::take_disarmed(&mut d);
+        for &b in &d {
+            let (c, i) = (b >> (CHUNK_SHIFT - BLOCK_SHIFT), b as usize & (CHUNK_BLOCKS - 1));
+            if let Some(w) = self.watch.get_mut(&c) {
+                if w.armed >> i & 1 != 0 {
+                    w.strikes[i] = (w.strikes[i] + 1).min(6);
+                }
+                w.armed &= !(1 << i);
+                w.clean[i] = 0;
+            }
+            if let Some(q) = self.queried.get_mut(&c) {
+                q[i] = 0;
+            }
+        }
+        d.clear();
+        self.disarmed = d;
     }
 
     /// Runs [first, end) of the blocks first..=last not queried in a current
     /// epoch, marked as queried now.
     fn blocks_to_query(&mut self, first: u64, last: u64) -> smallvec::SmallVec<[(u64, u64); 4]> {
+        let watching = cpuwatch::enabled();
+        if watching {
+            self.take_disarmed();
+        }
         let (epoch, required) = (self.epoch, self.required.max(1));
         let mut runs: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
         let mut b = first;
         while b <= last {
             let c = b >> (CHUNK_SHIFT - BLOCK_SHIFT);
             let q = self.queried.entry(c).or_insert([0; CHUNK_BLOCKS]);
+            // (Armed blocks: unwritten until a write faults.)
+            let armed = if watching { self.watch.get(&c).map_or(0, |w| w.armed) } else { 0 };
             let stop = last.min(((c + 1) << (CHUNK_SHIFT - BLOCK_SHIFT)) - 1);
             while b <= stop {
                 let i = b as usize & (CHUNK_BLOCKS - 1);
-                if q[i] < required {
+                if q[i] < required && armed >> i & 1 != 0 {
+                    q[i] = epoch;
+                    self.armed_skips += 1;
+                } else if q[i] < required {
                     q[i] = epoch;
                     match runs.last_mut() {
                         Some(r) if r.1 == b => r.1 = b + 1,

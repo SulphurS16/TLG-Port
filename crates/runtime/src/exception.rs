@@ -584,6 +584,9 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
             if crate::gpu::lazywb::fault(rec.ExceptionInformation[1] as u64, rec.ExceptionInformation[0] == 8) {
                 return -1;
             }
+            if rec.ExceptionInformation[0] == 1 && crate::gpu::cpuwatch::fault(rec.ExceptionInformation[1] as u64) {
+                return -1;
+            }
             if crate::gpu::wbprobe::fault(rec.ExceptionInformation[1] as u64, rec.ExceptionInformation[0] == 1, rip, || format!("{} [{}]", describe(rip), crate::log::thread_name())) {
                 return -1;
             }
