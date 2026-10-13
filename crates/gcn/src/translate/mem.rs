@@ -1430,8 +1430,10 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
         vals.push(v);
     }
     let act = tr.active()?;
-    // Kill inactive fragments at the valid-mask export.
-    if tr.spec.stage == Stage::Fragment && ins.exp_vm() {
+    // Kill inactive fragments at the valid-mask export (a program that never
+    // writes EXEC has none: a discard would cost depth-only draws their
+    // early depth tests).
+    if tr.spec.stage == Stage::Fragment && ins.exp_vm() && tr.exec_written {
         let nact = e(tr.b.logical_not(tr.t.bool_, None, act))?;
         let merge = tr.b.id();
         let kill = tr.b.id();

@@ -395,6 +395,9 @@ pub(crate) struct T<'a> {
     pub pc_var: Word,
     pub exit_block: Option<Word>,
     pub kill_used: bool,
+    /// Whether any instruction of the program may write EXEC (`may_write_exec`):
+    /// without one every lane stays active, and valid-mask exports kill none.
+    pub exec_written: bool,
     /// Workgroup LDS accesses since the last barrier (bit 0 reads, bit 1
     /// writes) and the nesting depth of structured constructs being emitted:
     /// GCN lanes of a wave run in lockstep, so a wave-sized workgroup may
@@ -767,6 +770,24 @@ fn block_ranges(code: &[Inst], starts: &BTreeSet<u32>) -> Vec<std::ops::Range<us
         .collect()
 }
 
+/// Whether `ins` may write EXEC (conservatively: any scalar destination
+/// field naming exec_lo/exec_hi counts, also where the encoding has none).
+pub fn may_write_exec(ins: &Inst) -> bool {
+    let exec_dst = |r: u16| r == crate::OP_EXEC_LO || r == crate::OP_EXEC_LO + 1;
+    match ins.enc {
+        // (SOP1 36..=43: s_*_saveexec_b64.)
+        Enc::Sop1 => (36..=43).contains(&ins.op) || exec_dst(ins.sdst()),
+        Enc::Sop2 | Enc::Sopk | Enc::Smrd => exec_dst(ins.sdst()),
+        // v_cmpx_* (odd high nibble).
+        Enc::Vopc => (ins.op >> 4) & 1 == 1,
+        // VOPC in VOP3 form, VOP3b carry-outs, v_readlane into exec.
+        Enc::Vop3 => (ins.op < 0x100 && (ins.op >> 4) & 1 == 1) || exec_dst(ins.sdst()) || exec_dst(ins.vdst()),
+        // v_readfirstlane / v_readlane name an SGPR destination.
+        Enc::Vop1 | Enc::Vop2 => exec_dst(ins.vdst()),
+        _ => false,
+    }
+}
+
 pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     if code.is_empty() {
         return Err("empty program".into());
@@ -880,6 +901,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         pc_var: 0,
         exit_block: None,
         kill_used: false,
+        exec_written: code.iter().any(may_write_exec),
         lds_phase: 0,
         cf_depth: 0,
         lds_hazards_nested: 0,
@@ -1390,5 +1412,22 @@ mod tests {
         assert_eq!(block_ranges(&code, &starts), [0..3, 3..4, 4..5]);
         let plan = crate::analysis::analyze(&code, 0, 0);
         translate(&code, &plan, &vertex_spec(0)).unwrap();
+    }
+
+    #[test]
+    fn valid_mask_export_kills_only_after_exec_writes() {
+        let kills = |words: &[u32]| -> usize {
+            let code = crate::decode_program(words).unwrap();
+            let plan = crate::analysis::analyze(&code, 0, 0);
+            let spec = Spec { stage: Stage::Fragment, ..vertex_spec(0) };
+            let out = translate(&code, &plan, &spec).unwrap();
+            let m = rspirv::dr::load_words(&out.spirv).unwrap();
+            m.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions).filter(|i| i.class.opcode == spirv::Op::Kill).count()
+        };
+        // TLG's depth-only ps 0x1130fedf00: s_mov_b32 vcc_hi, 3;
+        // exp null done vm; s_endpgm. Every lane stays active.
+        assert_eq!(kills(&[0xBEEB_0383, 0xF800_1890, 0, 0xBF81_0000]), 0);
+        // v_cmpx_gt_u32 vcc, v0, v1 first (an alpha test): lanes may die.
+        assert_eq!(kills(&[0x7DA8_0300, 0xF800_1890, 0, 0xBF81_0000]), 1);
     }
 }
