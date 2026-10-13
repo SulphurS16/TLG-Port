@@ -173,7 +173,23 @@ pub const CP_SYNC_VIEW: usize = 32;
 /// per-frame memory every frame (~12 new images per second, never used again).
 pub const EVICT_SMALL: usize = 33;
 
-const TABLE: [(&str, &str, i64); 34] = [
+/// Dispatches are ordered against earlier dispatches by the buffer ranges
+/// they access (`TLG_DISPATCH_HAZARDS`, 1): a full barrier only where one
+/// writes what another since the last barrier read or wrote, or where other
+/// GPU work (copies, fills, render passes, storage images, GDS, indirect
+/// arguments) is unordered; 0: a full barrier before every dispatch after
+/// any write.
+pub const DISPATCH_HAZARDS: usize = 34;
+
+/// Page bitmaps of mirror write-backs come from a device-ring area zeroed
+/// once per batch (`TLG_BITS_ARENA`, 1) instead of a fill and a full
+/// barrier per registration (0, default). Off: with it the device was lost
+/// reproducibly ~1 s after the cave stage started (4 of 4 runs, the zero
+/// fill placed before or after the batch-start barrier, even with the area
+/// unused), never without it (3 runs); cause not found yet (docs/LOG.md).
+pub const BITS_ARENA: usize = 35;
+
+const TABLE: [(&str, &str, i64); 36] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -208,6 +224,8 @@ const TABLE: [(&str, &str, i64); 34] = [
     ("index_mirror", "TLG_INDEX_MIRROR", 0),
     ("cp_sync_view", "TLG_CP_SYNC_VIEW", 1),
     ("evict_small", "TLG_EVICT_SMALL", 1),
+    ("dispatch_hazards", "TLG_DISPATCH_HAZARDS", 1),
+    ("bits_arena", "TLG_BITS_ARENA", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

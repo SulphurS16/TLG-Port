@@ -544,6 +544,11 @@ fn gfx_thread() {
                 let mut b: Vec<(u32, u64)> = render::BARRIER_SITES.lock().take().unwrap_or_default().into_iter().collect();
                 b.sort_by(|x, y| y.1.cmp(&x.1));
                 crate::info!("full barriers by render.rs line since last report: {:?}", &b[..b.len().min(14)]);
+                let (emitted, skipped) = std::mem::take(&mut r.hz_stats);
+                let [args, unknown, conflict] = std::mem::take(&mut r.hz_reasons);
+                let mut other: Vec<(u32, u64)> = std::mem::take(&mut r.hz_other_lines).into_iter().collect();
+                other.sort_by(|x, y| y.1.cmp(&x.1));
+                crate::info!("barriers before dispatches since last report: {emitted} emitted, {skipped} left out (no conflicting accesses; tune dispatch_hazards); needed for indirect arguments {args}, untracked resources {unknown}, conflicting accesses {conflict}, other unordered work by render.rs line {:?}", &other[..other.len().min(10)]);
                 if render::perf_on() {
                     let mut bs: Vec<((&str, u32), (u64, u64))> = render::BATCH_SITES.lock().take().unwrap_or_default().into_iter().collect();
                     bs.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));

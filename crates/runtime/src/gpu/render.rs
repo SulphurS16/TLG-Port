@@ -12,6 +12,18 @@ use gcn::translate::{BindingKind, Stage, TessRole, TessSpec};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 
+/// GPU work just recorded (or about to be) writes memory and is not ordered
+/// before later commands: the next consumer starts with a full barrier.
+/// (`barrier_needed` alone is also set after dispatches, whose own buffer
+/// accesses are tracked instead: see `tune dispatch_hazards`.)
+macro_rules! unordered {
+    ($s:expr) => {{
+        $s.barrier_needed = true;
+        $s.unordered_gen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        $s.unordered_line = line!();
+    }};
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 struct Attachment {
     key: ImageKey,
@@ -1190,6 +1202,30 @@ pub struct Renderer {
     cs_pipes: FastMap<u64, Pipe>,
     rendering: Option<Rendering>,
     barrier_needed: bool,
+    /// `BARRIERS` count when GPU work other than dispatches' tracked buffer
+    /// accesses was last left unordered (`unordered!`; u64::MAX: never).
+    unordered_gen: u64,
+    /// Buffer ranges dispatches accessed since the full barrier that made
+    /// `BARRIERS` `hz_gen` (buffer, offset, size, written), and whether one
+    /// used resources not tracked that way (`tune dispatch_hazards`).
+    hz: smallvec::SmallVec<[(vk::Buffer, u64, u64, bool); 32]>,
+    hz_gen: u64,
+    hz_unknown: bool,
+    /// The accesses of the dispatch whose descriptors were written last.
+    cur_access: smallvec::SmallVec<[(vk::Buffer, u64, u64, bool); 24]>,
+    cur_unknown: bool,
+    /// Page bitmaps of mirror write-backs (`mirror_write_back`): device-ring
+    /// words zeroed at the start of the batch (`begin`): (batch, offset,
+    /// words used, capacity in words).
+    bits_arena: (u64, u64, u64, u64),
+    /// Barriers before dispatches emitted, and skipped by the tracking.
+    pub hz_stats: (u64, u64),
+    /// Why those barriers were needed (TLG_PERF): indirect arguments,
+    /// untracked resources, conflicting accesses; and by the render.rs line
+    /// that left other GPU work unordered (`unordered!`).
+    pub hz_reasons: [u64; 3],
+    pub hz_other_lines: FastMap<u32, u64>,
+    unordered_line: u32,
     /// See `DynState` (None at the start of a command buffer).
     dyn_state: Option<DynState>,
     /// Graphics pipeline bound in the current command buffer (consecutive
@@ -1524,6 +1560,17 @@ pub fn init() -> Result<(), String> {
             cs_pipes: FastMap::default(),
             rendering: None,
             barrier_needed: false,
+            unordered_gen: u64::MAX,
+            hz: smallvec::SmallVec::new(),
+            hz_gen: u64::MAX,
+            hz_unknown: false,
+            cur_access: smallvec::SmallVec::new(),
+            cur_unknown: true,
+            hz_stats: (0, 0),
+            bits_arena: (u64::MAX, 0, 0, 0),
+            hz_reasons: [0; 3],
+            hz_other_lines: FastMap::default(),
+            unordered_line: 0,
             dyn_state: None,
             bound_gfx: vk::Pipeline::null(),
             dring,
@@ -1747,6 +1794,10 @@ pub static WRITEBACK_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, bool), 
 /// (TLG_PERF report per second).
 pub static BUFFER_UPLOAD_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, bool), u64>>> = parking_lot::Mutex::new(None);
 
+/// Device-ring bytes zeroed per batch for write-back page bitmaps (one bit
+/// per 4 KiB page: 64 KiB cover 2 GiB of written ranges).
+const BITS_ARENA_BYTES: u64 = 64 << 10;
+
 /// Full barriers and render-pass begins recorded (TLG_PERF).
 pub static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PASS_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1858,6 +1909,20 @@ impl Renderer {
             c.device.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         }
         global_barrier(self.cmd);
+        // The page bitmaps of this batch's write-backs, zeroed once here
+        // (no fill and barrier for each). After the batch-start barrier:
+        // batches still running may read this segment (forwards and device
+        // copies of in-flight writes keep their data until the slot's next
+        // batch overwrites it after that barrier; a fill before it raced
+        // with them and lost the device).
+        self.bits_arena = match self.dring.alloc(BITS_ARENA_BYTES).filter(|_| crate::tune::get(crate::tune::BITS_ARENA) != 0) {
+            Some(off) => {
+                unsafe { c.device.cmd_fill_buffer(self.cmd, self.dring.buffer, off, BITS_ARENA_BYTES, 0) };
+                global_barrier(self.cmd);
+                (self.batch, off, 0, BITS_ARENA_BYTES / 4)
+            }
+            None => (u64::MAX, 0, 0, 0),
+        };
         let exec = self.slots[self.cur].exec;
         if exec != vk::QueryPool::null() {
             unsafe {
@@ -1943,7 +2008,7 @@ impl Renderer {
     fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
             unsafe { ctx().device.cmd_end_rendering(self.cmd) };
-            self.barrier_needed = true;
+            unordered!(self);
         }
     }
 
@@ -1981,7 +2046,7 @@ impl Renderer {
     pub fn order_barrier(&mut self) {
         if self.recording {
             self.end_rendering();
-            self.barrier_needed = true;
+            unordered!(self);
         }
     }
 
@@ -2320,7 +2385,7 @@ impl Renderer {
                 c.device.cmd_clear_color_image(self.cmd, img.image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
             }
         }
-        self.barrier_needed = true;
+        unordered!(self);
         self.register(img);
         Ok(())
     }
@@ -2444,7 +2509,7 @@ impl Renderer {
             })
             .collect();
         unsafe { ctx().device.cmd_copy_image(self.cmd, self.images[&old].image, vk::ImageLayout::GENERAL, self.images[&new].image, vk::ImageLayout::GENERAL, &regions) };
-        self.barrier_needed = true;
+        unordered!(self);
         self.mark(|| "level grow copy".into());
         // The new image takes over the old one's state and index entries.
         let o = self.images.remove(&old).unwrap();
@@ -2522,7 +2587,7 @@ impl Renderer {
         let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: layers };
         let region = vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: w, height: h, depth: 1 } };
         unsafe { ctx().device.cmd_copy_image(self.cmd, self.images[&src].image, vk::ImageLayout::GENERAL, self.images[&dst].image, vk::ImageLayout::GENERAL, &[region]) };
-        self.barrier_needed = true;
+        unordered!(self);
         self.mark(|| "alias copy".into());
         let last = self.images[&src].last_write;
         let d = self.images.get_mut(&dst).unwrap();
@@ -2679,7 +2744,7 @@ impl Renderer {
         for (dev_off, zbuf, zoff, size) in std::mem::take(&mut self.gpu_wb) {
             unsafe { c.device.cmd_copy_buffer(self.cmd, self.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: dev_off, dst_offset: zoff, size }]) };
         }
-        self.barrier_needed = true;
+        unordered!(self);
         self.mark(|| "written buffer write-back copies (GPU)".into());
     }
 
@@ -2876,11 +2941,19 @@ impl Renderer {
         let words = pages.div_ceil(32) as u32;
         let host_off = self.ring.alloc(size).ok_or_else(|| format!("ring full: {size:#x}-byte write-back of {base:#x} (segment {:#x})", self.ring.segment_size()))?;
         let bits_host = self.ring.alloc(words as u64 * 4).ok_or("ring full: page bitmap")?;
-        let bits = self.dring.alloc(words as u64 * 4).ok_or("device ring full: page bitmap")?;
         self.begin();
-        self.end_rendering();
-        unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, 0) };
-        global_barrier(self.cmd);
+        let (b, off, used, cap) = self.bits_arena;
+        let bits = if b == self.batch && used + words as u64 <= cap && crate::tune::get(crate::tune::BITS_ARENA) != 0 {
+            // (Pre-zeroed words of this batch: see `begin`.)
+            self.bits_arena.2 += words as u64;
+            off + 4 * used
+        } else {
+            let bits = self.dring.alloc(words as u64 * 4).ok_or("device ring full: page bitmap")?;
+            self.end_rendering();
+            unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, 0) };
+            global_barrier(self.cmd);
+            bits
+        };
         self.push_writeback(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: Some((bits, bits_host, words)) });
         Ok((bits, words, head))
     }
@@ -2950,7 +3023,7 @@ impl Renderer {
             let sub = vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: skey.layers.max(1) };
             let region = vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: skey.width, height: skey.height, depth: 1 } };
             unsafe { ctx().device.cmd_copy_image(self.cmd, self.images[&skey].image, vk::ImageLayout::GENERAL, self.images[&dkey].image, vk::ImageLayout::GENERAL, &[region]) };
-            self.barrier_needed = true;
+            unordered!(self);
             self.note_image_written(dkey);
             self.mark(|| "surface copy (image)".into());
             self.last_elide = "surface copy (image)";
@@ -2981,7 +3054,7 @@ impl Renderer {
         self.end_rendering();
         global_barrier(self.cmd);
         unsafe { ctx().device.cmd_copy_buffer(self.cmd, sb, db, &[vk::BufferCopy { src_offset: so, dst_offset: doff, size: bytes }]) };
-        self.barrier_needed = true;
+        unordered!(self);
         if !mirrored {
             self.zc_read(sv.base, sv.base + bytes);
             self.note_inplace_gpu_write(dv.base, bytes);
@@ -3022,7 +3095,7 @@ impl Renderer {
             }
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: key.levels.max(1), base_array_layer: layers.0, layer_count: layers.1 };
             unsafe { ctx().device.cmd_clear_color_image(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, &color, &[range]) };
-            self.barrier_needed = true;
+            unordered!(self);
             self.note_image_written(key);
             self.mark(|| "surface fill (clear)".into());
             self.last_elide = "surface fill (clear)";
@@ -3058,7 +3131,7 @@ impl Renderer {
         self.end_rendering();
         global_barrier(self.cmd);
         unsafe { ctx().device.cmd_fill_buffer(self.cmd, zbuf, zoff, bytes, pattern) };
-        self.barrier_needed = true;
+        unordered!(self);
         if !mirrored {
             self.note_inplace_gpu_write(dv.base, bytes);
         }
@@ -3109,7 +3182,7 @@ impl Renderer {
         if sbuf != self.dring.buffer {
             self.zc_read(src, src + bytes);
         }
-        self.barrier_needed = true;
+        unordered!(self);
         self.note_inplace_gpu_write(dst, bytes);
         self.mark(|| "DMA_DATA copy (GPU)".into());
         true
@@ -3144,7 +3217,7 @@ impl Renderer {
         self.end_rendering();
         global_barrier(self.cmd);
         unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]) };
-        self.barrier_needed = true;
+        unordered!(self);
         self.writes.note_gpu_write(dst, bytes);
         self.note_pending_gpu_write(dst, bytes);
         self.vcache_validate(dbuf, dst, bytes);
@@ -3196,7 +3269,7 @@ impl Renderer {
         if sbuf != self.dring.buffer {
             self.zc_read(src, src + n);
         }
-        self.barrier_needed = true;
+        unordered!(self);
         self.mark(|| "GDS load (GPU source)".into());
         true
     }
@@ -3555,7 +3628,7 @@ impl Renderer {
             image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
         };
         unsafe { ctx().device.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
-        self.barrier_needed = true;
+        unordered!(self);
         self.uploads += 1;
         self.gpu_tex_uploads += 1;
         self.mark(|| "texture detiling (GPU)".into());
@@ -3888,7 +3961,7 @@ impl Renderer {
                     self.flushes[5] += 1;
                 }
             }
-            self.barrier_needed = true;
+            unordered!(self);
             let vc = self.vcache.as_mut().unwrap();
             let w = vc.windows.get_mut(&k).unwrap();
             for &(a, b) in &runs {
@@ -4070,7 +4143,7 @@ impl Renderer {
                 global_barrier(self.cmd);
                 c.device.cmd_copy_buffer_to_image(self.cmd, scratch, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[to_img]);
             }
-            self.barrier_needed = true;
+            unordered!(self);
             self.mark(|| "depth copy for sampling".into());
             DEPTH_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.shadows.insert(skey, (dst_key, wgen));
@@ -4135,7 +4208,7 @@ impl Renderer {
             c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             c.device.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
         }
-        self.barrier_needed = true;
+        unordered!(self);
         Ok(true)
     }
 
@@ -4187,7 +4260,7 @@ impl Renderer {
                     ctx().device.cmd_copy_image(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[region]);
                 }
             }
-            self.barrier_needed = true;
+            unordered!(self);
             self.mark(|| "shadow copy for sampling".into());
             self.shadows.insert(skey, (dst_key, wgen));
             self.images.get_mut(&dst_key).unwrap().gpu_written = true;
@@ -4287,7 +4360,7 @@ impl Renderer {
                 );
             }
         }
-        self.barrier_needed = true;
+        unordered!(self);
         self.mark(|| "texture upload".into());
         if crate::log::enabled(crate::log::Level::Debug) {
             crate::debug!("uploaded texture {:#x} {}x{}x{} dfmt {} nfmt {} tiling {}", t.base, t.width, t.height, layers, t.dfmt, t.nfmt, t.tiling_index);
@@ -4622,7 +4695,7 @@ impl Renderer {
             since.push((a, b));
             unsafe { c.device.cmd_copy_buffer(self.cmd, *buf, self.ring.buffer, std::slice::from_ref(r)) };
         }
-        self.barrier_needed = true;
+        unordered!(self);
         self.mark(|| "pending-write forwards".into());
     }
 
@@ -5125,7 +5198,12 @@ impl Renderer {
                                 self.note_pending_gpu_write(base, extent);
                                 self.vcache_validate(vb, base, extent);
                                 self.end_rendering();
-                                self.barrier_needed = true;
+                                // (A dispatch's own write: tracked as its access.)
+                                if p.stage == Stage::Compute {
+                                    self.barrier_needed = true;
+                                } else {
+                                    unordered!(self);
+                                }
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range: extent.next_multiple_of(4) })));
                                 continue;
                             }
@@ -5163,7 +5241,7 @@ impl Renderer {
                                 self.end_rendering();
                                 global_barrier(self.cmd);
                                 unsafe { ctx().device.cmd_copy_buffer(self.cmd, zbuf, self.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: dev_off, size }]) };
-                                self.barrier_needed = true;
+                                unordered!(self);
                                 self.gpu_wb.push((dev_off, zbuf, zoff, size));
                                 self.push_zc_write(base, size);
                                 self.writes.note_gpu_write(base, size);
@@ -5196,7 +5274,7 @@ impl Renderer {
                         }
                         let region = vk::BufferCopy { src_offset: off, dst_offset: dev_off, size };
                         unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
-                        self.barrier_needed = true;
+                        unordered!(self);
                         self.push_writeback(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
                         self.writes.note_gpu_write(base, size);
                         self.note_pending_gpu_write(base, size);
@@ -5253,6 +5331,27 @@ impl Renderer {
         if prepared.iter().any(|p| p.tess == TessRole::Ds) {
             let (_, tf) = self.tess_buffers()?;
             infos.push((TESS_TF_BINDING, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: tf, offset: 0, range: TESS_FACTOR_RING_BYTES })));
+        }
+        // A dispatch's buffer accesses (`tune dispatch_hazards`): bound
+        // ranges with the shader's write flag. Images are tracked only as
+        // sampled reads (their writers order themselves: render passes,
+        // copies, uploads); storage images, GDS and the rest are unknown.
+        if let [p] = prepared {
+            if p.stage == Stage::Compute {
+                self.cur_access.clear();
+                self.cur_unknown = false;
+                for (binding, _, info) in &infos {
+                    let kind = p.translated.out.bindings.iter().find(|b| b.binding == *binding).map(|b| b.kind);
+                    match (kind, info) {
+                        (Some(BindingKind::Buffer(i)), Info::Buf(bi)) => {
+                            let n = if bi.range == vk::WHOLE_SIZE { u64::MAX - bi.offset } else { bi.range };
+                            self.cur_access.push((bi.buffer, bi.offset, n, buffer_written(p, i)));
+                        }
+                        (Some(BindingKind::Image(_) | BindingKind::Sampler(_) | BindingKind::SgprData | BindingKind::DirtyInfo | BindingKind::DirtyBits), _) => {}
+                        _ => self.cur_unknown = true,
+                    }
+                }
+            }
         }
         let writes: smallvec::SmallVec<[vk::WriteDescriptorSet; 24]> = infos
             .iter()
@@ -5800,7 +5899,7 @@ impl Renderer {
         if self.writebacks.len() + self.zc_writes.len() > wb_before {
             // Buffer writes: order later consumers; CPU-sourced textures may
             // alias the written memory.
-            self.barrier_needed = true;
+            unordered!(self);
             self.epoch += 1;
         }
         if trace_frame() {
@@ -6452,7 +6551,7 @@ impl Renderer {
             c.device.cmd_dispatch(self.cmd, groups, 1, 1);
         }
         self.mark(|| format!("{} {:#x}", if p.tess == TessRole::Ls { "ls" } else { "hs" }, p.addr));
-        self.barrier_needed = true;
+        unordered!(self);
         self.perform_gpu_writebacks();
         self.batch_cmds += 1;
         Ok(())
@@ -6589,12 +6688,52 @@ impl Renderer {
             },
             None => None,
         };
+        self.cur_unknown = true;
         let (set, wb_before) = self.descriptors_with_retry(set_layout, &[&cs])?;
         self.flush_forwards();
         self.end_rendering();
+        // Ordering: behind unordered writes of other GPU work, and behind
+        // dispatches since the last barrier whose buffer accesses conflict
+        // with this one's (a write on either side of an overlap).
+        let hazards = crate::tune::get(crate::tune::DISPATCH_HAZARDS) != 0;
+        let bgen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        if self.hz_gen != bgen {
+            self.hz.clear();
+            self.hz_unknown = false;
+            self.hz_gen = bgen;
+        }
+        let conflict = || {
+            self.hz_unknown
+                || self.cur_unknown
+                || self.cur_access.iter().any(|&(b, o, n, w)| self.hz.iter().any(|&(hb, ho, hn, hw)| hb == b && ho < o.saturating_add(n) && o < ho.saturating_add(hn) && (w || hw)))
+        };
         // (The validated arguments must be visible to the indirect read.)
-        if self.barrier_needed || args_slot.is_some() {
+        let need = args_slot.is_some() || (self.barrier_needed && (!hazards || self.unordered_gen == bgen || conflict()));
+        if need && perf_on() {
+            if args_slot.is_some() {
+                self.hz_reasons[0] += 1;
+            } else if !hazards || self.unordered_gen == bgen {
+                *self.hz_other_lines.entry(if hazards { self.unordered_line } else { 0 }).or_default() += 1;
+            } else if self.hz_unknown || self.cur_unknown {
+                self.hz_reasons[1] += 1;
+            } else {
+                self.hz_reasons[2] += 1;
+            }
+        }
+        if need {
             global_barrier(self.cmd);
+            self.hz.clear();
+            self.hz_unknown = false;
+            self.hz_gen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+            self.hz_stats.0 += 1;
+        } else if self.barrier_needed {
+            self.hz_stats.1 += 1;
+        }
+        if hazards {
+            let acc = std::mem::take(&mut self.cur_access);
+            self.hz.extend(acc.iter().copied());
+            self.cur_access = acc;
+            self.hz_unknown |= self.cur_unknown;
         }
         let c = ctx();
         let regs = &cp.regs;
@@ -6611,7 +6750,7 @@ impl Renderer {
             }
         }
         self.mark(|| format!("cs {:#x}", cs.addr));
-        self.barrier_needed = true;
+        self.barrier_needed = true; // (its accesses: `hz`)
         self.perform_gpu_writebacks();
         self.dispatches += 1;
         self.batch_cmds += 1;
@@ -6782,7 +6921,7 @@ impl Renderer {
             pos += lin_sizes[i];
         }
         unsafe { c.device.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions) };
-        self.barrier_needed = true;
+        unordered!(self);
         self.uploads += 1;
         self.gpu_tex_uploads += 1;
         self.mark(|| "texture detiling, mip chain (GPU)".into());
@@ -6891,7 +7030,7 @@ impl Renderer {
         self.end_rendering();
         global_barrier(self.cmd);
         unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[vk::BufferCopy { src_offset: up, dst_offset: dev, size }]) };
-        self.barrier_needed = true;
+        unordered!(self);
         Ok(Some((self.dring.buffer, dev)))
     }
 
@@ -7115,7 +7254,7 @@ impl Renderer {
             c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
             c.device.cmd_dispatch(self.cmd, 1, 1, 1);
         }
-        self.barrier_needed = true;
+        unordered!(self);
         // (Read in place: CP writes of the arguments wait for this batch.)
         if ctx().ext_host.is_some() {
             self.zc_read(addr, addr + 12);
@@ -7306,7 +7445,7 @@ impl Renderer {
             self.note_pending_gpu_write(key.base, total);
             self.vcache_validate(zbuf, key.base, total);
         }
-        self.barrier_needed = true;
+        unordered!(self);
         self.mark(|| if tile { "render target tiling (GPU)".into() } else { "render target detiling (GPU)".into() });
         Ok(true)
     }
@@ -7370,7 +7509,7 @@ impl Renderer {
                         image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
                     };
                     unsafe { ctx().device.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
-                    self.barrier_needed = true;
+                    unordered!(self);
                     *self.write_gen.entry(key).or_default() += 1;
                     self.images.get_mut(&key).unwrap().last_write = self.draws + self.dispatches + 1;
                     self.gpu_remaps[0] += 1;
@@ -7412,7 +7551,7 @@ impl Renderer {
             image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
         };
         unsafe { ctx().device.cmd_copy_buffer_to_image(self.cmd, self.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
-        self.barrier_needed = true;
+        unordered!(self);
         // Shadow copies of the old contents are out of date.
         *self.write_gen.entry(key).or_default() += 1;
         self.images.get_mut(&key).unwrap().last_write = self.draws + self.dispatches + 1;
@@ -7531,7 +7670,7 @@ impl Renderer {
                     global_barrier(self.cmd);
                     let range = vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: key.layers };
                     unsafe { c.device.cmd_clear_depth_stencil_image(self.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
-                    self.barrier_needed = true;
+                    unordered!(self);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                         crate::info!("HTILE clear of depth {:#x} ({:?}, depth {} stencil {})", key.base, aspect, value.depth, value.stencil);
@@ -7554,7 +7693,7 @@ impl Renderer {
                     global_barrier(self.cmd);
                     let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: key.layers };
                     unsafe { c.device.cmd_clear_color_image(self.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
-                    self.barrier_needed = true;
+                    unordered!(self);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                         crate::info!("CMASK fast clear of {:#x} {:?} to {w0:#x}/{w1:#x}", key.base, format);
@@ -7728,7 +7867,7 @@ impl Renderer {
             }
         }
         self.end_rendering();
-        self.barrier_needed = true;
+        unordered!(self);
         if mirror {
             // The expanded state (when a clear applied) is in the mirror:
             // written back to guest memory at the end of the batch (every
@@ -7804,7 +7943,7 @@ impl Renderer {
                     global_barrier(self.cmd);
                     unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.gds, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: n }]) };
                     self.note_inplace_gpu_write(dst, n);
-                    self.barrier_needed = true;
+                    unordered!(self);
                     return Ok(());
                 }
                 // Otherwise like a shader write: device ring now, host ring at
@@ -7822,7 +7961,7 @@ impl Renderer {
                 self.epoch += 1;
             }
         }
-        self.barrier_needed = true;
+        unordered!(self);
         Ok(())
     }
 
