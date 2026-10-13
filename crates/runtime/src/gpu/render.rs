@@ -1290,6 +1290,10 @@ pub struct Renderer {
     gpu_pending_pages: FastMap<u64, u64>,
     /// Batch with a pending GPU write too large to track by page.
     gpu_pending_all: u64,
+    /// Ranges whose pages `gpu_pending_pages` already maps to batch
+    /// `pending_noted.0` (a buffer written by many commands of a batch is
+    /// entered once: 1,500 map inserts per binding of a 6 MiB buffer).
+    pending_noted: (u64, FastSet<(u64, u64)>),
     /// Shader preparations that had to wait for GPU writes to the memory
     /// they read (descriptor tables, scalar loads), and scatter dispatches
     /// whose writes were narrowed to their records.
@@ -1547,6 +1551,7 @@ pub fn init() -> Result<(), String> {
             stale_aged: 0,
             gpu_pending_pages: FastMap::default(),
             gpu_pending_all: 0,
+            pending_noted: (0, FastSet::default()),
             prepare_syncs: 0,
             scatters: 0,
             elided: 0,
@@ -2514,6 +2519,15 @@ impl Renderer {
         }
         if len > SURFACE_WRITE_MAX {
             self.gpu_pending_all = seq;
+            return;
+        }
+        // (Entries of this batch stay until it completes: a range noted for
+        // it already is mapped.)
+        if self.pending_noted.0 != seq {
+            self.pending_noted.0 = seq;
+            self.pending_noted.1.clear();
+        }
+        if !self.pending_noted.1.insert((base, len)) {
             return;
         }
         for p in (base >> 12)..=((base + len.max(1) - 1) >> 12) {
