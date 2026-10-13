@@ -215,6 +215,9 @@ struct Voice {
     port_volume: [f32; 4],
     port_matrix: [i32; 4],
     matrices: HashMap<i32, Vec<f32>>,
+    /// Where each matrix's levels came from (TLG_NGS2_TRACE: checked for
+    /// later in-place changes).
+    matrix_src: HashMap<i32, (u64, usize)>,
     patches: Vec<Patch>,
     sampler: Sampler,
     /// Input bus (submixers, mastering): `grain` frames of MAX_CH channels.
@@ -222,8 +225,17 @@ struct Voice {
     gain: f32,
     /// Peak level of the voice's last rendered grain (state peakHeight).
     peak: f32,
+    /// Highest peak (samplers: output, mixers: input) since the last
+    /// TLG_NGS2_TRACE voice report.
+    peak_win: f32,
     /// Flags last returned to the title (for TLG_NGS2_TRACE transitions).
     reported: u32,
+    /// Submixer user effect (the title's own DSP, `run_user_fx`): handler and
+    /// user data; its calls so far; guest scratch for its context and
+    /// planar channel buffers.
+    user_fx: Option<(u64, u64)>,
+    fx_calls: u64,
+    fx_buf: u64,
 }
 
 impl Voice {
@@ -237,12 +249,17 @@ impl Voice {
             port_volume: [1.0; 4],
             port_matrix: [-1; 4],
             matrices: HashMap::new(),
+            matrix_src: HashMap::new(),
             patches: Vec::new(),
             sampler: Sampler::default(),
             input: Vec::new(),
             gain: 1.0,
             peak: 0.0,
+            peak_win: 0.0,
             reported: 0,
+            user_fx: None,
+            fx_calls: 0,
+            fx_buf: 0,
         }
     }
 }
@@ -385,12 +402,18 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                 PARAM_PORT_VOLUME => {
                     let port = u32_at(8) as usize;
                     if port < 4 {
+                        if trace_voices() && v.port_volume[port] != f32_at(12) {
+                            crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): port {port} volume {:.4}", v.kind, v.channels, f32_at(12));
+                        }
                         v.port_volume[port] = f32_at(12);
                     }
                 }
                 PARAM_PORT_MATRIX => {
                     let port = u32_at(8) as usize;
                     if port < 4 {
+                        if trace_voices() && v.port_matrix[port] != u32_at(12) as i32 {
+                            crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): port {port} matrix {}", v.kind, v.channels, u32_at(12) as i32);
+                        }
                         v.port_matrix[port] = u32_at(12) as i32;
                     }
                 }
@@ -405,7 +428,12 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                         if l.iter().any(|&x| x != 0.0) && LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
                             crate::info!("NGS2 matrix {mid} ({} ch voice, {n} levels): {l:?}", v.channels);
                         }
+                        if trace_voices() && v.matrices.get(&mid) != Some(&l) {
+                            let nz: Vec<String> = l.iter().enumerate().filter(|(_, x)| **x != 0.0).map(|(i, x)| format!("{i}:{x:.3}")).collect();
+                            crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): matrix {mid}, {n} levels, nonzero [{}]", v.kind, v.channels, nz.join(" "));
+                        }
                         v.matrices.insert(mid, l);
+                        v.matrix_src.insert(mid, (levels as u64, n));
                     }
                 }
                 PARAM_PATCH => {
@@ -416,6 +444,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     v.patches.retain(|pa| pa.port != port || pa.dest_input != dest_input);
                     if dest != 0 {
                         v.patches.push(Patch { port, dest, dest_input });
+                    }
+                    if trace_voices() {
+                        crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): patch port {port} -> {dest:#x} input {dest_input}", v.kind, v.channels);
                     }
                 }
                 PARAM_PORT_DELAY => unimpl = Some("port delay"),
@@ -506,10 +537,25 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     // {float fbwLevel; float lfeLevel}
                     v.gain = f32_at(8);
                 }
-                0x2000_0001..=0x2000_0006 => unimpl = Some("submixer envelope/compressor/distortion/user effect/filter"),
+                SUBMIXER_USER_FX => {
+                    // {handler; userData; ...}: run per grain (`run_user_fx`).
+                    let (h, u) = (u64_at(8), u64_at(16));
+                    v.user_fx = (h != 0 && user_fx_on()).then_some((h, u));
+                    v.fx_calls = 0;
+                    if trace_voices() {
+                        crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): user effect {h:#x} (data {u:#x})", v.kind, v.channels);
+                    }
+                }
+                0x2000_0001..=0x2000_0003 | 0x2000_0005..=0x2000_0006 => unimpl = Some("submixer envelope/compressor/distortion/filter"),
                 0x2001_0001..=0x2001_00FF => unimpl = Some("reverb (I3DL2)"),
                 0x3000_0001..=0x3000_0003 | 0x3000_0005..=0x3000_00FF => unimpl = Some("mastering matrix/LFE/limiter/output/peak meter"),
-                0x4000_0000..=0x4FFF_FFFF => unimpl = Some("custom rack modules"),
+                0x4000_0000..=0x4FFF_FFFF => {
+                    unimpl = Some("custom rack modules");
+                    if trace_voices() {
+                        let words: Vec<String> = (0..((size as usize).saturating_sub(8) / 4).min(34)).map(|i| format!("{:08x}", u32_at(8 + i * 4))).collect();
+                        crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): custom module param {id:#x}: {}", v.kind, v.channels, words.join(" "));
+                    }
+                }
                 _ => unimpl = Some("unknown voice parameters"),
             }
         }
@@ -522,6 +568,56 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
         p = unsafe { p.offset(next as isize) };
     }
     0
+}
+
+const SUBMIXER_USER_FX: u32 = 0x2000_0004;
+
+/// TLG_NGS2_USER_FX=0: user effects not called (audio passes through).
+fn user_fx_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_NGS2_USER_FX").map_or(true, |v| v != "0"))
+}
+
+/// Runs a submixer's user effect (the title's DSP) on its mixed input, in
+/// place. The handler takes a context: +0 the address of eight channel
+/// pointers (planar float buffers of one grain), +8 the user data, +0x20
+/// flags (bit 0 on the first call: reset; TLG's handler skips processing for
+/// bits 2-3); we also fill +0x24 channels, +0x28 grain samples, +0x2c rate.
+fn run_user_fx(v: &mut Voice, input: &mut [[f32; MAX_CH]], rate: u32) {
+    let Some((handler, user)) = v.user_fx else { return };
+    let grain = input.len();
+    let need = 0x80 + (MAX_CH * grain * 4) as u64;
+    if v.fx_buf == 0 {
+        v.fx_buf = crate::mem::arena_alloc(need.max(0x80 + MAX_CH as u64 * 1024 * 4), 64);
+    }
+    let base = v.fx_buf;
+    unsafe {
+        let ctx = base as *mut u8;
+        std::ptr::write_bytes(ctx, 0, 0x40);
+        let ptrs = (base + 0x40) as *mut u64;
+        for c in 0..MAX_CH {
+            let ch = base + 0x80 + (c * grain * 4) as u64;
+            *ptrs.add(c) = ch;
+            let dst = ch as *mut f32;
+            for (i, fr) in input.iter().enumerate() {
+                *dst.add(i) = fr[c];
+            }
+        }
+        *(ctx as *mut u64) = base + 0x40;
+        *(ctx.add(8) as *mut u64) = user;
+        *(ctx.add(0x20) as *mut u32) = u32::from(v.fx_calls == 0);
+        *(ctx.add(0x24) as *mut u32) = v.channels;
+        *(ctx.add(0x28) as *mut u32) = grain as u32;
+        *(ctx.add(0x2c) as *mut u32) = rate;
+        crate::hle::call_guest(handler, &[base]);
+        for c in 0..MAX_CH {
+            let src = (base + 0x80 + (c * grain * 4) as u64) as *const f32;
+            for (i, fr) in input.iter_mut().enumerate() {
+                fr[c] = *src.add(i);
+            }
+        }
+    }
+    v.fx_calls += 1;
 }
 
 /// Decodes the next portion of the front block into `sm.pcm`; false when the
@@ -811,6 +907,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             render_sampler(v, grain, rate, &mut buf);
             let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
             v.peak = buf.iter().flat_map(|f| f[..ch].iter()).fold(0f32, |m, &x| m.max(x.abs()));
+            v.peak_win = v.peak_win.max(v.peak);
             ch
         };
         route(s, *vh, &buf, ch);
@@ -838,7 +935,12 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
     for (_, vh) in order {
         let (input, ch) = {
             let v = s.voices.get_mut(&vh).unwrap();
-            (std::mem::take(&mut v.input), v.channels as usize)
+            let ch = v.channels as usize;
+            let mut input = std::mem::take(&mut v.input);
+            run_user_fx(v, &mut input, rate);
+            let pk = input.iter().flat_map(|f| f[..ch.clamp(1, MAX_CH)].iter()).fold(0f32, |m, &x| m.max(x.abs()));
+            v.peak_win = v.peak_win.max(pk);
+            (input, ch)
         };
         route(s, vh, &input, ch.clamp(1, MAX_CH));
         if let Some(v) = s.voices.get_mut(&vh) {
@@ -852,6 +954,11 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
         if v.kind != Kind::Mastering {
             continue;
         }
+        let pk = v.input.iter().take(grain).flat_map(|f| f.iter()).fold(0f32, |m, &x| m.max(x.abs()));
+        if let Some(m) = s.voices.get_mut(vh) {
+            m.peak_win = m.peak_win.max(pk);
+        }
+        let Some(v) = s.voices.get(vh) else { continue };
         for (i, fr) in v.input.iter().enumerate().take(grain) {
             for c in 0..MAX_CH {
                 out[i][c] += fr[c] * v.gain;
@@ -991,6 +1098,52 @@ sysv! {
             }
             crate::info!("NGS2: {} sampler voices playing (by waveform type {:x?}), {starved} without data; output peak {:.4} over the last 10 s", by_type.values().sum::<u32>(), by_type, s.peak);
             s.peak = 0.0;
+            if trace_voices() {
+                // The mix path's levels: each voice that carried sound, with
+                // its routing (port volume, matrix id, destination).
+                let mut lines = Vec::new();
+                for (&vh, v) in s.voices.iter() {
+                    if v.peak_win <= 0.0 && !(v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0) {
+                        continue;
+                    }
+                    let route: Vec<String> = v
+                        .patches
+                        .iter()
+                        .map(|pa| {
+                            let dest = if s.voices.contains_key(&pa.dest) { Some(pa.dest) } else { s.racks.get(&pa.dest).and_then(|r| r.voices.first().copied()) };
+                            let d = dest.and_then(|d| s.voices.get(&d).map(|dv| format!("{d:#x} {:?} {}ch", dv.kind, dv.channels))).unwrap_or_else(|| "?".into());
+                            format!("port {} vol {:.3} matrix {} -> {d} in {}", pa.port, v.port_volume[pa.port as usize & 3], v.port_matrix[pa.port as usize & 3], pa.dest_input)
+                        })
+                        .collect();
+                    let rack = s.racks.get(&v.rack).map_or(0, |r| r.rack_id);
+                    let what = match v.kind {
+                        Kind::Sampler => format!("type {:#x} {}ch {} Hz pitch {:.3}", v.sampler.wf_type, v.sampler.channels, v.sampler.rate, v.sampler.pitch),
+                        Kind::Mastering => format!("{}ch gain {:.3}", v.channels, v.gain),
+                        Kind::Submixer => format!("rack {rack:#x} {}ch{}", v.channels, if v.user_fx.is_some() { " +user effect" } else { "" }),
+                    };
+                    lines.push(format!("{vh:#x} {:?} {what} peak {:.4}: [{}]", v.kind, v.peak_win, route.join("; ")));
+                }
+                lines.sort();
+                for l in lines {
+                    crate::info!("NGS2 voice {l}");
+                }
+                // Matrix level arrays the title changed in place since it
+                // passed them.
+                for (&vh, v) in s.voices.iter() {
+                    for (&mid, &(ptr, n)) in &v.matrix_src {
+                        let mut raw = vec![0u8; n * 4];
+                        crate::gpu::resources::copy_from_guest(&mut raw, ptr);
+                        let now: Vec<f32> = raw.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+                        if v.matrices.get(&mid) != Some(&now) {
+                            let nz: Vec<String> = now.iter().enumerate().filter(|(_, x)| **x != 0.0).map(|(i, x)| format!("{i}:{x:.3}")).collect();
+                            crate::info!("NGS2 voice {vh:#x}: matrix {mid} levels at {ptr:#x} changed in place: nonzero [{}]", nz.join(" "));
+                        }
+                    }
+                }
+                for v in s.voices.values_mut() {
+                    v.peak_win = 0.0;
+                }
+            }
         }
         for i in 0..count as usize {
             let e = infos.add(i * 24);
