@@ -239,6 +239,12 @@ impl WriteTracker {
         (written, self.seq)
     }
 
+    /// The current stamp: writes registered or harvested later have higher
+    /// ones (`gpu_written_since`).
+    pub fn stamp(&self) -> u64 {
+        self.seq
+    }
+
     /// Whether GPU writes (and CPU writes registered like them) recorded
     /// after stamp `since` overlap [addr, addr+len), without a write-watch
     /// query: within one CPU epoch nothing else changes guest memory.

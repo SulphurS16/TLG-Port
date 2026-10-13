@@ -400,6 +400,9 @@ const VCACHE_MIN: u64 = 64 << 10;
 const VCACHE_MAX: u64 = 64 << 20;
 const VWIN_SIZE: u64 = (1 << VWIN_SHIFT) + VCACHE_MAX;
 const VCACHE_BUDGET: u64 = 4 << 30;
+/// Largest read-only copy `upload_guest_ro` puts in the BAR ring (bigger
+/// ones would take a segment's room from many small ones).
+const BAR_UPLOAD_MAX: u64 = 64 << 10;
 
 /// VRAM pressure level from this process's device-local usage and budget
 /// (`Ctx::vram`): 0 below 70 %, 1 below 85 %, 2 below 95 %, 3 above; 0
@@ -1300,6 +1303,19 @@ pub struct Renderer {
     /// the copies not yet recorded (`flush_forwards`).
     upload_forwarded: bool,
     fwd_pending: Vec<(vk::Buffer, vk::BufferCopy)>,
+    /// Read-only guest ranges copied into this batch's ring segments in CPU
+    /// epoch `upload_reuse_epoch`, by (aligned) base: (bytes, ring buffer and
+    /// offset, write-tracker stamp after the copy, CP queue). See
+    /// `reused_upload`.
+    upload_reuse: FastMap<u64, (u64, vk::Buffer, u64, u64, usize)>,
+    upload_reuse_epoch: u64,
+    /// The CP queue of the command being recorded.
+    cmd_queue: usize,
+    /// Bindings served by an earlier copy, bytes not copied again.
+    pub upload_reused: (u64, u64),
+    /// Read-only copies into the BAR ring (`upload_guest_ro`): count, bytes,
+    /// and copies that went to the host ring for want of room.
+    pub bar_uploads: (u64, u64, u64),
     retired_scratch: Vec<(vk::Buffer, vk::DeviceMemory)>,
     scratch_mem: Option<vk::DeviceMemory>,
     /// VRAM copies of read-only vertex/index data (`vcache_bind`).
@@ -1531,6 +1547,11 @@ pub fn init() -> Result<(), String> {
             dma_mirror: 0,
             upload_forwarded: false,
             fwd_pending: Vec::new(),
+            upload_reuse: FastMap::default(),
+            upload_reuse_epoch: 0,
+            cmd_queue: 0,
+            upload_reused: (0, 0),
+            bar_uploads: (0, 0, 0),
             retired_scratch: Vec::new(),
             scratch_mem: None,
             vcache: None,
@@ -2108,6 +2129,9 @@ impl Renderer {
         }
         self.cmd = next.cmd;
         self.desc_pool = next.desc_pool;
+        // (Copies in the previous segment: the CPU may overwrite them while
+        // the GPU still runs the batch that would read them.)
+        self.upload_reuse.clear();
         self.ring.set_segment(self.cur, SLOTS);
         self.dring.set_segment(self.cur, SLOTS);
         if let Some(b) = self.bar.as_mut() {
@@ -4396,6 +4420,76 @@ impl Renderer {
         Ok(off)
     }
 
+    /// `upload_guest` for data shaders only read: copies of up to
+    /// `BAR_UPLOAD_MAX` bytes that need no forwards (no GPU write to the range
+    /// pending in this batch or in flight) go to the device-local BAR ring
+    /// while its segment has room, so shaders read them from VRAM rather than
+    /// over PCIe. Returns the ring buffer and offset.
+    fn upload_guest_ro(&mut self, base: u64, size: u64) -> Result<(vk::Buffer, u64), String> {
+        if size <= BAR_UPLOAD_MAX && crate::tune::get(crate::tune::BAR_UPLOADS) != 0 && self.bar.is_some() && !self.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size) && !writeback_in_flight(base, size) {
+            let r = self.bar.as_mut().unwrap();
+            match r.alloc(size) {
+                Some(off) => {
+                    let t0 = std::time::Instant::now();
+                    r.write_guest(off, base, size);
+                    let buf = r.buffer;
+                    self.prof[2] += t0.elapsed();
+                    self.upload_forwarded = false;
+                    self.bar_uploads.0 += 1;
+                    self.bar_uploads.1 += size;
+                    return Ok((buf, off));
+                }
+                None => self.bar_uploads.2 += 1,
+            }
+        }
+        Ok((self.ring.buffer, self.upload_guest(base, size)?))
+    }
+
+    /// The ring offset of this batch's copy of [base, base+size) when a
+    /// read-only binding can use it: copied in the current CPU epoch (within
+    /// one, guest memory changes only through GPU and CP writes), with no
+    /// write registered in the range since (GPU writes, write-backs, harvested
+    /// CPU writes; CP writes drop entries in `forget_uploads`), by the same
+    /// CP queue (another queue's CP may write the range between its copy and
+    /// this command without either ordering against the other). Copies that
+    /// needed forwards are not kept (their GPU copies belong to one command).
+    fn reused_upload(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64)> {
+        if self.upload_reuse_epoch != self.cpu_epoch {
+            self.upload_reuse.clear();
+            self.upload_reuse_epoch = self.cpu_epoch;
+            return None;
+        }
+        let &(bytes, buf, off, stamp, queue) = self.upload_reuse.get(&base)?;
+        if queue != self.cmd_queue {
+            return None;
+        }
+        if bytes < size || self.writes.gpu_written_since(base, bytes, stamp) {
+            self.upload_reuse.remove(&base);
+            return None;
+        }
+        self.upload_reused.0 += 1;
+        self.upload_reused.1 += size;
+        Some((buf, off))
+    }
+
+    /// Remembers a read-only binding's fresh ring copy for `reused_upload`.
+    fn note_upload(&mut self, base: u64, size: u64, buf: vk::Buffer, off: u64) {
+        if self.upload_forwarded || crate::tune::get(crate::tune::UPLOAD_REUSE) == 0 {
+            return;
+        }
+        if self.upload_reuse_epoch != self.cpu_epoch {
+            self.upload_reuse.clear();
+            self.upload_reuse_epoch = self.cpu_epoch;
+        }
+        self.upload_reuse.insert(base, (size, buf, off, self.writes.stamp(), self.cmd_queue));
+    }
+
+    /// The CP wrote guest [addr, addr+len) directly: copies of it are stale.
+    fn forget_uploads(&mut self, addr: u64, len: u64) {
+        let end = addr + len.max(1);
+        self.upload_reuse.retain(|&b, &mut (n, _, _, _, _)| b >= end || b + n <= addr);
+    }
+
     /// Records the forwards `upload_guest` queued: shader writes before the
     /// first copy; earlier forwards before a copy only where it overlaps
     /// them (later writes land later). Their ring ranges are fresh, used only
@@ -4916,6 +5010,12 @@ impl Renderer {
                             }
                         }
                         let size = extent.clamp(4, 64 << 20);
+                        if !buffer_written(p, i) && crate::tune::get(crate::tune::UPLOAD_REUSE) != 0 {
+                            if let Some((buf, off)) = self.reused_upload(base, size) {
+                                infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
+                                continue;
+                            }
+                        }
                         let cause = if buffer_written(p, i) { 0 } else if bias != 0 { 1 } else { 2 };
                         self.upload_bytes[cause] += size;
                         if perf_on() {
@@ -4950,31 +5050,33 @@ impl Renderer {
                                 continue;
                             }
                         }
-                        let off = self.upload_guest(base, size)?;
-                        if buffer_written(p, i) {
-                            // The shader works on a device-local copy; written
-                            // back to guest memory when the batch completes.
-                            // (A barrier only after GPU forwards into the ring
-                            // copy: host writes are visible at submission, the
-                            // device range is fresh.)
-                            let forwarded = self.upload_forwarded;
-                            self.flush_forwards();
-                            let dev_off = self.dring.alloc(size).ok_or("device ring full")?;
-                            self.end_rendering();
-                            if forwarded {
-                                global_barrier(self.cmd);
-                            }
-                            let region = vk::BufferCopy { src_offset: off, dst_offset: dev_off, size };
-                            unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
-                            self.barrier_needed = true;
-                            self.writebacks.push(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
-                            self.writes.note_gpu_write(base, size);
-                            self.note_pending_gpu_write(base, size);
-                            self.mark(|| "written buffer setup copy".into());
-                            infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.dring.buffer, offset: dev_off, range: size.next_multiple_of(4) })));
+                        if !buffer_written(p, i) {
+                            let (buf, off) = self.upload_guest_ro(base, size)?;
+                            self.note_upload(base, size, buf, off);
+                            infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
                             continue;
                         }
-                        infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.ring.buffer, offset: off, range: size.next_multiple_of(4) })));
+                        // Written: the shader works on a device-local copy;
+                        // written back to guest memory when the batch
+                        // completes. (A barrier only after GPU forwards into
+                        // the ring copy: host writes are visible at
+                        // submission, the device range is fresh.)
+                        let off = self.upload_guest(base, size)?;
+                        let forwarded = self.upload_forwarded;
+                        self.flush_forwards();
+                        let dev_off = self.dring.alloc(size).ok_or("device ring full")?;
+                        self.end_rendering();
+                        if forwarded {
+                            global_barrier(self.cmd);
+                        }
+                        let region = vk::BufferCopy { src_offset: off, dst_offset: dev_off, size };
+                        unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
+                        self.barrier_needed = true;
+                        self.writebacks.push(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
+                        self.writes.note_gpu_write(base, size);
+                        self.note_pending_gpu_write(base, size);
+                        self.mark(|| "written buffer setup copy".into());
+                        infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.dring.buffer, offset: dev_off, range: size.next_multiple_of(4) })));
                     }
                     BindingKind::Image(i) | BindingKind::StorageImage(i) => {
                         let ResolvedRes::Image(t) = &p.resources[i] else { return Err("binding/resource mismatch".into()) };
@@ -5104,6 +5206,7 @@ impl Renderer {
 
     fn draw_inner(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) -> Result<(), String> {
         self.draw_targets.clear();
+        self.cmd_queue = cp.queue;
         let mut tl = unsafe { core::arch::x86_64::_rdtsc() };
         macro_rules! phase {
             ($i:expr) => {{
@@ -6219,6 +6322,7 @@ impl Renderer {
     /// caller then waits for its arguments and dispatches directly).
     fn dispatch_inner(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32, indirect: Option<u64>) -> Result<bool, String> {
         self.draw_targets.clear();
+        self.cmd_queue = cp.queue;
         let cs_addr = ((cp.regs.sh(0x2E0C) as u64) | ((cp.regs.sh(0x2E0D) as u64) << 32)) << 8;
         super::set_phase(super::phase::DISPATCH, cs_addr);
         if SKIP_CS.lock().contains(&cs_addr) {
@@ -8253,6 +8357,7 @@ impl Hooks for VkHooks {
         let end = addr + len.max(1);
         if let Some(r) = RENDERER.lock().as_mut() {
             r.vcache_invalidate(addr, len);
+            r.forget_uploads(addr, len);
             if r.zc_reads.overlaps(addr, end) {
                 r.flushes[1] += 1;
                 r.submit_batch(Vec::new());

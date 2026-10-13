@@ -141,7 +141,18 @@ pub const CP_WAIT_NOTIFY: usize = 27;
 /// 0: depth -> buffer -> color transfers).
 pub const DEPTH_COPY_CS: usize = 28;
 
-const TABLE: [(&str, &str, i64); 29] = [
+/// A read-only binding of a guest range this batch already copied into the
+/// upload ring in the current CPU epoch, untouched by registered writes
+/// since, reuses that copy (`TLG_UPLOAD_REUSE`, 1; 0: a copy per binding).
+pub const UPLOAD_REUSE: usize = 29;
+
+/// Read-only bindings of up to `BAR_UPLOAD_MAX` bytes that need no GPU
+/// forwards are copied into the device-local BAR ring (when its segment has
+/// room) instead of host memory the GPU reads over PCIe
+/// (`TLG_BAR_UPLOADS`, 0 for now: under test; 0: host ring).
+pub const BAR_UPLOADS: usize = 30;
+
+const TABLE: [(&str, &str, i64); 31] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -171,6 +182,8 @@ const TABLE: [(&str, &str, i64); 29] = [
     ("lazy_wb", "TLG_LAZY_WB", 1),
     ("cp_wait_notify", "TLG_CP_WAIT_NOTIFY", 1),
     ("depth_copy_cs", "TLG_DEPTH_COPY_CS", 1),
+    ("upload_reuse", "TLG_UPLOAD_REUSE", 1),
+    ("bar_uploads", "TLG_BAR_UPLOADS", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
