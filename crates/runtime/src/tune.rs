@@ -167,7 +167,13 @@ pub const INDEX_MIRROR: usize = 31;
 /// (`TLG_CP_SYNC_VIEW`, 1; 0: the renderer lock for every access).
 pub const CP_SYNC_VIEW: usize = 32;
 
-const TABLE: [(&str, &str, i64); 33] = [
+/// CPU-sourced textures of at most `SMALL_IMAGE_BYTES` unused for 600
+/// frames are evicted even with image eviction off (`TLG_EVICT_SMALL`, 1):
+/// the cave's tiny R32F textures sit at a new address in the title's
+/// per-frame memory every frame (~12 new images per second, never used again).
+pub const EVICT_SMALL: usize = 33;
+
+const TABLE: [(&str, &str, i64); 34] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -201,6 +207,7 @@ const TABLE: [(&str, &str, i64); 33] = [
     ("bar_uploads", "TLG_BAR_UPLOADS", 0),
     ("index_mirror", "TLG_INDEX_MIRROR", 0),
     ("cp_sync_view", "TLG_CP_SYNC_VIEW", 1),
+    ("evict_small", "TLG_EVICT_SMALL", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

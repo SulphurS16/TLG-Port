@@ -423,6 +423,12 @@ fn vram_pressure(usage: u64, budget: u64) -> u8 {
 /// pressure level (from level 2 on, VRAM mirror windows too).
 const EVICT_AGE: [u64; 4] = [5400, 600, 120, 30];
 
+/// Largest CPU-sourced texture `tune evict_small` evicts (and the frames it
+/// must have gone unused).
+const SMALL_IMAGE_BYTES: u64 = 64 << 10;
+const SMALL_IMAGE_AGE: u64 = 600;
+const SMALL_PER_PASS: usize = 256;
+
 /// Without VRAM pressure (levels 0 and 1), a housekeeping pass evicts at
 /// most this many images / bytes (the oldest first) and destroys at most
 /// `RETIRE_PER_PASS` retired objects: evicting 326 images (204 MiB) at once
@@ -1723,6 +1729,10 @@ pub fn perf_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some())
 }
 
+/// Images created (TLG_PERF): by (width, height, layers, levels, format) ->
+/// (count, last guest base), reported and cleared every second.
+pub static NEW_IMAGES: parking_lot::Mutex<Option<HashMap<(u32, u32, u32, u32, vk::Format), (u64, u64)>>> = parking_lot::Mutex::new(None);
+
 /// Full barriers by source line (TLG_PERF).
 pub static BARRIER_SITES: parking_lot::Mutex<Option<HashMap<u32, u64>>> = parking_lot::Mutex::new(None);
 
@@ -2267,6 +2277,12 @@ impl Renderer {
             }
         }
         let img = resources::create_image(key)?;
+        if perf_on() {
+            let mut g = NEW_IMAGES.lock();
+            let e = g.get_or_insert_with(HashMap::new).entry((key.width, key.height, key.layers, key.levels, key.format)).or_default();
+            e.0 += 1;
+            e.1 = key.base;
+        }
         self.begin();
         self.end_rendering();
         let c = ctx();
@@ -7896,17 +7912,35 @@ impl Renderer {
         let release_windows = *WINDOWS.get_or_init(|| std::env::var("TLG_EVICT_WINDOWS").map(|v| v != "0").unwrap_or(true));
         static SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let evict_shadows = *SHADOWS.get_or_init(|| std::env::var("TLG_EVICT_SHADOWS").map(|v| v != "0").unwrap_or(true));
-        let mut candidates: Vec<(u64, u64, ImageKey)> = self.images.iter().filter(|(k, i)| evict_images && (evict_shadows || !is_shadow(k)) && evictable(k, i) && i.last_used + age <= frame).map(|(k, i)| (i.last_used, i.bytes, *k)).collect();
+        let small = crate::tune::get(crate::tune::EVICT_SMALL) != 0;
+        let mut candidates: Vec<(u64, u64, ImageKey)> = self
+            .images
+            .iter()
+            .filter(|(k, i)| {
+                let tiny = small && !i.gpu_written && !is_shadow(k) && i.bytes <= SMALL_IMAGE_BYTES && i.last_used + SMALL_IMAGE_AGE.min(age) <= frame;
+                evictable(k, i) && (tiny || (evict_images && (evict_shadows || !is_shadow(k)) && i.last_used + age <= frame))
+            })
+            .map(|(k, i)| (i.last_used, i.bytes, *k))
+            .collect();
         if self.pressure < 2 {
             candidates.sort_unstable_by_key(|c| c.0);
-            let (mut n, mut bytes) = (0usize, 0u64);
+            // (Small textures under a cap of their own: cheap to destroy, and
+            // they arrive faster than the general cap would take them.)
+            let (mut n, mut bytes, mut small_n) = (0usize, 0u64, 0usize);
             candidates.retain(|c| {
+                if c.1 <= SMALL_IMAGE_BYTES {
+                    small_n += 1;
+                    return small_n <= SMALL_PER_PASS;
+                }
                 let keep = n < EVICT_PER_PASS.0 && bytes < EVICT_PER_PASS.1;
                 n += 1;
                 bytes += c.1;
                 keep
             });
         }
+        // (Passes that evict only small textures are not logged: the VRAM
+        // report counts them.)
+        let any_big = candidates.iter().any(|c| c.1 > SMALL_IMAGE_BYTES);
         let victims: Vec<ImageKey> = candidates.into_iter().map(|c| c.2).collect();
         let mut freed = 0;
         for k in &victims {
@@ -7940,7 +7974,9 @@ impl Renderer {
             self.shadows.retain(|sk, (dk, _)| !gone.contains(&sk.0) && !gone.contains(dk));
             self.evicted.0 += victims.len() as u64;
             self.evicted.1 += freed;
-            crate::info!("VRAM: evicted {} images unused for {age}+ frames ({} MiB; pressure {})", victims.len(), freed >> 20, self.pressure);
+            if any_big {
+                crate::info!("VRAM: evicted {} images unused for {age}+ frames ({} MiB; pressure {})", victims.len(), freed >> 20, self.pressure);
+            }
         }
         let mut released = 0;
         if self.pressure >= 2 && release_windows {

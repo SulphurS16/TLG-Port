@@ -870,6 +870,14 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             pr.join(", "),
             vram
         );
+        // Images created in the second, the most frequent kinds first.
+        let mut ni: Vec<((u32, u32, u32, u32, ash::vk::Format), (u64, u64))> = render::NEW_IMAGES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
+        if !ni.is_empty() {
+            ni.sort_by_key(|e| std::cmp::Reverse(e.1 .0));
+            let n: u64 = ni.iter().map(|e| e.1 .0).sum();
+            let top: Vec<String> = ni.iter().take(6).map(|((w, h, l, m, f), (c, b))| format!("{c} x {w}x{h}x{l} {m} levels {f:?} (last at {b:#x})")).collect();
+            crate::info!("images created/s: {n}; {}", top.join(", "));
+        }
         // The largest buffer uploads of the second (base, bytes, written).
         let mut ups: Vec<((u64, u64, bool), u64)> = render::BUFFER_UPLOAD_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
         if !ups.is_empty() {
