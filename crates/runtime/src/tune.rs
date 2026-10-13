@@ -155,9 +155,11 @@ pub const BAR_UPLOADS: usize = 30;
 
 /// Index data whose guest memory is current is fetched from the VRAM mirror
 /// (copied in once, then per CPU-written page) instead of a host-ring copy
-/// per draw (`TLG_INDEX_MIRROR`, 0. Cave A/B, run 20261013-032442, CPU
-/// 19-20%: upload time per command halved, GPU-thread CPU per command the
-/// same, GPU busy 307 vs 265 ms per frame, 0.88 vs 1.00 fps).
+/// per draw (`TLG_INDEX_MIRROR`, 1). Before the write protection of cold
+/// blocks (`CPU_WATCH`) the mirror's write-watch checks ate the gain (run
+/// 20261013-032442: 0.88 vs 1.00 fps); with it (run 20261013-120421, CPU
+/// 31%) 4.70 vs 4.46 fps, GPU-thread CPU per command -5.5%, upload time
+/// per command -49%.
 pub const INDEX_MIRROR: usize = 31;
 
 /// CP threads check a separately locked summary of the current batch's
@@ -223,7 +225,7 @@ const TABLE: [(&str, &str, i64); 37] = [
     ("depth_copy_cs", "TLG_DEPTH_COPY_CS", 1),
     ("upload_reuse", "TLG_UPLOAD_REUSE", 1),
     ("bar_uploads", "TLG_BAR_UPLOADS", 0),
-    ("index_mirror", "TLG_INDEX_MIRROR", 0),
+    ("index_mirror", "TLG_INDEX_MIRROR", 1),
     ("cp_sync_view", "TLG_CP_SYNC_VIEW", 1),
     ("evict_small", "TLG_EVICT_SMALL", 1),
     ("dispatch_hazards", "TLG_DISPATCH_HAZARDS", 1),
