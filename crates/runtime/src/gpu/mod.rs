@@ -903,7 +903,12 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             ups.sort_by_key(|&((_, size, _), n)| std::cmp::Reverse(size * n));
             let total: u64 = ups.iter().map(|&((_, s, _), n)| s * n).sum();
             let top: Vec<String> = ups.iter().take(8).map(|&((b, s, w), n)| format!("{n} x {b:#x}+{s:#x}{}", if w { " (written)" } else { "" })).collect();
-            crate::info!("buffer uploads/s: {} MiB in {} bindings; largest: {}", total >> 20, ups.iter().map(|u| u.1).sum::<u64>(), top.join(", "));
+            // (Read-only ranges: how often each was copied, and the bytes.)
+            let ro: Vec<&((u64, u64, bool), u64)> = ups.iter().filter(|u| !u.0 .2).collect();
+            let (ro_n, ro_bytes) = (ro.iter().map(|u| u.1).sum::<u64>(), ro.iter().map(|u| u.0 .1 * u.1).sum::<u64>());
+            let same = render::UPLOADS_UNCHANGED.swap(0, Ordering::Relaxed);
+            let reusable = render::UPLOADS_REUSABLE.swap(0, Ordering::Relaxed);
+            crate::info!("buffer uploads/s: {} MiB in {} bindings ({} ranges; read-only: {} ranges, {} copies, {} MiB, {same} copies equal to the range's previous one, {reusable} with no write found since); largest: {}", total >> 20, ups.iter().map(|u| u.1).sum::<u64>(), ups.len(), ro.len(), ro_n, ro_bytes >> 20, top.join(", "));
         }
         // Per command-processor queue: renderer lock wait / hold, WAIT_REG_MEM (ms).
         static LAST_Q: Mutex<Option<[[u64; 3]; 64]>> = Mutex::new(None);

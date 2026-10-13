@@ -1283,6 +1283,8 @@ pub struct Renderer {
     /// Graphics pipeline bound in the current command buffer (consecutive
     /// draws mostly share one; the bind is skipped then).
     bound_gfx: vk::Pipeline,
+    /// The compute pipeline bound in the batch's command buffer (null: unknown).
+    bound_cs: vk::Pipeline,
     /// Device-local ring segment (same slot rotation as `ring`).
     dring: Ring,
     /// Device-local ring the CPU writes through the BAR window, for per-draw
@@ -1662,6 +1664,7 @@ pub fn init() -> Result<(), String> {
             unordered_line: 0,
             dyn_state: None,
             bound_gfx: vk::Pipeline::null(),
+            bound_cs: vk::Pipeline::null(),
             dring,
             bar,
             writebacks: Vec::new(),
@@ -1865,6 +1868,11 @@ pub static GUARD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parki
 /// Upload copies that needed forwards of pending GPU writes: (read range,
 /// reader, written range, where the write is) -> count (TLG_PERF report).
 pub static FORWARD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
+/// Read-only upload copies: the last copy's content hash per range, and the
+/// copies equal to the range's previous one (TLG_PERF).
+static UPLOAD_HASHES: parking_lot::Mutex<Option<HashMap<(u64, u64), (u64, u64)>>> = parking_lot::Mutex::new(None);
+pub static UPLOADS_UNCHANGED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static UPLOADS_REUSABLE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Fast clears left to the CPU path, by reason (`meta_clear_on_gpu`), and
 /// how often that path then waited for the GPU (TLG_PERF report).
 pub static META_DECLINES: parking_lot::Mutex<Option<HashMap<&'static str, u64>>> = parking_lot::Mutex::new(None);
@@ -2054,6 +2062,7 @@ impl Renderer {
         self.recording = true;
         self.dyn_state = None;
         self.bound_gfx = vk::Pipeline::null();
+        self.bound_cs = vk::Pipeline::null();
         self.marks.clear();
         let q = self.slots[self.cur].queries;
         if q != vk::QueryPool::null() {
@@ -4416,7 +4425,7 @@ impl Renderer {
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
             global_barrier(self.cmd);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
             c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
             c.device.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
@@ -4876,7 +4885,31 @@ impl Renderer {
                 None => self.bar_uploads.2 += 1,
             }
         }
-        self.upload_guest_ex(base, size, crate::tune::get(crate::tune::DEVCOPY_READS) != 0)
+        let r = self.upload_guest_ex(base, size, crate::tune::get(crate::tune::DEVCOPY_READS) != 0)?;
+        if perf_on() && !self.upload_devcopy && r.0 == self.ring.buffer {
+            // (TLG_PERF: copies whose guest bytes equal the previous copy's.)
+            let h = resources::hash_slice(size, unsafe { std::slice::from_raw_parts(self.ring.ptr.add(r.1 as usize), size as usize) });
+            let stamp = self.writes.stamp();
+            let prev = {
+                let mut g = UPLOAD_HASHES.lock();
+                let m = g.get_or_insert_with(HashMap::new);
+                if m.len() > 1 << 16 {
+                    m.clear();
+                }
+                m.insert((base, size), (h, stamp))
+            };
+            if prev.is_some_and(|p| p.0 == h) {
+                UPLOADS_UNCHANGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            // (Neither GPU nor CPU writes found since the previous copy: a
+            // copy kept from then would still be current.)
+            if let Some((_, s)) = prev {
+                if !self.writes.gpu_written_since(base, size, s) && !self.writes.cpu_changed_since(base, size, s, false).0 {
+                    UPLOADS_REUSABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(r)
     }
 
     /// The ring offset of this batch's copy of [base, base+size) when a
@@ -6861,7 +6894,7 @@ impl Renderer {
         global_barrier(self.cmd);
         let c = ctx();
         unsafe {
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
             c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             c.device.cmd_dispatch(self.cmd, groups, 1, 1);
         }
@@ -7058,7 +7091,10 @@ impl Renderer {
         let regs = &cp.regs;
         let (sx, sy, sz) = (regs.sh(0x2E04), regs.sh(0x2E05), regs.sh(0x2E06));
         unsafe {
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            if pipeline != self.bound_cs {
+                c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                self.bound_cs = pipeline;
+            }
             c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             if let Some(slot) = args_slot {
                 c.device.cmd_dispatch_indirect(self.cmd, self.dring.buffer, slot);
@@ -7209,7 +7245,7 @@ impl Renderer {
             let per_layer = lin_sizes[i] / layers as u64;
             unsafe {
                 c.device.update_descriptor_sets(&writes, &[]);
-                c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, detile);
+                c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, detile); self.bound_cs = vk::Pipeline::null();
                 c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
                 for s in 0..layers as u64 {
                     let pc = [n as u32, bpp / 32, ((l.offset + s * l.slice_bytes) / 4) as u32, ((lin_at + s * per_layer) / 4) as u32];
@@ -7464,6 +7500,7 @@ impl Renderer {
         let c = ctx();
         let mut bitmaps = Vec::new();
         unsafe { c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline) };
+        self.bound_cs = vk::Pipeline::null();
         for p in pending {
             let Some((bits, bits_host, words)) = p.bits else { continue };
             let set = self.dirty_set(p.dev_buf)?;
@@ -7572,7 +7609,7 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
             c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
             c.device.cmd_dispatch(self.cmd, 1, 1, 1);
@@ -7695,7 +7732,7 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
             c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
             c.device.cmd_dispatch(self.cmd, 1, 1, 1);
@@ -7862,7 +7899,7 @@ impl Renderer {
         let c = ctx();
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, if tile { tilep } else { detile });
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, if tile { tilep } else { detile }); self.bound_cs = vk::Pipeline::null();
             c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             for l in 0..layers {
                 let pc = [n as u32, bpp / 32, (l * slice / 4) as u32, (l * lin_slice / 4) as u32];
@@ -8269,7 +8306,7 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, probe);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, probe); self.bound_cs = vk::Pipeline::null();
             c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
             c.device.cmd_dispatch(self.cmd, 1, 1, 1);
@@ -8279,7 +8316,7 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             // (Same layout: the set and push constants stay bound.)
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, expand);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, expand); self.bound_cs = vk::Pipeline::null();
             c.device.cmd_dispatch(self.cmd, n.div_ceil(64), 1, 1);
         }
         // The clears, each gated by its predicate.
