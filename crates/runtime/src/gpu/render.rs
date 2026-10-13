@@ -1190,6 +1190,9 @@ pub struct Renderer {
     pub dprof_draws: u64,
     /// Ticks in parts of the descriptor phase (`DESC_PARTS`).
     pub dsub: [u64; 6],
+    /// Buffer bindings by path (`BUFFER_PATHS`): ticks and count.
+    pub bsub: [u64; 9],
+    pub bcnt: [u64; 9],
     /// Synchronizing flushes by reason (see FLUSH_REASONS).
     pub flushes: [u64; 6],
     /// Buffer bytes copied at record time by cause: shader-written (device
@@ -1523,6 +1526,8 @@ pub fn init() -> Result<(), String> {
             dprof: [0; 8],
             dprof_draws: 0,
             dsub: [0; 6],
+            bsub: [0; 9],
+            bcnt: [0; 9],
             cpu_epoch: 0,
             required_epoch: 0,
             img_bases: std::collections::BTreeMap::new(),
@@ -4881,6 +4886,7 @@ impl Renderer {
         // next one starts.)
         let mut tb = unsafe { core::arch::x86_64::_rdtsc() };
         let mut part = 4usize;
+        let mut bpath = 0usize;
         for p in prepared {
             // Per resource: page bitmap of its writes (`BindingKind::DirtyInfo`);
             // writes not tracked mark the sink.
@@ -4892,6 +4898,10 @@ impl Renderer {
             for b in &p.translated.out.bindings {
                 let t = unsafe { core::arch::x86_64::_rdtsc() };
                 self.dsub[part] += t.wrapping_sub(tb);
+                if part == 2 {
+                    self.bsub[bpath] += t.wrapping_sub(tb);
+                    self.bcnt[bpath] += 1;
+                }
                 tb = t;
                 part = match b.kind {
                     BindingKind::SgprData => 1,
@@ -4921,6 +4931,7 @@ impl Renderer {
                     }
                     BindingKind::Buffer(i) => {
                         let ResolvedRes::Buffer(v) = &p.resources[i] else { return Err("binding/resource mismatch".into()) };
+                        bpath = 0;
                         if let Some(off) = tess_ring_offset(v.base) {
                             // The tessellation factor ring (HS stores).
                             if off % 256 != 0 {
@@ -4937,7 +4948,9 @@ impl Renderer {
                         let base = v.base - bias;
                         if self.in_place(p, i, v.base, v.size().max(4)) {
                             if let Some((buf, off, range)) = self.zc_binding(base, v.size().max(4) + bias) {
+                                bpath = 1;
                                 if buffer_written(p, i) {
+                                    bpath = 2;
                                     // The scatter kernel's records name the
                                     // few dwords it writes in its 2 GB binding.
                                     let ranges = match (&p.sparse_writes, p.scatter) {
@@ -4958,6 +4971,7 @@ impl Renderer {
                                 }
                                 if !buffer_written(p, i) && range <= VCACHE_MAX {
                                     if let Some((vb, voff)) = self.vcache_bind(base, range) {
+                                        bpath = 3;
                                         infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range })));
                                         continue;
                                     }
@@ -4983,6 +4997,7 @@ impl Renderer {
                             let n = extent.min(room);
                             self.vc_why = "read binding";
                             if let Some((vb, voff)) = self.vcache_bind_ex(base, n, false, n < VCACHE_MIN) {
+                                bpath = 3;
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range: n.next_multiple_of(4) })));
                                 continue;
                             }
@@ -4995,6 +5010,7 @@ impl Renderer {
                             // batch completes (copied out at its end).
                             self.vc_why = "written binding";
                             if let Some((vb, voff)) = self.vcache_bind_ex(base, extent, false, extent < VCACHE_MIN) {
+                                bpath = 4;
                                 let (bits, words, head) = self.mirror_write_back(base, extent, vb, voff)?;
                                 if let Some(d) = dinfo.get_mut(3 * i..3 * i + 3) {
                                     d.copy_from_slice(&[(bits / 4) as u32, head, words - 1]);
@@ -5015,6 +5031,7 @@ impl Renderer {
                         let size = extent.clamp(4, 64 << 20);
                         if !buffer_written(p, i) && crate::tune::get(crate::tune::UPLOAD_REUSE) != 0 {
                             if let Some((buf, off)) = self.reused_upload(base, size) {
+                                bpath = 5;
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
                                 continue;
                             }
@@ -5039,6 +5056,7 @@ impl Renderer {
                                 // working copy) now and back right after the
                                 // command, both as bulk copies on the GPU
                                 // timeline (shader stores into host memory crawl).
+                                bpath = 7;
                                 let dev_off = self.dring.alloc(size).ok_or("device ring full")?;
                                 self.end_rendering();
                                 global_barrier(self.cmd);
@@ -5054,6 +5072,7 @@ impl Renderer {
                             }
                         }
                         if !buffer_written(p, i) {
+                            bpath = 6;
                             let (buf, off) = self.upload_guest_ro(base, size)?;
                             self.note_upload(base, size, buf, off);
                             infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
@@ -5064,6 +5083,7 @@ impl Renderer {
                         // completes. (A barrier only after GPU forwards into
                         // the ring copy: host writes are visible at
                         // submission, the device range is fresh.)
+                        bpath = 8;
                         let off = self.upload_guest(base, size)?;
                         let forwarded = self.upload_forwarded;
                         self.flush_forwards();
@@ -5123,6 +5143,10 @@ impl Renderer {
         }
         let t = unsafe { core::arch::x86_64::_rdtsc() };
         self.dsub[part] += t.wrapping_sub(tb);
+        if part == 2 {
+            self.bsub[bpath] += t.wrapping_sub(tb);
+            self.bcnt[bpath] += 1;
+        }
         tb = t;
         if prepared.iter().any(|p| p.tess == TessRole::Ds) {
             let (_, tf) = self.tess_buffers()?;
@@ -8566,6 +8590,8 @@ fn res_summary(r: &ResolvedRes) -> String {
 pub const DRAW_PHASES: [&str; 8] = ["setup", "shaders", "targets", "pipeline", "guest reads", "descriptors", "pass", "record"];
 /// Parts of the descriptor phase timed in `Renderer::dsub` (all commands).
 pub const DESC_PARTS: [&str; 6] = ["alloc", "sgpr data", "buffers", "images", "samplers+other", "update"];
+/// Buffer binding paths timed in `Renderer::bsub` (`write_descriptors`).
+pub const BUFFER_PATHS: [&str; 9] = ["other", "in place read", "in place written", "mirror read", "mirror written", "reused copy", "read-only copy", "written round trip", "written copy"];
 
 pub const PROF_NAMES: [&str; 7] = ["submit+wait", "writeback", "buffer upload", "texture hash", "texture read", "shader prep", "slot wait"];
 

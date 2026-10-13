@@ -783,6 +783,8 @@ struct PerfSnap {
     dprof: [u64; 8],
     dprof_draws: u64,
     dsub: [u64; 6],
+    bsub: [u64; 9],
+    bcnt: [u64; 9],
     tsc: u64,
 }
 
@@ -816,6 +818,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         dprof: r.dprof,
         dprof_draws: r.dprof_draws,
         dsub: r.dsub,
+        bsub: r.bsub,
+        bcnt: r.bcnt,
         tsc: unsafe { core::arch::x86_64::_rdtsc() },
     };
     drop(g);
@@ -833,6 +837,17 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         let ph: Vec<String> = render::DRAW_PHASES.iter().enumerate().map(|(i, n)| format!("{n} {:.1}", now.dprof[i].wrapping_sub(p.dprof[i]) as f64 / hz * 1e6 / nd)).collect();
         let ds: Vec<String> = render::DESC_PARTS.iter().enumerate().map(|(i, n)| format!("{n} {:.1}", now.dsub[i].wrapping_sub(p.dsub[i]) as f64 / hz * 1e6 / nd)).collect();
         crate::info!("draw µs/draw: {}; descriptor parts (all commands, per draw): {}", ph.join(", "), ds.join(", "));
+        // Buffer bindings by path: count/s and µs each (all commands).
+        let bp: Vec<String> = render::BUFFER_PATHS
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| now.bcnt[*i] != p.bcnt[*i])
+            .map(|(i, n)| {
+                let c = now.bcnt[i] - p.bcnt[i];
+                format!("{n} {c} x {:.1} us", now.bsub[i].wrapping_sub(p.bsub[i]) as f64 / hz * 1e6 / c as f64)
+            })
+            .collect();
+        crate::info!("buffer bindings/s by path: {}", bp.join(", "));
         crate::info!(
             "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
             now.frames - p.frames,
