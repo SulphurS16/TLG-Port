@@ -136,7 +136,12 @@ pub const LAZY_WB: usize = 26;
 /// with 100 us sleeps).
 pub const CP_WAIT_NOTIFY: usize = 27;
 
-const TABLE: [(&str, &str, i64); 28] = [
+/// Depth targets sampled through a smaller T# are copied to their color
+/// shadow by one compute pass reading the depth view (`TLG_DEPTH_COPY_CS`, 1;
+/// 0: depth -> buffer -> color transfers).
+pub const DEPTH_COPY_CS: usize = 28;
+
+const TABLE: [(&str, &str, i64); 29] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -165,6 +170,7 @@ const TABLE: [(&str, &str, i64); 28] = [
     ("vcache_gpu_reads", "TLG_VCACHE_GPU_READS", 0),
     ("lazy_wb", "TLG_LAZY_WB", 1),
     ("cp_wait_notify", "TLG_CP_WAIT_NOTIFY", 1),
+    ("depth_copy_cs", "TLG_DEPTH_COPY_CS", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

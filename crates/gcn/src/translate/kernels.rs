@@ -525,6 +525,86 @@ pub fn meta_expand_cs() -> Vec<u32> {
     b.module().assemble()
 }
 
+/// Copies the texels of a depth image (a depth view, fetched by integer
+/// coordinates) into a color storage image (R32/R16, written without a
+/// format) in one pass, for sampling through a smaller T# than the depth
+/// target (instead of depth -> buffer -> color transfers). Bindings (set 0):
+/// 0 = the depth view (sampled image), 1 = the color image (storage image).
+/// Push constants (2 x u32): width, height. 8x8 invocations per workgroup.
+pub fn depth_copy_cs() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(spirv::Capability::Shader);
+    b.capability(spirv::Capability::StorageImageWriteWithoutFormat);
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let boolt = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let i32t = b.type_int(32, 1);
+    let f32t = b.type_float(32, None);
+    let v2i = b.type_vector(i32t, 2);
+    let v3u = b.type_vector(u32t, 3);
+    let v4f = b.type_vector(f32t, 4);
+    let img_t = b.type_image(f32t, spirv::Dim::Dim2D, 0, 0, 0, 1, spirv::ImageFormat::Unknown, None);
+    let st_t = b.type_image(f32t, spirv::Dim::Dim2D, 0, 0, 0, 2, spirv::ImageFormat::Unknown, None);
+    let p_img = b.type_pointer(None, StorageClass::UniformConstant, img_t);
+    let p_st = b.type_pointer(None, StorageClass::UniformConstant, st_t);
+    let src = global(&mut b, p_img, StorageClass::UniformConstant);
+    let dst = global(&mut b, p_st, StorageClass::UniformConstant);
+    for (v, binding) in [(src, 0), (dst, 1)] {
+        b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+        b.decorate(v, Decoration::Binding, [Operand::LiteralBit32(binding)]);
+    }
+    b.decorate(dst, Decoration::NonReadable, []);
+    let pcs = b.type_struct([u32t, u32t]);
+    b.decorate(pcs, Decoration::Block, []);
+    for m in 0..2 {
+        b.member_decorate(pcs, m, Decoration::Offset, [Operand::LiteralBit32(m * 4)]);
+    }
+    let p_pcs = b.type_pointer(None, StorageClass::PushConstant, pcs);
+    let p_pc_u = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let pc = global(&mut b, p_pcs, StorageClass::PushConstant);
+    let p_in_v3 = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid = global(&mut b, p_in_v3, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+
+    let fn_ty = b.type_function(void, []);
+    let func = b.begin_function(void, None, spirv::FunctionControl::NONE, fn_ty).unwrap();
+    b.begin_block(None).unwrap();
+    let c0 = b.constant_bit32(u32t, 0);
+    let c1 = b.constant_bit32(u32t, 1);
+    let lod0 = b.constant_bit32(i32t, 0);
+    let pw = b.access_chain(p_pc_u, None, pc, [c0]).unwrap();
+    let w = b.load(u32t, None, pw, None, []).unwrap();
+    let ph = b.access_chain(p_pc_u, None, pc, [c1]).unwrap();
+    let h = b.load(u32t, None, ph, None, []).unwrap();
+    let g = b.load(v3u, None, gid, None, []).unwrap();
+    let x = b.composite_extract(u32t, None, g, [0]).unwrap();
+    let y = b.composite_extract(u32t, None, g, [1]).unwrap();
+    let in_x = b.u_less_than(boolt, None, x, w).unwrap();
+    let in_y = b.u_less_than(boolt, None, y, h).unwrap();
+    let inside = b.logical_and(boolt, None, in_x, in_y).unwrap();
+    let body = b.id();
+    let merge = b.id();
+    b.selection_merge(merge, spirv::SelectionControl::NONE).unwrap();
+    b.branch_conditional(inside, body, merge, []).unwrap();
+    b.begin_block(Some(body)).unwrap();
+    let xi = b.bitcast(i32t, None, x).unwrap();
+    let yi = b.bitcast(i32t, None, y).unwrap();
+    let at = b.composite_construct(v2i, None, [xi, yi]).unwrap();
+    let si = b.load(img_t, None, src, None, []).unwrap();
+    let v = b.image_fetch(v4f, None, si, at, Some(spirv::ImageOperands::LOD), [Operand::IdRef(lod0)]).unwrap();
+    let di = b.load(st_t, None, dst, None, []).unwrap();
+    b.image_write(di, at, v, None, []).unwrap();
+    b.branch(merge).unwrap();
+    b.begin_block(Some(merge)).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, func, "main", [gid]);
+    b.execution_mode(func, ExecutionMode::LocalSize, [8, 8, 1]);
+    b.module().assemble()
+}
+
 fn global(b: &mut Builder, ptr: u32, sc: StorageClass) -> u32 {
     let id = b.id();
     let inst = rspirv::dr::Instruction::new(spirv::Op::Variable, Some(ptr), Some(id), vec![Operand::StorageClass(sc)]);
@@ -558,6 +638,16 @@ mod tests {
                 let last = b.instructions.last().map(|i| i.class.opcode);
                 assert!(matches!(last, Some(rspirv::spirv::Op::Return | rspirv::spirv::Op::Branch | rspirv::spirv::Op::BranchConditional)), "{name}: block without terminator");
             }
+        }
+    }
+
+    #[test]
+    fn depth_copy_kernel_assembles() {
+        let w = super::depth_copy_cs();
+        check_module(&w, "depth_copy");
+        if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/depth_copy.spv"), bytes).unwrap();
         }
     }
 

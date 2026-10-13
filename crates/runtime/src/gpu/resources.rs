@@ -217,7 +217,7 @@ pub fn is_depth(f: vk::Format) -> bool {
     matches!(f, vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D24_UNORM_S8_UINT)
 }
 
-fn storage_capable(c: &Ctx, f: vk::Format) -> bool {
+pub fn storage_capable(c: &Ctx, f: vk::Format) -> bool {
     let p = unsafe { c.instance.get_physical_device_format_properties(c.pdev, f) };
     p.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
 }

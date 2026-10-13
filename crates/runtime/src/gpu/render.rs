@@ -1209,6 +1209,8 @@ pub struct Renderer {
     /// diagnostics buffer (host-visible: rejections, last rejected x, y, z;
     /// mapped address) and the rejection count last logged.
     indirect_pipe: Option<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline)>,
+    /// `kernels::depth_copy_cs` (created on first use).
+    depth_copy_pipe: Option<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline)>,
     /// Selective write-back of mirror-resident writes (kernels::dirty_copy_cs):
     /// set layout, layout, pipeline and the pool of its per-source sets.
     dirty_pipe: Option<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline, vk::DescriptorPool)>,
@@ -1487,6 +1489,7 @@ pub fn init() -> Result<(), String> {
             gds,
             remap: None,
             indirect_pipe: None,
+            depth_copy_pipe: None,
             dirty_pipe: None,
             dirty_sets: FastMap::default(),
             dirty_sink: (u64::MAX, 0),
@@ -3940,6 +3943,15 @@ impl Renderer {
             self.begin();
             self.end_rendering();
             let (w, h) = (t.width.min(src.width), t.height.min(src.height));
+            if crate::tune::get(crate::tune::DEPTH_COPY_CS) != 0 && resources::storage_capable(ctx(), vfmt) && self.depth_copy_compute(src, dst_key, w, h)? {
+                self.mark(|| "depth copy for sampling (compute)".into());
+                DEPTH_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                DEPTH_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.shadows.insert(skey, (dst_key, wgen));
+                self.images.get_mut(&dst_key).unwrap().gpu_written = true;
+                let img = self.images.get_mut(&dst_key).unwrap();
+                return img.view(vfmt, t.dst_sel, view_type, false, 0, 1);
+            }
             let bpp = if vfmt == vk::Format::R16_UNORM { 2 } else { 4 };
             // Through device memory: shadow maps (4096x4096, 64 MiB) do not
             // fit a host ring segment.
@@ -3969,6 +3981,60 @@ impl Renderer {
         }
         let img = self.images.get_mut(&dst_key).unwrap();
         img.view(vfmt, t.dst_sel, view_type, false, 0, 1)
+    }
+
+    /// The depth-copy kernel's pipeline (created on first use).
+    fn depth_copy_pipe(&mut self) -> Result<(vk::DescriptorSetLayout, vk::PipelineLayout, vk::Pipeline), String> {
+        if let Some(p) = self.depth_copy_pipe {
+            return Ok(p);
+        }
+        let c = ctx();
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default().binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let set_layout = unsafe { c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }.map_err(|e| e.to_string())?;
+        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 8 }];
+        let sls = [set_layout];
+        let layout = unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sls).push_constant_ranges(&pcr), None) }.map_err(|e| e.to_string())?;
+        let m = self.module(0x4445_5054_4843_5900, &gcn::translate::kernels::depth_copy_cs())?;
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main");
+        let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
+        let pipeline = unsafe { c.device.create_compute_pipelines(vk::PipelineCache::null(), &[ci], None) }.map_err(|(_, e)| format!("depth copy pipeline: {e}"))?[0];
+        self.depth_copy_pipe = Some((set_layout, layout, pipeline));
+        Ok((set_layout, layout, pipeline))
+    }
+
+    /// Copies [0, w) x [0, h) of depth image `src` into color image `dst` by
+    /// `kernels::depth_copy_cs`. False when it could not (no descriptor set
+    /// left in the batch's pool: allocating one here must not split the
+    /// batch, a draw's setup is under way): the caller transfers instead.
+    fn depth_copy_compute(&mut self, src: ImageKey, dst: ImageKey, w: u32, h: u32) -> Result<bool, String> {
+        let (set_layout, layout, pipeline) = self.depth_copy_pipe()?;
+        let c = ctx();
+        let layouts = [set_layout];
+        let ai = vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.desc_pool).set_layouts(&layouts);
+        let Ok(sets) = (unsafe { c.device.allocate_descriptor_sets(&ai) }) else { return Ok(false) };
+        let set = sets[0];
+        let sv = self.images.get_mut(&src).unwrap().view(src.format, 0, vk::ImageViewType::TYPE_2D, false, 0, 1)?;
+        let dv = self.images.get_mut(&dst).unwrap().view(dst.format, 0, vk::ImageViewType::TYPE_2D, true, 0, 1)?;
+        let si = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: sv, image_layout: vk::ImageLayout::GENERAL }];
+        let di = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: dv, image_layout: vk::ImageLayout::GENERAL }];
+        let writes = [
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(&si),
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&di),
+        ];
+        let pc: Vec<u8> = [w, h].iter().flat_map(|v| v.to_le_bytes()).collect();
+        unsafe {
+            c.device.update_descriptor_sets(&writes, &[]);
+            global_barrier(self.cmd);
+            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+            c.device.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
+        }
+        self.barrier_needed = true;
+        Ok(true)
     }
 
     fn shadow_view(&mut self, src: ImageKey, t: &Tsharp, vfmt: vk::Format, store_fmt: vk::Format, view_type: vk::ImageViewType) -> Result<vk::ImageView, String> {
@@ -8240,7 +8306,7 @@ pub static SKIP_PS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 pub static SKIP_CS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Depth targets sampled through a smaller T#: cropped copies made, direct
 /// views for texel loads (`depth_shadow_view`).
-pub static DEPTH_VIEWS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub static DEPTH_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// Debug: image dumps also write the raw texels (control `dumpraw 1`).
 pub static DUMP_RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
