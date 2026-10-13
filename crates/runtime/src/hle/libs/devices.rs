@@ -164,6 +164,8 @@ sysv! {
     }
     fn scePadReadState(h: i32, data: *mut PadData) -> i32 {
         if h != 1 || data.is_null() { return 0x80920003u32 as i32; }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::info!("scePadReadState: first call (handle {h})"));
         std::ptr::write_unaligned(data, read_pad());
         0
     }
@@ -172,6 +174,8 @@ sysv! {
     fn scePadRead(h: i32, data: *mut PadData, num: i32) -> i32 {
         if data.is_null() || !(1..=64).contains(&num) { return 0x80920001u32 as i32; }
         if h != 1 { return 0x80920003u32 as i32; }
+        static FIRST: std::sync::Once = std::sync::Once::new();
+        FIRST.call_once(|| crate::info!("scePadRead: first call (handle {h}, up to {num} states)"));
         std::ptr::write_unaligned(data, read_pad());
         1
     }
