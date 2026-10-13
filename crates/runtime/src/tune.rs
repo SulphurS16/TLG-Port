@@ -160,7 +160,14 @@ pub const BAR_UPLOADS: usize = 30;
 /// same, GPU busy 307 vs 265 ms per frame, 0.88 vs 1.00 fps).
 pub const INDEX_MIRROR: usize = 31;
 
-const TABLE: [(&str, &str, i64); 32] = [
+/// CP threads check a separately locked summary of the current batch's
+/// pending GPU writes and in-place reads before direct memory accesses, and
+/// take the renderer lock only on overlap; their writes' mirror/upload-cache
+/// invalidations are applied by the renderer before its next command
+/// (`TLG_CP_SYNC_VIEW`, 1; 0: the renderer lock for every access).
+pub const CP_SYNC_VIEW: usize = 32;
+
+const TABLE: [(&str, &str, i64); 33] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -193,6 +200,7 @@ const TABLE: [(&str, &str, i64); 32] = [
     ("upload_reuse", "TLG_UPLOAD_REUSE", 1),
     ("bar_uploads", "TLG_BAR_UPLOADS", 0),
     ("index_mirror", "TLG_INDEX_MIRROR", 0),
+    ("cp_sync_view", "TLG_CP_SYNC_VIEW", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

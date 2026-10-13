@@ -663,6 +663,9 @@ fn clear_color_for(format: vk::Format, e: &[u8]) -> Option<vk::ClearColorValue> 
 pub struct Ranges(std::collections::BTreeMap<u64, u64>, [(u64, u64); 16]);
 
 impl Ranges {
+    pub const fn new() -> Ranges {
+        Ranges(std::collections::BTreeMap::new(), [(0, 0); 16])
+    }
     pub fn insert(&mut self, lo: u64, hi: u64) {
         let hi = hi.max(lo + 1);
         let slot = ((lo ^ hi) >> 4) as usize & 15;
@@ -695,6 +698,29 @@ impl Ranges {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+}
+
+/// What CP threads check before they access guest memory directly, without
+/// taking the renderer lock (`tune cp_sync_view`): the current batch's
+/// pending GPU writes (write-backs at its completion, in-place stores) and
+/// in-place reads, entered when the renderer records them and cleared once
+/// the batch's completion is queued (where `wait_overlapping` and the CP's
+/// completion checks see them); and the CP's direct writes, whose mirror and
+/// upload-cache invalidations the renderer applies before its next command
+/// (`drain_cp_writes`). A CP thread's own earlier commands are always
+/// entered; another queue's command being recorded meanwhile is unordered
+/// with the access, as it is on the hardware without a wait between them.
+pub struct CpView {
+    pending: Ranges,
+    reads: Ranges,
+    cp_writes: Vec<(u64, u64)>,
+}
+
+pub static CP_VIEW: parking_lot::Mutex<CpView> = parking_lot::Mutex::new(CpView { pending: Ranges::new(), reads: Ranges::new(), cp_writes: Vec::new() });
+static CP_WRITES_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn cp_view_on() -> bool {
+    crate::tune::get(crate::tune::CP_SYNC_VIEW) != 0
 }
 
 /// Work performed (in submission order) when a batch completes.
@@ -2088,6 +2114,8 @@ impl Renderer {
             // Ordering-only completion (nothing new to wait for on the GPU).
             self.last_seq += 1;
             push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: self.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads: Ranges::default(), wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
+            // (In COMPLETIONS now: the view may forget them.)
+            CP_VIEW.lock().pending = Ranges::new();
             return self.last_seq;
         }
         self.end_rendering();
@@ -2123,6 +2151,12 @@ impl Renderer {
         let profile = (slot.queries != vk::QueryPool::null() && self.marks.len() > 1).then(|| (slot.queries, std::mem::take(&mut self.marks)));
         let zc_reads = std::mem::take(&mut self.zc_reads);
         push_completion(Completion { seq: self.last_seq, fence: slot.fence, exec: slot.exec, ring_ptr: self.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
+        // (In COMPLETIONS now: the view may forget them.)
+        {
+            let mut v = CP_VIEW.lock();
+            v.pending = Ranges::new();
+            v.reads = Ranges::new();
+        }
         self.recording = false;
         self.batch += 1;
         // Move to the next slot once its previous batch has completed.
@@ -2831,7 +2865,7 @@ impl Renderer {
         self.end_rendering();
         unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, 0) };
         global_barrier(self.cmd);
-        self.writebacks.push(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: Some((bits, bits_host, words)) });
+        self.push_writeback(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: Some((bits, bits_host, words)) });
         Ok((bits, words, head))
     }
 
@@ -2848,7 +2882,7 @@ impl Renderer {
             return Ok(());
         }
         let host_off = self.ring.alloc(size).ok_or_else(|| format!("ring full: {size:#x}-byte write-back of {base:#x} (segment {:#x})", self.ring.segment_size()))?;
-        self.writebacks.push(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: None });
+        self.push_writeback(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: None });
         Ok(())
     }
 
@@ -2933,7 +2967,7 @@ impl Renderer {
         unsafe { ctx().device.cmd_copy_buffer(self.cmd, sb, db, &[vk::BufferCopy { src_offset: so, dst_offset: doff, size: bytes }]) };
         self.barrier_needed = true;
         if !mirrored {
-            self.zc_reads.insert(sv.base, sv.base + bytes);
+            self.zc_read(sv.base, sv.base + bytes);
             self.note_inplace_gpu_write(dv.base, bytes);
         }
         self.mark(|| "buffer copy (in place)".into());
@@ -3057,7 +3091,7 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, zbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: zoff, size: bytes }]) };
         if sbuf != self.dring.buffer {
-            self.zc_reads.insert(src, src + bytes);
+            self.zc_read(src, src + bytes);
         }
         self.barrier_needed = true;
         self.note_inplace_gpu_write(dst, bytes);
@@ -3144,7 +3178,7 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, self.gds, &[vk::BufferCopy { src_offset: soff, dst_offset: o, size: n }]) };
         if sbuf != self.dring.buffer {
-            self.zc_reads.insert(src, src + n);
+            self.zc_read(src, src + n);
         }
         self.barrier_needed = true;
         self.mark(|| "GDS load (GPU source)".into());
@@ -3156,7 +3190,7 @@ impl Renderer {
     /// batch end, write tracking, readers' synchronization, images and
     /// metadata it overwrites.
     fn note_inplace_gpu_write(&mut self, base: u64, len: u64) {
-        self.zc_writes.push((base, len));
+        self.push_zc_write(base, len);
         self.writes.note_gpu_write(base, len);
         self.note_pending_gpu_write(base, len);
         if len <= SURFACE_WRITE_MAX {
@@ -3494,7 +3528,7 @@ impl Renderer {
             return Ok(false);
         }
         if ctx().ext_host.is_some() {
-            self.zc_reads.insert(t.base, t.base + bytes);
+            self.zc_read(t.base, t.base + bytes);
         }
         let region = vk::BufferImageCopy {
             buffer_offset: lin_off,
@@ -3531,6 +3565,7 @@ impl Renderer {
     /// pages entirely inside it need no copy-in.
     /// (`small`: ranges below VCACHE_MIN too, in windows that exist.)
     fn vcache_bind_ex(&mut self, base: u64, size: u64, overwrite: bool, small: bool) -> Option<(vk::Buffer, u64)> {
+        self.drain_cp_writes();
         // (Bindings up to a window: callers limit written ones to VCACHE_MAX.)
         if size == 0 || size > VWIN_SIZE || (size < VCACHE_MIN && !small) || crate::tune::get(crate::tune::VCACHE) == 0 {
             return None;
@@ -3855,7 +3890,7 @@ impl Renderer {
             // The copy reads guest memory in place when it executes.
             if ctx().ext_host.is_some() {
                 for r in &regions {
-                    self.zc_reads.insert(wlo + r.dst_offset, wlo + r.dst_offset + r.size);
+                    self.zc_read(wlo + r.dst_offset, wlo + r.dst_offset + r.size);
                 }
             }
             self.mark(|| "vertex/index data to VRAM".into());
@@ -4247,6 +4282,42 @@ impl Renderer {
 
     /// Whether GPU writes recorded in the current (unsubmitted) batch overlap
     /// guest memory [base, base+size).
+    /// A write-back this batch performs at completion (also entered in
+    /// `CP_VIEW`).
+    fn push_writeback(&mut self, w: PendingWrite) {
+        CP_VIEW.lock().pending.insert(w.base, w.base + w.size.max(1));
+        self.writebacks.push(w);
+    }
+
+    /// An in-place GPU write of this batch (also entered in `CP_VIEW`).
+    fn push_zc_write(&mut self, base: u64, len: u64) {
+        CP_VIEW.lock().pending.insert(base, base + len.max(1));
+        self.zc_writes.push((base, len));
+    }
+
+    /// An in-place GPU read of this batch (also entered in `CP_VIEW`).
+    fn zc_read(&mut self, lo: u64, hi: u64) {
+        CP_VIEW.lock().reads.insert(lo, hi);
+        self.zc_reads.insert(lo, hi);
+    }
+
+    /// Applies the mirror and upload-cache invalidations of direct CP writes
+    /// queued by `sync_write` (before any command that may use those caches).
+    fn drain_cp_writes(&mut self) {
+        if !CP_WRITES_QUEUED.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let writes = {
+            let mut v = CP_VIEW.lock();
+            CP_WRITES_QUEUED.store(false, std::sync::atomic::Ordering::Release);
+            std::mem::take(&mut v.cp_writes)
+        };
+        for (a, n) in writes {
+            self.vcache_invalidate(a, n);
+            self.forget_uploads(a, n);
+        }
+    }
+
     fn pending_write_overlaps(&self, base: u64, size: u64) -> bool {
         self.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size) || self.zc_overlaps(base, size)
     }
@@ -4476,6 +4547,7 @@ impl Renderer {
     /// this command without either ordering against the other). Copies that
     /// needed forwards are not kept (their GPU copies belong to one command).
     fn reused_upload(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64)> {
+        self.drain_cp_writes();
         if self.upload_reuse_epoch != self.cpu_epoch {
             self.upload_reuse.clear();
             self.upload_reuse_epoch = self.cpu_epoch;
@@ -4720,7 +4792,7 @@ impl Renderer {
                     Ok(true) => {
                         // (Mirror tiling registered its write-back itself.)
                         if !mirrored {
-                            self.zc_writes.push((key.base, total));
+                            self.push_zc_write(key.base, total);
                             self.writes.note_gpu_write(key.base, total);
                             self.note_pending_gpu_write(key.base, total);
                         }
@@ -4972,7 +5044,7 @@ impl Renderer {
                                         _ => vec![(base, range)],
                                     };
                                     for (b, n) in ranges {
-                                        self.zc_writes.push((b, n));
+                                        self.push_zc_write(b, n);
                                         self.writes.note_gpu_write(b, n);
                                         self.note_pending_gpu_write(b, n);
                                         // Other huge bindings are sparse writers
@@ -4989,7 +5061,7 @@ impl Renderer {
                                         infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range })));
                                         continue;
                                     }
-                                    self.zc_reads.insert(base, base + range);
+                                    self.zc_read(base, base + range);
                                 }
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range })));
                                 continue;
@@ -5077,7 +5149,7 @@ impl Renderer {
                                 unsafe { ctx().device.cmd_copy_buffer(self.cmd, zbuf, self.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: dev_off, size }]) };
                                 self.barrier_needed = true;
                                 self.gpu_wb.push((dev_off, zbuf, zoff, size));
-                                self.zc_writes.push((base, size));
+                                self.push_zc_write(base, size);
                                 self.writes.note_gpu_write(base, size);
                                 self.note_pending_gpu_write(base, size);
                                 self.mark(|| "written buffer setup copy".into());
@@ -5109,7 +5181,7 @@ impl Renderer {
                         let region = vk::BufferCopy { src_offset: off, dst_offset: dev_off, size };
                         unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
                         self.barrier_needed = true;
-                        self.writebacks.push(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
+                        self.push_writeback(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
                         self.writes.note_gpu_write(base, size);
                         self.note_pending_gpu_write(base, size);
                         self.mark(|| "written buffer setup copy".into());
@@ -5248,6 +5320,7 @@ impl Renderer {
     fn draw_inner(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) -> Result<(), String> {
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
+        self.drain_cp_writes();
         let mut tl = unsafe { core::arch::x86_64::_rdtsc() };
         macro_rules! phase {
             ($i:expr) => {{
@@ -5542,7 +5615,7 @@ impl Renderer {
             let current = !self.writebacks.iter().any(|w| w.base < index_addr + n && index_addr < w.base + w.size) && !cpu_writeback_in_flight(index_addr, n);
             let zc = if current && index_addr % isz == 0 && ctx().ext_host.is_some() { self.zc_binding(index_addr & !15, n + (index_addr & 15)) } else { None };
             if zc.is_some() {
-                self.zc_reads.insert(index_addr, index_addr + n);
+                self.zc_read(index_addr, index_addr + n);
             }
             indexed = Some(match zc {
                 Some((buf, off, _)) => match self.vcache_bind(index_addr & !15, n + (index_addr & 15)) {
@@ -6379,6 +6452,7 @@ impl Renderer {
     fn dispatch_inner(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32, indirect: Option<u64>) -> Result<bool, String> {
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
+        self.drain_cp_writes();
         let cs_addr = ((cp.regs.sh(0x2E0C) as u64) | ((cp.regs.sh(0x2E0D) as u64) << 32)) << 8;
         super::set_phase(super::phase::DISPATCH, cs_addr);
         if SKIP_CS.lock().contains(&cs_addr) {
@@ -6670,7 +6744,7 @@ impl Renderer {
         }
         global_barrier(self.cmd);
         if ctx().ext_host.is_some() {
-            self.zc_reads.insert(t.base, t.base + bytes);
+            self.zc_read(t.base, t.base + bytes);
         }
         static VERIFY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         static QUEUED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -7028,7 +7102,7 @@ impl Renderer {
         self.barrier_needed = true;
         // (Read in place: CP writes of the arguments wait for this batch.)
         if ctx().ext_host.is_some() {
-            self.zc_reads.insert(addr, addr + 12);
+            self.zc_read(addr, addr + 12);
         }
         self.mark(|| "indirect dispatch arguments".into());
         Ok(Some(slot))
@@ -7264,7 +7338,7 @@ impl Renderer {
             if let Some(lin_off) = (self.dring.remaining() >= dev_need).then(|| self.dring.alloc(lin_bytes)).flatten() {
                 if self.gpu_remap(&key, false, lin_off)? {
                     if !staged {
-                        self.zc_reads.insert(key.base, key.base + total);
+                        self.zc_read(key.base, key.base + total);
                     }
                     let region = vk::BufferImageCopy {
                         buffer_offset: lin_off,
@@ -7650,8 +7724,8 @@ impl Renderer {
         } else {
             // The expanded state lands in place (when a clear applied); the
             // probe read the metadata in place.
-            self.zc_writes.push((mbase, msize));
-            self.zc_reads.insert(mbase, mbase + msize);
+            self.push_zc_write(mbase, msize);
+            self.zc_read(mbase, mbase + msize);
             self.writes.note_gpu_write(mbase, msize);
             self.note_pending_gpu_write(mbase, msize);
         }
@@ -7725,7 +7799,7 @@ impl Renderer {
                 global_barrier(self.cmd);
                 let region = vk::BufferCopy { src_offset: o, dst_offset: dev_off, size: n };
                 unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.gds, self.dring.buffer, &[region]) };
-                self.writebacks.push(PendingWrite { base: dst, size: n, host_off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
+                self.push_writeback(PendingWrite { base: dst, size: n, host_off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
                 self.writes.note_gpu_write(dst, n);
                 self.note_pending_gpu_write(dst, n);
                 self.note_buffer_write(dst, n);
@@ -8395,10 +8469,13 @@ impl Hooks for VkHooks {
         }
     }
     fn sync_range(&mut self, cp: &CommandProcessor, addr: u64, len: u64) {
-        if let Some(r) = TimedRenderer::lock(cp.queue).as_mut() {
-            if r.pending_write_overlaps(addr, len) {
-                r.flushes[1] += 1;
-                r.submit_batch(Vec::new());
+        // (Without overlap in the view, nothing of this batch is in the way.)
+        if !cp_view_on() || CP_VIEW.lock().pending.overlaps(addr, addr + len.max(1)) {
+            if let Some(r) = TimedRenderer::lock(cp.queue).as_mut() {
+                if r.pending_write_overlaps(addr, len) {
+                    r.flushes[1] += 1;
+                    r.submit_batch(Vec::new());
+                }
             }
         }
         wait_overlapping(addr, len);
@@ -8411,12 +8488,24 @@ impl Hooks for VkHooks {
     }
     fn sync_write(&mut self, _cp: &CommandProcessor, addr: u64, len: u64) {
         let end = addr + len.max(1);
-        if let Some(r) = RENDERER.lock().as_mut() {
-            r.vcache_invalidate(addr, len);
-            r.forget_uploads(addr, len);
-            if r.zc_reads.overlaps(addr, end) {
-                r.flushes[1] += 1;
-                r.submit_batch(Vec::new());
+        let read = if cp_view_on() {
+            let mut v = CP_VIEW.lock();
+            v.cp_writes.push((addr, len));
+            CP_WRITES_QUEUED.store(true, std::sync::atomic::Ordering::Release);
+            v.reads.overlaps(addr, end)
+        } else {
+            if let Some(r) = RENDERER.lock().as_mut() {
+                r.vcache_invalidate(addr, len);
+                r.forget_uploads(addr, len);
+            }
+            true
+        };
+        if read {
+            if let Some(r) = RENDERER.lock().as_mut() {
+                if r.zc_reads.overlaps(addr, end) {
+                    r.flushes[1] += 1;
+                    r.submit_batch(Vec::new());
+                }
             }
         }
         let seq = COMPLETIONS.lock().iter().filter(|c| c.zc_reads.overlaps(addr, end)).map(|c| c.seq).max();
