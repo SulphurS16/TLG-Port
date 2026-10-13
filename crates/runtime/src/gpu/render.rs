@@ -1311,8 +1311,8 @@ pub struct Renderer {
     /// Ticks in parts of the descriptor phase (`DESC_PARTS`).
     pub dsub: [u64; 6],
     /// Buffer bindings by path (`BUFFER_PATHS`): ticks and count.
-    pub bsub: [u64; 9],
-    pub bcnt: [u64; 9],
+    pub bsub: [u64; 11],
+    pub bcnt: [u64; 11],
     /// Synchronizing flushes by reason (see FLUSH_REASONS).
     pub flushes: [u64; 6],
     /// Buffer bytes copied at record time by cause: shader-written (device
@@ -1500,6 +1500,8 @@ pub struct Renderer {
     vgen_keep: vk::Buffer,
     /// The current slot's prologue is being recorded; operations put there.
     pro_recording: bool,
+    /// The last `upload_guest_ex` bound a pending write's device copy.
+    upload_devcopy: bool,
     /// Shader stages the CP prepared before taking the lock for the next
     /// dispatch / draw (`tune prepare_unlocked`).
     pre_cs: Option<Result<shaders::Prepared, String>>,
@@ -1696,8 +1698,8 @@ pub fn init() -> Result<(), String> {
             dprof: [0; 8],
             dprof_draws: 0,
             dsub: [0; 6],
-            bsub: [0; 9],
-            bcnt: [0; 9],
+            bsub: [0; 11],
+            bcnt: [0; 11],
             cpu_epoch: 0,
             required_epoch: 0,
             img_bases: std::collections::BTreeMap::new(),
@@ -1759,6 +1761,7 @@ pub fn init() -> Result<(), String> {
             vgen: 0,
             vgen_keep: vk::Buffer::null(),
             pro_recording: false,
+            upload_devcopy: false,
             pre_cs: None,
             pre_draw: None,
             pro_ops: 0,
@@ -4757,6 +4760,16 @@ impl Renderer {
     /// writes recorded in this batch are forwarded with GPU copies (in
     /// program order) on top of the guest data.
     fn upload_guest(&mut self, base: u64, size: u64) -> Result<u64, String> {
+        self.upload_guest_ex(base, size, false).map(|(_, off)| off)
+    }
+
+    /// `upload_guest`; `devcopy` (read-only data, `tune devcopy_reads`): when
+    /// the newest pending GPU write overlapping the range (this batch's, else
+    /// one in flight) covers it whole, that write's device copy instead of a
+    /// ring copy with it forwarded on top (`upload_devcopy` says which).
+    /// Returns the buffer and offset.
+    fn upload_guest_ex(&mut self, base: u64, size: u64, devcopy: bool) -> Result<(vk::Buffer, u64), String> {
+        self.upload_devcopy = false;
         // Shader writes of submitted batches that have not reached guest
         // memory yet: forwarded from their device-ring copies (intact until
         // their slot is reused, which the queue orders after this batch)
@@ -4785,6 +4798,22 @@ impl Renderer {
                 let t0 = std::time::Instant::now();
                 wait_overlapping(base, size);
                 self.prof[0] += t0.elapsed();
+            }
+        }
+        if devcopy {
+            let covers = |w: u64, n: u64| w <= base && base + size <= w + n;
+            let overlaps = |w: u64, n: u64| w < base + size && base < w + n;
+            // (This batch's writes land after those in flight.)
+            let newest = match self.writebacks.iter().rev().find(|p| overlaps(p.base, p.size)) {
+                Some(p) => Some((p.base, p.dev_buf, p.dev_off, p.size)),
+                None => inflight.iter().rev().find(|e| overlaps(e.0, e.3)).copied(),
+            };
+            let align = ctx().limits.min_storage_buffer_offset_alignment.max(4);
+            if let Some((w, buf, off, n)) = newest.filter(|e| covers(e.0, e.3) && (e.2 + (base - e.0)) % align == 0) {
+                let _ = n;
+                self.upload_forwarded = false;
+                self.upload_devcopy = true;
+                return Ok((buf, off + (base - w)));
             }
         }
         let Some(off) = self.ring.alloc(size) else {
@@ -4821,7 +4850,7 @@ impl Renderer {
             self.flushes[5] += 1;
             self.fwd_pending.extend(regions);
         }
-        Ok(off)
+        Ok((self.ring.buffer, off))
     }
 
     /// `upload_guest` for data shaders only read: copies of up to
@@ -4839,6 +4868,7 @@ impl Renderer {
                     let buf = r.buffer;
                     self.prof[2] += t0.elapsed();
                     self.upload_forwarded = false;
+                    self.upload_devcopy = false;
                     self.bar_uploads.0 += 1;
                     self.bar_uploads.1 += size;
                     return Ok((buf, off));
@@ -4846,7 +4876,7 @@ impl Renderer {
                 None => self.bar_uploads.2 += 1,
             }
         }
-        Ok((self.ring.buffer, self.upload_guest(base, size)?))
+        self.upload_guest_ex(base, size, crate::tune::get(crate::tune::DEVCOPY_READS) != 0)
     }
 
     /// The ring offset of this batch's copy of [base, base+size) when a
@@ -5480,9 +5510,27 @@ impl Renderer {
                         if !written {
                             bpath = 6;
                             let (buf, off) = self.upload_guest_ro(base, size)?;
+                            if self.upload_devcopy {
+                                bpath = 9;
+                            }
                             self.note_upload(base, size, buf, off);
                             infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
                             continue;
+                        }
+                        // The same range an earlier command of this batch wrote
+                        // into a device-ring copy, written by a dispatch: that
+                        // copy, in place (its write-back lands the newest data;
+                        // the dispatch hazards order the two).
+                        if p.stage == Stage::Compute && crate::tune::get(crate::tune::CHAIN_WRITTEN) != 0 {
+                            let over = |w: &PendingWrite| w.base < base + size && base < w.base + w.size;
+                            let prev = self.writebacks.iter().rev().find(|w| over(w)).filter(|w| !w.mirror && w.bits.is_none() && w.dev_buf == self.dring.buffer && w.base == base && w.size == size).map(|w| w.dev_off);
+                            if let Some(dev_off) = prev {
+                                bpath = 10;
+                                self.writes.note_gpu_write(base, size);
+                                self.note_pending_gpu_write(base, size);
+                                infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.dring.buffer, offset: dev_off, range: size.next_multiple_of(4) })));
+                                continue;
+                            }
                         }
                         // Written: the shader works on a device-local copy;
                         // written back to guest memory when the batch
@@ -9328,7 +9376,7 @@ pub const DRAW_PHASES: [&str; 8] = ["setup", "shaders", "targets", "pipeline", "
 /// Parts of the descriptor phase timed in `Renderer::dsub` (all commands).
 pub const DESC_PARTS: [&str; 6] = ["alloc", "sgpr data", "buffers", "images", "samplers+other", "update"];
 /// Buffer binding paths timed in `Renderer::bsub` (`write_descriptors`).
-pub const BUFFER_PATHS: [&str; 9] = ["other", "in place read", "in place written", "mirror read", "mirror written", "reused copy", "read-only copy", "written round trip", "written copy"];
+pub const BUFFER_PATHS: [&str; 11] = ["other", "in place read", "in place written", "mirror read", "mirror written", "reused copy", "read-only copy", "written round trip", "written copy", "device copy", "written copy chained"];
 
 pub const PROF_NAMES: [&str; 7] = ["submit+wait", "writeback", "buffer upload", "texture hash", "texture read", "shader prep", "slot wait"];
 

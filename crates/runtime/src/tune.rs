@@ -251,7 +251,25 @@ pub const PROLOGUE: usize = 44;
 /// pending). 0: prepared under the lock.
 pub const PREPARE_UNLOCKED: usize = 45;
 
-const TABLE: [(&str, &str, i64); 46] = [
+/// A read-only binding whose range one pending GPU write (this batch's or a
+/// batch's in flight) covers entirely binds that write's device copy
+/// (`TLG_DEVCOPY_READS`, 0) instead of an upload-ring copy of guest memory
+/// with the write forwarded on top (a CPU copy, a GPU copy, two barriers).
+/// Cave A/B (run 20261013-145735) on top of `chain_written`: GPU -1.6%,
+/// barriers -5%, graphics-CP CPU +1-6%: off on this CPU-bound machine.
+pub const DEVCOPY_READS: usize = 46;
+
+/// A dispatch writing exactly the range an earlier command of the batch
+/// wrote into a device-ring copy works on that copy in place
+/// (`TLG_CHAIN_WRITTEN`, 1; its write-back lands the newest data, the
+/// dispatch hazards order the two) instead of a new copy set up from guest
+/// memory with the earlier write forwarded on top and a write-back of its
+/// own (TLG's cs 0x1130f7bc00 updates one 28 KiB buffer ~325 times a frame).
+/// Cave A/B (run 20261013-145735): full barriers -36%, GPU -11% per frame,
+/// fps unchanged where the graphics CP is the limit.
+pub const CHAIN_WRITTEN: usize = 47;
+
+const TABLE: [(&str, &str, i64); 48] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -298,6 +316,8 @@ const TABLE: [(&str, &str, i64); 46] = [
     ("vbind_cache", "TLG_VBIND_CACHE", 1),
     ("prologue", "TLG_PROLOGUE", 1),
     ("prepare_unlocked", "TLG_PREPARE_UNLOCKED", 1),
+    ("devcopy_reads", "TLG_DEVCOPY_READS", 0),
+    ("chain_written", "TLG_CHAIN_WRITTEN", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
