@@ -776,6 +776,7 @@ struct PerfSnap {
     passes: u64,
     harvests: u64,
     harvest_pages: u64,
+    harvest_ns: u64,
     ww_cached: u64,
     cpu_epochs: u64,
     gfx_cpu: u64,
@@ -811,6 +812,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         passes: render::PASS_BEGINS.load(Ordering::Relaxed),
         harvests: crate::mem::HARVESTS.load(Ordering::Relaxed),
         harvest_pages: crate::mem::HARVEST_PAGES.load(Ordering::Relaxed),
+        harvest_ns: crate::mem::HARVEST_NS.load(Ordering::Relaxed),
         ww_cached: r.writes.cached,
         cpu_epochs: CPU_EPOCH.load(Ordering::Relaxed),
         gfx_cpu: GFX_CPU_100NS.load(Ordering::Relaxed),
@@ -849,7 +851,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             .collect();
         crate::info!("buffer bindings/s by path: {}", bp.join(", "));
         crate::info!(
-            "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
+            "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages, {} ms; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
             now.frames - p.frames,
             now.draws - p.draws,
             now.dispatches - p.dispatches,
@@ -859,6 +861,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             now.cpu_epochs - p.cpu_epochs,
             now.harvests - p.harvests,
             now.harvest_pages - p.harvest_pages,
+            (now.harvest_ns - p.harvest_ns) / 1_000_000,
             now.ww_cached - p.ww_cached,
             now.uploads - p.uploads,
             (now.hashed - p.hashed) >> 20,

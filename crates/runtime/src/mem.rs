@@ -210,6 +210,8 @@ fn occupied(lo: u64, hi: u64) -> String {
 /// Write-watch queries and pages queried (TLG_PERF).
 pub static HARVESTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static HARVEST_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Time spent in GetWriteWatch (ns).
+pub static HARVEST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Held while host code writes guest memory and then forgets those writes
 /// (`reset_write_watch`), so a harvest never sees the writes alone.
@@ -239,7 +241,10 @@ pub fn harvest_writes(addr: u64, len: u64, buf: &mut Vec<usize>, out: &mut Vec<u
     let mut granularity = 0u32;
     let r = {
         let _h = HARVEST_LOCK.lock();
-        unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, lo as _, (hi - lo) as usize, buf.as_mut_ptr() as *mut *mut core::ffi::c_void, &mut count, &mut granularity) }
+        let t0 = std::time::Instant::now();
+        let r = unsafe { GetWriteWatch(WRITE_WATCH_FLAG_RESET, lo as _, (hi - lo) as usize, buf.as_mut_ptr() as *mut *mut core::ffi::c_void, &mut count, &mut granularity) };
+        HARVEST_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        r
     };
     if r != 0 {
         return false;
