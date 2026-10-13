@@ -155,7 +155,9 @@ pub const BAR_UPLOADS: usize = 30;
 
 /// Index data whose guest memory is current is fetched from the VRAM mirror
 /// (copied in once, then per CPU-written page) instead of a host-ring copy
-/// per draw (`TLG_INDEX_MIRROR`, 0 for now: under test).
+/// per draw (`TLG_INDEX_MIRROR`, 0. Cave A/B, run 20261013-032442, CPU
+/// 19-20%: upload time per command halved, GPU-thread CPU per command the
+/// same, GPU busy 307 vs 265 ms per frame, 0.88 vs 1.00 fps).
 pub const INDEX_MIRROR: usize = 31;
 
 const TABLE: [(&str, &str, i64); 32] = [
