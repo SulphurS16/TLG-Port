@@ -151,7 +151,7 @@ pub fn copy_to_guest(src: &[u8], addr: u64) -> bool {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ImageKey {
     pub base: u64,
     pub width: u32,
@@ -161,6 +161,16 @@ pub struct ImageKey {
     pub format: vk::Format,
     pub depth: bool,
     pub ty3d: bool,
+}
+
+/// Three words instead of eight fields: image maps are probed dozens of
+/// times per draw. (Equal keys hash equally; the packing only mixes fields.)
+impl std::hash::Hash for ImageKey {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        h.write_u64(self.base);
+        h.write_u64(self.width as u64 | (self.height as u64) << 32);
+        h.write_u64(self.layers as u64 ^ (self.levels as u64) << 24 ^ (self.depth as u64) << 30 ^ (self.ty3d as u64) << 31 ^ (self.format.as_raw() as u32 as u64) << 32);
+    }
 }
 
 pub struct Image {

@@ -1526,6 +1526,10 @@ pub struct Renderer {
     stale: std::collections::BTreeMap<u64, Vec<ImageKey>>,
     stale_max: u64,
     stale_aged: u64,
+    /// Guest ranges the images of `stale` may cover (twice their layout's
+    /// size; unbounded while it is unknown), rebuilt with each aging: lets
+    /// `writeback_images` return at once for memory no stale image overlaps.
+    stale_ivals: Vec<(u64, u64)>,
     /// Guest pages (4 KiB) with GPU writes that have not completed yet:
     /// page -> sequence number of the batch writing it.
     gpu_pending_pages: PageSeqs,
@@ -1843,6 +1847,7 @@ pub fn init() -> Result<(), String> {
             stale: std::collections::BTreeMap::new(),
             stale_max: 0,
             stale_aged: 0,
+            stale_ivals: Vec::new(),
             gpu_pending_pages: PageSeqs::default(),
             gpu_pending_all: 0,
             pending_noted: (0, FastSet::default()),
@@ -2020,8 +2025,8 @@ pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomi
 pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// TLG_PERF: TSC cycles and counts of buffer-binding steps (`BPART_NAMES`).
-pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 19] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 19];
-pub const BPART_NAMES: [&str; 19] = [
+pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 25] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 25];
+pub const BPART_NAMES: [&str; 25] = [
     "mirror written: bind",
     "write-back",
     "meta+surface",
@@ -2041,6 +2046,12 @@ pub const BPART_NAMES: [&str; 19] = [
     "mirror",
     "commands: prepared-ahead take",
     "own preparation",
+    "draw guest reads: binding bytes",
+    "texture estimate",
+    "reserve",
+    "buffers (prepare_guest_reads)",
+    "images (prepare_guest_reads)",
+    "draw targets",
 ];
 
 /// Adds the cycles since `t0` to buffer-binding step `i` (TLG_PERF);
@@ -2886,6 +2897,8 @@ impl Renderer {
                 *k = new;
             }
         }
+        // (`stale_ivals` rebuilt with the next aging.)
+        self.stale_aged = u64::MAX;
         if let Some(v) = self.by_base.get_mut(&old.base) {
             v.retain(|x| *x != old);
         }
@@ -2950,6 +2963,11 @@ impl Renderer {
         Ok(())
     }
 
+    /// The guest range a stale image may cover (`stale_ivals`).
+    fn stale_ival(key: &ImageKey, total: Option<u64>) -> (u64, u64) {
+        (key.base, total.map_or(u64::MAX, |t| key.base.saturating_add(t.saturating_mul(2))))
+    }
+
     /// Adds `key` to the index of images that may be newer than guest memory.
     fn mark_stale(&mut self, key: ImageKey) {
         // Becoming stale: CPU writes to the image's memory from now on mean
@@ -2963,11 +2981,11 @@ impl Renderer {
         let ks = self.stale.entry(key.base).or_default();
         if !ks.contains(&key) {
             ks.push(key);
-            if let Some(i) = self.images.get(&key) {
-                if let Some(g) = Self::image_guest_layout(&key, i) {
-                    self.stale_max = self.stale_max.max(g.3);
-                }
+            let total = self.images.get(&key).and_then(|i| Self::image_guest_layout(&key, i)).map(|g| g.3);
+            if let Some(t) = total {
+                self.stale_max = self.stale_max.max(t);
             }
+            self.stale_ivals.push(Self::stale_ival(&key, total));
         }
     }
 
@@ -5291,7 +5309,13 @@ impl Renderer {
                 });
             }
             stale.retain(|_, ks| !ks.is_empty());
+            self.stale_ivals = stale.values().flatten().map(|k| Self::stale_ival(k, self.images.get(k).and_then(|i| Self::image_guest_layout(k, i)).map(|g| g.3))).collect();
             self.stale = stale;
+        }
+        // (No stale image near this memory: nothing to write back.)
+        let end = base.saturating_add(size);
+        if !self.stale_ivals.iter().any(|&(lo, hi)| lo < end && base < hi) {
+            return;
         }
         let mut keys: Vec<ImageKey> = Vec::new();
         for ks in self.stale.range(base.saturating_sub(self.stale_max)..base + size).map(|(_, ks)| ks) {
@@ -5436,7 +5460,11 @@ impl Renderer {
         self.zc_revalidate();
         // Buffers first: their render target write-backs may write guest
         // memory that CPU-sourced textures read.
+        let mut tp = unsafe { core::arch::x86_64::_rdtsc() };
         for pass in 0..2 {
+            if pass == 1 {
+                tp = bpart(22, tp);
+            }
             for p in stages {
                 for b in &p.translated.out.bindings {
                     match b.kind {
@@ -5487,14 +5515,25 @@ impl Renderer {
                         }
                         BindingKind::Image(i) | BindingKind::StorageImage(i) if pass == 1 => {
                             if let ResolvedRes::Image(t) = &p.resources[i] {
-                                let layers = if t.ty == desc::T_3D { t.depth } else { t.total_layers() }.max(1);
-                                let bytes = resources::texture_bytes(t, layers);
                                 // Only guest-memory reads need this batch's
                                 // writes landed first (`sync_guest` checks them
                                 // again); a GPU-written image here is read on the
                                 // GPU, reloads included (ordered by barriers).
-                                let gpu_image = self.by_base.get(&t.base).is_some_and(|ks| ks.iter().any(|k| self.images[k].gpu_written));
+                                let (gpu_image, mut any_newer) = self.by_base.get(&t.base).map_or((false, false), |ks| {
+                                    ks.iter().fold((false, false), |(g, n), k| {
+                                        let i = &self.images[k];
+                                        (g || i.gpu_written, n || i.guest_newer)
+                                    })
+                                });
+                                let bytes = if gpu_image {
+                                    0
+                                } else {
+                                    let layers = if t.ty == desc::T_3D { t.depth } else { t.total_layers() }.max(1);
+                                    resources::texture_bytes(t, layers)
+                                };
                                 if !gpu_image && self.pending_write_overlaps(t.base, bytes) {
+                                    // (Validation may change the images here.)
+                                    any_newer = true;
                                     // Validate it now, while a flush is still allowed:
                                     // GPU-detiled textures follow this batch's in-place
                                     // writes in GPU order (no wait); the CPU path
@@ -5515,7 +5554,7 @@ impl Renderer {
                                     }
                                 }
                                 // Render targets here made stale by buffer stores.
-                                let newer: Vec<ImageKey> = self.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| self.images[k].guest_newer).collect()).unwrap_or_default();
+                                let newer: Vec<ImageKey> = if any_newer { self.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| self.images[k].guest_newer).collect()).unwrap_or_default() } else { Vec::new() };
                                 for k in newer {
                                     if let Err(e) = self.refresh_from_guest(k, true) {
                                         self.report(format!("render target reload failed: {e}"));
@@ -5528,6 +5567,7 @@ impl Renderer {
                 }
             }
         }
+        bpart(23, tp);
     }
 
     // -------------------------------------------------------------------
@@ -6107,6 +6147,7 @@ impl Renderer {
             self.report(format!("user clip planes {:#x} not implemented", regs.ctx(0xA204) & 0x3F));
         }
         // Attachments.
+        let tt = unsafe { core::arch::x86_64::_rdtsc() };
         let target_mask = regs.ctx(0xA08E);
         let color_mode = (regs.ctx(0xA202) >> 4) & 7;
         let mut colors = Colors::new();
@@ -6134,6 +6175,7 @@ impl Renderer {
         let depth = if depth_used { self.depth_target(regs)? } else { None };
         self.draw_targets = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).collect();
         self.apply_meta_clears(regs, &colors, depth);
+        bpart(24, tt);
         if trace_frame() {
             let res: Vec<String> = std::iter::once(&vs).chain(ps.iter()).flat_map(|p| stage_res_summary(p)).collect();
             crate::info!(
@@ -6246,9 +6288,13 @@ impl Renderer {
         if let Some(p) = &ps {
             stages.push(p);
         }
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
         let (host, dev) = self.binding_bytes(&stages);
+        let t0 = bpart(19, t0);
         let tex = self.texture_upload_estimate(&stages);
+        let t0 = bpart(20, t0);
         self.reserve(host + tex + count as u64 * 4, dev);
+        bpart(21, t0);
         self.prepare_guest_reads(&stages);
         self.begin();
         // Uploads end any active rendering; record them first.

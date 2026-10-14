@@ -874,10 +874,10 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             .collect();
         crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {})", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers);
         // (Their steps: us each, count.)
-        static LAST_BP: Mutex<[(u64, u64); 19]> = Mutex::new([(0, 0); 19]);
-        let cur: [(u64, u64); 19] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
+        static LAST_BP: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);
+        let cur: [(u64, u64); 25] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
         let prev = std::mem::replace(&mut *LAST_BP.lock(), cur);
-        let parts: Vec<String> = (0..19)
+        let parts: Vec<String> = (0..25)
             .filter(|&i| cur[i].1 > prev[i].1)
             .map(|i| format!("{} {:.2} us x {}", render::BPART_NAMES[i], (cur[i].0 - prev[i].0) as f64 / hz * 1e6 / (cur[i].1 - prev[i].1) as f64, cur[i].1 - prev[i].1))
             .collect();
