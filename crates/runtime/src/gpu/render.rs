@@ -2020,8 +2020,8 @@ pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomi
 pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// TLG_PERF: TSC cycles and counts of buffer-binding steps (`BPART_NAMES`).
-pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 17] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 17];
-pub const BPART_NAMES: [&str; 17] = [
+pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 19] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 19];
+pub const BPART_NAMES: [&str; 19] = [
     "mirror written: bind",
     "write-back",
     "meta+surface",
@@ -2039,6 +2039,8 @@ pub const BPART_NAMES: [&str; 17] = [
     "mirror fill: CPU-write check",
     "write notes: tracker",
     "mirror",
+    "commands: prepared-ahead take",
+    "own preparation",
 ];
 
 /// Adds the cycles since `t0` to buffer-binding step `i` (TLG_PERF);
@@ -9381,7 +9383,11 @@ impl Hooks for VkHooks {
         // Shader preparation reads registers and guest memory only: before
         // the lock (its reads are checked under it). Not for patches.
         let prim = cp.regs.uconfig[(0xC242 - 0xC000) as usize];
-        let pre = (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0 && prim != 9).then(|| {
+        let tp = unsafe { core::arch::x86_64::_rdtsc() };
+        let ahead = (crate::tune::get(crate::tune::PREP_AHEAD) != 0 && cp.queue == 0 && prim != 9).then(|| super::prepahead::take_draw(&cp.regs)).flatten();
+        let tp = if crate::tune::get(crate::tune::PREP_AHEAD) != 0 { bpart(17, tp) } else { tp };
+        let own = ahead.is_none();
+        let pre = ahead.or_else(|| (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0 && prim != 9).then(|| {
             let regs = &cp.regs;
             let ps_addr = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64) << 32)) << 8;
             let vs = shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, Default::default());
@@ -9392,7 +9398,10 @@ impl Hooks for VkHooks {
                 }
             }
             (vs, ps)
-        });
+        }));
+        if own {
+            bpart(18, tp);
+        }
         let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return self.fallback.draw(cp, kind, count, index_addr) };
         r.pre_draw = pre;
@@ -9406,7 +9415,8 @@ impl Hooks for VkHooks {
         if matches!(crate::tune::get(crate::tune::SKIP_CMDS), 1 | 3) {
             return;
         }
-        let pre = (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs }));
+        let ahead = (crate::tune::get(crate::tune::PREP_AHEAD) != 0 && cp.queue == 0).then(|| super::prepahead::take_dispatch(&cp.regs)).flatten();
+        let pre = ahead.or_else(|| (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs })));
         if let Some(Ok(p)) = pre.as_ref().filter(|_| crate::tune::get(crate::tune::PREFETCH) != 0) {
             prefetch_reads(p);
         }

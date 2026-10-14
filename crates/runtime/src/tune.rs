@@ -307,7 +307,12 @@ pub const ASYNC_COPIES: usize = 52;
 /// 256 MiB window no longer drops every binding served from it.
 pub const VBIND_PARTS: usize = 53;
 
-const TABLE: [(&str, &str, i64); 54] = [
+/// The `GPU-prep` thread prepares the shader stages of graphics-queue draws
+/// and dispatches ahead of the graphics CP, which uses a result once it
+/// validates (`TLG_PREP_AHEAD`, 1; `gpu::prepahead`).
+pub const PREP_AHEAD: usize = 54;
+
+const TABLE: [(&str, &str, i64); 55] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -362,6 +367,7 @@ const TABLE: [(&str, &str, i64); 54] = [
     ("prefetch", "TLG_PREFETCH", 0),
     ("async_copies", "TLG_ASYNC_COPIES", 1),
     ("vbind_parts", "TLG_VBIND_PARTS", 1),
+    ("prep_ahead", "TLG_PREP_AHEAD", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

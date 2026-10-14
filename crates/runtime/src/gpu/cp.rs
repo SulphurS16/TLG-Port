@@ -335,6 +335,10 @@ pub trait Hooks {
         let _ = cp;
         crate::warn!("GDS transfer without a renderer ignored: {op:?}");
     }
+    /// A dry-run CP's write of guest memory [addr, addr+4*len) (`prepahead`).
+    fn dry_write(&mut self, addr: u64, data: &[u32]) {
+        let _ = (addr, data);
+    }
     /// PIXEL_PIPE_STAT_DUMP at this point of the command stream (`begin`:
     /// a query's begin sample): the occlusion queries counted since the
     /// previous dump, whose results its write adds up.
@@ -374,6 +378,9 @@ pub struct CommandProcessor {
     pub stats: Stats,
     pub markers: Vec<String>,
     pub trace: bool,
+    /// Dry run (`prepahead`): registers, indirect buffers, constant RAM and
+    /// the draw/dispatch hooks only; memory writes go to `Hooks::dry_write`.
+    pub dry: bool,
 }
 
 fn guest_ok(addr: u64, len: u64) -> bool {
@@ -518,6 +525,7 @@ impl CommandProcessor {
             stats: Stats::default(),
             markers: Vec::new(),
             trace: false,
+            dry: false,
         }
     }
 
@@ -686,7 +694,13 @@ impl CommandProcessor {
         }
         s.set_cur(next);
         self.stats.packets += 1;
-        OPCODES[(opcode as usize) | if self.watch { 0 } else { 256 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if self.dry {
+            if self.dry_packet(opcode, body, hooks) {
+                return Step::Ok;
+            }
+        } else {
+            OPCODES[(opcode as usize) | if self.watch { 0 } else { 256 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if self.trace {
             crate::trace!("{} {:?} op {:#04x} len {} at {:#x}", self.name, engine, opcode, count, cur);
         }
@@ -1038,6 +1052,71 @@ impl CommandProcessor {
             }
         }
         Step::Ok
+    }
+
+    /// Dry run: packets with effects outside the register state are left
+    /// out, CP memory writes go to `Hooks::dry_write`, constant RAM loads
+    /// read through it (`shaders::dry_read`). False: the packet runs as usual.
+    fn dry_packet(&mut self, opcode: u32, body: &[u32], hooks: &mut dyn Hooks) -> bool {
+        match opcode {
+            op::WRITE_DATA => {
+                let dst_sel = (body[0] >> 8) & 0xF;
+                let one_addr = body[0] & (1 << 16) != 0;
+                let addr = (body[1] as u64) | ((body[2] as u64) << 32);
+                let data = &body[3..];
+                match dst_sel {
+                    0 => {
+                        for (i, &v) in data.iter().enumerate() {
+                            self.write_reg(body[1] + if one_addr { 0 } else { i as u32 }, v);
+                        }
+                    }
+                    1 | 2 | 5 if one_addr => {
+                        if let Some(&v) = data.last() {
+                            hooks.dry_write(addr, &[v]);
+                        }
+                    }
+                    1 | 2 | 5 => hooks.dry_write(addr, data),
+                    _ => {}
+                }
+                true
+            }
+            op::DUMP_CONST_RAM => {
+                let off = (body[0] & 0xFFFF) as usize / 4;
+                let n = (body[1] & 0x7FFF) as usize;
+                let addr = (body[2] as u64) | ((body[3] as u64) << 32);
+                if off + n <= CE_RAM_DWORDS {
+                    hooks.dry_write(addr, &self.ce_ram[off..off + n]);
+                }
+                true
+            }
+            op::LOAD_CONST_RAM => {
+                let addr = (body[0] as u64) | ((body[1] as u64) << 32);
+                let n = (body[2] & 0x7FFF) as usize;
+                let off = (body[3] & 0xFFFF) as usize / 4;
+                if guest_ok(addr, n as u64 * 4) && off + n <= CE_RAM_DWORDS {
+                    super::shaders::dry_read(addr, &mut self.ce_ram[off..off + n]);
+                }
+                true
+            }
+            op::NOP
+            | op::EVENT_WRITE_EOP
+            | op::RELEASE_MEM
+            | op::EVENT_WRITE_EOS
+            | op::WAIT_REG_MEM
+            | op::DMA_DATA
+            | op::COPY_DATA
+            | op::MEM_SEMAPHORE
+            | op::EVENT_WRITE
+            | op::GET_LOD_STATS
+            | op::SET_PREDICATION
+            | op::DRAW_INDIRECT
+            | op::DRAW_INDEX_INDIRECT
+            | op::DRAW_INDIRECT_MULTI
+            | op::DRAW_INDEX_INDIRECT_MULTI
+            | op::DRAW_INDEX_INDIRECT_COUNT_MULTI
+            | op::DISPATCH_INDIRECT => true,
+            _ => false,
+        }
     }
 
     fn nop(&mut self, body: &[u32]) {

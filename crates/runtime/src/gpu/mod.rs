@@ -6,6 +6,7 @@ pub mod cpuwatch;
 pub mod desc;
 pub mod lazywb;
 pub mod pm4;
+pub mod prepahead;
 pub mod rec;
 pub mod render;
 pub mod resources;
@@ -423,6 +424,11 @@ fn gfx_thread() {
         let has_flip = s.flip.is_some();
         let captured = std::sync::Arc::new(std::mem::take(&mut s.captured));
         let exec_captured = if pm4_capture() { captured.clone() } else { std::sync::Arc::new(cp::Captured::new()) };
+        // (Once started, the prepare thread sees every submission: its
+        // register state follows the CP's even while results are not used.)
+        if crate::tune::get(crate::tune::PREP_AHEAD) != 0 || prepahead::started() {
+            prepahead::submit(&s.dcb, &s.ccb, exec_captured.clone());
+        }
         let mut de = Stream::chained(exec_captured.clone());
         let mut ce = Stream::chained(exec_captured.clone());
         for (i, &(addr, dw)) in s.dcb.iter().enumerate() {
@@ -868,10 +874,10 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             .collect();
         crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {})", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers);
         // (Their steps: us each, count.)
-        static LAST_BP: Mutex<[(u64, u64); 17]> = Mutex::new([(0, 0); 17]);
-        let cur: [(u64, u64); 17] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
+        static LAST_BP: Mutex<[(u64, u64); 19]> = Mutex::new([(0, 0); 19]);
+        let cur: [(u64, u64); 19] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
         let prev = std::mem::replace(&mut *LAST_BP.lock(), cur);
-        let parts: Vec<String> = (0..17)
+        let parts: Vec<String> = (0..19)
             .filter(|&i| cur[i].1 > prev[i].1)
             .map(|i| format!("{} {:.2} us x {}", render::BPART_NAMES[i], (cur[i].0 - prev[i].0) as f64 / hz * 1e6 / (cur[i].1 - prev[i].1) as f64, cur[i].1 - prev[i].1))
             .collect();
@@ -948,6 +954,11 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let pk = std::mem::replace(&mut *LAST_CP.lock(), k);
             if k.0 > pk.0 {
                 recorder.push_str(&format!("; ring copies {} by the copy thread, {} waits for them ({} ms)", k.0 - pk.0, k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
+            }
+            // (Shader stages prepared ahead: used, none made, invalid.)
+            let pa: [u64; 3] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));
+            if pa.iter().any(|&n| n != 0) {
+                recorder.push_str(&format!("; prepared ahead: {} used, {} without a result, {} invalid", pa[0], pa[1], pa[2]));
             }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
         }

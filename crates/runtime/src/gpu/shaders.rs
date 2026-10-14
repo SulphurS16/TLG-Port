@@ -84,6 +84,104 @@ thread_local! {
     static LAST_VMA: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((0, 0, u64::MAX)) };
 }
 
+// Dry preparation (`prepahead`): on the prepare thread, guest reads see the
+// overlay of the dry-run CP's memory writes and are logged (address, dwords,
+// hash) for the graphics CP to validate the result against memory.
+thread_local! {
+    static DRY_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static DRY_OVERLAY: std::cell::RefCell<FastMap<u64, u32>> = std::cell::RefCell::new(FastMap::default());
+    static DRY_LOG: std::cell::RefCell<Vec<(u64, u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn hash_dwords(w: &[u32]) -> u64 {
+    let mut h = super::render::FxHasher::default();
+    for &x in w {
+        h.write_u32(x);
+    }
+    h.finish()
+}
+
+/// Starts logging this thread's guest reads (one preparation).
+pub fn dry_begin() {
+    DRY_LOG.with(|l| l.borrow_mut().clear());
+    DRY_ON.set(true);
+}
+
+/// Ends the log started by `dry_begin` and returns it.
+pub fn dry_end() -> Vec<(u64, u32, u64)> {
+    DRY_ON.set(false);
+    DRY_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+}
+
+/// The dry-run CP wrote guest [addr, addr+4*len): later reads see it.
+pub fn dry_write(addr: u64, data: &[u32]) {
+    DRY_OVERLAY.with(|o| {
+        let mut o = o.borrow_mut();
+        for (i, &v) in data.iter().enumerate() {
+            o.insert(addr + 4 * i as u64, v);
+        }
+    });
+}
+
+/// Forgets the overlay (the real writes are in guest memory now).
+pub fn dry_clear() {
+    DRY_OVERLAY.with(|o| o.borrow_mut().clear());
+}
+
+/// Guest dwords at `addr` as the dry-run CP sees them (constant RAM loads).
+pub fn dry_read(addr: u64, out: &mut [u32]) {
+    for (k, w) in out.iter_mut().enumerate() {
+        *w = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
+    }
+    dry_overlay(addr, out);
+}
+
+fn dry_overlay(addr: u64, words: &mut [u32]) {
+    DRY_OVERLAY.with(|o| {
+        let o = o.borrow();
+        if !o.is_empty() {
+            for (i, w) in words.iter_mut().enumerate() {
+                if let Some(&v) = o.get(&(addr + 4 * i as u64)) {
+                    *w = v;
+                }
+            }
+        }
+    });
+}
+
+/// A dry preparation read `words` at `addr` (after `dry_overlay`): logged.
+fn dry_seen(addr: u64, words: &mut [u32]) {
+    dry_overlay(addr, words);
+    DRY_LOG.with(|l| l.borrow_mut().push((addr, words.len() as u32, hash_dwords(words))));
+}
+
+/// Whether guest memory still holds what a dry preparation read.
+pub fn dry_valid(log: &[(u64, u32, u64)]) -> bool {
+    let mut buf = [0u32; 64];
+    for &(addr, n, h) in log {
+        let end = addr + 4 * n as u64;
+        if !mapped(addr, end) {
+            return false;
+        }
+        let mut hs = super::render::FxHasher::default();
+        let mut a = addr;
+        while a < end {
+            let k = (((end - a) / 4) as usize).min(buf.len());
+            for (i, w) in buf[..k].iter_mut().enumerate() {
+                *w = unsafe { std::ptr::read_volatile((a + 4 * i as u64) as *const u32) };
+            }
+            for &x in &buf[..k] {
+                hs.write_u32(x);
+            }
+            a += 4 * k as u64;
+        }
+        if hs.finish() != h {
+            return false;
+        }
+    }
+    true
+}
+
 /// Records a guest read for `Prepared::mem_reads`, whose users only look at
 /// pages: consecutive reads in one page are recorded once.
 fn note_read(addr: u64) {
@@ -120,7 +218,11 @@ fn guest_u32(addr: u64) -> Option<u32> {
         return None;
     }
     note_read(addr);
-    Some(unsafe { std::ptr::read_volatile(addr as *const u32) })
+    let mut v = [unsafe { std::ptr::read_volatile(addr as *const u32) }];
+    if DRY_ON.get() {
+        dry_seen(addr, &mut v);
+    }
+    Some(v[0])
 }
 
 /// Reads `out.len()` consecutive guest dwords at `addr` with one mapping
@@ -135,6 +237,9 @@ fn guest_read_words(addr: u64, out: &mut [u32]) -> bool {
     for (k, w) in out.iter_mut().enumerate() {
         *w = unsafe { std::ptr::read_volatile((addr + 4 * k as u64) as *const u32) };
     }
+    if DRY_ON.get() {
+        dry_seen(addr, out);
+    }
     true
 }
 
@@ -144,7 +249,11 @@ fn guest_read_into(addr: Option<u64>, n: u32, out: &mut Vec<u32>) {
         Some(a) if a % 4 == 0 && mapped(a, a + 4 * n as u64) => {
             note_read(a);
             note_read(a + 4 * n.max(1) as u64 - 4);
+            let start = out.len();
             out.extend((0..n as u64).map(|k| unsafe { std::ptr::read_volatile((a + 4 * k) as *const u32) }));
+            if DRY_ON.get() && n > 0 {
+                dry_seen(a, &mut out[start..]);
+            }
         }
         Some(a) => out.extend((0..n as u64).map(|k| guest_u32(a + 4 * k).unwrap_or(0))),
         None => out.extend(std::iter::repeat_n(0, n as usize)),
@@ -262,6 +371,9 @@ pub struct Prepared {
     /// Guest addresses read while resolving descriptors and scalar loads
     /// (record time): they must not have pending GPU writes.
     pub mem_reads: Vec<u64>,
+    /// Hash of the program's code (with its fetch subroutine), see
+    /// `code_hash_now`.
+    pub code_hash: u64,
     /// The engine's scatter kernel: (records resource, destination resource).
     pub scatter: Option<(usize, usize)>,
     /// Destination dwords the scatter records write, as byte ranges (set by
@@ -508,6 +620,28 @@ pub fn debug_vs_pos(addr: u64) -> bool {
 
 pub fn prepare(sr: &StageRegs) -> Result<Prepared, String> {
     prepare_tess(sr, TessSpec::default())
+}
+
+/// The code hash `prepare` would give the stage's program now (VS, PS, CS;
+/// `Prepared::code_hash`).
+pub fn code_hash_now(sr: &StageRegs) -> Option<u64> {
+    let r = sr.regs;
+    let (pgm_lo, user_base) = match sr.stage {
+        Stage::Vertex => (VS_PGM_LO, 0x2C4C),
+        Stage::Fragment => (PS_PGM_LO, 0x2C0C),
+        Stage::Compute => (CS_PGM_LO, 0x2E40),
+    };
+    let addr = ((r.sh(pgm_lo) as u64) | ((r.sh(pgm_lo + 1) as u64) << 32)) << 8;
+    let (_, main_hash, fetch_sgpr) = program(addr).ok()?;
+    match fetch_sgpr {
+        Some(s) if sr.stage == Stage::Vertex => {
+            let ub = (user_base - 0x2C00) as usize + s as usize;
+            let faddr = (*r.sh.get(ub)? as u64) | ((*r.sh.get(ub + 1)? as u64) << 32);
+            let (_, fh, _) = program(faddr).ok()?;
+            Some(main_hash ^ fh.rotate_left(17))
+        }
+        _ => Some(main_hash),
+    }
 }
 
 /// `prepare` for a stage of a tessellated draw: `tess.role` LS or HS (with
@@ -811,7 +945,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         pool_give(&mut p.u32s, std::mem::take(&mut spec.buffer_strides));
         pool_give(&mut p.inputs, std::mem::take(&mut spec.ps_inputs));
     });
-    Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, load_only, mem_reads, scatter, sparse_writes: None, utility, tess: tess.role })
+    Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, load_only, mem_reads, code_hash, scatter, sparse_writes: None, utility, tess: tess.role })
 }
 
 #[cfg(test)]
