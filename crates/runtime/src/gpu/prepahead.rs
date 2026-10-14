@@ -50,7 +50,7 @@ static SUB: AtomicU64 = AtomicU64::new(0);
 static STARTED: std::sync::Once = std::sync::Once::new();
 /// Commands served from prepared results, and declined ones (no result,
 /// or it did not validate) (TLG_PERF).
-pub static STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+pub static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 /// Results kept at most (a submission has ~2,000 commands).
 const MAX_RESULTS: usize = 8192;
@@ -147,7 +147,12 @@ fn take(key: u64, draw: bool) -> Option<Entry> {
     while q.front().is_some_and(|e| e.sub < sub) {
         q.pop_front();
     }
-    let i = q.iter().take(8).position(|e| e.key == key && matches!(e.prep, Prep::Draw(_)) == draw)?;
+    // (TLG_PERF: no result yet - the prepare thread behind -, or none
+    // matching among the next ones.)
+    let Some(i) = q.iter().take(8).position(|e| e.key == key && matches!(e.prep, Prep::Draw(_)) == draw) else {
+        STATS[if q.is_empty() { 3 } else { 4 }].fetch_add(1, Ordering::Relaxed);
+        return None;
+    };
     q.drain(..i);
     q.pop_front()
 }

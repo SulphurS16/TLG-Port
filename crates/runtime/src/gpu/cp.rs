@@ -1098,13 +1098,54 @@ impl CommandProcessor {
                 }
                 true
             }
+            // Register destinations: loaded as the CP would (memory through
+            // the overlay); other DMA and copies are left out.
+            op::DMA_DATA => {
+                let das = body[5] & (1 << 27) != 0;
+                if das {
+                    let (src_sel, sas, saic, daic) = ((body[0] >> 29) & 3, body[5] & (1 << 26) != 0, body[5] & (1 << 28) != 0, body[5] & (1 << 29) != 0);
+                    let src = (body[1] as u64) | ((body[2] as u64) << 32);
+                    let reg = (body[3] >> 2) as u32;
+                    let bytes = (body[5] & 0x1F_FFFF) as u64;
+                    for i in 0..(bytes / 4) as u32 {
+                        let v = match src_sel {
+                            2 => body[1],
+                            0 if !sas && guest_ok(src, bytes) => {
+                                let mut w = [0u32];
+                                super::shaders::dry_read(src + if saic { 0 } else { i as u64 * 4 }, &mut w);
+                                w[0]
+                            }
+                            _ => 0,
+                        };
+                        self.write_reg(reg + if daic { 0 } else { i }, v);
+                    }
+                }
+                true
+            }
+            op::COPY_DATA => {
+                let (src_sel, dst_sel) = (body[0] & 0xF, (body[0] >> 8) & 0xF);
+                if dst_sel == 0 {
+                    let src = (body[1] as u64) | ((body[2] as u64) << 32);
+                    let v = match src_sel {
+                        1 | 2 if guest_ok(src, 4) => {
+                            let mut w = [0u32];
+                            super::shaders::dry_read(src, &mut w);
+                            Some(w[0])
+                        }
+                        5 => Some(body[1]),
+                        _ => None,
+                    };
+                    if let Some(v) = v {
+                        self.write_reg(body[3], v);
+                    }
+                }
+                true
+            }
             op::NOP
             | op::EVENT_WRITE_EOP
             | op::RELEASE_MEM
             | op::EVENT_WRITE_EOS
             | op::WAIT_REG_MEM
-            | op::DMA_DATA
-            | op::COPY_DATA
             | op::MEM_SEMAPHORE
             | op::EVENT_WRITE
             | op::GET_LOD_STATS

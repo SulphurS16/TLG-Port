@@ -956,9 +956,9 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 recorder.push_str(&format!("; ring copies {} by the copy thread, {} waits for them ({} ms)", k.0 - pk.0, k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
             }
             // (Shader stages prepared ahead: used, none made, invalid.)
-            let pa: [u64; 3] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));
+            let pa: [u64; 5] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));
             if pa.iter().any(|&n| n != 0) {
-                recorder.push_str(&format!("; prepared ahead: {} used, {} without a result, {} invalid", pa[0], pa[1], pa[2]));
+                recorder.push_str(&format!("; prepared ahead: {} used, {} without a result ({} none yet, {} none matching), {} invalid", pa[0], pa[1], pa[3], pa[4], pa[2]));
             }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
         }
