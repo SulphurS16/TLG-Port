@@ -2545,6 +2545,7 @@ impl Renderer {
         let e = if compute_queue { &super::CS_EPOCH } else { &super::GFX_EPOCH };
         self.required_epoch = e.load(std::sync::atomic::Ordering::Relaxed);
         self.writes.required = self.required_epoch;
+        self.writes.class = compute_queue as usize;
         super::REQUIRED_EPOCH.with(|r| r.set(self.required_epoch));
     }
 

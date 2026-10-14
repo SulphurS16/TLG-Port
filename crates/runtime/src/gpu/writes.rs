@@ -63,6 +63,17 @@ impl Chunk {
 /// TLG_PERF: validation harvests that queried blocks: calls, block runs,
 /// pages queried, written pages found, calls that found none.
 pub static HV_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// TLG_PERF: bulk queries at round starts (`tune ww_bulk`): rounds, runs,
+/// pages queried, written pages found.
+pub static BULK_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+/// A queue class's validations since its required epoch last changed
+/// (`WriteTracker::bulk_round`): the block ranges they asked for.
+#[derive(Default)]
+struct Round {
+    required: u64,
+    asked: Vec<(u64, u64)>,
+}
 
 pub struct WriteTracker {
     /// Stamp counter: advances with every harvest that finds written pages
@@ -88,11 +99,14 @@ pub struct WriteTracker {
     disarmed: Vec<u64>,
     /// Block queries left out because the block was armed (TLG_PERF).
     pub armed_skips: u64,
+    /// Per queue class (graphics, compute: `class`, set with `required`).
+    rounds: [Round; 2],
+    pub class: usize,
 }
 
 impl WriteTracker {
     pub fn new() -> WriteTracker {
-        WriteTracker { seq: 1, chunks: FastMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: FastMap::default(), epoch: 0, required: 0, cached: 0, watch: FastMap::default(), disarmed: Vec::new(), armed_skips: 0 }
+        WriteTracker { seq: 1, chunks: FastMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: FastMap::default(), epoch: 0, required: 0, cached: 0, watch: FastMap::default(), disarmed: Vec::new(), armed_skips: 0, rounds: Default::default(), class: 0 }
     }
 
     /// Collects the OS's records of [addr, addr+len) for a validation: the
@@ -108,15 +122,37 @@ impl WriteTracker {
             self.stamp_harvest();
             return true;
         }
-        let runs = self.blocks_to_query(addr >> BLOCK_SHIFT, (hi - 1) >> BLOCK_SHIFT);
+        let (first, last) = (addr >> BLOCK_SHIFT, (hi - 1) >> BLOCK_SHIFT);
+        let gap = crate::tune::get(crate::tune::WW_BULK);
+        if gap > 0 {
+            self.bulk_round(gap as u64);
+            let asked = &mut self.rounds[self.class.min(1)].asked;
+            match asked.last_mut() {
+                Some(r) if first <= r.1 && r.0 <= last + 1 => {
+                    r.0 = r.0.min(first);
+                    r.1 = r.1.max(last + 1);
+                }
+                _ => asked.push((first, last + 1)),
+            }
+        }
+        let runs = self.blocks_to_query(first, last);
         if runs.is_empty() {
             self.cached += 1;
             return true;
         }
         self.pages.clear();
         let perf = super::render::perf_on();
+        let log = crate::tune::get(crate::tune::WW_LOG) > 0;
         for (i, &(lo, hi)) in runs.iter().enumerate() {
-            if !mem::harvest_writes(lo << BLOCK_SHIFT, (hi - lo) << BLOCK_SHIFT, &mut self.buf, &mut self.pages) {
+            let before = self.pages.len();
+            let t0 = log.then(std::time::Instant::now);
+            let ok = mem::harvest_writes(lo << BLOCK_SHIFT, (hi - lo) << BLOCK_SHIFT, &mut self.buf, &mut self.pages);
+            if let Some(t0) = t0 {
+                let left = crate::tune::get(crate::tune::WW_LOG);
+                let _ = crate::tune::set("ww_log", &(left - 1).max(0).to_string());
+                crate::info!("ww: e{} r{} {:#x} +{} KiB found {} in {} us (asked {:#x}+{:#x})", self.epoch, self.required, lo << BLOCK_SHIFT, (hi - lo) << (BLOCK_SHIFT - 10), self.pages.len() - before, t0.elapsed().as_micros(), addr, len);
+            }
+            if !ok {
                 // (Not expected inside the guest range.) The blocks not
                 // queried count as unqueried again.
                 for &(lo, hi) in &runs[i..] {
@@ -145,6 +181,71 @@ impl WriteTracker {
         }
         self.stamp_harvest();
         true
+    }
+
+    /// At the first validation of a new round of the current queue class
+    /// (its required epoch changed): queries the blocks the previous round
+    /// asked for that are due again, in runs merged across gaps of up to
+    /// `gap` blocks - a few kernel calls instead of one per validation that
+    /// finds unqueried blocks. Queried blocks count for this epoch as in
+    /// `blocks_to_query` (gaps included: they were queried as well); runs
+    /// the kernel refuses are left to the validations.
+    fn bulk_round(&mut self, gap: u64) {
+        let c = self.class.min(1);
+        if self.rounds[c].required == self.required {
+            return;
+        }
+        self.rounds[c].required = self.required;
+        let mut asked = std::mem::take(&mut self.rounds[c].asked);
+        asked.sort_unstable();
+        let watching = cpuwatch::enabled();
+        if watching {
+            self.take_disarmed();
+        }
+        let required = self.required.max(1);
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut done = 0u64;
+        for &(lo, hi) in &asked {
+            for b in lo.max(done)..hi {
+                let (ch, i) = (b >> (CHUNK_SHIFT - BLOCK_SHIFT), b as usize & (CHUNK_BLOCKS - 1));
+                if self.queried.get(&ch).is_some_and(|q| q[i] >= required) || (watching && self.watch.get(&ch).is_some_and(|w| w.armed >> i & 1 != 0)) {
+                    continue;
+                }
+                match runs.last_mut() {
+                    Some(r) if b - r.1 <= gap => r.1 = b + 1,
+                    _ => runs.push((b, b + 1)),
+                }
+            }
+            done = done.max(hi);
+        }
+        asked.clear();
+        self.rounds[c].asked = asked;
+        if runs.is_empty() {
+            return;
+        }
+        self.pages.clear();
+        let epoch = self.epoch;
+        runs.retain(|&(lo, hi)| {
+            let (a, n) = (lo << BLOCK_SHIFT, (hi - lo) << BLOCK_SHIFT);
+            if !mem::is_guest(a, n) || !mem::harvest_writes(a, n, &mut self.buf, &mut self.pages) {
+                return false;
+            }
+            for b in lo..hi {
+                self.queried.entry(b >> (CHUNK_SHIFT - BLOCK_SHIFT)).or_insert([0; CHUNK_BLOCKS])[b as usize & (CHUNK_BLOCKS - 1)] = epoch;
+            }
+            true
+        });
+        if super::render::perf_on() {
+            use std::sync::atomic::Ordering::Relaxed;
+            BULK_STATS[0].fetch_add(1, Relaxed);
+            BULK_STATS[1].fetch_add(runs.len() as u64, Relaxed);
+            BULK_STATS[2].fetch_add(runs.iter().map(|r| (r.1 - r.0) << (BLOCK_SHIFT - PAGE_SHIFT)).sum::<u64>(), Relaxed);
+            BULK_STATS[3].fetch_add(self.pages.len() as u64, Relaxed);
+        }
+        if watching {
+            self.arm_cold(&runs);
+        }
+        self.stamp_harvest();
     }
 
     /// After the queries of `runs` (blocks [first, end)): counts the blocks

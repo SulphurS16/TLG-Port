@@ -367,7 +367,22 @@ pub const PUSH_DESC: usize = 61;
 pub const DELAY_GFX_NS: usize = 62;
 pub const DELAY_CS_NS: usize = 63;
 
-const TABLE: [(&str, &str, i64); 64] = [
+/// Diagnostics: logs the next this many write-watch validation queries
+/// (epochs, range, pages found; `ww:` lines), then 0 again (`TLG_WW_LOG`, 0).
+pub const WW_LOG: usize = 64;
+
+/// Write-watch queries in bulk: when a queue class's required epoch changes
+/// (graphics: each submission; compute: each doorbell), the blocks the
+/// previous round of its validations asked for and that are due are queried
+/// at once, in runs merged across gaps of up to this many 64 KiB blocks (0:
+/// each validation queries its own blocks; `TLG_WW_BULK`, 16). Every query
+/// that resets written pages costs a TLB flush on all cores (cave, 31%
+/// clock: ~37 us against ~9 us for one that finds none); the graphics CP
+/// made ~240 per frame, the same ones each frame. Cave: calls 296 -> 104 per
+/// frame, query time -45%, frame -2.5 to -3.4% (64 blocks: more pages, less gain).
+pub const WW_BULK: usize = 65;
+
+const TABLE: [(&str, &str, i64); 66] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -432,6 +447,8 @@ const TABLE: [(&str, &str, i64); 64] = [
     ("push_desc", "TLG_PUSH_DESC", 0),
     ("delay_gfx_ns", "TLG_DELAY_GFX_NS", 0),
     ("delay_cs_ns", "TLG_DELAY_CS_NS", 0),
+    ("ww_log", "TLG_WW_LOG", 0),
+    ("ww_bulk", "TLG_WW_BULK", 16),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
