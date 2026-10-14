@@ -996,6 +996,10 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         if !parts.is_empty() {
             crate::info!("buffer binding steps/s of compute queues: {}", parts.join("; "));
         }
+        let wi = [render::WB_IMAGES[0].swap(0, Ordering::Relaxed), render::WB_IMAGES[1].swap(0, Ordering::Relaxed)];
+        if wi[0] != 0 {
+            crate::info!("render-target write-back checks/s: {} (stale intervals {:.1} each)", wi[0], wi[1] as f64 / wi[0] as f64);
+        }
         crate::info!(
             "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages, {} ms; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
             now.frames - p.frames,
@@ -1062,7 +1066,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let k = (copier::COPIES.load(Ordering::Relaxed), copier::WAITS.load(Ordering::Relaxed), copier::WAIT_NS.load(Ordering::Relaxed));
             let pk = std::mem::replace(&mut *LAST_CP.lock(), k);
             if k.0 > pk.0 {
-                recorder.push_str(&format!("; ring copies {} by the copy thread ({} by the CPs while it slept), {} waits for them ({} ms)", k.0 - pk.0, copier::INLINE.swap(0, Ordering::Relaxed), k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
+                recorder.push_str(&format!("; ring copies {} by the copy thread ({} by the CPs while it slept, {} woke it), {} waits for them ({} ms)", k.0 - pk.0, copier::INLINE.swap(0, Ordering::Relaxed), copier::WAKES.swap(0, Ordering::Relaxed), k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
             }
             // (Shader stages prepared ahead: used, none made, invalid.)
             let pa: [u64; 15] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));

@@ -46,6 +46,8 @@ static STARTED: std::sync::Once = std::sync::Once::new();
 pub static COPIES: AtomicU64 = AtomicU64::new(0);
 /// Copies made by the queuing CP itself while the copy thread slept.
 pub static INLINE: AtomicU64 = AtomicU64::new(0);
+/// Copies queued while the copy thread slept (each wakes it; TLG_PERF).
+pub static WAKES: AtomicU64 = AtomicU64::new(0);
 
 /// Copies up to this size are made by the CP when the copy thread sleeps
 /// (`tune copy_inline`): waking it costs more than such a copy.
@@ -77,6 +79,7 @@ pub fn copy(dst: *mut u8, src: u64, len: usize) -> u64 {
         seq
     };
     if SLEEPING.load(Ordering::SeqCst) {
+        WAKES.fetch_add(1, Ordering::Relaxed);
         CV.notify_one();
     }
     seq
@@ -140,9 +143,10 @@ fn run() {
             if q.is_empty() {
                 drop(q);
                 // (Copies arrive within microseconds of each other while a
-                // CP records: stay awake briefly.)
+                // CP records: stay awake briefly, `tune copy_spin_us`.)
                 let t0 = std::time::Instant::now();
-                while QUEUED.load(Ordering::Acquire) == DONE.load(Ordering::Acquire) && t0.elapsed() < std::time::Duration::from_micros(50) {
+                let spin = std::time::Duration::from_micros(crate::tune::get(crate::tune::COPY_SPIN_US).max(0) as u64);
+                while QUEUED.load(Ordering::Acquire) == DONE.load(Ordering::Acquire) && t0.elapsed() < spin {
                     std::hint::spin_loop();
                 }
                 q = QUEUE.lock();

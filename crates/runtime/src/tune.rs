@@ -382,7 +382,15 @@ pub const WW_LOG: usize = 64;
 /// frame, query time -45%, frame -2.5 to -3.4% (64 blocks: more pages, less gain).
 pub const WW_BULK: usize = 65;
 
-const TABLE: [(&str, &str, i64); 66] = [
+/// Microseconds the copy thread (`gpu::copier`) keeps polling for the next
+/// copy before it sleeps (`TLG_COPY_SPIN_US`, 1000; was 50): each copy queued
+/// while it sleeps wakes it (a kernel call on the CP; ~4% of the graphics CP
+/// at 31% clock, where draws come more than 50 us apart). Cave, 31% clock:
+/// wakes per frame 890 -> ~4, frame -4 to -6.5% (200 us: -1%). It polls while a CP
+/// records and sleeps through the label waits.
+pub const COPY_SPIN_US: usize = 66;
+
+const TABLE: [(&str, &str, i64); 67] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -449,6 +457,7 @@ const TABLE: [(&str, &str, i64); 66] = [
     ("delay_cs_ns", "TLG_DELAY_CS_NS", 0),
     ("ww_log", "TLG_WW_LOG", 0),
     ("ww_bulk", "TLG_WW_BULK", 16),
+    ("copy_spin_us", "TLG_COPY_SPIN_US", 1000),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

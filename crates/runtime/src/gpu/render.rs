@@ -1602,6 +1602,13 @@ pub struct Renderer {
     /// size; unbounded while it is unknown), rebuilt with each aging: lets
     /// `writeback_images` return at once for memory no stale image overlaps.
     stale_ivals: Vec<(u64, u64)>,
+    /// `stale_ivals` sorted (false after additions), with the longest bounded
+    /// interval and the lowest start of the unbounded ones (u64::MAX: none):
+    /// `writeback_images` searches them instead of scanning (it runs for
+    /// every read buffer binding).
+    stale_sorted: bool,
+    stale_span_max: u64,
+    stale_unbounded_lo: u64,
     /// Guest pages (4 KiB) with GPU writes that have not completed yet:
     /// page -> sequence number of the batch writing it.
     gpu_pending_pages: PageSeqs,
@@ -1927,6 +1934,9 @@ pub fn init() -> Result<(), String> {
             stale_max: 0,
             stale_aged: 0,
             stale_ivals: Vec::new(),
+            stale_sorted: false,
+            stale_span_max: 0,
+            stale_unbounded_lo: u64::MAX,
             gpu_pending_pages: PageSeqs::default(),
             gpu_pending_all: 0,
             pending_noted: (0, FastSet::default()),
@@ -2123,6 +2133,10 @@ impl Descriptors {
         }
     }
 }
+
+/// TLG_PERF: `writeback_images` calls and the stale intervals they had to
+/// consider in all (`Renderer::stale_ivals`).
+pub static WB_IMAGES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// TLG_PERF: dispatches by queue class (graphics, compute) and the
 /// synchronizing packets before them since the previous dispatch
@@ -3153,6 +3167,7 @@ impl Renderer {
                 self.stale_max = self.stale_max.max(t);
             }
             self.stale_ivals.push(Self::stale_ival(&key, total));
+            self.stale_sorted = false;
         }
     }
 
@@ -5516,11 +5531,26 @@ impl Renderer {
             }
             stale.retain(|_, ks| !ks.is_empty());
             self.stale_ivals = stale.values().flatten().map(|k| Self::stale_ival(k, self.images.get(k).and_then(|i| Self::image_guest_layout(k, i)).map(|g| g.3))).collect();
+            self.stale_sorted = false;
             self.stale = stale;
         }
         // (No stale image near this memory: nothing to write back.)
         let end = base.saturating_add(size);
-        if !self.stale_ivals.iter().any(|&(lo, hi)| lo < end && base < hi) {
+        if !self.stale_sorted {
+            self.stale_ivals.sort_unstable();
+            self.stale_span_max = self.stale_ivals.iter().filter(|e| e.1 != u64::MAX).map(|e| e.1 - e.0).max().unwrap_or(0);
+            self.stale_unbounded_lo = self.stale_ivals.iter().filter(|e| e.1 == u64::MAX).map(|e| e.0).min().unwrap_or(u64::MAX);
+            self.stale_sorted = true;
+        }
+        let near = || {
+            let i0 = self.stale_ivals.partition_point(|e| e.0 < base.saturating_sub(self.stale_span_max));
+            self.stale_ivals[i0..].iter().take_while(|e| e.0 < end).any(|e| base < e.1)
+        };
+        if perf_on() {
+            WB_IMAGES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            WB_IMAGES[1].fetch_add(self.stale_ivals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+        if self.stale_unbounded_lo >= end && !near() {
             return;
         }
         let mut keys: Vec<ImageKey> = Vec::new();
