@@ -252,8 +252,21 @@ fn run() {
 }
 
 fn hash_regs(h: &mut crate::gpu::render::FxHasher, regs: &[u32]) {
-    for &r in regs {
+    // (Pairs of words in four independent lanes, folded in at the end: one
+    // multiply chain per word was ~1% of the graphics CP's time.)
+    let mut lanes = [0u64; 4];
+    let mut chunks = regs.chunks_exact(8);
+    for c in &mut chunks {
+        for (l, lane) in lanes.iter_mut().enumerate() {
+            let v = c[2 * l] as u64 | (c[2 * l + 1] as u64) << 32;
+            *lane = (lane.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+    for &r in chunks.remainder() {
         h.write_u32(r);
+    }
+    for l in lanes {
+        h.write_u64(l);
     }
 }
 
