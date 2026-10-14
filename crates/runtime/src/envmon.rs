@@ -3,8 +3,9 @@
 //! thermal limits throttle it heavily on the development machine), this
 //! process's share of the CPU, and the 3D engine utilization of the GPU this
 //! process uses, ours and other processes' (another process rendering slows
-//! our GPU work). Timing results are only comparable between runs with
-//! similar figures.
+//! our GPU work), and the ACPI thermal zones' highest temperature and lowest
+//! passive limit (whether the clock limits coincide with heat). Timing
+//! results are only comparable between runs with similar figures.
 
 use windows_sys::Win32::System::Performance::{
     PDH_FMT_COUNTERVALUE, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_HCOUNTER, PDH_HQUERY, PdhAddEnglishCounterW, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhGetFormattedCounterValue,
@@ -17,6 +18,24 @@ struct Pdh {
     perf: PDH_HCOUNTER,
     /// `GPU Engine(*engtype_3D)`: one instance per process and engine.
     gpu: PDH_HCOUNTER,
+    /// `Thermal Zone Information(*)`: temperature (K), passive limit (%).
+    temp: PDH_HCOUNTER,
+    passive: PDH_HCOUNTER,
+}
+
+/// The values of all instances of counter `c`.
+fn instances(c: PDH_HCOUNTER) -> Vec<f64> {
+    let (mut size, mut count) = (0u32, 0u32);
+    unsafe { PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE, &mut size, &mut count, std::ptr::null_mut()) };
+    if size == 0 {
+        return Vec::new();
+    }
+    let mut buf = vec![0u64; (size as usize).div_ceil(8)];
+    let items = buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W;
+    if unsafe { PdhGetFormattedCounterArrayW(c, PDH_FMT_DOUBLE, &mut size, &mut count, items) } != 0 {
+        return Vec::new();
+    }
+    (0..count as usize).map(|i| unsafe { (*items.add(i)).FmtValue.Anonymous.doubleValue }).collect()
 }
 
 // PDH handles are used from the host thread only (under the lock).
@@ -87,13 +106,16 @@ pub fn report() {
             return;
         }
         let (mut load, mut perf, mut gpu): (PDH_HCOUNTER, PDH_HCOUNTER, PDH_HCOUNTER) = unsafe { (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed()) };
+        let (mut temp, mut passive): (PDH_HCOUNTER, PDH_HCOUNTER) = unsafe { (std::mem::zeroed(), std::mem::zeroed()) };
         unsafe {
             PdhAddEnglishCounterW(q, wide(r"\Processor(_Total)\% Processor Time").as_ptr(), 0, &mut load);
             PdhAddEnglishCounterW(q, wide(r"\Processor Information(_Total)\% Processor Performance").as_ptr(), 0, &mut perf);
             PdhAddEnglishCounterW(q, wide(r"\GPU Engine(*engtype_3D)\Utilization Percentage").as_ptr(), 0, &mut gpu);
+            PdhAddEnglishCounterW(q, wide(r"\Thermal Zone Information(*)\Temperature").as_ptr(), 0, &mut temp);
+            PdhAddEnglishCounterW(q, wide(r"\Thermal Zone Information(*)\% Passive Limit").as_ptr(), 0, &mut passive);
             PdhCollectQueryData(q);
         }
-        *g = Some((Pdh { query: q, load, perf, gpu }, process_cpu_100ns(), std::time::Instant::now()));
+        *g = Some((Pdh { query: q, load, perf, gpu, temp, passive }, process_cpu_100ns(), std::time::Instant::now()));
         return;
     }
     let (pdh, last_cpu, last_t) = g.as_mut().unwrap();
@@ -104,11 +126,17 @@ pub fn report() {
     };
     let (load, perf) = (read(pdh.load), read(pdh.perf));
     let gpu = gpu_3d(pdh.gpu).map(|(o, x)| format!(", GPU 3D engine: this process {o:.0}%, others {x:.0}%")).unwrap_or_default();
+    let (temps, limits) = (instances(pdh.temp), instances(pdh.passive));
+    let thermal = match (temps.iter().copied().reduce(f64::max), limits.iter().copied().reduce(f64::min)) {
+        (Some(t), Some(l)) => format!(", thermal zone {:.0} C (passive limit {l:.0}%)", t - 273.15),
+        (Some(t), None) => format!(", thermal zone {:.0} C", t - 273.15),
+        _ => String::new(),
+    };
     let cpu = process_cpu_100ns();
     let dt = last_t.elapsed().as_secs_f64().max(1e-3);
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
     let ours = (cpu - *last_cpu) as f64 / 1e7 / dt / cores * 100.0;
     *last_cpu = cpu;
     *last_t = std::time::Instant::now();
-    crate::info!("env: machine CPU load {load:.0}%, CPU performance {perf:.0}% of nominal, this process {ours:.0}% of {cores} logical CPUs{gpu}");
+    crate::info!("env: machine CPU load {load:.0}%, CPU performance {perf:.0}% of nominal, this process {ours:.0}% of {cores} logical CPUs{gpu}{thermal}");
 }
