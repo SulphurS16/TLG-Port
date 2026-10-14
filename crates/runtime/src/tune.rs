@@ -390,7 +390,14 @@ pub const WW_BULK: usize = 65;
 /// records and sleeps through the label waits.
 pub const COPY_SPIN_US: usize = 66;
 
-const TABLE: [(&str, &str, i64); 67] = [
+/// A draw reuses the previous draw's render targets when the registers that
+/// select them are unchanged, no other draw or dispatch began in between,
+/// the previous draw stored nothing but its targets, and the images still
+/// exist with no newer guest data (`TLG_TARGET_CACHE`, 1): consecutive draws
+/// of a pass skip the target lookups (~1.2 us per draw at full clock).
+pub const TARGET_CACHE: usize = 67;
+
+const TABLE: [(&str, &str, i64); 68] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -458,6 +465,7 @@ const TABLE: [(&str, &str, i64); 67] = [
     ("ww_log", "TLG_WW_LOG", 0),
     ("ww_bulk", "TLG_WW_BULK", 16),
     ("copy_spin_us", "TLG_COPY_SPIN_US", 1000),
+    ("target_cache", "TLG_TARGET_CACHE", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -188,6 +188,17 @@ pub enum EpochKind {
 /// Color attachments of a draw (at most 8, inline).
 type Colors = smallvec::SmallVec<[Option<Attachment>; 8]>;
 
+/// A draw's render targets (`tune target_cache`): the registers that
+/// selected them, the draw's `Renderer::work_seq`, and the result.
+struct TargetCache {
+    regs: smallvec::SmallVec<[u32; 96]>,
+    seq: u64,
+    colors: Colors,
+    blends: smallvec::SmallVec<[u32; 8]>,
+    masks: smallvec::SmallVec<[u32; 8]>,
+    depth: Option<Attachment>,
+}
+
 /// Dynamic graphics state last recorded in the current command buffer
 /// (floats as bits): draws only record what changed.
 #[derive(Clone, Copy, PartialEq, Default)]
@@ -1541,6 +1552,11 @@ pub struct Renderer {
     meta_images: Vec<ImageKey>,
     /// Set layouts created for push descriptors (`tune push_desc`).
     push_layouts: FastSet<vk::DescriptorSetLayout>,
+    /// Draws and dispatches begun (`TargetCache::seq`), the previous draw's
+    /// targets, and cache hits / lookups (TLG_PERF).
+    work_seq: u64,
+    target_cache: Option<TargetCache>,
+    pub target_hits: (u64, u64),
     /// The metadata surfaces of `meta_images` sorted by address ([start, end),
     /// image) with the largest one's size, valid while `meta_gen` is
     /// `meta_cache.0` (bumped when an image's metadata, the list or the set
@@ -1903,6 +1919,9 @@ pub fn init() -> Result<(), String> {
             tile_maps: FastMap::default(),
             meta_images: Vec::new(),
             push_layouts: FastSet::default(),
+            work_seq: 0,
+            target_cache: None,
+            target_hits: (0, 0),
             meta_gen: 1,
             meta_cache: (0, Vec::new(), 0),
             hz_bufs: smallvec::SmallVec::new(),
@@ -2921,6 +2940,79 @@ impl Renderer {
     }
 
     /// Render target image for a color buffer (padded dimensions from pitch/slice).
+    /// A draw's color attachments (by MRT slot), their blend controls and
+    /// write masks, and its depth attachment; the previous draw's when
+    /// nothing they depend on changed (`tune target_cache`, `TargetCache`).
+    #[allow(clippy::type_complexity)]
+    fn draw_attachments(&mut self, regs: &Regs, vs: &Prepared, ps: Option<&Prepared>) -> Result<(Colors, smallvec::SmallVec<[u32; 8]>, smallvec::SmallVec<[u32; 8]>, Option<Attachment>), String> {
+        let target_mask = regs.ctx(0xA08E);
+        let color_mode = (regs.ctx(0xA202) >> 4) & 7;
+        let mrt_mask = ps.map_or(0, |p| p.translated.out.mrt_mask);
+        let dctl = regs.ctx(0xA200);
+        let depth_used = dctl & 0x7 != 0 || regs.ctx(0xA000) & 3 != 0;
+        // (Every register `color_target` and `depth_target` read for this
+        // draw, and the blend controls.)
+        let caching = crate::tune::get(crate::tune::TARGET_CACHE) != 0;
+        let mut tregs: smallvec::SmallVec<[u32; 96]> = smallvec::SmallVec::new();
+        if caching {
+            tregs.extend_from_slice(&[target_mask, regs.ctx(0xA202), mrt_mask, dctl, regs.ctx(0xA000)]);
+            if color_mode != 0 {
+                for n in 0..8u32 {
+                    if (target_mask >> (4 * n)) & 0xF != 0 && mrt_mask & (1 << n) != 0 {
+                        let r = 0xA318 + n * 0xF;
+                        tregs.push(n);
+                        tregs.extend((0..8).map(|i| regs.ctx(r + i)));
+                        tregs.push(regs.ctx(0xA1E0 + n));
+                    }
+                }
+            }
+            if depth_used {
+                tregs.extend_from_slice(&[regs.ctx(0xA010), regs.ctx(0xA011), regs.ctx(0xA014), regs.ctx(0xA016), regs.ctx(0xA005)]);
+            }
+            let hit = self.target_cache.as_ref().filter(|c| {
+                c.seq + 1 == self.work_seq && c.regs == tregs && c.colors.iter().flatten().map(|a| a.key).chain(c.depth.map(|d| d.key)).all(|k| self.images.get(&k).is_some_and(|i| !i.guest_newer))
+            });
+            if perf_on() {
+                self.target_hits.0 += hit.is_some() as u64;
+                self.target_hits.1 += 1;
+            }
+            if let Some(c) = hit {
+                let r = (c.colors.clone(), c.blends.clone(), c.masks.clone(), c.depth);
+                self.target_cache.as_mut().unwrap().seq = self.work_seq;
+                return Ok(r);
+            }
+        }
+        self.target_cache = None;
+        let mut colors = Colors::new();
+        let mut blends = smallvec::SmallVec::<[u32; 8]>::new();
+        let mut masks = smallvec::SmallVec::<[u32; 8]>::new();
+        if color_mode != 0 {
+            for n in 0..8u32 {
+                let mask = (target_mask >> (4 * n)) & 0xF;
+                let written = mrt_mask & (1 << n) != 0;
+                let att = if mask != 0 && written { self.color_target(regs, n)? } else { None };
+                if att.is_some() {
+                    colors.resize(n as usize, None);
+                    colors.push(att);
+                    while blends.len() < n as usize {
+                        blends.push(0);
+                        masks.push(0);
+                    }
+                    blends.push(regs.ctx(0xA1E0 + n));
+                    masks.push(mask);
+                }
+            }
+        }
+        let depth = if depth_used { self.depth_target(regs)? } else { None };
+        // (Kept for the next draw only while this one stores nothing but its
+        // targets: buffer or storage-image stores may change its images.)
+        let only_targets = [Some(vs), ps].into_iter().flatten().all(|p| p.written_buffers.is_empty() && !p.translated.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_))));
+        if caching && only_targets {
+            self.target_cache = Some(TargetCache { regs: tregs, seq: self.work_seq, colors: colors.clone(), blends: blends.clone(), masks: masks.clone(), depth });
+        }
+        Ok((colors, blends, masks, depth))
+    }
+
     fn color_target(&mut self, regs: &Regs, n: u32) -> Result<Option<Attachment>, String> {
         let r = 0xA318 + n * 0xF;
         let info = regs.ctx(r + 4);
@@ -5826,10 +5918,14 @@ impl Renderer {
         for p in prepared {
             // Per resource: page bitmap of its writes (`BindingKind::DirtyInfo`);
             // writes not tracked mark the sink.
-            let mut dinfo: Vec<u32> = Vec::new();
+            // (On the stack for up to 32 resources: built per command.)
+            let mut dinfo: smallvec::SmallVec<[u32; 96]> = smallvec::SmallVec::new();
             if p.translated.out.bindings.iter().any(|b| b.kind == BindingKind::DirtyInfo) {
                 let sink = (self.dirty_sink()? / 4) as u32;
-                dinfo = (0..p.resources.len()).flat_map(|_| [sink, 0, 0]).collect();
+                dinfo.resize(3 * p.resources.len(), 0);
+                for d in dinfo.chunks_exact_mut(3) {
+                    d[0] = sink;
+                }
             }
             for b in &p.translated.out.bindings {
                 let t = unsafe { core::arch::x86_64::_rdtsc() };
@@ -6276,6 +6372,7 @@ impl Renderer {
 
     fn draw_inner(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) -> Result<(), String> {
         BPART_CS.set(false);
+        self.work_seq += 1;
         spin_ns(crate::tune::get(crate::tune::DELAY_GFX_NS));
         let pre = self.pre_draw.take();
         self.draw_targets.clear();
@@ -6404,31 +6501,7 @@ impl Renderer {
         }
         // Attachments.
         let tt = unsafe { core::arch::x86_64::_rdtsc() };
-        let target_mask = regs.ctx(0xA08E);
-        let color_mode = (regs.ctx(0xA202) >> 4) & 7;
-        let mut colors = Colors::new();
-        let mut blends = smallvec::SmallVec::<[u32; 8]>::new();
-        let mut masks = smallvec::SmallVec::<[u32; 8]>::new();
-        if color_mode != 0 {
-            for n in 0..8u32 {
-                let mask = (target_mask >> (4 * n)) & 0xF;
-                let written = ps.as_ref().is_some_and(|p| p.translated.out.mrt_mask & (1 << n) != 0);
-                let att = if mask != 0 && written { self.color_target(regs, n)? } else { None };
-                if att.is_some() {
-                    colors.resize(n as usize, None);
-                    colors.push(att);
-                    while blends.len() < n as usize {
-                        blends.push(0);
-                        masks.push(0);
-                    }
-                    blends.push(regs.ctx(0xA1E0 + n));
-                    masks.push(mask);
-                }
-            }
-        }
-        let dctl = regs.ctx(0xA200);
-        let depth_used = dctl & 0x7 != 0 || regs.ctx(0xA000) & 3 != 0;
-        let depth = if depth_used { self.depth_target(regs)? } else { None };
+        let (colors, blends, masks, depth) = self.draw_attachments(regs, &vs, ps.as_ref())?;
         self.draw_targets = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).collect();
         self.apply_meta_clears(regs, &colors, depth);
         bpart(24, tt);
@@ -6475,8 +6548,8 @@ impl Renderer {
                 let cb = |n: u32, o: u32| regs.ctx(0xA318 + n * 0xF + o);
                 crate::info!(
                     "FRAME skipped draw: CB mode {} target mask {:#x} DB_RENDER_CONTROL {:#x} DB_RENDER_OVERRIDE {:#x} | CB0 base {:#x} info {:#x} attrib {:#x} cmask {:#x} fmask {:#x} clear {:#x}/{:#x} | CB1 base {:#x} info {:#x} | DB z {:#x} zinfo {:#x} htile {:#x}",
-                    color_mode,
-                    target_mask,
+                    (regs.ctx(0xA202) >> 4) & 7,
+                    regs.ctx(0xA08E),
                     regs.ctx(0xA000),
                     regs.ctx(0xA003),
                     (cb(0, 0) as u64) << 8,
@@ -7447,6 +7520,7 @@ impl Renderer {
     /// caller then waits for its arguments and dispatches directly).
     fn dispatch_inner(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32, indirect: Option<u64>) -> Result<bool, String> {
         let pre = self.pre_cs.take();
+        self.work_seq += 1;
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
         let class = (cp.queue != 0) as usize;

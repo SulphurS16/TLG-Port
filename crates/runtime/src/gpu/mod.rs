@@ -886,6 +886,7 @@ struct PerfSnap {
     dprof_draws: u64,
     cprof: [[u64; 7]; 2],
     cprof_n: [u64; 2],
+    target_hits: (u64, u64),
     dsub: [u64; 6],
     bsub: [u64; 11],
     bcnt: [u64; 11],
@@ -927,6 +928,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         dprof_draws: r.dprof_draws,
         cprof: r.cprof,
         cprof_n: r.cprof_n,
+        target_hits: r.target_hits,
         dsub: r.dsub,
         bsub: r.bsub,
         bcnt: r.bcnt,
@@ -996,6 +998,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         if !parts.is_empty() {
             crate::info!("buffer binding steps/s of compute queues: {}", parts.join("; "));
         }
+        crate::info!("render targets/s: {} lookups, {} reused from the previous draw", now.target_hits.1.saturating_sub(p.target_hits.1), now.target_hits.0.saturating_sub(p.target_hits.0));
         let wi = [render::WB_IMAGES[0].swap(0, Ordering::Relaxed), render::WB_IMAGES[1].swap(0, Ordering::Relaxed)];
         if wi[0] != 0 {
             crate::info!("render-target write-back checks/s: {} (stale intervals {:.1} each)", wi[0], wi[1] as f64 / wi[0] as f64);
