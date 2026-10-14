@@ -301,7 +301,13 @@ pub const PREFETCH: usize = 51;
 /// copies (0: the CP copies under the renderer lock).
 pub const ASYNC_COPIES: usize = 52;
 
-const TABLE: [(&str, &str, i64); 53] = [
+/// The mirror binding cache (`vbind_cache`) keys validity on the generation of
+/// the 4 MiB parts of a window a binding touches (`TLG_VBIND_PARTS`, 1)
+/// instead of the whole window's (0): a GPU write or CPU change elsewhere in a
+/// 256 MiB window no longer drops every binding served from it.
+pub const VBIND_PARTS: usize = 53;
+
+const TABLE: [(&str, &str, i64); 54] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -355,6 +361,7 @@ const TABLE: [(&str, &str, i64); 53] = [
     ("rec_batch", "TLG_REC_BATCH", 64),
     ("prefetch", "TLG_PREFETCH", 0),
     ("async_copies", "TLG_ASYNC_COPIES", 1),
+    ("vbind_parts", "TLG_VBIND_PARTS", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

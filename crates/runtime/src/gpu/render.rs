@@ -308,6 +308,29 @@ struct VCache {
     hits: u64,
 }
 
+/// `VWindow::cgen` granularity: 4 MiB.
+const VGEN_SHIFT: u32 = 22;
+
+impl VWindow {
+    /// The newest generation of the parts of the window [base, base+size)
+    /// touches (`tune vbind_parts` 0: the window's).
+    fn part_gen(&self, base: u64, size: u64) -> u64 {
+        if crate::tune::get(crate::tune::VBIND_PARTS) == 0 {
+            return self.wgen;
+        }
+        let (a, b) = (((base.max(self.lo) - self.lo) >> VGEN_SHIFT) as usize, ((base + size.max(1) - 1).min(self.hi - 1).saturating_sub(self.lo) >> VGEN_SHIFT) as usize);
+        self.cgen.get(a..=b.min(self.cgen.len().saturating_sub(1))).and_then(|g| g.iter().copied().max()).unwrap_or(self.wgen)
+    }
+
+    /// Guest [a, b) of the window stopped being current: generation `g`.
+    fn bump(&mut self, a: u64, b: u64, g: u64) {
+        let (i, j) = (((a.max(self.lo) - self.lo) >> VGEN_SHIFT) as usize, ((b.max(a + 1) - 1).min(self.hi - 1).saturating_sub(self.lo) >> VGEN_SHIFT) as usize);
+        for c in self.cgen.iter_mut().take(j + 1).skip(i) {
+            *c = g;
+        }
+    }
+}
+
 struct VWindow {
     lo: u64,
     hi: u64,
@@ -326,6 +349,9 @@ struct VWindow {
     /// Changes whenever pages of the window stop being current (unique
     /// across windows: `Renderer::vgen`), for `Renderer::vbind`.
     wgen: u64,
+    /// The same per 4 MiB of the window (`VGEN_SHIFT`): bindings in one part
+    /// stay served while other parts change (`vbind`).
+    cgen: Vec<u64>,
     /// Sparse windows (`Ctx::sparse`): `mem` is null, memory is bound block
     /// by block on first use, so a window costs what has been bound of it.
     sparse: Option<SparseMem>,
@@ -699,6 +725,60 @@ fn clear_color_for(format: vk::Format, e: &[u8]) -> Option<vk::ClearColorValue> 
         _ => return None,
     };
     Some(vk::ClearColorValue { float32: c })
+}
+
+/// Guest pages with GPU writes not completed yet, as disjoint page
+/// intervals [start, end) -> sequence number of the newest batch writing
+/// them. Sequence numbers only grow, so a new write's interval replaces what
+/// it overlaps (one map operation per write instead of one per page: a 6 MiB
+/// buffer had 1,536 hash-map inserts per batch).
+#[derive(Default)]
+struct PageSeqs(std::collections::BTreeMap<u64, (u64, u64)>);
+
+impl PageSeqs {
+    /// Pages [lo, hi) are written by batch `seq` (>= every sequence noted).
+    fn insert(&mut self, lo: u64, hi: u64, seq: u64) {
+        let (mut lo, mut hi) = (lo, hi);
+        // Overlapping intervals: the parts outside [lo, hi) stay.
+        let over: smallvec::SmallVec<[(u64, (u64, u64)); 4]> = self.0.range(..hi).rev().take_while(|&(_, &(e, _))| e > lo).map(|(&s, &v)| (s, v)).collect();
+        for (s, (e, q)) in over {
+            self.0.remove(&s);
+            if s < lo {
+                self.0.insert(s, (lo, q));
+            }
+            if e > hi {
+                self.0.insert(hi, (e, q));
+            }
+        }
+        // (Neighbours of the same batch merge.)
+        if let Some((&s, &(e, q))) = self.0.range(..lo).next_back() {
+            if e == lo && q == seq {
+                self.0.remove(&s);
+                lo = s;
+            }
+        }
+        if let Some(&(e, q)) = self.0.get(&hi) {
+            if q == seq {
+                self.0.remove(&hi);
+                hi = e;
+            }
+        }
+        self.0.insert(lo, (hi, seq));
+    }
+
+    /// The batch of the newest pending write to `page`, if any.
+    fn get(&self, page: u64) -> Option<u64> {
+        self.0.range(..=page).next_back().filter(|&(_, &(e, _))| e > page).map(|(_, &(_, q))| q)
+    }
+
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Forgets writes of batches up to `done`.
+    fn retain_after(&mut self, done: u64) {
+        self.0.retain(|_, &mut (_, q)| q > done);
+    }
 }
 
 /// Disjoint, merged byte intervals [lo, hi), plus a small cache of recent
@@ -1448,7 +1528,7 @@ pub struct Renderer {
     stale_aged: u64,
     /// Guest pages (4 KiB) with GPU writes that have not completed yet:
     /// page -> sequence number of the batch writing it.
-    gpu_pending_pages: FastMap<u64, u64>,
+    gpu_pending_pages: PageSeqs,
     /// Batch with a pending GPU write too large to track by page.
     gpu_pending_all: u64,
     /// Ranges whose pages `gpu_pending_pages` already maps to batch
@@ -1763,7 +1843,7 @@ pub fn init() -> Result<(), String> {
             stale: std::collections::BTreeMap::new(),
             stale_max: 0,
             stale_aged: 0,
-            gpu_pending_pages: FastMap::default(),
+            gpu_pending_pages: PageSeqs::default(),
             gpu_pending_all: 0,
             pending_noted: (0, FastSet::default()),
             prepare_syncs: 0,
@@ -2913,9 +2993,7 @@ impl Renderer {
         if !self.pending_noted.1.insert((base, len)) {
             return;
         }
-        for p in (base >> 12)..=((base + len.max(1) - 1) >> 12) {
-            self.gpu_pending_pages.insert(p, seq);
-        }
+        self.gpu_pending_pages.insert(base >> 12, ((base + len.max(1) - 1) >> 12) + 1, seq);
     }
 
     /// GPU work of this batch writes guest [base, base+len) in the mirror
@@ -2940,14 +3018,14 @@ impl Renderer {
         let done = *DONE.lock();
         let mut need = if self.gpu_pending_all > done { self.gpu_pending_all } else { 0 };
         for &a in reads {
-            if let Some(&s) = self.gpu_pending_pages.get(&(a >> 12)) {
+            if let Some(s) = self.gpu_pending_pages.get(a >> 12) {
                 if s > done {
                     need = need.max(s);
                 }
             }
         }
-        if self.gpu_pending_pages.len() > 1 << 16 {
-            self.gpu_pending_pages.retain(|_, s| *s > done);
+        if self.gpu_pending_pages.len() > 1 << 12 {
+            self.gpu_pending_pages.retain_after(done);
         }
         if need == 0 {
             return false;
@@ -2959,7 +3037,7 @@ impl Renderer {
             let mut g = GUARD_SITES.lock();
             let m = g.get_or_insert_with(HashMap::new);
             for &a in reads {
-                if !self.gpu_pending_pages.get(&(a >> 12)).is_some_and(|&s| s > done) && self.gpu_pending_all <= done {
+                if !self.gpu_pending_pages.get(a >> 12).is_some_and(|s| s > done) && self.gpu_pending_all <= done {
                     continue;
                 }
                 let w = self.writebacks.iter().rev().find(|w| w.base <= a && a < w.base + w.size).map(|w| (w.base, w.size, w.mirror, "this batch"));
@@ -3950,7 +4028,7 @@ impl Renderer {
             if let Some(&(k, wgen, checked, buf, off)) = self.vbind.get(&(base, size)) {
                 let required = self.required_epoch;
                 if let Some(vc) = self.vcache.as_mut() {
-                    if let Some(w) = vc.windows.get_mut(&k).filter(|w| w.wgen == wgen && checked != u64::MAX && checked >= required) {
+                    if let Some(w) = vc.windows.get_mut(&k).filter(|w| w.buf == buf && w.part_gen(base, size) == wgen && checked != u64::MAX && checked >= required) {
                         w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
                         vc.hits += 1;
                         if perf_on() {
@@ -4065,7 +4143,7 @@ impl Renderer {
             let blocks = ((hi - lo + 0xFFFF) >> 16) as usize;
             let cost = if sparse.is_some() { 0 } else { hi - lo };
             self.vgen += 1;
-            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, wgen: self.vgen, sparse };
+            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, wgen: self.vgen, cgen: vec![self.vgen; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], sparse };
             let vc = self.vcache.get_or_insert_with(|| VCache { windows: FastMap::default(), bytes: 0, copied: 0, hits: 0 });
             vc.bytes += cost;
             vc.windows.insert(lo, w);
@@ -4149,10 +4227,11 @@ impl Renderer {
                     // (Written but no page stamps: no write watching.)
                     runs.push((rlo, rhi));
                 }
+                self.vgen += 1;
                 for (a, b) in runs {
                     bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, false);
+                    w.bump(a, b, self.vgen);
                 }
-                self.vgen += 1;
                 w.wgen = self.vgen;
             }
             for x in i..j {
@@ -4300,7 +4379,7 @@ impl Renderer {
                 if self.vbind.len() >= 1 << 16 {
                     self.vbind.clear();
                 }
-                self.vbind.insert((base, size), (k, w.wgen, checked, vbuf, base - wlo));
+                self.vbind.insert((base, size), (k, w.part_gen(base, size), checked, vbuf, base - wlo));
             }
         }
         Some((vbuf, base - wlo))
@@ -4386,6 +4465,7 @@ impl Renderer {
                 if w.buf != self.vgen_keep {
                     self.vgen += 1;
                     w.wgen = self.vgen;
+                    w.bump(a, b, self.vgen);
                 }
             }
         }
@@ -9628,6 +9708,24 @@ pub const FLUSH_REASONS: [&str; 6] = ["eop/dma", "writeback sync", "ring full", 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pending-write page intervals: newest batch per page, replacement of
+    /// overlaps, merging of neighbours of one batch.
+    #[test]
+    fn page_seqs_track_the_newest_batch() {
+        let mut p = PageSeqs::default();
+        p.insert(10, 20, 1);
+        p.insert(20, 30, 1);
+        assert_eq!(p.len(), 1);
+        p.insert(15, 25, 2);
+        assert_eq!((p.get(9), p.get(10), p.get(14), p.get(15), p.get(24), p.get(25), p.get(29), p.get(30)), (None, Some(1), Some(1), Some(2), Some(2), Some(1), Some(1), None));
+        p.insert(0, 40, 3);
+        assert_eq!(p.len(), 1);
+        assert_eq!((p.get(0), p.get(39), p.get(40)), (Some(3), Some(3), None));
+        p.insert(50, 51, 4);
+        p.retain_after(3);
+        assert_eq!((p.get(5), p.get(50)), (None, Some(4)));
+    }
 
     #[test]
     fn ranges_merge_and_contain() {
