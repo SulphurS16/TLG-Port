@@ -1249,6 +1249,11 @@ fn record_profile(pool: vk::QueryPool, labels: &[String]) {
     }
 }
 
+/// TLG_GPU_PROFILE: the next batch submitted ends a frame (its operations
+/// are profiled as "tail: ...": what the GPU still does once the graphics
+/// CP has finished the frame).
+pub static TAIL_PROFILE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Takes the accumulated GPU profile, most expensive first: (label, count, ns).
 pub fn take_gpu_profile() -> Vec<(String, u64, u64)> {
     let mut v: Vec<(String, u64, u64)> = GPU_PROFILE.lock().take().unwrap_or_default().into_iter().map(|(k, (c, ns))| (k, c, ns)).collect();
@@ -2621,7 +2626,16 @@ impl Renderer {
         }
         self.last_seq += 1;
         slot.seq = self.last_seq;
-        let profile = (slot.queries != vk::QueryPool::null() && self.marks.len() > 1).then(|| (slot.queries, std::mem::take(&mut self.marks)));
+        let tail = TAIL_PROFILE.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let profile = (slot.queries != vk::QueryPool::null() && self.marks.len() > 1).then(|| {
+            let mut m = std::mem::take(&mut self.marks);
+            if tail {
+                for l in &mut m {
+                    l.insert_str(0, "tail: ");
+                }
+            }
+            (slot.queries, m)
+        });
         let zc_reads = std::mem::take(&mut self.zc_reads);
         push_completion(Completion { seq: self.last_seq, fence: slot.fence, exec: slot.exec, ring_ptr: self.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
         // (In COMPLETIONS now: the view may forget them.)
@@ -3810,16 +3824,27 @@ impl Renderer {
         let store_fmt = canonical(vfmt);
         let depth_layers = if ty3d { t.depth } else { total_layers };
         // Render targets here whose memory the title reused (see
-        // `reused_target`).
-        if !storage {
-            let old: smallvec::SmallVec<[ImageKey; 4]> = self.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| self.images[k].gpu_written).collect()).unwrap_or_default();
-            for k in old {
-                self.reused_target(k);
+        // `reused_target`), and those whose guest memory was since written by
+        // buffer stores: reloaded before sampling (directly or via shadows).
+        // (One walk over the images at the base for both.)
+        let (mut old, mut newer) = (smallvec::SmallVec::<[ImageKey; 4]>::new(), smallvec::SmallVec::<[ImageKey; 4]>::new());
+        if let Some(ks) = self.by_base.get(&t.base) {
+            for k in ks {
+                let img = &self.images[k];
+                if img.gpu_written && !storage {
+                    old.push(*k);
+                }
+                if img.guest_newer {
+                    newer.push(*k);
+                }
             }
         }
-        // Render targets here whose guest memory was since written by buffer
-        // stores: reload them before sampling (directly or via shadows).
-        let newer: Vec<ImageKey> = self.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| self.images[k].guest_newer).collect()).unwrap_or_default();
+        for k in old {
+            // (A reused target stops being GPU-written: not refreshed below.)
+            if self.reused_target(k) {
+                newer.retain(|n| *n != k);
+            }
+        }
         for k in newer {
             self.refresh_from_guest(k, false)?;
         }
@@ -9356,8 +9381,27 @@ fn guest_extent(base: u64, size: u64) -> u64 {
     if size <= 1 << 20 {
         return size;
     }
+    // (The spans looked up lately, valid while the mappings are unchanged:
+    // the same large bindings recur every frame, and the memory map lock is
+    // shared with the title's allocations.)
+    thread_local! {
+        static SPANS: std::cell::Cell<(u64, [(u64, u64); 4], usize)> = const { std::cell::Cell::new((u64::MAX, [(0, 0); 4], 0)) };
+    }
+    let generation = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
+    let (g, mut spans, next) = SPANS.get();
+    if g == generation {
+        if let Some(&(_, end)) = spans.iter().find(|&&(s, e)| s <= base && base < e) {
+            return size.min(end - base);
+        }
+    } else {
+        spans = [(0, 0); 4];
+    }
     match crate::mem::MEM.lock().committed_span(base) {
-        Some((_, end)) => size.min(end - base),
+        Some((start, end)) => {
+            spans[next] = (start, end);
+            SPANS.set((generation, spans, (next + 1) % spans.len()));
+            size.min(end - base)
+        }
         None => size,
     }
 }

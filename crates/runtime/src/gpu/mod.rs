@@ -489,6 +489,10 @@ fn gfx_thread() {
         // memory waits on them are resolved as before.)
         let coalesce = !has_flip && crate::tune::get(crate::tune::COALESCE) != 0 && !q.pending.lock().is_empty();
         if !coalesce {
+            // (TLG_GPU_PROFILE: the frame's last batch, profiled apart.)
+            if has_flip && render::gpu_profile_on() {
+                render::TAIL_PROFILE.store(true, Ordering::Relaxed);
+            }
             cp.commit(&mut hooks);
             // Close the batch at the end of each title submission so shader
             // results the title may poll for reach memory without further work.
@@ -496,6 +500,7 @@ fn gfx_thread() {
                 r.submit_batch(Vec::new());
             }
         }
+        render::TAIL_PROFILE.store(false, Ordering::Relaxed);
         if let Some(f) = s.flip {
             let ended = FRAMES.fetch_add(1, Ordering::Relaxed);
             if render::TRACE_REQUEST.load(Ordering::Relaxed) == ended {
@@ -624,8 +629,15 @@ fn gfx_thread() {
                     let prof = render::take_gpu_profile();
                     let total: u64 = prof.iter().map(|p| p.2).sum();
                     crate::info!("GPU profile since last report: {:.1} ms in {} timed operations", total as f64 / 1e6, prof.iter().map(|p| p.1).sum::<u64>());
-                    for (label, n, ns) in prof.iter().take(20) {
+                    for (label, n, ns) in prof.iter().filter(|p| !p.0.starts_with("tail: ")).take(20) {
                         crate::info!("  {:9.2} ms {:6}x {:8.1} us  {}", *ns as f64 / 1e6, n, *ns as f64 / 1e3 / *n as f64, label);
+                    }
+                    let tail: Vec<&(String, u64, u64)> = prof.iter().filter(|p| p.0.starts_with("tail: ")).collect();
+                    if !tail.is_empty() {
+                        crate::info!("GPU profile of frames' last batches: {:.1} ms in {} timed operations", tail.iter().map(|p| p.2).sum::<u64>() as f64 / 1e6, tail.iter().map(|p| p.1).sum::<u64>());
+                        for (label, n, ns) in tail.iter().take(15).map(|p| (&p.0, p.1, p.2)) {
+                            crate::info!("  {:9.2} ms {:6}x {:8.1} us  {}", ns as f64 / 1e6, n, ns as f64 / 1e3 / n as f64, label);
+                        }
                     }
                 }
                 for (m, c) in r.top_reports(6) {

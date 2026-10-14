@@ -548,6 +548,22 @@ pub fn hash_slice(seed: u64, d: &[u8]) -> u64 {
 pub fn texture_bytes(t: &Tsharp, layers: u32) -> u64 {
     let (bpp, block) = element_bits(t.dfmt);
     let levels = texture_levels(t);
+    // (Memoized: a binding needs it several times, and the same textures are
+    // bound every frame.)
+    let key = [t.width, t.height, t.pitch, t.dfmt as u32 | (t.tiling_index as u32) << 8 | (t.pow2_pad as u32) << 16 | (t.ty as u32) << 24, levels, layers];
+    thread_local! {
+        static MEMO: std::cell::RefCell<Vec<([u32; 6], u64)>> = std::cell::RefCell::new(vec![([u32::MAX; 6], 0); 64]);
+    }
+    let slot = (key.iter().fold(0u64, |h, &w| (h ^ w as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)) >> 58) as usize;
+    if let Some(v) = MEMO.with(|m| m.borrow().get(slot).filter(|e| e.0 == key).map(|e| e.1)) {
+        return v;
+    }
+    let v = texture_bytes_uncached(t, layers, bpp, block, levels);
+    MEMO.with(|m| m.borrow_mut()[slot] = (key, v));
+    v
+}
+
+fn texture_bytes_uncached(t: &Tsharp, layers: u32, bpp: u32, block: u32, levels: u32) -> u64 {
     let mut end = 0;
     tiling::for_each_mip_level(t.width, t.height, t.pitch, block, bpp, t.tiling_index, t.pow2_pad && levels > 1, levels, layers, t.ty == desc::T_CUBE, |l| {
         // (A lone base level: the slices actually used.)
