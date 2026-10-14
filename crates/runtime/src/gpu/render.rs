@@ -1428,7 +1428,8 @@ pub struct Renderer {
     /// Buffer ranges dispatches accessed since the full barrier that made
     /// `BARRIERS` `hz_gen` (buffer, offset, size, written), and whether one
     /// used resources not tracked that way (`tune dispatch_hazards`).
-    hz: smallvec::SmallVec<[(vk::Buffer, u64, u64, bool); 32]>,
+    /// With the title's synchronization count at each access (`tune title_sync`).
+    hz: smallvec::SmallVec<[(vk::Buffer, u64, u64, bool, u64); 32]>,
     hz_gen: u64,
     hz_unknown: bool,
     /// The accesses of the dispatch whose descriptors were written last.
@@ -2078,6 +2079,15 @@ pub static BATCH_SITES: parking_lot::Mutex<Option<HashMap<(&'static str, u32), (
 /// write since, by the same CP queue: in the same CPU epoch, and in the same
 /// required epoch (graphics or compute) though another CPU epoch began.
 pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// TLG_PERF: dispatches by queue class (graphics, compute) and the
+/// synchronizing packets before them since the previous dispatch
+/// (`cp::SYNC_*` bits): [class][bits] -> (dispatches, full barriers before them).
+pub static DISPATCH_SYNC: [[(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 128]; 2] = [const { [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 128] }; 2];
+/// TLG_PERF: full barriers before dispatches by queue class, reason
+/// (indirect arguments, untracked resources, conflicting accesses, other
+/// unordered work) and whether the title synchronized since the previous
+/// dispatch of that CP.
+pub static BARRIER_WHY: [[[std::sync::atomic::AtomicU64; 2]; 4]; 2] = [const { [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4] }; 2];
 /// TLG_PERF: mirror copy-ins recorded in their batch and ahead of it.
 pub static COPYIN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// TLG_PERF: mirror bindings served by the binding cache, and all.
@@ -5179,7 +5189,8 @@ impl Renderer {
     /// (`tune async_copies`; the batch's submit waits for it) or now.
     fn ring_copy(&mut self, off: u64, addr: u64, n: u64) {
         if crate::tune::get(crate::tune::ASYNC_COPIES) != 0 && n != 0 {
-            self.batch_copies = super::copier::copy(unsafe { self.ring.ptr.add(off as usize) }, addr, n as usize);
+            // (The newest queued copy of the batch: 0 for one made at once.)
+            self.batch_copies = self.batch_copies.max(super::copier::copy(unsafe { self.ring.ptr.add(off as usize) }, addr, n as usize));
         } else {
             self.ring.write_guest(off, addr, n);
         }
@@ -7438,22 +7449,43 @@ impl Renderer {
             self.hz_unknown = false;
             self.hz_gen = bgen;
         }
+        // (`tune title_sync`: accesses of GPU work the title has not
+        // synchronized with since - no label wait, cache acquire or event on
+        // any queue after it - are unordered with this dispatch, as on PS4.)
+        let mode = crate::tune::get(crate::tune::TITLE_SYNC);
+        let relax = mode != 0;
+        let synced = super::cp::TITLE_SYNC.load(std::sync::atomic::Ordering::SeqCst);
+        // (Mode 2: this queue's own latest synchronization point; mode 1: any queue's.)
+        let ordered_after = if mode >= 2 { super::cp::QUEUE_SYNC[cp.queue as usize & 63].load(std::sync::atomic::Ordering::SeqCst) } else { synced };
         let conflict = || {
             self.hz_unknown
                 || self.cur_unknown
-                || self.cur_access.iter().any(|&(b, o, n, w)| self.hz.iter().any(|&(hb, ho, hn, hw)| hb == b && ho < o.saturating_add(n) && o < ho.saturating_add(hn) && (w || hw)))
+                || self.hz.len() > 1024
+                || self.cur_access.iter().any(|&(b, o, n, w)| self.hz.iter().any(|&(hb, ho, hn, hw, hs)| (!relax || hs < ordered_after) && hb == b && ho < o.saturating_add(n) && o < ho.saturating_add(hn) && (w || hw)))
         };
         // (The validated arguments must be visible to the indirect read.)
         let need = args_slot.is_some() || (self.barrier_needed && (!hazards || self.unordered_gen == bgen || conflict()));
         if need && perf_on() {
-            if args_slot.is_some() {
+            let why = if args_slot.is_some() {
                 self.hz_reasons[0] += 1;
+                0
             } else if !hazards || self.unordered_gen == bgen {
                 *self.hz_other_lines.entry(if hazards { self.unordered_line } else { 0 }).or_default() += 1;
+                3
             } else if self.hz_unknown || self.cur_unknown {
                 self.hz_reasons[1] += 1;
+                1
             } else {
                 self.hz_reasons[2] += 1;
+                2
+            };
+            BARRIER_WHY[(cp.queue != 0) as usize][why][(cp.last_sync & !super::cp::SYNC_DRAW != 0) as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if perf_on() {
+            let e = &DISPATCH_SYNC[(cp.queue != 0) as usize][(cp.last_sync & 127) as usize];
+            e.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if need {
+                e.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         if need {
@@ -7467,7 +7499,7 @@ impl Renderer {
         }
         if hazards {
             let acc = std::mem::take(&mut self.cur_access);
-            self.hz.extend(acc.iter().copied());
+            self.hz.extend(acc.iter().map(|&(b, o, n, w)| (b, o, n, w, synced)));
             self.cur_access = acc;
             self.hz_unknown |= self.cur_unknown;
         }
@@ -7487,7 +7519,9 @@ impl Renderer {
                 REC.cmd_dispatch(self.cmd, x, y, z);
             }
         }
-        self.mark(|| format!("cs {:#x}", cs.addr));
+        // (TLG_GPU_PROFILE: by queue; single-workgroup dispatches and those
+        // behind a full barrier apart.)
+        self.mark(|| format!("q{} cs {:#x}{}{}", cp.queue, cs.addr, if x.max(1) * y.max(1) * z.max(1) == 1 && args_slot.is_none() { " 1 group" } else { "" }, if need { " +barrier" } else { "" }));
         self.barrier_needed = true; // (its accesses: `hz`)
         self.perform_gpu_writebacks();
         self.dispatches += 1;

@@ -601,6 +601,25 @@ fn gfx_thread() {
                 other.sort_by(|x, y| y.1.cmp(&x.1));
                 crate::info!("barriers before dispatches since last report: {emitted} emitted, {skipped} left out (no conflicting accesses; tune dispatch_hazards); needed for indirect arguments {args}, untracked resources {unknown}, conflicting accesses {conflict}, other unordered work by render.rs line {:?}", &other[..other.len().min(10)]);
                 if render::perf_on() {
+                    // (Whether the title synchronized between consecutive
+                    // dispatches of a CP: GCN overlaps them otherwise.)
+                    for (class, name) in [(0usize, "graphics"), (1, "compute")] {
+                        let why: Vec<String> = ["indirect arguments", "untracked", "conflicts", "unordered work"]
+                            .iter()
+                            .enumerate()
+                            .map(|(r, n)| {
+                                let a = render::BARRIER_WHY[class][r][0].swap(0, Ordering::Relaxed);
+                                let b = render::BARRIER_WHY[class][r][1].swap(0, Ordering::Relaxed);
+                                format!("{n} {a} without / {b} with")
+                            })
+                            .collect();
+                        let mut masks: Vec<(usize, u64, u64)> = (0..128).map(|m| (m, render::DISPATCH_SYNC[class][m].0.swap(0, Ordering::Relaxed), render::DISPATCH_SYNC[class][m].1.swap(0, Ordering::Relaxed))).filter(|e| e.1 != 0).collect();
+                        masks.sort_by(|a, b| b.1.cmp(&a.1));
+                        let ms: Vec<String> = masks.iter().take(8).map(|&(m, n, b)| format!("{m:#04x}: {n} ({b} behind a barrier)")).collect();
+                        crate::info!("{name} dispatches by synchronizing packets since the previous dispatch (bits: 1 CS partial flush, 2 other events, 4 acquire, 8 wait, 16 release, 32 CP write, 64 draw): {}; barriers by reason, without / with title synchronization since: {}", ms.join(", "), why.join(", "));
+                    }
+                }
+                if render::perf_on() {
                     let mut bs: Vec<((&str, u32), (u64, u64))> = render::BATCH_SITES.lock().take().unwrap_or_default().into_iter().collect();
                     bs.sort_by(|x, y| y.1 .0.cmp(&x.1 .0));
                     let bs: Vec<String> = bs.iter().take(12).map(|((f, l), (n, c))| format!("{f}:{l} {n}x ({:.1} cmds)", *c as f64 / *n as f64)).collect();
@@ -632,6 +651,24 @@ fn gfx_thread() {
                     for (label, n, ns) in prof.iter().filter(|p| !p.0.starts_with("tail: ")).take(20) {
                         crate::info!("  {:9.2} ms {:6}x {:8.1} us  {}", *ns as f64 / 1e6, n, *ns as f64 / 1e3 / *n as f64, label);
                     }
+                    // (Dispatches by queue: all, single-workgroup ones, those behind a full barrier.)
+                    let mut by_q: std::collections::BTreeMap<String, [(u64, u64); 3]> = std::collections::BTreeMap::new();
+                    for (label, n, ns) in prof.iter().map(|p| (p.0.trim_start_matches("tail: "), p.1, p.2)) {
+                        let Some((q, rest)) = label.split_once(" cs ") else { continue };
+                        let e = by_q.entry(q.to_string()).or_insert([(0, 0); 3]);
+                        e[0].0 += n;
+                        e[0].1 += ns;
+                        if rest.contains(" 1 group") {
+                            e[1].0 += n;
+                            e[1].1 += ns;
+                        }
+                        if rest.contains("+barrier") {
+                            e[2].0 += n;
+                            e[2].1 += ns;
+                        }
+                    }
+                    let qs: Vec<String> = by_q.iter().map(|(q, e)| format!("{q}: {} dispatches {:.1} ms (single-workgroup {} {:.1} ms, behind a full barrier {} {:.1} ms)", e[0].0, e[0].1 as f64 / 1e6, e[1].0, e[1].1 as f64 / 1e6, e[2].0, e[2].1 as f64 / 1e6)).collect();
+                    crate::info!("GPU profile, dispatches by queue: {}", qs.join("; "));
                     let tail: Vec<&(String, u64, u64)> = prof.iter().filter(|p| p.0.starts_with("tail: ")).collect();
                     if !tail.is_empty() {
                         crate::info!("GPU profile of frames' last batches: {:.1} ms in {} timed operations", tail.iter().map(|p| p.2).sum::<u64>() as f64 / 1e6, tail.iter().map(|p| p.1).sum::<u64>());
@@ -1000,7 +1037,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let k = (copier::COPIES.load(Ordering::Relaxed), copier::WAITS.load(Ordering::Relaxed), copier::WAIT_NS.load(Ordering::Relaxed));
             let pk = std::mem::replace(&mut *LAST_CP.lock(), k);
             if k.0 > pk.0 {
-                recorder.push_str(&format!("; ring copies {} by the copy thread, {} waits for them ({} ms)", k.0 - pk.0, k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
+                recorder.push_str(&format!("; ring copies {} by the copy thread ({} by the CPs while it slept), {} waits for them ({} ms)", k.0 - pk.0, copier::INLINE.swap(0, Ordering::Relaxed), k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
             }
             // (Shader stages prepared ahead: used, none made, invalid.)
             let pa: [u64; 15] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));

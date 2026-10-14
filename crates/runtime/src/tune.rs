@@ -335,7 +335,22 @@ pub const WW_FILTER: usize = 57;
 /// -15%, GPU time per frame -2.7%.
 pub const HOIST_COPYINS: usize = 58;
 
-const TABLE: [(&str, &str, i64); 59] = [
+/// Small guest-to-ring copies are made by the CP itself while the copy thread
+/// sleeps instead of waking it (`TLG_COPY_INLINE`, 0; `gpu::copier`).
+pub const COPY_INLINE: usize = 59;
+
+/// Dispatch hazards follow the title's synchronization: a dispatch is
+/// ordered behind the conflicting buffer accesses of earlier GPU work only
+/// when the title synchronized after them (label waits, cache acquires,
+/// events; `cp::TITLE_SYNC`) - PS4 command processors overlap dispatches
+/// otherwise (`TLG_TITLE_SYNC`, 1: any queue's synchronization point; 2: the
+/// dispatching queue's own; 0: every conflict). Barriers for our own copies
+/// stay. Cave: full barriers -26%, GPU time per frame -21%, +6-9% fps (the
+/// compute queues' single-workgroup jobs on shared multi-MiB buffers, which
+/// the title issues back to back, no longer run one at a time).
+pub const TITLE_SYNC: usize = 60;
+
+const TABLE: [(&str, &str, i64); 61] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -395,6 +410,8 @@ const TABLE: [(&str, &str, i64); 59] = [
     ("prep_priority", "TLG_PREP_PRIORITY", 0),
     ("ww_filter", "TLG_WW_FILTER", 1),
     ("hoist_copyins", "TLG_HOIST_COPYINS", 1),
+    ("copy_inline", "TLG_COPY_INLINE", 0),
+    ("title_sync", "TLG_TITLE_SYNC", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

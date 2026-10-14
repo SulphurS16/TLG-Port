@@ -400,6 +400,10 @@ pub struct CommandProcessor {
     /// Dry run (`prepahead`): registers, indirect buffers, constant RAM and
     /// the draw/dispatch hooks only; memory writes go to `Hooks::dry_write`.
     pub dry: bool,
+    /// Synchronizing packets since this CP's last dispatch, and those before
+    /// the dispatch being executed (`SYNC_*` bits; TLG_PERF).
+    pub sync_seen: u8,
+    pub last_sync: u8,
 }
 
 fn guest_ok(addr: u64, len: u64) -> bool {
@@ -412,6 +416,34 @@ unsafe fn rd(addr: u64) -> u32 {
 
 /// Type-3 packets executed per opcode (graphics queue; +256 compute queues).
 pub static OPCODES: [std::sync::atomic::AtomicU64; 512] = [const { std::sync::atomic::AtomicU64::new(0) }; 512];
+
+/// `CommandProcessor::sync_seen` bits: EVENT_WRITE CS_PARTIAL_FLUSH, other
+/// EVENT_WRITE events, ACQUIRE_MEM/SURFACE_SYNC, WAIT_REG_MEM, end-of-pipe/
+/// shader releases, CP memory writes (WRITE_DATA, COPY_DATA, DMA_DATA), draws.
+pub const SYNC_CS_FLUSH: u8 = 1;
+pub const SYNC_EVENT: u8 = 2;
+pub const SYNC_ACQUIRE: u8 = 4;
+pub const SYNC_WAIT: u8 = 8;
+pub const SYNC_RELEASE: u8 = 16;
+pub const SYNC_CP_WRITE: u8 = 32;
+pub const SYNC_DRAW: u8 = 64;
+
+/// Synchronization points of the title's command streams, all queues: label
+/// waits once met, ACQUIRE_MEM/SURFACE_SYNC, EVENT_WRITE events. GPU work
+/// recorded with no synchronization point after it is unordered with later
+/// work on PS4 (the CP does not serialize dispatches): `tune title_sync`.
+/// A sequence over all queues, and per queue the sequence number of its
+/// latest synchronization point (`tune title_sync 2`: a queue's dispatch is
+/// ordered behind work its own queue synchronized with since; work of other
+/// queues orders it only through a wait of its own, which comes later).
+pub static TITLE_SYNC: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static QUEUE_SYNC: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+/// A synchronization point of the command stream of queue `q`.
+fn title_sync_point(q: usize) {
+    let s = TITLE_SYNC.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    QUEUE_SYNC[q & 63].store(s, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// EVENT_WRITE packets by VGT event type. They are not acted on: caches are
 /// coherent and partial flushes are implied by our ordering. Counter samples
@@ -545,6 +577,8 @@ impl CommandProcessor {
             markers: Vec::new(),
             trace: false,
             dry: false,
+            sync_seen: 0,
+            last_sync: 0,
         }
     }
 
@@ -769,6 +803,25 @@ impl CommandProcessor {
     /// indirect buffers (stream control, in `step`).
     fn exec_packet(&mut self, opcode: u32, body: &[u32], cur: u64, hooks: &mut dyn Hooks) -> Step {
         let count = body.len();
+        self.sync_seen |= match opcode {
+            op::EVENT_WRITE if body.first().is_some_and(|&e| e & 0x3F == 0x07) => SYNC_CS_FLUSH,
+            op::EVENT_WRITE => SYNC_EVENT,
+            op::ACQUIRE_MEM | op::SURFACE_SYNC => SYNC_ACQUIRE,
+            op::WAIT_REG_MEM => SYNC_WAIT,
+            op::RELEASE_MEM | op::EVENT_WRITE_EOP | op::EVENT_WRITE_EOS => SYNC_RELEASE,
+            op::WRITE_DATA | op::COPY_DATA | op::DMA_DATA => SYNC_CP_WRITE,
+            op::DRAW_INDEX_AUTO | op::DRAW_INDEX_2 | op::DRAW_INDEX_OFFSET_2 | op::DRAW_INDIRECT | op::DRAW_INDEX_INDIRECT | op::DRAW_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_MULTI | op::DRAW_INDEX_INDIRECT_COUNT_MULTI => SYNC_DRAW,
+            op::DISPATCH_DIRECT | op::DISPATCH_INDIRECT => {
+                self.last_sync = std::mem::take(&mut self.sync_seen);
+                0
+            }
+            _ => 0,
+        };
+        // (Events and cache acquires order the work before them at once; a
+        // label wait once it is met, below.)
+        if matches!(opcode, op::EVENT_WRITE | op::ACQUIRE_MEM | op::SURFACE_SYNC) && !self.dry {
+            title_sync_point(self.queue as usize);
+        }
         match opcode {
             op::NOP => self.nop(&body),
             op::SET_CONTEXT_REG => self.set_regs(pm4::CONTEXT_REG_BASE, &body),
@@ -861,7 +914,12 @@ impl CommandProcessor {
                     _ => crate::warn!("{}: WRITE_DATA dst_sel {} unsupported", self.name, dst_sel),
                 }
             }
-            op::WAIT_REG_MEM => self.wait_reg_mem(&body, hooks),
+            op::WAIT_REG_MEM => {
+                self.wait_reg_mem(&body, hooks);
+                if !self.dry {
+                    title_sync_point(self.queue as usize);
+                }
+            }
             op::DMA_DATA => {
                 let src = (body[1] as u64) | ((body[2] as u64) << 32);
                 let dst = (body[3] as u64) | ((body[4] as u64) << 32);

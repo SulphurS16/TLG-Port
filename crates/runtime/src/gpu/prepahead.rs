@@ -394,7 +394,8 @@ fn decoded_skips(opcode: u32, body: &[u32]) -> bool {
     use super::pm4::{marker, op};
     match opcode {
         op::WAIT_ON_CE_COUNTER | op::WAIT_ON_DE_COUNTER_DIFF => true,
-        op::CONTEXT_CONTROL | op::CLEAR_STATE | op::SURFACE_SYNC | op::ACQUIRE_MEM | op::PFP_SYNC_ME | op::DRAW_PREAMBLE | op::PREAMBLE_CNTL | op::PRED_EXEC | op::SWITCH_BUFFER | op::OCCLUSION_QUERY => true,
+        // (SURFACE_SYNC and ACQUIRE_MEM stay: the CP counts them, TLG_PERF.)
+        op::CONTEXT_CONTROL | op::CLEAR_STATE | op::PFP_SYNC_ME | op::DRAW_PREAMBLE | op::PREAMBLE_CNTL | op::PRED_EXEC | op::SWITCH_BUFFER | op::OCCLUSION_QUERY => true,
         op::NOP => !matches!(body.first(), Some(&(marker::PUSH | marker::POP | marker::SET | marker::WAIT_FLIP))),
         _ => false,
     }

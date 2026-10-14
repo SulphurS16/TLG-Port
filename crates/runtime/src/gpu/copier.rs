@@ -44,15 +44,31 @@ static WAITERS: AtomicU64 = AtomicU64::new(0);
 static STARTED: std::sync::Once = std::sync::Once::new();
 /// Copies performed and waits for them (TLG_PERF).
 pub static COPIES: AtomicU64 = AtomicU64::new(0);
+/// Copies made by the queuing CP itself while the copy thread slept.
+pub static INLINE: AtomicU64 = AtomicU64::new(0);
+
+/// Copies up to this size are made by the CP when the copy thread sleeps
+/// (`tune copy_inline`): waking it costs more than such a copy.
+const INLINE_MAX: usize = 16 << 10;
 pub static WAITS: AtomicU64 = AtomicU64::new(0);
 pub static WAIT_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Queues a copy of guest [src, src+len) to `dst` (upload ring bytes nothing
-/// reads before `wait` returns for the result); returns its sequence number.
+/// reads before `wait` returns for the result); returns its sequence number
+/// (0: copied already).
 pub fn copy(dst: *mut u8, src: u64, len: usize) -> u64 {
     STARTED.call_once(|| {
         crate::thread::spawn_host("GPU-copy", 4 << 20, Box::new(run)).expect("copy thread");
     });
+    // (A small copy while the copy thread sleeps: made here. It reads guest
+    // memory now, as the queued copies would before the batch's submit, and
+    // writes ring bytes only this copy owns.)
+    if len <= INLINE_MAX && SLEEPING.load(Ordering::SeqCst) && crate::tune::get(crate::tune::COPY_INLINE) != 0 {
+        let d = unsafe { std::slice::from_raw_parts_mut(dst, len) };
+        super::resources::copy_from_guest(d, src);
+        INLINE.fetch_add(1, Ordering::Relaxed);
+        return 0;
+    }
     let seq = {
         let mut q = QUEUE.lock();
         let seq = QUEUED.load(Ordering::Relaxed) + 1;
