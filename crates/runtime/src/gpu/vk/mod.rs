@@ -38,6 +38,8 @@ pub struct Ctx {
     pub occl_precise: bool,
     /// shaderDenormFlushToZeroFloat32 (shaders may request FP32 flushing).
     pub denorm_flush32: bool,
+    /// VkPhysicalDevicePushDescriptorPropertiesKHR::maxPushDescriptors.
+    pub push_max: u32,
     pub device_name: String,
     pub validation: bool,
     /// VK_EXT_device_fault: what the GPU was doing when the device was lost.
@@ -250,6 +252,12 @@ pub fn init() -> Result<(), String> {
             dexts.push(ash::ext::conditional_rendering::NAME.as_ptr());
         }
         let have = instance.get_physical_device_features(pdev);
+        let push_max = {
+            let mut pd = vk::PhysicalDevicePushDescriptorPropertiesKHR::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut pd);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            pd.max_push_descriptors
+        };
         let denorm_flush32 = {
             let mut fc = vk::PhysicalDeviceFloatControlsProperties::default();
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut fc);
@@ -366,6 +374,7 @@ pub fn init() -> Result<(), String> {
             clip_cull,
             occl_precise,
             denorm_flush32,
+            push_max,
             entry,
             instance,
             pdev,

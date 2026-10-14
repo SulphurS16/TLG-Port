@@ -884,6 +884,8 @@ struct PerfSnap {
     batches: u64,
     dprof: [u64; 8],
     dprof_draws: u64,
+    cprof: [[u64; 7]; 2],
+    cprof_n: [u64; 2],
     dsub: [u64; 6],
     bsub: [u64; 11],
     bcnt: [u64; 11],
@@ -923,6 +925,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         batches: r.last_seq,
         dprof: r.dprof,
         dprof_draws: r.dprof_draws,
+        cprof: r.cprof,
+        cprof_n: r.cprof_n,
         dsub: r.dsub,
         bsub: r.bsub,
         bcnt: r.bcnt,
@@ -946,6 +950,15 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         let ph: Vec<String> = render::DRAW_PHASES.iter().enumerate().map(|(i, n)| format!("{n} {:.1}", now.dprof[i].wrapping_sub(p.dprof[i]) as f64 / hz * 1e6 / nd)).collect();
         let ds: Vec<String> = render::DESC_PARTS.iter().enumerate().map(|(i, n)| format!("{n} {:.1}", now.dsub[i].wrapping_sub(p.dsub[i]) as f64 / hz * 1e6 / nd)).collect();
         crate::info!("draw µs/draw: {}; descriptor parts (all commands, per draw): {}", ph.join(", "), ds.join(", "));
+        let cs: Vec<String> = [(0usize, "graphics"), (1, "compute")]
+            .iter()
+            .map(|&(c, name)| {
+                let n = now.cprof_n[c].saturating_sub(p.cprof_n[c]).max(1) as f64;
+                let parts: Vec<String> = render::DISPATCH_PHASES.iter().enumerate().map(|(i, ph)| format!("{ph} {:.1}", now.cprof[c][i].wrapping_sub(p.cprof[c][i]) as f64 / hz * 1e6 / n)).collect();
+                format!("{name} ({}/s) {}", now.cprof_n[c] - p.cprof_n[c], parts.join(", "))
+            })
+            .collect();
+        crate::info!("dispatch µs/dispatch by queue: {}", cs.join("; "));
         // Buffer bindings by path: count/s and µs each (all commands).
         let bp: Vec<String> = render::BUFFER_PATHS
             .iter()
@@ -970,6 +983,17 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let v = [render::VBIND_STATS[0].swap(0, Ordering::Relaxed), render::VBIND_STATS[1].swap(0, Ordering::Relaxed)];
             let h: [u64; 5] = std::array::from_fn(|i| writes::HV_STATS[i].swap(0, Ordering::Relaxed));
             crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served: {} same CPU epoch, {} same required epoch; mirror binding cache {} of {}; validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none)", parts.join("; "), x[0], x[1], v[0], v[1], h[0], h[1], h[2], h[3], h[4]);
+        }
+        // (The compute queues' share of them.)
+        static LAST_CS: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);
+        let cur: [(u64, u64); 25] = std::array::from_fn(|i| (render::BPARTS_CS[i].0.load(Ordering::Relaxed), render::BPARTS_CS[i].1.load(Ordering::Relaxed)));
+        let prev = std::mem::replace(&mut *LAST_CS.lock(), cur);
+        let parts: Vec<String> = (0..25)
+            .filter(|&i| cur[i].1 > prev[i].1)
+            .map(|i| format!("{} {:.2} us x {}", render::BPART_NAMES[i], (cur[i].0 - prev[i].0) as f64 / hz * 1e6 / (cur[i].1 - prev[i].1) as f64, cur[i].1 - prev[i].1))
+            .collect();
+        if !parts.is_empty() {
+            crate::info!("buffer binding steps/s of compute queues: {}", parts.join("; "));
         }
         crate::info!(
             "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages, {} ms; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",

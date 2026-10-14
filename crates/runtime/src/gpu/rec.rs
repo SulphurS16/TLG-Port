@@ -27,11 +27,36 @@ use super::vk::ctx;
 
 type Thunk = Box<dyn FnOnce(&ash::Device) + Send>;
 
+/// One descriptor of a pushed set (`cmd_push_descriptor_set`).
+#[derive(Clone, Copy)]
+pub enum DescInfo {
+    Buf(vk::DescriptorBufferInfo),
+    Img(vk::DescriptorImageInfo),
+}
+
+/// A pushed set's descriptors: (binding, type, descriptor).
+pub type PushWrites = SmallVec<[(u32, vk::DescriptorType, DescInfo); 24]>;
+
+fn push_set_now(cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, w: &PushWrites) {
+    let writes: SmallVec<[vk::WriteDescriptorSet; 24]> = w
+        .iter()
+        .map(|(binding, ty, info)| {
+            let wd = vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(*ty);
+            match info {
+                DescInfo::Buf(b) => wd.buffer_info(std::slice::from_ref(b)),
+                DescInfo::Img(i) => wd.image_info(std::slice::from_ref(i)),
+            }
+        })
+        .collect();
+    unsafe { ctx().push_desc.cmd_push_descriptor_set(cb, bp, layout, set, &writes) };
+}
+
 /// One queued operation; the frequent ones without a heap allocation.
 enum Op {
     Barrier(vk::CommandBuffer, vk::PipelineStageFlags, vk::PipelineStageFlags, vk::MemoryBarrier<'static>),
     BindPipeline(vk::CommandBuffer, vk::PipelineBindPoint, vk::Pipeline),
     BindSet(vk::CommandBuffer, vk::PipelineBindPoint, vk::PipelineLayout, u32, vk::DescriptorSet),
+    PushSet(vk::CommandBuffer, vk::PipelineBindPoint, vk::PipelineLayout, u32, Box<PushWrites>),
     PushConstants(vk::CommandBuffer, vk::PipelineLayout, vk::ShaderStageFlags, u32, SmallVec<[u8; 32]>),
     Dispatch(vk::CommandBuffer, u32, u32, u32),
     Draw(vk::CommandBuffer, u32, u32, u32, u32),
@@ -253,6 +278,7 @@ unsafe fn perform(d: &ash::Device, op: Op, unsignaled: &mut Option<vk::Semaphore
             Op::Barrier(cb, src, dst, mb) => d.cmd_pipeline_barrier(cb, src, dst, vk::DependencyFlags::empty(), &[mb], &[], &[]),
             Op::BindPipeline(cb, bp, p) => d.cmd_bind_pipeline(cb, bp, p),
             Op::BindSet(cb, bp, layout, first, set) => d.cmd_bind_descriptor_sets(cb, bp, layout, first, &[set], &[]),
+            Op::PushSet(cb, bp, layout, set, w) => push_set_now(cb, bp, layout, set, &w),
             Op::PushConstants(cb, layout, stages, off, data) => d.cmd_push_constants(cb, layout, stages, off, &data),
             Op::Dispatch(cb, x, y, z) => d.cmd_dispatch(cb, x, y, z),
             Op::Draw(cb, a, b, c, e) => d.cmd_draw(cb, a, b, c, e),
@@ -483,6 +509,14 @@ impl Rec {
         }
         let (sets, dynamic) = (sets.to_vec(), dynamic.to_vec());
         thunk(move |d| unsafe { d.cmd_bind_descriptor_sets(cb, bp, layout, first, &sets, &dynamic) });
+    }
+
+    /// vkCmdPushDescriptorSetKHR with the descriptors `w`.
+    pub unsafe fn cmd_push_descriptor_set(&self, cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, w: Box<PushWrites>) {
+        if deferred() {
+            return push(Op::PushSet(cb, bp, layout, set, w), false);
+        }
+        push_set_now(cb, bp, layout, set, &w);
     }
 
     pub unsafe fn cmd_push_constants(&self, cb: vk::CommandBuffer, layout: vk::PipelineLayout, stages: vk::ShaderStageFlags, offset: u32, data: &[u8]) {

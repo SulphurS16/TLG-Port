@@ -1483,6 +1483,10 @@ pub struct Renderer {
     /// (`DRAW_PHASES`) and the draws timed (TLG_PERF: µs per draw).
     pub dprof: [u64; 8],
     pub dprof_draws: u64,
+    /// `dispatch_inner` phases (`DISPATCH_PHASES`) by queue class (graphics,
+    /// compute), TSC cycles, and the dispatches timed.
+    pub cprof: [[u64; 7]; 2],
+    pub cprof_n: [u64; 2],
     /// Ticks in parts of the descriptor phase (`DESC_PARTS`).
     pub dsub: [u64; 6],
     /// Buffer bindings by path (`BUFFER_PATHS`): ticks and count.
@@ -1535,6 +1539,8 @@ pub struct Renderer {
     /// that may change one (every buffer a shader writes) look only at
     /// these, not at every image (that scan was ~4% of the GPU thread).
     meta_images: Vec<ImageKey>,
+    /// Set layouts created for push descriptors (`tune push_desc`).
+    push_layouts: FastSet<vk::DescriptorSetLayout>,
     /// The metadata surfaces of `meta_images` sorted by address ([start, end),
     /// image) with the largest one's size, valid while `meta_gen` is
     /// `meta_cache.0` (bumped when an image's metadata, the list or the set
@@ -1889,6 +1895,7 @@ pub fn init() -> Result<(), String> {
             indirect_rejected: 0,
             tile_maps: FastMap::default(),
             meta_images: Vec::new(),
+            push_layouts: FastSet::default(),
             meta_gen: 1,
             meta_cache: (0, Vec::new(), 0),
             hz_bufs: smallvec::SmallVec::new(),
@@ -1896,6 +1903,8 @@ pub fn init() -> Result<(), String> {
             gpu_tex_uploads: 0,
             dprof: [0; 8],
             dprof_draws: 0,
+            cprof: [[0; 7]; 2],
+            cprof_n: [0; 2],
             dsub: [0; 6],
             bsub: [0; 11],
             bcnt: [0; 11],
@@ -2091,6 +2100,30 @@ pub static BATCH_SITES: parking_lot::Mutex<Option<HashMap<(&'static str, u32), (
 /// write since, by the same CP queue: in the same CPU epoch, and in the same
 /// required epoch (graphics or compute) though another CPU epoch began.
 pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// A command's descriptors: an allocated set, or the descriptors to push
+/// (`tune push_desc`).
+enum Descriptors {
+    Set(vk::DescriptorSet),
+    Push(Box<super::rec::PushWrites>),
+}
+
+impl Descriptors {
+    fn new(set: vk::DescriptorSet, push: Option<Box<super::rec::PushWrites>>) -> Descriptors {
+        match push {
+            Some(w) => Descriptors::Push(w),
+            None => Descriptors::Set(set),
+        }
+    }
+
+    /// Binds them as set 0 of `layout` (pipeline bound).
+    unsafe fn bind(self, cmd: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout) {
+        match self {
+            Descriptors::Set(set) => unsafe { REC.cmd_bind_descriptor_sets(cmd, bp, layout, 0, &[set], &[]) },
+            Descriptors::Push(w) => unsafe { REC.cmd_push_descriptor_set(cmd, bp, layout, 0, w) },
+        }
+    }
+}
+
 /// TLG_PERF: dispatches by queue class (graphics, compute) and the
 /// synchronizing packets before them since the previous dispatch
 /// (`cp::SYNC_*` bits): [class][bits] -> (dispatches, full barriers before them).
@@ -2143,9 +2176,32 @@ fn bpart(i: usize, t0: u64) -> u64 {
     if perf_on() {
         BPARTS[i].0.fetch_add(t.wrapping_sub(t0), std::sync::atomic::Ordering::Relaxed);
         BPARTS[i].1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if BPART_CS.get() {
+            BPARTS_CS[i].0.fetch_add(t.wrapping_sub(t0), std::sync::atomic::Ordering::Relaxed);
+            BPARTS_CS[i].1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
     }
     t
 }
+
+/// Busy-waits `ns` nanoseconds (`tune delay_gfx_ns`/`delay_cs_ns`).
+fn spin_ns(ns: i64) {
+    if ns <= 0 {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let d = std::time::Duration::from_nanos(ns as u64);
+    while t0.elapsed() < d {
+        std::hint::spin_loop();
+    }
+}
+
+thread_local! {
+    /// Whether this thread's current command is a compute queue's (`BPARTS_CS`).
+    static BPART_CS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+/// TLG_PERF: `BPARTS` of the compute queues' commands alone.
+pub static BPARTS_CS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 25] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 25];
 
 pub fn perf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2729,7 +2785,16 @@ impl Renderer {
                 bindings.push(vk::DescriptorSetLayoutBinding::default().binding(b.binding).descriptor_type(ty).descriptor_count(1).stage_flags(flags));
             }
         }
-        unsafe { ctx().device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }.map_err(|e| format!("descriptor set layout: {e}"))
+        // (`tune push_desc`: pushed into the command buffer per command, no
+        // set to allocate and write on the CP thread; up to the device's
+        // limit of push descriptors.)
+        let push = crate::tune::get(crate::tune::PUSH_DESC) != 0 && bindings.len() as u32 <= ctx().push_max;
+        let flags = if push { vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR } else { vk::DescriptorSetLayoutCreateFlags::empty() };
+        let l = unsafe { ctx().device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None) }.map_err(|e| format!("descriptor set layout: {e}"))?;
+        if push {
+            self.push_layouts.insert(l);
+        }
+        Ok(l)
     }
 
     fn rect_gs(&mut self, params: u32) -> Result<vk::ShaderModule, String> {
@@ -5713,7 +5778,9 @@ impl Renderer {
     // -------------------------------------------------------------------
     // Descriptors
 
-    fn write_descriptors(&mut self, set: vk::DescriptorSet, prepared: &[&Prepared]) -> Result<(), String> {
+    /// Writes the descriptors of `prepared` into `set`, or returns them for
+    /// a push (`set` null: a push-descriptor layout).
+    fn write_descriptors(&mut self, set: vk::DescriptorSet, prepared: &[&Prepared]) -> Result<Option<Box<super::rec::PushWrites>>, String> {
         let c = ctx();
         enum Info {
             Buf(vk::DescriptorBufferInfo),
@@ -6081,6 +6148,20 @@ impl Renderer {
                 }
             }
         }
+        if set == vk::DescriptorSet::null() {
+            let w: super::rec::PushWrites = infos
+                .iter()
+                .map(|(binding, ty, info)| {
+                    let d = match info {
+                        Info::Buf(b) => super::rec::DescInfo::Buf(*b),
+                        Info::Img(i) => super::rec::DescInfo::Img(*i),
+                    };
+                    (*binding, *ty, d)
+                })
+                .collect();
+            self.dsub[4] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tb);
+            return Ok(Some(Box::new(w)));
+        }
         let writes: smallvec::SmallVec<[vk::WriteDescriptorSet; 24]> = infos
             .iter()
             .map(|(binding, ty, info)| {
@@ -6095,7 +6176,7 @@ impl Renderer {
         self.dsub[4] += t.wrapping_sub(tb);
         unsafe { c.device.update_descriptor_sets(&writes, &[]) };
         self.dsub[5] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t);
-        Ok(())
+        Ok(None)
     }
 
     /// Allocates and writes a draw/dispatch's descriptor set. The ring
@@ -6103,14 +6184,16 @@ impl Renderer {
     /// can reload render targets or turn in-place bindings into copies); when
     /// the ring fills up anyway, the batch is submitted and the descriptors
     /// are written again in the next one instead of dropping the command.
-    /// Returns the set and the pending-write count before it was written.
-    fn descriptors_with_retry(&mut self, set_layout: vk::DescriptorSetLayout, stages: &[&Prepared]) -> Result<(vk::DescriptorSet, usize), String> {
+    /// Returns the set (for a push-descriptor layout the descriptors to push
+    /// instead) and the pending-write count before it was written.
+    fn descriptors_with_retry(&mut self, set_layout: vk::DescriptorSetLayout, stages: &[&Prepared]) -> Result<(Descriptors, usize), String> {
+        let push = self.push_layouts.contains(&set_layout);
         let t0 = unsafe { core::arch::x86_64::_rdtsc() };
-        let set = self.alloc_set(set_layout)?;
+        let set = if push { vk::DescriptorSet::null() } else { self.alloc_set(set_layout)? };
         self.dsub[0] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
         let wb_before = self.writebacks.len() + self.zc_writes.len();
         match self.write_descriptors(set, stages) {
-            Ok(()) => Ok((set, wb_before)),
+            Ok(w) => Ok((Descriptors::new(set, w), wb_before)),
             Err(e) if e.contains("ring full") => {
                 self.flushes[2] += 1;
                 self.ring_retries += 1;
@@ -6119,13 +6202,13 @@ impl Renderer {
                 self.fwd_pending.clear();
                 self.submit_batch(Vec::new());
                 self.begin();
-                let set = self.alloc_set(set_layout)?;
+                let set = if push { vk::DescriptorSet::null() } else { self.alloc_set(set_layout)? };
                 let wb_before = self.writebacks.len() + self.zc_writes.len();
                 self.desc_retry = true;
                 let r = self.write_descriptors(set, stages);
                 self.desc_retry = false;
-                r.map_err(|e2| format!("{e2} (retried in a new batch after: {e}; ring {:#x} of {:#x} left)", self.ring.remaining(), self.ring.segment_size()))?;
-                Ok((set, wb_before))
+                let w = r.map_err(|e2| format!("{e2} (retried in a new batch after: {e}; ring {:#x} of {:#x} left)", self.ring.remaining(), self.ring.segment_size()))?;
+                Ok((Descriptors::new(set, w), wb_before))
             }
             Err(e) => Err(e),
         }
@@ -6161,6 +6244,8 @@ impl Renderer {
     // Draw
 
     fn draw_inner(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) -> Result<(), String> {
+        BPART_CS.set(false);
+        spin_ns(crate::tune::get(crate::tune::DELAY_GFX_NS));
         let pre = self.pre_draw.take();
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
@@ -6558,7 +6643,7 @@ impl Renderer {
                 REC.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 self.bound_gfx = pipeline;
             }
-            REC.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
+            set.bind(cmd, vk::PipelineBindPoint::GRAPHICS, layout);
             self.set_dynamic_state(regs, extent, prim, depth.is_some());
             // Depth/stencil clears requested through DB_RENDER_CONTROL.
             let rc = regs.ctx(0xA000);
@@ -7312,7 +7397,7 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
-            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            set.bind(self.cmd, vk::PipelineBindPoint::COMPUTE, layout);
             REC.cmd_dispatch(self.cmd, groups, 1, 1);
         }
         self.mark(|| format!("{} {:#x}", if p.tess == TessRole::Ls { "ls" } else { "hs" }, p.addr));
@@ -7333,6 +7418,17 @@ impl Renderer {
         let pre = self.pre_cs.take();
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
+        let class = (cp.queue != 0) as usize;
+        BPART_CS.set(class == 1);
+        spin_ns(crate::tune::get(if class == 1 { crate::tune::DELAY_CS_NS } else { crate::tune::DELAY_GFX_NS }));
+        let mut tl = unsafe { core::arch::x86_64::_rdtsc() };
+        macro_rules! phase {
+            ($i:expr) => {{
+                let t = unsafe { core::arch::x86_64::_rdtsc() };
+                self.cprof[class][$i] += t.wrapping_sub(tl);
+                tl = t;
+            }};
+        }
         self.drain_cp_writes();
         let cs_addr = ((cp.regs.sh(0x2E0C) as u64) | ((cp.regs.sh(0x2E0D) as u64) << 32)) << 8;
         super::set_phase(super::phase::DISPATCH, cs_addr);
@@ -7421,6 +7517,7 @@ impl Renderer {
             let loads = &cs.sgpr_data[(gcn::translate::SGPR_DATA_USER as usize).min(cs.sgpr_data.len())..];
             crate::info!("FRAME {} dispatch {groups} cs {:#x} res [{}] written {:?} sgpr data after user [{:x?}]", cp.name, cs.addr, res.join(", "), cs.written_buffers, &loads[..loads.len().min(48)]);
         }
+        phase!(0);
         let key = cs.translated.key_hash ^ cs.addr;
         if !self.cs_pipes.contains_key(&key) {
             let c = ctx();
@@ -7443,6 +7540,7 @@ impl Renderer {
             let p = &self.cs_pipes[&key];
             (p.pipeline, p.layout, p.set_layout)
         };
+        phase!(1);
         let (host, dev) = self.binding_bytes(&[&cs]);
         let tex = self.texture_upload_estimate(&[&cs]);
         self.reserve(host + tex, dev);
@@ -7458,9 +7556,12 @@ impl Renderer {
             None => None,
         };
         self.cur_unknown = true;
+        phase!(2);
         let (set, wb_before) = self.descriptors_with_retry(set_layout, &[&cs])?;
+        phase!(3);
         self.flush_forwards();
         self.end_rendering();
+        phase!(4);
         // Ordering: behind unordered writes of other GPU work, and behind
         // dispatches since the last barrier whose buffer accesses conflict
         // with this one's (a write on either side of an overlap).
@@ -7537,6 +7638,7 @@ impl Renderer {
             self.cur_access = acc;
             self.hz_unknown |= self.cur_unknown;
         }
+        phase!(5);
         let regs = &cp.regs;
         let (sx, sy, sz) = (regs.sh(0x2E04), regs.sh(0x2E05), regs.sh(0x2E06));
         unsafe {
@@ -7544,7 +7646,7 @@ impl Renderer {
                 REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.bound_cs = pipeline;
             }
-            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            set.bind(self.cmd, vk::PipelineBindPoint::COMPUTE, layout);
             if let Some(slot) = args_slot {
                 REC.cmd_dispatch_indirect(self.cmd, self.dring.buffer, slot);
             } else if sx | sy | sz != 0 {
@@ -7563,6 +7665,8 @@ impl Renderer {
         if self.writebacks.len() + self.zc_writes.len() > wb_before {
             self.epoch += 1;
         }
+        self.cprof[class][6] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tl);
+        self.cprof_n[class] += 1;
         if trace_frame() {
             self.trace_timing("dispatch");
         }
@@ -9956,6 +10060,8 @@ fn res_summary(r: &ResolvedRes) -> String {
 
 /// `draw_inner` phases timed in `Renderer::dprof`.
 pub const DRAW_PHASES: [&str; 8] = ["setup", "shaders", "targets", "pipeline", "guest reads", "descriptors", "pass", "record"];
+/// `dispatch_inner` phases timed in `Renderer::cprof`.
+pub const DISPATCH_PHASES: [&str; 7] = ["setup", "pipeline", "guest reads", "descriptors", "forwards", "hazards", "record"];
 /// Parts of the descriptor phase timed in `Renderer::dsub` (all commands).
 pub const DESC_PARTS: [&str; 6] = ["alloc", "sgpr data", "buffers", "images", "samplers+other", "update"];
 /// Buffer binding paths timed in `Renderer::bsub` (`write_descriptors`).

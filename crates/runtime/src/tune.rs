@@ -350,7 +350,24 @@ pub const COPY_INLINE: usize = 59;
 /// the title issues back to back, no longer run one at a time).
 pub const TITLE_SYNC: usize = 60;
 
-const TABLE: [(&str, &str, i64); 61] = [
+/// Descriptor sets of translated shaders are pushed into the command buffer
+/// (VK_KHR_push_descriptor) by the recorder thread instead of allocated from
+/// the batch's pool and written on the CP threads, for layouts within the
+/// device's push limit. Read when a layout is created: set it at boot
+/// (`TLG_PUSH_DESC`, 0). Cave: the CPs' descriptor allocation and writes
+/// 1.5 -> 0.2 us per command, the recorder +50 ms/s, frame rate unchanged
+/// (26.0 vs 25.9 fps at 102-108% clock); every pipeline is created again
+/// for the new layouts (first boot).
+pub const PUSH_DESC: usize = 61;
+
+/// Measurement only: busy-waits this many ns per draw / per dispatch of the
+/// graphics queue, and per dispatch of the compute queues, under the
+/// renderer lock (`TLG_DELAY_GFX_NS`, `TLG_DELAY_CS_NS`, 0): how much the
+/// frame time follows each queue's per-command cost.
+pub const DELAY_GFX_NS: usize = 62;
+pub const DELAY_CS_NS: usize = 63;
+
+const TABLE: [(&str, &str, i64); 64] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -412,6 +429,9 @@ const TABLE: [(&str, &str, i64); 61] = [
     ("hoist_copyins", "TLG_HOIST_COPYINS", 1),
     ("copy_inline", "TLG_COPY_INLINE", 0),
     ("title_sync", "TLG_TITLE_SYNC", 1),
+    ("push_desc", "TLG_PUSH_DESC", 0),
+    ("delay_gfx_ns", "TLG_DELAY_GFX_NS", 0),
+    ("delay_cs_ns", "TLG_DELAY_CS_NS", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
