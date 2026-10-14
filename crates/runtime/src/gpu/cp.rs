@@ -339,6 +339,25 @@ pub trait Hooks {
     fn dry_write(&mut self, addr: u64, data: &[u32]) {
         let _ = (addr, data);
     }
+    /// A dry-run CP executes command memory at guest [addr, addr+len)
+    /// (indirect buffers; `prepahead` diagnostics).
+    fn dry_commands(&mut self, addr: u64, len: u64) {
+        let _ = (addr, len);
+    }
+    /// A dry-run CP is about to read command words at guest [addr, addr+len):
+    /// returns once CP writes there recorded before have been performed
+    /// (`prepahead`: the graphics CP executes them).
+    fn dry_sync(&mut self, addr: u64, len: u64) {
+        let _ = (addr, len);
+    }
+    /// A dry-run CP executed a type-3 packet (decoded stream, `prepahead`).
+    fn dry_emit(&mut self, opcode: u32, body: &[u32], addr: u64, constant: bool) {
+        let _ = (opcode, body, addr, constant);
+    }
+    /// A dry-run CP wrote registers [reg, reg+len) from a type-0 packet.
+    fn dry_emit_regs(&mut self, reg: u32, vals: &[u32]) {
+        let _ = (reg, vals);
+    }
     /// PIXEL_PIPE_STAT_DUMP at this point of the command stream (`begin`:
     /// a query's begin sample): the occlusion queries counted since the
     /// previous dump, whose results its write adds up.
@@ -615,6 +634,9 @@ impl CommandProcessor {
         } else if self.queue != 0 {
             super::set_qphase(self.queue, super::phase::PACKET, cur);
         }
+        if self.dry {
+            hooks.dry_sync(cur, 4);
+        }
         let header = s.word(cur);
         let ptype = header >> 30;
         self.cur_packet = (cur, engine == Engine::Constant);
@@ -626,9 +648,18 @@ impl CommandProcessor {
             0 => {
                 let base = header & 0xFFFF;
                 let count = ((header >> 16) & 0x3FFF) + 1;
-                for i in 0..count {
-                    let v = s.word(cur + 4 + i as u64 * 4);
-                    self.write_reg(base + i, v);
+                if self.dry {
+                    hooks.dry_sync(cur, 4 + count as u64 * 4);
+                    let vals: Vec<u32> = (0..count).map(|i| s.word(cur + 4 + i as u64 * 4)).collect();
+                    for (i, &v) in vals.iter().enumerate() {
+                        self.write_reg(base + i as u32, v);
+                    }
+                    hooks.dry_emit_regs(base, &vals);
+                } else {
+                    for i in 0..count {
+                        let v = s.word(cur + 4 + i as u64 * 4);
+                        self.write_reg(base + i, v);
+                    }
                 }
                 s.set_cur(cur + 4 + count as u64 * 4);
                 self.stats.packets += 1;
@@ -666,6 +697,9 @@ impl CommandProcessor {
             s.set_cur(end);
             return Step::Ok;
         }
+        if self.dry {
+            hooks.dry_sync(cur, next - cur);
+        }
         // (Most packets are short: no allocation, no initialization.)
         let mut small = [const { std::mem::MaybeUninit::<u32>::uninit() }; 128];
         let big: Vec<u32>;
@@ -694,40 +728,53 @@ impl CommandProcessor {
         }
         s.set_cur(next);
         self.stats.packets += 1;
-        if self.dry {
-            if self.dry_packet(opcode, body, hooks) {
-                return Step::Ok;
-            }
-        } else {
-            OPCODES[(opcode as usize) | if self.watch { 0 } else { 256 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
         if self.trace {
             crate::trace!("{} {:?} op {:#04x} len {} at {:#x}", self.name, engine, opcode, count, cur);
         }
+        if matches!(opcode, op::INDIRECT_BUFFER | op::INDIRECT_BUFFER_CONST) {
+            let addr = (body[0] as u64 & !3) | ((body[1] as u64 & 0xFFFF) << 32);
+            let size = body[2] & 0xFFFFF;
+            if !(guest_ok(addr, size as u64 * 4) && size > 0) {
+                static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                    crate::warn!("{}: indirect buffer packet {:#x} not executed: body {:08x?} at {:#x}", self.name, opcode, body, cur);
+                }
+            }
+            if guest_ok(addr, size as u64 * 4) && size > 0 {
+                if self.dry {
+                    hooks.dry_commands(addr, size as u64 * 4);
+                }
+                if s.frames.len() > 16 {
+                    crate::error!("{}: indirect buffer nesting too deep", self.name);
+                } else {
+                    if !self.dry {
+                        super::note_exec(addr, !self.watch);
+                    }
+                    s.push(addr, size);
+                }
+            }
+            return Step::Ok;
+        }
+        if self.dry {
+            let step = if self.dry_packet(opcode, body, hooks) { Step::Ok } else { self.exec_packet(opcode, body, cur, hooks) };
+            // (After its execution: a draw's prepared stages come first.)
+            hooks.dry_emit(opcode, body, cur, engine == Engine::Constant);
+            return step;
+        }
+        OPCODES[(opcode as usize) | if self.watch { 0 } else { 256 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.exec_packet(opcode, body, cur, hooks)
+    }
+
+    /// Executes type-3 packet `opcode` with `body` (at guest `cur`): all but
+    /// indirect buffers (stream control, in `step`).
+    fn exec_packet(&mut self, opcode: u32, body: &[u32], cur: u64, hooks: &mut dyn Hooks) -> Step {
+        let count = body.len();
         match opcode {
             op::NOP => self.nop(&body),
             op::SET_CONTEXT_REG => self.set_regs(pm4::CONTEXT_REG_BASE, &body),
             op::SET_SH_REG => self.set_regs(pm4::SH_REG_BASE, &body),
             op::SET_UCONFIG_REG => self.set_regs(pm4::UCONFIG_REG_BASE, &body),
             op::SET_CONFIG_REG => self.set_regs(pm4::CONFIG_REG_BASE, &body),
-            op::INDIRECT_BUFFER | op::INDIRECT_BUFFER_CONST => {
-                let addr = (body[0] as u64 & !3) | ((body[1] as u64 & 0xFFFF) << 32);
-                let size = body[2] & 0xFFFFF;
-                if !(guest_ok(addr, size as u64 * 4) && size > 0) {
-                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
-                        crate::warn!("{}: indirect buffer packet {:#x} not executed: body {:08x?} at {:#x}", self.name, opcode, body, cur);
-                    }
-                }
-                if guest_ok(addr, size as u64 * 4) && size > 0 {
-                    if s.frames.len() > 16 {
-                        crate::error!("{}: indirect buffer nesting too deep", self.name);
-                    } else {
-                        super::note_exec(addr, !self.watch);
-                        s.push(addr, size);
-                    }
-                }
-            }
             // End-of-pipe/shader writes happen once all prior work completes:
             // they are queued and performed by `commit` after the renderer has
             // finished that work (one GPU synchronization for many events).
@@ -1052,6 +1099,50 @@ impl CommandProcessor {
             }
         }
         Step::Ok
+    }
+
+    /// Runs a submission decoded by the prepare thread (`prepahead::Decoded`):
+    /// its register writes and packets in execution order (indirect buffers
+    /// followed, constant and draw engines interleaved there).
+    pub fn run_decoded(&mut self, d: &super::prepahead::Decoded, hooks: &mut dyn Hooks) {
+        let mut done = 0u64;
+        while let Some((chunk, ops)) = d.next() {
+            let mut i = 0;
+            while i < chunk.len() {
+                let w0 = chunk[i];
+                if w0 & (1 << 31) != 0 {
+                    // Registers [reg, reg+n).
+                    let n = (w0 & 0x7FFF_FFFF) as usize;
+                    let reg = chunk[i + 1];
+                    for (k, &v) in chunk[i + 2..i + 2 + n].iter().enumerate() {
+                        self.write_reg(reg + k as u32, v);
+                    }
+                    self.stats.packets += 1;
+                    i += 2 + n;
+                } else {
+                    let opcode = w0 & 0xFF;
+                    let constant = w0 & 0x100 != 0;
+                    let n = (w0 >> 16) as usize;
+                    let addr = chunk[i + 1] as u64 | (chunk[i + 2] as u64) << 32;
+                    let body = &chunk[i + 3..i + 3 + n];
+                    if self.watch {
+                        super::set_phase(super::phase::PACKET, addr);
+                    }
+                    self.cur_packet = (addr, constant);
+                    self.stats.packets += 1;
+                    OPCODES[(opcode as usize) | if self.watch { 0 } else { 256 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if self.trace {
+                        crate::trace!("{} {} op {:#04x} len {} at {:#x} (decoded)", self.name, if constant { "CE" } else { "DE" }, opcode, n, addr);
+                    }
+                    let _ = self.exec_packet(opcode, body, addr, hooks);
+                    i += 3 + n;
+                }
+                done += 1;
+                d.executed_through(done);
+            }
+            debug_assert_eq!(done, ops);
+            d.recycle(chunk);
+        }
     }
 
     /// Dry run: packets with effects outside the register state are left

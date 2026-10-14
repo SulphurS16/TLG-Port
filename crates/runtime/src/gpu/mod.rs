@@ -426,9 +426,8 @@ fn gfx_thread() {
         let exec_captured = if pm4_capture() { captured.clone() } else { std::sync::Arc::new(cp::Captured::new()) };
         // (Once started, the prepare thread sees every submission: its
         // register state follows the CP's even while results are not used.)
-        if crate::tune::get(crate::tune::PREP_AHEAD) != 0 || prepahead::started() {
-            prepahead::submit(&s.dcb, &s.ccb, exec_captured.clone());
-        }
+        let decode = crate::tune::get(crate::tune::DECODED_CP) != 0;
+        let decoded = if decode || crate::tune::get(crate::tune::PREP_AHEAD) != 0 || prepahead::started() { prepahead::submit(&s.dcb, &s.ccb, exec_captured.clone(), decode) } else { None };
         let mut de = Stream::chained(exec_captured.clone());
         let mut ce = Stream::chained(exec_captured.clone());
         for (i, &(addr, dw)) in s.dcb.iter().enumerate() {
@@ -454,7 +453,10 @@ fn gfx_thread() {
                 ce.chain(a, n);
             }
         }
-        cp.run(&mut de, &mut ce, &mut hooks);
+        match &decoded {
+            Some(d) => cp.run_decoded(d, &mut hooks),
+            None => cp.run(&mut de, &mut ce, &mut hooks),
+        }
         // (Coalescing, `tune::COALESCE`: the next queued submission continues
         // this batch; its end-of-pipe actions stay pending in the CP, where
         // memory waits on them are resolved as before.)
@@ -956,9 +958,12 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 recorder.push_str(&format!("; ring copies {} by the copy thread, {} waits for them ({} ms)", k.0 - pk.0, k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
             }
             // (Shader stages prepared ahead: used, none made, invalid.)
-            let pa: [u64; 5] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));
+            let pa: [u64; 12] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));
             if pa.iter().any(|&n| n != 0) {
-                recorder.push_str(&format!("; prepared ahead: {} used, {} without a result ({} none yet, {} none matching), {} invalid", pa[0], pa[1], pa[3], pa[4], pa[2]));
+                recorder.push_str(&format!("; prepared ahead: {} used, {} without a result ({} none yet, {} none matching), {} invalid; CP writes into command memory {}, command reads after a CP write into them {}", pa[0], pa[1], pa[3], pa[4], pa[2], pa[5], pa[6]));
+                if pa[7] + pa[8] != 0 {
+                    recorder.push_str(&format!("; decoded submissions: prepare-thread waits for CP writes {}, graphics-CP waits for decoding {} ({:.2} ms; at a submission's start {}, {:.2} ms)", pa[7], pa[8], pa[9] as f64 / 1e6, pa[10], pa[11] as f64 / 1e6));
+                }
             }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
         }

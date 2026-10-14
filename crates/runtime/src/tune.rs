@@ -312,7 +312,17 @@ pub const VBIND_PARTS: usize = 53;
 /// validates (`TLG_PREP_AHEAD`, 1; `gpu::prepahead`).
 pub const PREP_AHEAD: usize = 54;
 
-const TABLE: [(&str, &str, i64); 55] = [
+/// The graphics CP runs each submission as decoded by the `GPU-prep` thread
+/// (register writes and packets in execution order) instead of parsing its
+/// PM4 itself (`TLG_DECODED_CP`, 1; `gpu::prepahead::Decoded`). (TLG_POOL_WATCH
+/// then counts no graphics indirect buffers.)
+pub const DECODED_CP: usize = 55;
+
+/// The `GPU-prep` thread runs at the graphics CP's raised priority
+/// (`TLG_PREP_PRIORITY`, 0; 0: normal).
+pub const PREP_PRIORITY: usize = 56;
+
+const TABLE: [(&str, &str, i64); 57] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -368,6 +378,8 @@ const TABLE: [(&str, &str, i64); 55] = [
     ("async_copies", "TLG_ASYNC_COPIES", 1),
     ("vbind_parts", "TLG_VBIND_PARTS", 1),
     ("prep_ahead", "TLG_PREP_AHEAD", 1),
+    ("decoded_cp", "TLG_DECODED_CP", 1),
+    ("prep_priority", "TLG_PREP_PRIORITY", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

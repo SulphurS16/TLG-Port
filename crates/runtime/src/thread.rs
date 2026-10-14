@@ -122,6 +122,12 @@ pub fn raise_priority() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
 }
 
+/// The current thread at raised (`raise_priority`) or normal priority.
+pub fn set_raised_priority(raised: bool) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL};
+    unsafe { SetThreadPriority(GetCurrentThread(), if raised { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL }) };
+}
+
 /// Samples where every guest thread is for `ms` milliseconds (about once a
 /// millisecond, on a thread of its own) and logs each thread's hottest
 /// locations: guest code by module offset (64-byte buckets), otherwise the
