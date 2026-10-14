@@ -976,6 +976,7 @@ fn completion_thread() {
             // (`tune wb_lock_bump`: waiting write-watch queries go first
             // between entries; each entry's copy and reset stay together.)
             let bump = crate::tune::get(crate::tune::WB_LOCK_BUMP) != 0;
+            let fine = crate::tune::get(crate::tune::WB_LOCK_BUMP) >= 2;
             for (k, &(addr, off, size)) in c.writebacks.iter().enumerate() {
                 if bump && k > 0 {
                     if let Some(g) = ww.as_mut() {
@@ -995,6 +996,7 @@ fn completion_thread() {
                     let pages = (head + size).div_ceil(4096);
                     let marked = |p: u64| bm.get((p / 32) as usize).is_some_and(|w| w >> (p % 32) & 1 != 0);
                     let mut page = 0;
+                    let mut runs = 0u32;
                     while page < pages {
                         if bm.get((page / 32) as usize).is_some_and(|&w| w == 0) {
                             page = (page / 32 + 1) * 32;
@@ -1008,6 +1010,14 @@ fn completion_thread() {
                         while page < pages && marked(page) {
                             page += 1;
                         }
+                        // (`wb_lock_bump 2`: waiting queries go between runs;
+                        // each run's copy and reset stay together.)
+                        if fine && runs > 0 {
+                            if let Some(g) = ww.as_mut() {
+                                parking_lot::MutexGuard::bump(g);
+                            }
+                        }
+                        runs += 1;
                         let start = (first * 4096).saturating_sub(head);
                         let end = (page * 4096 - head).min(size);
                         let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add((off + start) as usize), (end - start) as usize) };
@@ -1024,13 +1034,37 @@ fn completion_thread() {
                     super::lazywb::after_write(addr, size, true);
                     continue;
                 }
+                let mirror = c.wb_mirror.get(k).copied().unwrap_or(false);
+                if fine && mirror && size > 256 << 10 {
+                    // (In 256 KiB pieces, each forgotten by the write watch
+                    // right after its copy, waiting queries in between.)
+                    // (Pieces end at 256 KiB-aligned addresses: whole pages.)
+                    let mut a = addr;
+                    while a < addr + size {
+                        let b = (((a >> 18) + 1) << 18).min(addr + size);
+                        if a > addr {
+                            if let Some(g) = ww.as_mut() {
+                                parking_lot::MutexGuard::bump(g);
+                            }
+                        }
+                        let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add((off + (a - addr)) as usize), (b - a) as usize) };
+                        resources::copy_to_guest(src, a);
+                        crate::mem::reset_write_watch(a, b - a);
+                        a = b;
+                    }
+                    wb_bytes += size;
+                    if probe {
+                        super::wbprobe::after_write(addr, size);
+                    }
+                    super::lazywb::after_write(addr, size, mirror);
+                    continue;
+                }
                 let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add(off as usize), size as usize) };
                 resources::copy_to_guest(src, addr);
                 wb_bytes += size;
                 if probe {
                     super::wbprobe::after_write(addr, size);
                 }
-                let mirror = c.wb_mirror.get(k).copied().unwrap_or(false);
                 super::lazywb::after_write(addr, size, mirror);
                 if bump && mirror {
                     // (One of `mirror_writes`.)
@@ -1443,10 +1477,16 @@ pub struct Renderer {
     /// `reused_upload`.
     upload_reuse: FastMap<u64, (u64, vk::Buffer, u64, u64, usize)>,
     upload_reuse_epoch: u64,
+    /// TLG_PERF: read-only ranges copied: (CPU epoch, required epoch, stamp,
+    /// queue, batch) of the last copy (`XBATCH`).
+    upload_seen: FastMap<(u64, u64), (u64, u64, u64, usize, u64)>,
     /// The CP queue of the command being recorded.
     cmd_queue: usize,
     /// Bindings served by an earlier copy, bytes not copied again.
     pub upload_reused: (u64, u64),
+    /// The newest asynchronous ring copy of the batch being recorded
+    /// (`copier`; its submit waits for it).
+    batch_copies: u64,
     /// Read-only copies into the BAR ring (`upload_guest_ro`): count, bytes,
     /// and copies that went to the host ring for want of room.
     pub bar_uploads: (u64, u64, u64),
@@ -1735,8 +1775,10 @@ pub fn init() -> Result<(), String> {
             fwd_pending: Vec::new(),
             upload_reuse: FastMap::default(),
             upload_reuse_epoch: 0,
+            upload_seen: FastMap::default(),
             cmd_queue: 0,
             upload_reused: (0, 0),
+            batch_copies: 0,
             bar_uploads: (0, 0, 0),
             index_mirrored: (0, 0),
             retired_scratch: Vec::new(),
@@ -1889,6 +1931,47 @@ pub static RELOAD_SITES: parking_lot::Mutex<Option<HashMap<String, u64>>> = park
 /// TLG_PERF: texture uploads by texture (count, microseconds reading/detiling).
 pub static UPLOAD_SITES: parking_lot::Mutex<Option<HashMap<String, (u64, u64)>>> = parking_lot::Mutex::new(None);
 pub static BATCH_SITES: parking_lot::Mutex<Option<HashMap<(&'static str, u32), (u64, u64)>>> = parking_lot::Mutex::new(None);
+
+/// TLG_PERF: read-only copies of a range an earlier batch copied with no GPU
+/// write since, by the same CP queue: in the same CPU epoch, and in the same
+/// required epoch (graphics or compute) though another CPU epoch began.
+pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// TLG_PERF: mirror bindings served by the binding cache, and all.
+pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// TLG_PERF: TSC cycles and counts of buffer-binding steps (`BPART_NAMES`).
+pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 17] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 17];
+pub const BPART_NAMES: [&str; 17] = [
+    "mirror written: bind",
+    "write-back",
+    "meta+surface",
+    "write notes",
+    "rest",
+    "read-only copy: reuse miss",
+    "upload",
+    "note",
+    "mirror read: bind",
+    "written copy: upload",
+    "rest",
+    "uploads: in-flight check",
+    "copy",
+    "forward scan",
+    "mirror fill: CPU-write check",
+    "write notes: tracker",
+    "mirror",
+];
+
+/// Adds the cycles since `t0` to buffer-binding step `i` (TLG_PERF);
+/// returns the current TSC.
+#[inline]
+fn bpart(i: usize, t0: u64) -> u64 {
+    let t = unsafe { core::arch::x86_64::_rdtsc() };
+    if perf_on() {
+        BPARTS[i].0.fetch_add(t.wrapping_sub(t0), std::sync::atomic::Ordering::Relaxed);
+        BPARTS[i].1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    t
+}
 
 pub fn perf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -2259,6 +2342,12 @@ impl Renderer {
         // (Forwards still queued belong to a command that was abandoned:
         // their ring ranges are used by nothing.)
         self.fwd_pending.clear();
+        // The batch's ring copies first (`copier`): one that faults on a lazy
+        // write-back's pages reads them back once the batch of the range's
+        // newest skip is submitted - a skip this batch may decide below.
+        if self.recording {
+            super::copier::wait(self.batch_copies);
+        }
         if self.recording && perf_on() {
             let loc = std::panic::Location::caller();
             let file = loc.file().rsplit(['/', '\\']).next().unwrap_or("");
@@ -2370,9 +2459,9 @@ impl Renderer {
             let r = if self.pro_recording {
                 prologue_barrier(slot.pro);
                 REC.end_command_buffer(slot.pro).ok();
-                REC.submit(&[slot.pro, slot.cmd], &waits, slot.fence, lazy.last().copied(), seq)
+                REC.submit(&[slot.pro, slot.cmd], &waits, slot.fence, lazy.last().copied(), seq, self.batch_copies)
             } else {
-                REC.submit(&[slot.cmd], &waits, slot.fence, lazy.last().copied(), seq)
+                REC.submit(&[slot.cmd], &waits, slot.fence, lazy.last().copied(), seq, self.batch_copies)
             };
             self.pro_recording = false;
             if let Err(e) = r {
@@ -3854,6 +3943,9 @@ impl Renderer {
         // Served before, and nothing of it stopped being current since: no
         // page invalidated in its window (CPU writes found, GPU writes
         // elsewhere, CP writes), its blocks' CPU-write checks still count.
+        if perf_on() {
+            VBIND_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if !overwrite && crate::tune::get(crate::tune::VBIND_CACHE) != 0 {
             if let Some(&(k, wgen, checked, buf, off)) = self.vbind.get(&(base, size)) {
                 let required = self.required_epoch;
@@ -3861,6 +3953,9 @@ impl Renderer {
                     if let Some(w) = vc.windows.get_mut(&k).filter(|w| w.wgen == wgen && checked != u64::MAX && checked >= required) {
                         w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
                         vc.hits += 1;
+                        if perf_on() {
+                            VBIND_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
                         return Some((buf, off));
                     }
                 }
@@ -4045,7 +4140,9 @@ impl Renderer {
             // (The GPU's own writes to the window keep it current; GPU writes
             // elsewhere invalidate it explicitly: `note_pending_gpu_write`.)
             let with_gpu = crate::tune::get(crate::tune::MIRROR_GPU_STAMPS) != 0;
+            let th = unsafe { core::arch::x86_64::_rdtsc() };
             let (written, stamp) = self.writes.cpu_changed_since(rlo, rhi - rlo, since, with_gpu);
+            bpart(14, th);
             if written {
                 let mut runs = if with_gpu { self.writes.dirty_runs(rlo, rhi, since) } else { self.writes.cpu_dirty_runs(rlo, rhi, since) };
                 if runs.is_empty() {
@@ -4135,7 +4232,7 @@ impl Renderer {
                     let n = end - off;
                     match sptr {
                         Some(p) => resources::copy_from_guest(unsafe { std::slice::from_raw_parts_mut(p.add(at as usize), n as usize) }, wlo + off),
-                        None => self.ring.write_guest(sbase + at, wlo + off, n),
+                        None => self.ring_copy(sbase + at, wlo + off, n),
                     }
                     regions.push(vk::BufferCopy { src_offset: sbase + at, dst_offset: off, size: n });
                     at += n;
@@ -4787,7 +4884,10 @@ impl Renderer {
         // their slot is reused, which the queue orders after this batch)
         // rather than waited for.
         let mut inflight: Vec<(u64, vk::Buffer, u64, u64)> = Vec::new();
-        if writeback_in_flight(base, size) {
+        let tf = unsafe { core::arch::x86_64::_rdtsc() };
+        let in_flight = writeback_in_flight(base, size);
+        bpart(11, tf);
+        if in_flight {
             let oldest = (self.last_seq + 2).saturating_sub(SLOTS as u64);
             let mut forward = true;
             for c in COMPLETIONS.lock().iter() {
@@ -4832,7 +4932,9 @@ impl Renderer {
             return Err(format!("ring full: {size:#x}-byte copy of {base:#x} (segment {:#x})", self.ring.segment_size()));
         };
         let t0 = std::time::Instant::now();
-        self.ring.write_guest(off, base, size);
+        let tc = unsafe { core::arch::x86_64::_rdtsc() };
+        self.ring_copy(off, base, size);
+        let tc = bpart(12, tc);
         self.prof[2] += t0.elapsed();
         let regions: Vec<(vk::Buffer, vk::BufferCopy)> = inflight
             .iter()
@@ -4843,6 +4945,7 @@ impl Renderer {
                 (lo < hi).then(|| (buf, vk::BufferCopy { src_offset: dev_off + (lo - pbase), dst_offset: off + (lo - base), size: hi - lo }))
             })
             .collect();
+        bpart(13, tc);
         self.upload_forwarded = !regions.is_empty();
         if perf_detail() && !regions.is_empty() {
             let mut g = FORWARD_SITES.lock();
@@ -4863,6 +4966,16 @@ impl Renderer {
             self.fwd_pending.extend(regions);
         }
         Ok((self.ring.buffer, off))
+    }
+
+    /// Copies guest [addr, addr+n) to ring offset `off`: by the copy thread
+    /// (`tune async_copies`; the batch's submit waits for it) or now.
+    fn ring_copy(&mut self, off: u64, addr: u64, n: u64) {
+        if crate::tune::get(crate::tune::ASYNC_COPIES) != 0 && n != 0 {
+            self.batch_copies = super::copier::copy(unsafe { self.ring.ptr.add(off as usize) }, addr, n as usize);
+        } else {
+            self.ring.write_guest(off, addr, n);
+        }
     }
 
     /// `upload_guest` for data shaders only read: copies of up to
@@ -4891,6 +5004,7 @@ impl Renderer {
         let r = self.upload_guest_ex(base, size, crate::tune::get(crate::tune::DEVCOPY_READS) != 0)?;
         if perf_detail() && !self.upload_devcopy && r.0 == self.ring.buffer {
             // (TLG_PERF=2: copies whose guest bytes equal the previous copy's.)
+            super::copier::wait(self.batch_copies);
             let h = resources::hash_slice(size, unsafe { std::slice::from_raw_parts(self.ring.ptr.add(r.1 as usize), size as usize) });
             let stamp = self.writes.stamp();
             let prev = {
@@ -5463,7 +5577,9 @@ impl Renderer {
                             let room = (base >> VWIN_SHIFT << VWIN_SHIFT) + VWIN_SIZE - base;
                             let n = extent.min(room);
                             self.vc_why = "read binding";
+                            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
                             if let Some((vb, voff)) = self.vcache_bind_ex(base, n, false, n < VCACHE_MIN) {
+                                bpart(8, t0);
                                 bpath = 3;
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range: n.next_multiple_of(4) })));
                                 continue;
@@ -5476,18 +5592,25 @@ impl Renderer {
                             // commands; guest memory gets the range when the
                             // batch completes (copied out at its end).
                             self.vc_why = "written binding";
+                            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
                             if let Some((vb, voff)) = self.vcache_bind_ex(base, extent, false, extent < VCACHE_MIN) {
+                                let t1 = bpart(0, t0);
                                 bpath = 4;
                                 let (bits, words, head) = self.mirror_write_back(base, extent, vb, voff)?;
                                 if let Some(d) = dinfo.get_mut(3 * i..3 * i + 3) {
                                     d.copy_from_slice(&[(bits / 4) as u32, head, words - 1]);
                                 }
+                                let t2 = bpart(1, t1);
                                 if extent <= SURFACE_WRITE_MAX {
                                     self.note_meta_write(base, extent);
                                     self.note_buffer_write(base, extent);
                                 }
+                                let t3 = bpart(2, t2);
                                 self.writes.note_gpu_write(base, extent);
+                                let tn = bpart(15, t3);
                                 self.note_mirror_write(vb, base, extent);
+                                bpart(16, tn);
+                                let t4 = bpart(3, t3);
                                 self.end_rendering();
                                 // (A dispatch's own write: tracked as its access.)
                                 if p.stage == Stage::Compute {
@@ -5495,17 +5618,22 @@ impl Renderer {
                                 } else {
                                     unordered!(self);
                                 }
+                                bpart(4, t4);
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: vb, offset: voff, range: extent.next_multiple_of(4) })));
                                 continue;
                             }
                         }
                         let size = extent.clamp(4, 64 << 20);
+                        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
                         if !written && crate::tune::get(crate::tune::UPLOAD_REUSE) != 0 {
                             if let Some((buf, off)) = self.reused_upload(base, size) {
                                 bpath = 5;
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
                                 continue;
                             }
+                        }
+                        if !written {
+                            bpart(5, t0);
                         }
                         let cause = if written { 0 } else if bias != 0 { 1 } else { 2 };
                         self.upload_bytes[cause] += size;
@@ -5544,11 +5672,30 @@ impl Renderer {
                         }
                         if !written {
                             bpath = 6;
+                            if perf_on() {
+                                let now = (self.cpu_epoch, self.required_epoch, self.writes.stamp(), self.cmd_queue, self.batch);
+                                if let Some(&(ce, re, st, q, b)) = self.upload_seen.get(&(base, size)) {
+                                    if q == now.3 && b != now.4 && !self.writes.gpu_written_since(base, size, st) {
+                                        if ce == now.0 {
+                                            XBATCH[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        } else if re == now.1 {
+                                            XBATCH[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        }
+                                    }
+                                }
+                                if self.upload_seen.len() > 1 << 16 {
+                                    self.upload_seen.clear();
+                                }
+                                self.upload_seen.insert((base, size), now);
+                            }
+                            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
                             let (buf, off) = self.upload_guest_ro(base, size)?;
+                            let t1 = bpart(6, t0);
                             if self.upload_devcopy {
                                 bpath = 9;
                             }
                             self.note_upload(base, size, buf, off);
+                            bpart(7, t1);
                             infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: buf, offset: off, range: size.next_multiple_of(4) })));
                             continue;
                         }
@@ -5573,7 +5720,9 @@ impl Renderer {
                         // the ring copy: host writes are visible at
                         // submission, the device range is fresh.)
                         bpath = 8;
+                        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
                         let off = self.upload_guest(base, size)?;
+                        let t0 = bpart(9, t0);
                         let forwarded = self.upload_forwarded;
                         self.flush_forwards();
                         let dev_off = self.dring.alloc(size).ok_or("device ring full")?;
@@ -5592,6 +5741,7 @@ impl Renderer {
                             unordered!(self);
                         }
                         self.push_writeback(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
+                        bpart(10, t0);
                         self.writes.note_gpu_write(base, size);
                         self.note_pending_gpu_write(base, size);
                         self.mark(|| "written buffer setup copy".into());
@@ -9120,6 +9270,29 @@ impl std::ops::DerefMut for TimedRenderer {
     }
 }
 
+/// Prefetches the first 16 KiB of each small read-only buffer of a prepared
+/// stage into this core's caches (`tune prefetch`): the upload copies made
+/// under the renderer lock then find the lines the title's threads wrote on
+/// other cores. (Prefetches never fault.)
+fn prefetch_reads(p: &Prepared) {
+    for &i in p.read_buffers.iter() {
+        if p.written_buffers.contains(&i) {
+            continue;
+        }
+        let Some(ResolvedRes::Buffer(v)) = p.resources.get(i) else { continue };
+        let size = v.size();
+        if size == 0 || size >= VCACHE_MIN {
+            continue;
+        }
+        let (lo, hi) = (v.base & !63, (v.base + size.min(16 << 10) + 63) & !63);
+        let mut a = lo;
+        while a < hi {
+            unsafe { core::arch::x86_64::_mm_prefetch(a as *const i8, core::arch::x86_64::_MM_HINT_T0) };
+            a += 64;
+        }
+    }
+}
+
 impl Hooks for VkHooks {
     fn draw(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) {
         if matches!(crate::tune::get(crate::tune::SKIP_CMDS), 1 | 2) {
@@ -9133,6 +9306,11 @@ impl Hooks for VkHooks {
             let ps_addr = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64) << 32)) << 8;
             let vs = shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, Default::default());
             let ps = (ps_addr != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Fragment, regs }));
+            if crate::tune::get(crate::tune::PREFETCH) != 0 {
+                for p in [vs.as_ref().ok(), ps.as_ref().and_then(|p| p.as_ref().ok())].into_iter().flatten() {
+                    prefetch_reads(p);
+                }
+            }
             (vs, ps)
         });
         let mut g = TimedRenderer::lock(cp.queue);
@@ -9149,6 +9327,9 @@ impl Hooks for VkHooks {
             return;
         }
         let pre = (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs }));
+        if let Some(Ok(p)) = pre.as_ref().filter(|_| crate::tune::get(crate::tune::PREFETCH) != 0) {
+            prefetch_reads(p);
+        }
         let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return self.fallback.dispatch(cp, x, y, z) };
         r.pre_cs = pre;
@@ -9229,6 +9410,8 @@ impl Hooks for VkHooks {
         RENDERER.lock().as_mut().is_some_and(|r| r.gds_load_on_gpu(offset, src, bytes))
     }
     fn sync_write(&mut self, _cp: &CommandProcessor, addr: u64, len: u64) {
+        // (Queued ring copies of this memory read it first.)
+        super::copier::wait_overlapping(addr, len);
         let end = addr + len.max(1);
         let read = if cp_view_on() {
             let mut v = CP_VIEW.lock();

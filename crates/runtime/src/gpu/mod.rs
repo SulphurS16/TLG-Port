@@ -1,5 +1,6 @@
 //! GPU emulation front end: submission queues, compute rings and events.
 
+pub mod copier;
 pub mod cp;
 pub mod cpuwatch;
 pub mod desc;
@@ -866,6 +867,19 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             })
             .collect();
         crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {})", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers);
+        // (Their steps: us each, count.)
+        static LAST_BP: Mutex<[(u64, u64); 17]> = Mutex::new([(0, 0); 17]);
+        let cur: [(u64, u64); 17] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
+        let prev = std::mem::replace(&mut *LAST_BP.lock(), cur);
+        let parts: Vec<String> = (0..17)
+            .filter(|&i| cur[i].1 > prev[i].1)
+            .map(|i| format!("{} {:.2} us x {}", render::BPART_NAMES[i], (cur[i].0 - prev[i].0) as f64 / hz * 1e6 / (cur[i].1 - prev[i].1) as f64, cur[i].1 - prev[i].1))
+            .collect();
+        if !parts.is_empty() {
+            let x = [render::XBATCH[0].swap(0, Ordering::Relaxed), render::XBATCH[1].swap(0, Ordering::Relaxed)];
+            let v = [render::VBIND_STATS[0].swap(0, Ordering::Relaxed), render::VBIND_STATS[1].swap(0, Ordering::Relaxed)];
+            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served: {} same CPU epoch, {} same required epoch; mirror binding cache {} of {}", parts.join("; "), x[0], x[1], v[0], v[1]);
+        }
         crate::info!(
             "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages, {} ms; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
             now.frames - p.frames,
@@ -926,7 +940,14 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             static LAST_REC: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0));
             let r = (rec::OPS.load(Ordering::Relaxed), rec::BUSY_NS.load(Ordering::Relaxed), rec::WAKES.load(Ordering::Relaxed));
             let pr = std::mem::replace(&mut *LAST_REC.lock(), r);
-            let recorder = if r.0 > pr.0 { format!("; recorder {} ops, busy {} ms, woken {}x", r.0 - pr.0, (r.1 - pr.1) / 1_000_000, r.2 - pr.2) } else { String::new() };
+            let mut recorder = if r.0 > pr.0 { format!("; recorder {} ops, busy {} ms, woken {}x", r.0 - pr.0, (r.1 - pr.1) / 1_000_000, r.2 - pr.2) } else { String::new() };
+            // (Asynchronous ring copies: done, and waits for them.)
+            static LAST_CP: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0));
+            let k = (copier::COPIES.load(Ordering::Relaxed), copier::WAITS.load(Ordering::Relaxed), copier::WAIT_NS.load(Ordering::Relaxed));
+            let pk = std::mem::replace(&mut *LAST_CP.lock(), k);
+            if k.0 > pk.0 {
+                recorder.push_str(&format!("; ring copies {} by the copy thread, {} waits for them ({} ms)", k.0 - pk.0, k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
+            }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
         }
         let mut fills: Vec<((u64, u64, &'static str), (u64, u64))> = render::VCACHE_FILL_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();

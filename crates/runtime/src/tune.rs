@@ -207,7 +207,9 @@ pub const WAIT_TIMER_KEEP: usize = 38;
 /// The completion thread lets write-watch queries in between a batch's
 /// write-back entries (`TLG_WB_LOCK_BUMP`, 1; each mirror-resident full
 /// write-back forgets its pages right after its copy) instead of holding the
-/// write-watch lock for all of them (0; the graphics CP's queries waited 1.8%).
+/// write-watch lock for all of them (0; the graphics CP's queries waited 1.8%);
+/// 2: also between the page runs of an entry and between 256 KiB pieces of
+/// whole-range mirror write-backs (each piece forgotten right after its copy).
 pub const WB_LOCK_BUMP: usize = 39;
 
 /// The graphics CP hands the renderer lock to a waiting compute CP after each
@@ -285,7 +287,21 @@ pub const RECORDER: usize = 49;
 /// (`TLG_REC_BATCH`, 64; submits hand over at once).
 pub const REC_BATCH: usize = 50;
 
-const TABLE: [(&str, &str, i64); 51] = [
+/// After shader preparation and before the renderer lock, the CP prefetches
+/// the guest bytes of the stages' small read-only buffers (`TLG_PREFETCH`, 0):
+/// the title's threads wrote them on other cores just before, and the upload
+/// copies (~1 us each, ~75,000 per second in the cave) waited for those
+/// cache lines under the lock. Measured: copies 1.18 -> 0.78 us, CP time per
+/// frame unchanged (issuing the prefetches costs as much).
+pub const PREFETCH: usize = 51;
+
+/// Guest-memory copies into the upload ring (read-only and written buffer
+/// bindings, mirror copy-in staging) run on the `GPU-copy` thread
+/// (`TLG_ASYNC_COPIES`, 1; `gpu::copier`); a batch's submit waits for its
+/// copies (0: the CP copies under the renderer lock).
+pub const ASYNC_COPIES: usize = 52;
+
+const TABLE: [(&str, &str, i64); 53] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -337,6 +353,8 @@ const TABLE: [(&str, &str, i64); 51] = [
     ("skip_cmds", "TLG_SKIP_CMDS", 0),
     ("recorder", "TLG_RECORDER", 1),
     ("rec_batch", "TLG_REC_BATCH", 64),
+    ("prefetch", "TLG_PREFETCH", 0),
+    ("async_copies", "TLG_ASYNC_COPIES", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

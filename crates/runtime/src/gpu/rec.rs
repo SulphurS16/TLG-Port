@@ -48,7 +48,7 @@ enum Op {
     End(vk::CommandBuffer),
     Reset(vk::CommandBuffer),
     BindSparse(Vec<(vk::Buffer, Vec<vk::SparseMemoryBind>)>, vk::Semaphore),
-    Submit { cmds: SmallVec<[vk::CommandBuffer; 2]>, waits: SmallVec<[(vk::Semaphore, vk::PipelineStageFlags); 1]>, fence: vk::Fence, lazy: Option<u64>, seq: u64 },
+    Submit { cmds: SmallVec<[vk::CommandBuffer; 2]>, waits: SmallVec<[(vk::Semaphore, vk::PipelineStageFlags); 1]>, fence: vk::Fence, lazy: Option<u64>, seq: u64, copies: u64 },
     Fn(Thunk),
 }
 
@@ -306,10 +306,12 @@ unsafe fn perform(d: &ash::Device, op: Op, unsignaled: &mut Option<vk::Semaphore
                     *unsignaled = Some(sem);
                 }
             }
-            Op::Submit { cmds, mut waits, fence, lazy, seq } => {
+            Op::Submit { cmds, mut waits, fence, lazy, seq, copies } => {
                 if let Some(s) = unsignaled.take() {
                     waits.retain(|w| w.0 != s);
                 }
+                // (The batch reads the ring bytes its queued copies fill.)
+                super::copier::wait(copies);
                 if let Err(e) = ctx().submit_cmds(&cmds, &waits, &[], fence) {
                     crate::error!("render submit: {e}");
                     if e.contains("lost") {
@@ -427,13 +429,15 @@ impl Rec {
         ctx().bind_sparse(&binds, signal)
     }
 
-    /// `Ctx::submit_cmds` of batch `seq` in queue order; `lazy`: the
-    /// batch's last lazy write-back skip (`lazywb::submitted` once submitted).
-    pub fn submit(&self, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, vk::PipelineStageFlags)], fence: vk::Fence, lazy: Option<u64>, seq: u64) -> Result<(), String> {
+    /// `Ctx::submit_cmds` of batch `seq` in queue order once the copies up
+    /// to `copies` are done (`copier`); `lazy`: the batch's last lazy
+    /// write-back skip (`lazywb::submitted` once submitted).
+    pub fn submit(&self, cmds: &[vk::CommandBuffer], waits: &[(vk::Semaphore, vk::PipelineStageFlags)], fence: vk::Fence, lazy: Option<u64>, seq: u64, copies: u64) -> Result<(), String> {
         if deferred() {
-            push(Op::Submit { cmds: SmallVec::from_slice(cmds), waits: SmallVec::from_slice(waits), fence, lazy, seq }, true);
+            push(Op::Submit { cmds: SmallVec::from_slice(cmds), waits: SmallVec::from_slice(waits), fence, lazy, seq, copies }, true);
             return Ok(());
         }
+        super::copier::wait(copies);
         let r = ctx().submit_cmds(cmds, waits, &[], fence);
         if let Some(t) = lazy {
             super::lazywb::submitted(t);
