@@ -60,6 +60,10 @@ impl Chunk {
     }
 }
 
+/// TLG_PERF: validation harvests that queried blocks: calls, block runs,
+/// pages queried, written pages found, calls that found none.
+pub static HV_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 pub struct WriteTracker {
     /// Stamp counter: advances with every harvest that finds written pages
     /// and every registered GPU write.
@@ -110,6 +114,7 @@ impl WriteTracker {
             return true;
         }
         self.pages.clear();
+        let perf = super::render::perf_on();
         for (i, &(lo, hi)) in runs.iter().enumerate() {
             if !mem::harvest_writes(lo << BLOCK_SHIFT, (hi - lo) << BLOCK_SHIFT, &mut self.buf, &mut self.pages) {
                 // (Not expected inside the guest range.) The blocks not
@@ -123,6 +128,16 @@ impl WriteTracker {
                 }
                 self.stamp_harvest();
                 return false;
+            }
+        }
+        if perf {
+            use std::sync::atomic::Ordering::Relaxed;
+            HV_STATS[0].fetch_add(1, Relaxed);
+            HV_STATS[1].fetch_add(runs.len() as u64, Relaxed);
+            HV_STATS[2].fetch_add(runs.iter().map(|r| (r.1 - r.0) << (BLOCK_SHIFT - PAGE_SHIFT)).sum::<u64>(), Relaxed);
+            HV_STATS[3].fetch_add(self.pages.len() as u64, Relaxed);
+            if self.pages.is_empty() {
+                HV_STATS[4].fetch_add(1, Relaxed);
             }
         }
         if cpuwatch::enabled() {

@@ -878,7 +878,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         if !parts.is_empty() {
             let x = [render::XBATCH[0].swap(0, Ordering::Relaxed), render::XBATCH[1].swap(0, Ordering::Relaxed)];
             let v = [render::VBIND_STATS[0].swap(0, Ordering::Relaxed), render::VBIND_STATS[1].swap(0, Ordering::Relaxed)];
-            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served: {} same CPU epoch, {} same required epoch; mirror binding cache {} of {}", parts.join("; "), x[0], x[1], v[0], v[1]);
+            let h: [u64; 5] = std::array::from_fn(|i| writes::HV_STATS[i].swap(0, Ordering::Relaxed));
+            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served: {} same CPU epoch, {} same required epoch; mirror binding cache {} of {}; validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none)", parts.join("; "), x[0], x[1], v[0], v[1], h[0], h[1], h[2], h[3], h[4]);
         }
         crate::info!(
             "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages, {} ms; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
