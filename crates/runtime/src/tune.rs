@@ -329,7 +329,13 @@ pub const PREP_PRIORITY: usize = 56;
 /// -> 5.7 us (cave, ~9,100 per second).
 pub const WW_FILTER: usize = 57;
 
-const TABLE: [(&str, &str, i64); 58] = [
+/// VRAM mirror copy-ins of pages no command of the batch used yet go into
+/// the batch's prologue instead of the batch, between full barriers
+/// (`TLG_HOIST_COPYINS`, 1): ~75% of copy-ins in the cave, full barriers
+/// -15%, GPU time per frame -2.7%.
+pub const HOIST_COPYINS: usize = 58;
+
+const TABLE: [(&str, &str, i64); 59] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -388,6 +394,7 @@ const TABLE: [(&str, &str, i64); 58] = [
     ("decoded_cp", "TLG_DECODED_CP", 1),
     ("prep_priority", "TLG_PREP_PRIORITY", 0),
     ("ww_filter", "TLG_WW_FILTER", 1),
+    ("hoist_copyins", "TLG_HOIST_COPYINS", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

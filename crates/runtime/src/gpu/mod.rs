@@ -367,8 +367,13 @@ fn pm4_capture() -> bool {
 
 pub fn submit(mut s: Submission) {
     if pm4_capture() || pm4_check() {
+        let t0 = std::time::Instant::now();
         let roots: Vec<(u64, u32)> = s.dcb.iter().chain(s.ccb.iter()).copied().filter(|&(a, n)| a != 0 && n != 0).collect();
         s.captured = cp::capture(&roots);
+        // (TLG_PERF: the capture is between the title's submission and the CP.)
+        CAPTURE_STATS[0].fetch_add(1, Ordering::Relaxed);
+        CAPTURE_STATS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        CAPTURE_STATS[2].fetch_add(s.captured.values().map(|w| w.len() as u64).sum(), Ordering::Relaxed);
     }
     let q = gfx_queue();
     SUBMITS.fetch_add(1, Ordering::Relaxed);
@@ -396,6 +401,9 @@ pub fn submit(mut s: Submission) {
         }
     }
 }
+
+/// TLG_PERF: submissions captured, their capture time (ns) and dwords.
+pub static CAPTURE_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 
 /// TLG_PERF frame tail, summed over frames (ns after the graphics CP finished
 /// a frame): frames, its last batch's fence, its actions performed, the
@@ -995,7 +1003,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let ts: [u64; 5] = std::array::from_fn(|i| TAIL_STATS[i].swap(0, Ordering::Relaxed));
             if ts[0] != 0 {
                 let ms = |v: u64| v as f64 / ts[0] as f64 / 1e6;
-                crate::info!("frame tail (ms per frame, after the graphics CP finished the frame): its last batch done on the GPU {:.2}, its end-of-pipe actions {:.2}, the title's next submission {:.2}, taken up {:.2} ({} frames)", ms(ts[1]), ms(ts[2]), ms(ts[3]), ms(ts[4]), ts[0]);
+                let cs: [u64; 3] = std::array::from_fn(|i| CAPTURE_STATS[i].swap(0, Ordering::Relaxed));
+                crate::info!("frame tail (ms per frame, after the graphics CP finished the frame): its last batch done on the GPU {:.2}, its end-of-pipe actions {:.2}, the title's next submission {:.2}, taken up {:.2} ({} frames); PM4 captures {} ({:.2} ms, {} KiB)", ms(ts[1]), ms(ts[2]), ms(ts[3]), ms(ts[4]), ts[0], cs[0], cs[1] as f64 / 1e6, cs[2] * 4 >> 10);
             }
         }
         let mut fills: Vec<((u64, u64, &'static str), (u64, u64))> = render::VCACHE_FILL_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
@@ -1003,7 +1012,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             fills.sort_by_key(|&(_, (_, bytes))| std::cmp::Reverse(bytes));
             let total: u64 = fills.iter().map(|&(_, (_, b))| b).sum();
             let top: Vec<String> = fills.iter().take(8).map(|&((b, s, why), (n, bytes))| format!("{n} x {b:#x}+{s:#x} {why} ({} KiB)", bytes >> 10)).collect();
-            crate::info!("mirror copy-ins/s: {} MiB for {} bindings; largest: {}", total >> 20, fills.iter().map(|f| f.1.0).sum::<u64>(), top.join(", "));
+            let ci: [u64; 2] = std::array::from_fn(|i| render::COPYIN_STATS[i].swap(0, Ordering::Relaxed));
+            crate::info!("mirror copy-ins/s: {} MiB for {} bindings ({} copies in their batch, {} ahead of it); largest: {}", total >> 20, fills.iter().map(|f| f.1.0).sum::<u64>(), ci[0], ci[1], top.join(", "));
         }
         let mut wbs: Vec<((u64, u64, bool), u64)> = render::WRITEBACK_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
         if !wbs.is_empty() {

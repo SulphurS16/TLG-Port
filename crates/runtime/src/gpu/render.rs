@@ -1464,6 +1464,10 @@ pub struct Renderer {
     zc_writes: Vec<(u64, u64)>,
     /// Guest ranges read in place in the current batch.
     zc_reads: Ranges,
+    /// Guest ranges served from VRAM mirror windows to the current batch's
+    /// commands so far (`vcache_bind_ex`): a copy-in of pages outside them
+    /// can go ahead of the batch (`tune hoist_copyins`).
+    batch_mirror_used: Ranges,
     /// Device-ring copies of shader-written buffers to copy back to guest
     /// memory after the current command: (ring offset, guest buffer, offset, size).
     gpu_wb: Vec<(u64, vk::Buffer, u64, u64)>,
@@ -1844,6 +1848,7 @@ pub fn init() -> Result<(), String> {
             zc_spans: Vec::new(),
             zc_gen: 0,
             zc_writes: Vec::new(),
+            batch_mirror_used: Ranges::new(),
             zc_reads: Ranges::default(),
             gpu_wb: Vec::new(),
             prof: Default::default(),
@@ -2068,6 +2073,8 @@ pub static BATCH_SITES: parking_lot::Mutex<Option<HashMap<(&'static str, u32), (
 /// write since, by the same CP queue: in the same CPU epoch, and in the same
 /// required epoch (graphics or compute) though another CPU epoch began.
 pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// TLG_PERF: mirror copy-ins recorded in their batch and ahead of it.
+pub static COPYIN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// TLG_PERF: mirror bindings served by the binding cache, and all.
 pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
@@ -2291,6 +2298,7 @@ impl Renderer {
                 REC.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, exec, 0);
             }
         }
+        self.batch_mirror_used = Ranges::new();
         self.recording = true;
         self.dyn_state = None;
         self.bound_gfx = vk::Pipeline::null();
@@ -4101,6 +4109,7 @@ impl Renderer {
                         if perf_on() {
                             VBIND_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         }
+                        self.batch_mirror_used.insert(base, base + size);
                         return Some((buf, off));
                     }
                 }
@@ -4167,7 +4176,11 @@ impl Renderer {
             return None;
         }
         w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-        self.vcache_fill(k, base, size, epoch, required, overwrite)
+        let r = self.vcache_fill(k, base, size, epoch, required, overwrite);
+        if r.is_some() {
+            self.batch_mirror_used.insert(base, base + size);
+        }
+        r
     }
 
     /// Allocates the VRAM mirror window [lo, hi) (all pages not yet current).
@@ -4385,36 +4398,56 @@ impl Renderer {
                 }
                 (sbuf, regions)
             };
-            // (After a full barrier: earlier commands of this batch may have
-            // written the source in place.)
-            self.begin();
-            self.end_rendering();
-            global_barrier(self.cmd);
-            if !regions.is_empty() {
-                unsafe { REC.cmd_copy_buffer(self.cmd, src, vbuf, &regions) };
-            }
             // Forwards land after the copy-in and earlier forwards they
             // overlap (a barrier then), in program order.
-            let mut since: Vec<(u64, u64)> = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
-            for &(pbase, pbuf, poff, psize) in fwd.iter().flat_map(|f| f.0.iter()) {
-                let over: Vec<vk::BufferCopy> = spans
-                    .iter()
-                    .filter_map(|&(off, end)| {
-                        let (a, b) = (pbase.max(wlo + off), (pbase + psize).min(wlo + end));
-                        (a < b).then(|| vk::BufferCopy { src_offset: poff + (a - pbase), dst_offset: a - wlo, size: b - a })
-                    })
-                    .collect();
-                if !over.is_empty() {
+            let fwd_copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = fwd
+                .iter()
+                .flat_map(|f| f.0.iter())
+                .filter_map(|&(pbase, pbuf, poff, psize)| {
+                    let over: Vec<vk::BufferCopy> = spans
+                        .iter()
+                        .filter_map(|&(off, end)| {
+                            let (a, b) = (pbase.max(wlo + off), (pbase + psize).min(wlo + end));
+                            (a < b).then(|| vk::BufferCopy { src_offset: poff + (a - pbase), dst_offset: a - wlo, size: b - a })
+                        })
+                        .collect();
+                    (!over.is_empty()).then_some((pbuf, over))
+                })
+                .collect();
+            // Ahead of the batch (`tune hoist_copyins`): pages no command of
+            // this batch used yet, nothing forwarded into them and no
+            // in-place write of the batch to their source: the prologue
+            // orders the copy behind earlier batches and before this one
+            // (no barriers inside the batch, rendering not interrupted).
+            let hoist = crate::tune::get(crate::tune::HOIST_COPYINS) != 0
+                && !regions.is_empty()
+                && fwd_copies.is_empty()
+                && !abs.iter().any(|&(a, b)| self.batch_mirror_used.overlaps(a, b) || self.zc_writes.iter().any(|&(x, y)| x < b && a < y));
+            COPYIN_STATS[hoist as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.begin();
+            if hoist {
+                let pro = self.prologue_cmd();
+                unsafe { REC.cmd_copy_buffer(pro, src, vbuf, &regions) };
+            } else {
+                // (After a full barrier: earlier commands of this batch may
+                // have written the source in place.)
+                self.end_rendering();
+                global_barrier(self.cmd);
+                if !regions.is_empty() {
+                    unsafe { REC.cmd_copy_buffer(self.cmd, src, vbuf, &regions) };
+                }
+                let mut since: Vec<(u64, u64)> = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
+                for (pbuf, over) in &fwd_copies {
                     if over.iter().any(|r| since.iter().any(|&(x, y)| r.dst_offset < y && x < r.dst_offset + r.size)) {
                         global_barrier(self.cmd);
                         since.clear();
                     }
                     since.extend(over.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)));
-                    unsafe { REC.cmd_copy_buffer(self.cmd, pbuf, vbuf, &over) };
+                    unsafe { REC.cmd_copy_buffer(self.cmd, *pbuf, vbuf, over) };
                     self.flushes[5] += 1;
                 }
+                unordered!(self);
             }
-            unordered!(self);
             let vc = self.vcache.as_mut().unwrap();
             let w = vc.windows.get_mut(&k).unwrap();
             for &(a, b) in &runs {
@@ -4435,7 +4468,9 @@ impl Renderer {
                     self.zc_read(wlo + r.dst_offset, wlo + r.dst_offset + r.size);
                 }
             }
-            self.mark(|| "vertex/index data to VRAM".into());
+            if !hoist {
+                self.mark(|| "vertex/index data to VRAM".into());
+            }
         }
         let vc = self.vcache.as_mut().unwrap();
         vc.hits += 1;

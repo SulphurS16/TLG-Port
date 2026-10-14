@@ -221,9 +221,9 @@ pub fn capture(roots: &[(u64, u32)]) -> Captured {
         if dw == 0 || out.contains_key(&addr) || !guest_ok(addr, dw as u64 * 4) || total + dw as usize > LIMIT_DWORDS {
             continue;
         }
-        let mut bytes = vec![0u8; dw as usize * 4];
-        super::resources::copy_from_guest(&mut bytes, addr);
-        let words: Vec<u32> = bytes.chunks_exact(4).map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect();
+        let mut words = vec![0u32; dw as usize];
+        // SAFETY: the dwords' storage, as bytes.
+        super::resources::copy_from_guest(unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, dw as usize * 4) }, addr);
         let mut i = 0usize;
         while i < words.len() {
             let h = words[i];
