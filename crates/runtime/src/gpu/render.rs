@@ -1535,6 +1535,15 @@ pub struct Renderer {
     /// that may change one (every buffer a shader writes) look only at
     /// these, not at every image (that scan was ~4% of the GPU thread).
     meta_images: Vec<ImageKey>,
+    /// The metadata surfaces of `meta_images` sorted by address ([start, end),
+    /// image) with the largest one's size, valid while `meta_gen` is
+    /// `meta_cache.0` (bumped when an image's metadata, the list or the set
+    /// of images changes): GPU buffer writes look them up instead of
+    /// visiting every image with metadata.
+    meta_gen: u64,
+    meta_cache: (u64, Vec<(u64, u64, ImageKey)>, u64),
+    /// Distinct buffers of `hz` and whether any access to each writes.
+    hz_bufs: smallvec::SmallVec<[(vk::Buffer, bool); 8]>,
     /// Render targets (de)tiled on the GPU: reloads, write-backs.
     pub gpu_remaps: [u64; 2],
     /// Textures read from guest memory and detiled on the GPU.
@@ -1880,6 +1889,9 @@ pub fn init() -> Result<(), String> {
             indirect_rejected: 0,
             tile_maps: FastMap::default(),
             meta_images: Vec::new(),
+            meta_gen: 1,
+            meta_cache: (0, Vec::new(), 0),
+            hz_bufs: smallvec::SmallVec::new(),
             gpu_remaps: [0; 2],
             gpu_tex_uploads: 0,
             dprof: [0; 8],
@@ -2753,6 +2765,7 @@ impl Renderer {
         self.img_max_bytes = self.img_max_bytes.max(bytes);
         self.image_bytes += img.bytes;
         self.images.insert(k, img);
+        self.meta_gen += 1;
     }
 
     fn init_image(&mut self, key: ImageKey) -> Result<(), String> {
@@ -2865,7 +2878,11 @@ impl Renderer {
         img.tile_index = Some((regs.ctx(r + 5) & 0x1F) as u8);
         // CB_COLOR*_INFO.FAST_CLEAR: CMASK (4 bits per 8x8 tile) tracks fast clears.
         let cmask = (regs.ctx(r + 7) as u64) << 8;
-        img.meta = (info & (1 << 13) != 0 && cmask != 0).then(|| (cmask, (pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64).div_ceil(2)));
+        let meta = (info & (1 << 13) != 0 && cmask != 0).then(|| (cmask, (pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64).div_ceil(2)));
+        if img.meta != meta {
+            img.meta = meta;
+            self.meta_gen += 1;
+        }
         if img.meta.is_some() && !img.meta_listed {
             img.meta_listed = true;
             self.meta_images.push(key);
@@ -2900,7 +2917,11 @@ impl Renderer {
         img.tile_index = Some(((zinfo >> 20) & 7) as u8);
         // DB_Z_INFO.TILE_SURFACE_ENABLE: HTILE (one dword per 8x8 tile).
         let htile = (regs.ctx(0xA005) as u64) << 8;
-        img.meta = (zinfo & (1 << 29) != 0 && htile != 0).then(|| (htile, pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64 * 4));
+        let meta = (zinfo & (1 << 29) != 0 && htile != 0).then(|| (htile, pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64 * 4));
+        if img.meta != meta {
+            img.meta = meta;
+            self.meta_gen += 1;
+        }
         if img.meta.is_some() && !img.meta_listed {
             img.meta_listed = true;
             self.meta_images.push(key);
@@ -2976,6 +2997,7 @@ impl Renderer {
                 *k = new;
             }
         }
+        self.meta_gen += 1;
         // (`stale_ivals` rebuilt with the next aging.)
         self.stale_aged = u64::MAX;
         if let Some(v) = self.by_base.get_mut(&old.base) {
@@ -7446,6 +7468,7 @@ impl Renderer {
         let bgen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
         if self.hz_gen != bgen {
             self.hz.clear();
+            self.hz_bufs.clear();
             self.hz_unknown = false;
             self.hz_gen = bgen;
         }
@@ -7461,7 +7484,11 @@ impl Renderer {
             self.hz_unknown
                 || self.cur_unknown
                 || self.hz.len() > 1024
-                || self.cur_access.iter().any(|&(b, o, n, w)| self.hz.iter().any(|&(hb, ho, hn, hw, hs)| (!relax || hs < ordered_after) && hb == b && ho < o.saturating_add(n) && o < ho.saturating_add(hn) && (w || hw)))
+                || self.cur_access.iter().any(|&(b, o, n, w)| {
+                    // (Only buffers the earlier accesses touch, with a write on either side.)
+                    self.hz_bufs.iter().any(|&(hb, hw)| hb == b && (w || hw))
+                        && self.hz.iter().any(|&(hb, ho, hn, hw, hs)| (!relax || hs < ordered_after) && hb == b && ho < o.saturating_add(n) && o < ho.saturating_add(hn) && (w || hw))
+                })
         };
         // (The validated arguments must be visible to the indirect read.)
         let need = args_slot.is_some() || (self.barrier_needed && (!hazards || self.unordered_gen == bgen || conflict()));
@@ -7491,6 +7518,7 @@ impl Renderer {
         if need {
             global_barrier(self.cmd);
             self.hz.clear();
+            self.hz_bufs.clear();
             self.hz_unknown = false;
             self.hz_gen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
             self.hz_stats.0 += 1;
@@ -7500,6 +7528,12 @@ impl Renderer {
         if hazards {
             let acc = std::mem::take(&mut self.cur_access);
             self.hz.extend(acc.iter().map(|&(b, o, n, w)| (b, o, n, w, synced)));
+            for &(b, _, _, w) in acc.iter() {
+                match self.hz_bufs.iter_mut().find(|e| e.0 == b) {
+                    Some(e) => e.1 |= w,
+                    None => self.hz_bufs.push((b, w)),
+                }
+            }
             self.cur_access = acc;
             self.hz_unknown |= self.cur_unknown;
         }
@@ -8459,26 +8493,35 @@ impl Renderer {
     /// GPU buffer writes to [base, base+size) that touch a render target's
     /// HTILE/CMASK surface: examined when the target is next bound.
     fn note_meta_write(&mut self, base: u64, size: u64) {
-        for k in &self.meta_images {
-            let Some(img) = self.images.get_mut(k) else { continue };
-            if let Some((m, n)) = img.meta {
-                if m < base + size && base < m + n {
-                    img.meta_dirty = true;
-                    img.meta_fill = None;
-                }
+        for k in self.meta_overlapping(base, size, false) {
+            if let Some(img) = self.images.get_mut(&k) {
+                img.meta_dirty = true;
+                img.meta_fill = None;
             }
         }
+    }
+
+    /// The images whose metadata surfaces overlap [base, base+size)
+    /// (`inside`: lie entirely inside it), from `meta_cache`.
+    fn meta_overlapping(&mut self, base: u64, size: u64, inside: bool) -> smallvec::SmallVec<[ImageKey; 4]> {
+        if self.meta_cache.0 != self.meta_gen {
+            let mut v: Vec<(u64, u64, ImageKey)> = self.meta_images.iter().filter_map(|k| self.images.get(k).and_then(|i| i.meta).map(|(m, n)| (m, m + n, *k))).collect();
+            v.sort_unstable_by_key(|e| e.0);
+            let max = v.iter().map(|e| e.1 - e.0).max().unwrap_or(0);
+            self.meta_cache = (self.meta_gen, v, max);
+        }
+        let (_, v, max) = &self.meta_cache;
+        let end = base.saturating_add(size);
+        let i0 = v.partition_point(|e| e.0 < base.saturating_sub(*max));
+        v[i0..].iter().take_while(|e| e.0 < end).filter(|e| if inside { base <= e.0 && e.1 <= end } else { base < e.1 }).map(|e| e.2).collect()
     }
 
     /// A fill of guest memory with a dword pattern was recorded: metadata
     /// surfaces it covers entirely hold that pattern (see `apply_meta_clears`).
     fn note_meta_fill(&mut self, base: u64, size: u64, pattern: u32) {
-        for k in &self.meta_images {
-            let Some(img) = self.images.get_mut(k) else { continue };
-            if let Some((m, n)) = img.meta {
-                if base <= m && m + n <= base + size {
-                    img.meta_fill = Some(pattern);
-                }
+        for k in self.meta_overlapping(base, size, true) {
+            if let Some(img) = self.images.get_mut(&k) {
+                img.meta_fill = Some(pattern);
             }
         }
     }
@@ -8998,6 +9041,7 @@ impl Renderer {
             let Some(img) = self.images.remove(k) else { continue };
             if img.meta_listed {
                 self.meta_images.retain(|x| x != k);
+                self.meta_gen += 1;
             }
             if let Some(v) = self.by_base.get_mut(&k.base) {
                 v.retain(|x| x != k);
