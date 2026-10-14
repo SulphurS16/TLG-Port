@@ -322,7 +322,14 @@ pub const DECODED_CP: usize = 55;
 /// (`TLG_PREP_PRIORITY`, 0; 0: normal).
 pub const PREP_PRIORITY: usize = 56;
 
-const TABLE: [(&str, &str, i64); 57] = [
+/// Write-backs whose host writes the write watch then forgets run without
+/// holding `mem::WRITE_WATCH_LOCK` (`TLG_WW_FILTER`, 1): write-watch queries
+/// leave out their pages meanwhile (`mem::forget_begin`, in either mode).
+/// The mirror's CPU-write checks no longer wait for write-back copies: 10.0
+/// -> 5.7 us (cave, ~9,100 per second).
+pub const WW_FILTER: usize = 57;
+
+const TABLE: [(&str, &str, i64); 58] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -380,6 +387,7 @@ const TABLE: [(&str, &str, i64); 57] = [
     ("prep_ahead", "TLG_PREP_AHEAD", 1),
     ("decoded_cp", "TLG_DECODED_CP", 1),
     ("prep_priority", "TLG_PREP_PRIORITY", 0),
+    ("ww_filter", "TLG_WW_FILTER", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

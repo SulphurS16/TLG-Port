@@ -147,8 +147,21 @@ static STARTED: std::sync::Once = std::sync::Once::new();
 /// or it did not validate); CP writes into command memory; decoded
 /// submissions: prepare-thread waits for the graphics CP (`dry_sync`),
 /// graphics-CP waits for chunks and their time (ns), those for a
-/// submission's first chunk (TLG_PERF).
-pub static STATS: [AtomicU64; 12] = [const { AtomicU64::new(0) }; 12];
+/// submission's first chunk; preparations over 200 us and their time (ns);
+/// the prepare thread's time on submissions (ns) (TLG_PERF).
+pub static STATS: [AtomicU64; 15] = [const { AtomicU64::new(0) }; 15];
+
+/// A preparation of `what` at `addr` took `t0.elapsed()` (TLG_PERF: slow ones).
+fn note_prep(t0: std::time::Instant, what: &str, addr: u64) {
+    let ns = t0.elapsed().as_nanos() as u64;
+    if ns >= 200_000 {
+        let n = STATS[12].fetch_add(1, Ordering::Relaxed);
+        STATS[13].fetch_add(ns, Ordering::Relaxed);
+        if n < 24 {
+            crate::info!("prepare thread: {what} {addr:#x} took {} us", ns / 1000);
+        }
+    }
+}
 
 /// Results kept at most (a submission has ~2,000 commands).
 const MAX_RESULTS: usize = 8192;
@@ -217,10 +230,12 @@ fn run() {
             ops: 0,
             written: crate::gpu::render::FastMap::default(),
         };
+        let t0 = std::time::Instant::now();
         cp.run(&mut de, &mut ce, &mut hooks);
         if let Some(d) = hooks.out.take() {
             d.publish(&mut hooks.words, hooks.ops, true);
         }
+        STATS[14].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         // (Diagnostics: CP writes into command memory of the submission.)
         if !hooks.written.is_empty() {
             let mut hits = 0;
@@ -394,18 +409,22 @@ impl Hooks for PrepHooks {
         }
         let key = draw_key(regs);
         let ps_addr = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64) << 32)) << 8;
+        let t0 = std::time::Instant::now();
         shaders::dry_begin();
         let vs = shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, Default::default());
         let ps = (ps_addr != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Fragment, regs }));
         let log = shaders::dry_end();
+        note_prep(t0, "draw with pixel shader", ps_addr);
         push(Entry { sub: self.sub, epoch: self.epoch, key, prep: Prep::Draw((vs, ps)), log });
     }
     fn dispatch(&mut self, cp: &CommandProcessor, _x: u32, _y: u32, _z: u32) {
         let regs = &cp.regs;
         let key = dispatch_key(regs);
+        let t0 = std::time::Instant::now();
         shaders::dry_begin();
         let cs = shaders::prepare(&StageRegs { stage: Stage::Compute, regs });
         let log = shaders::dry_end();
+        note_prep(t0, "dispatch of compute shader", ((regs.sh(0x2E0C) as u64) | ((regs.sh(0x2E0D) as u64) << 32)) << 8);
         push(Entry { sub: self.sub, epoch: self.epoch, key, prep: Prep::Dispatch(cs), log });
     }
     fn dry_write(&mut self, addr: u64, data: &[u32]) {

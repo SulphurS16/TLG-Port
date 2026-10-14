@@ -898,6 +898,40 @@ unsafe impl Sync for Completion {}
 static COMPLETIONS: parking_lot::Mutex<std::collections::VecDeque<std::sync::Arc<Completion>>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
 static COMPLETIONS_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 static DONE: parking_lot::Mutex<u64> = parking_lot::Mutex::new(0);
+
+/// TLG_PERF frame tail: the batch that ends a frame (`tail_mark`) and when
+/// its fence signalled and its actions were performed (`tail_ns`).
+static TAIL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static TAIL_FENCE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static TAIL_DONE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Nanoseconds on one clock since its first use (frame tail statistics).
+pub fn tail_ns() -> u64 {
+    static T0: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    T0.get_or_init(std::time::Instant::now).elapsed().as_nanos() as u64
+}
+
+/// The frame's work ends with batch `seq`: its completion is timed.
+pub fn tail_mark(seq: u64) {
+    use std::sync::atomic::Ordering::*;
+    TAIL_DONE_NS.store(0, SeqCst);
+    TAIL_FENCE_NS.store(0, SeqCst);
+    TAIL_SEQ.store(seq, SeqCst);
+    // (Completed already.)
+    if *DONE.lock() >= seq {
+        let now = tail_ns();
+        let _ = TAIL_FENCE_NS.compare_exchange(0, now, SeqCst, SeqCst);
+        let _ = TAIL_DONE_NS.compare_exchange(0, now, SeqCst, SeqCst);
+    }
+}
+
+/// When the frame's last batch signalled its fence and when its actions were
+/// done (`tail_ns`; 0: not yet).
+pub fn tail_times() -> (u64, u64) {
+    use std::sync::atomic::Ordering::*;
+    let done = TAIL_DONE_NS.load(SeqCst);
+    (TAIL_FENCE_NS.load(SeqCst), done)
+}
 static DONE_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 /// Diagnostics (TLG_PERF): host-observed GPU busy time and CP waits for
 /// pending guest-memory writes, in nanoseconds.
@@ -1046,12 +1080,16 @@ fn completion_thread() {
             record_profile(*pool, labels);
         }
         let tw = std::time::Instant::now();
+        let fence_ns = tail_ns();
         LAST_FENCE_NS.store((tw - tf).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         let mut wb_bytes = 0;
         {
             // (Write-backs of mirror-resident data are forgotten by the write
-            // watch together with their copy: see `mem::WRITE_WATCH_LOCK`.)
-            let mut ww = (!c.mirror_writes.is_empty() || c.wb_bits.iter().any(|b| b.is_some())).then(|| crate::mem::WRITE_WATCH_LOCK.lock());
+            // watch together with their copy: each copy is registered with
+            // `mem::forget_begin` until its reset; `tune ww_filter 0` also
+            // holds `mem::WRITE_WATCH_LOCK` meanwhile.)
+            let lock = crate::tune::get(crate::tune::WW_FILTER) == 0;
+            let mut ww = (lock && (!c.mirror_writes.is_empty() || c.wb_bits.iter().any(|b| b.is_some()))).then(|| crate::mem::WRITE_WATCH_LOCK.lock());
             let probe = super::wbprobe::enabled();
             // (`tune wb_lock_bump`: waiting write-watch queries go first
             // between entries; each entry's copy and reset stay together.)
@@ -1101,9 +1139,11 @@ fn completion_thread() {
                         let start = (first * 4096).saturating_sub(head);
                         let end = (page * 4096 - head).min(size);
                         let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add((off + start) as usize), (end - start) as usize) };
+                        crate::mem::forget_begin(addr + start, end - start);
                         resources::copy_to_guest(src, addr + start);
                         let tr = std::time::Instant::now();
                         crate::mem::reset_write_watch(addr + start, end - start);
+                        crate::mem::forget_end(addr + start, end - start);
                         WB_RESET_NS.fetch_add(tr.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                         WB_RESETS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         wb_bytes += end - start;
@@ -1128,8 +1168,10 @@ fn completion_thread() {
                             }
                         }
                         let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add((off + (a - addr)) as usize), (b - a) as usize) };
+                        crate::mem::forget_begin(a, b - a);
                         resources::copy_to_guest(src, a);
                         crate::mem::reset_write_watch(a, b - a);
+                        crate::mem::forget_end(a, b - a);
                         a = b;
                     }
                     wb_bytes += size;
@@ -1140,20 +1182,19 @@ fn completion_thread() {
                     continue;
                 }
                 let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add(off as usize), size as usize) };
+                if mirror {
+                    crate::mem::forget_begin(addr, size);
+                }
                 resources::copy_to_guest(src, addr);
                 wb_bytes += size;
                 if probe {
                     super::wbprobe::after_write(addr, size);
                 }
                 super::lazywb::after_write(addr, size, mirror);
-                if bump && mirror {
+                if mirror {
                     // (One of `mirror_writes`.)
                     crate::mem::reset_write_watch(addr, size);
-                }
-            }
-            if !bump {
-                for &(addr, size) in &c.mirror_writes {
-                    crate::mem::reset_write_watch(addr, size);
+                    crate::mem::forget_end(addr, size);
                 }
             }
         }
@@ -1168,6 +1209,12 @@ fn completion_thread() {
         COMPLETIONS.lock().pop_front();
         *DONE.lock() = c.seq;
         DONE_CV.notify_all();
+        if c.seq >= TAIL_SEQ.load(std::sync::atomic::Ordering::SeqCst) {
+            use std::sync::atomic::Ordering::SeqCst;
+            let _ = TAIL_FENCE_NS.compare_exchange(0, fence_ns, SeqCst, SeqCst);
+            let _ = TAIL_DONE_NS.compare_exchange(0, tail_ns(), SeqCst, SeqCst);
+            TAIL_SEQ.store(u64::MAX, SeqCst);
+        }
     }
 }
 

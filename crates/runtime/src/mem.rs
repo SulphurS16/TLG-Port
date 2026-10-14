@@ -214,8 +214,29 @@ pub static HARVEST_PAGES: std::sync::atomic::AtomicU64 = std::sync::atomic::Atom
 pub static HARVEST_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Held while host code writes guest memory and then forgets those writes
-/// (`reset_write_watch`), so a harvest never sees the writes alone.
+/// (`reset_write_watch`), so a harvest never sees the writes alone (`tune
+/// ww_filter 0`; `FORGETTING` gives that guarantee without it).
 pub static WRITE_WATCH_LOCK: Mutex<()> = Mutex::new(());
+/// Guest ranges host code is writing and will then forget
+/// (`reset_write_watch`): harvests leave out the pages wholly inside them, so
+/// a query between such a write and its reset does not report it. Harvests
+/// hold it around their query (an entry is removed only after its reset,
+/// never between a query and its filtering); writers to add and remove.
+static FORGETTING: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+
+/// Host code is about to write guest [addr, addr+len) and then forget the
+/// writes (`reset_write_watch`, then `forget_end`).
+pub fn forget_begin(addr: u64, len: u64) {
+    FORGETTING.lock().push((addr, addr + len));
+}
+
+/// The writes registered by `forget_begin(addr, len)` are forgotten.
+pub fn forget_end(addr: u64, len: u64) {
+    let mut g = FORGETTING.lock();
+    if let Some(i) = g.iter().position(|&r| r == (addr, addr + len)) {
+        g.swap_remove(i);
+    }
+}
 /// Held around a harvest's write-watch query only: the same guarantee for
 /// writers that must not wait for `WRITE_WATCH_LOCK` (lazy write-back
 /// readbacks run in faults, possibly taken while the memory map lock is
@@ -227,7 +248,8 @@ pub fn harvest_writes(addr: u64, len: u64, buf: &mut Vec<usize>, out: &mut Vec<u
     if !WRITE_WATCH.load(std::sync::atomic::Ordering::Relaxed) || !is_guest(addr, len) {
         return false;
     }
-    let _ww = WRITE_WATCH_LOCK.lock();
+    let _ww = (crate::tune::get(crate::tune::WW_FILTER) == 0).then(|| WRITE_WATCH_LOCK.lock());
+    let forgetting = FORGETTING.lock();
     let lo = addr & !0xFFF;
     let hi = (addr + len.max(1) + 0xFFF) & !0xFFF;
     let cap = ((hi - lo) >> 12) as usize;
@@ -249,7 +271,12 @@ pub fn harvest_writes(addr: u64, len: u64, buf: &mut Vec<usize>, out: &mut Vec<u
     if r != 0 {
         return false;
     }
-    out.extend(buf[..count.min(cap)].iter().map(|&p| p as u64));
+    if forgetting.is_empty() {
+        out.extend(buf[..count.min(cap)].iter().map(|&p| p as u64));
+    } else {
+        // (Host writes being forgotten: whole pages inside such a range.)
+        out.extend(buf[..count.min(cap)].iter().map(|&p| p as u64).filter(|&p| !forgetting.iter().any(|&(a, b)| p >= a && p + 0x1000 <= b)));
+    }
     true
 }
 

@@ -89,8 +89,72 @@ thread_local! {
 // hash) for the graphics CP to validate the result against memory.
 thread_local! {
     static DRY_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    static DRY_OVERLAY: std::cell::RefCell<FastMap<u64, u32>> = std::cell::RefCell::new(FastMap::default());
+    static DRY_OVERLAY: std::cell::RefCell<Overlay> = std::cell::RefCell::new(Overlay::default());
     static DRY_LOG: std::cell::RefCell<Vec<(u64, u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The dry-run CP's memory writes (dword-aligned ones; others are never read
+/// back): by 4 KiB page, the dwords and which of them were written.
+#[derive(Default)]
+struct Overlay {
+    pages: FastMap<u64, Box<OverlayPage>>,
+    free: Vec<Box<OverlayPage>>,
+}
+
+struct OverlayPage {
+    words: [u32; 1024],
+    valid: [u64; 16],
+}
+
+impl Overlay {
+    fn write(&mut self, addr: u64, data: &[u32]) {
+        if addr % 4 != 0 {
+            return;
+        }
+        let mut i = 0;
+        while i < data.len() {
+            let a = addr + 4 * i as u64;
+            let idx = ((a & 0xFFF) >> 2) as usize;
+            let n = (1024 - idx).min(data.len() - i);
+            let free = &mut self.free;
+            let p = self.pages.entry(a >> 12).or_insert_with(|| {
+                let mut p = free.pop().unwrap_or_else(|| Box::new(OverlayPage { words: [0; 1024], valid: [0; 16] }));
+                p.valid = [0; 16];
+                p
+            });
+            p.words[idx..idx + n].copy_from_slice(&data[i..i + n]);
+            for j in idx..idx + n {
+                p.valid[j >> 6] |= 1 << (j & 63);
+            }
+            i += n;
+        }
+    }
+
+    fn read(&self, addr: u64, words: &mut [u32]) {
+        if self.pages.is_empty() || addr % 4 != 0 {
+            return;
+        }
+        let mut i = 0;
+        while i < words.len() {
+            let a = addr + 4 * i as u64;
+            let idx = ((a & 0xFFF) >> 2) as usize;
+            let n = (1024 - idx).min(words.len() - i);
+            if let Some(p) = self.pages.get(&(a >> 12)) {
+                for k in 0..n {
+                    let j = idx + k;
+                    if p.valid[j >> 6] >> (j & 63) & 1 != 0 {
+                        words[i + k] = p.words[j];
+                    }
+                }
+            }
+            i += n;
+        }
+    }
+
+    fn clear(&mut self) {
+        let free = &mut self.free;
+        free.extend(self.pages.drain().map(|(_, p)| p));
+    }
 }
 
 fn hash_dwords(w: &[u32]) -> u64 {
@@ -110,17 +174,13 @@ pub fn dry_begin() {
 /// Ends the log started by `dry_begin` and returns it.
 pub fn dry_end() -> Vec<(u64, u32, u64)> {
     DRY_ON.set(false);
-    DRY_LOG.with(|l| std::mem::take(&mut *l.borrow_mut()))
+    // (A copy of exactly its size: the log keeps its capacity.)
+    DRY_LOG.with(|l| l.borrow().to_vec())
 }
 
 /// The dry-run CP wrote guest [addr, addr+4*len): later reads see it.
 pub fn dry_write(addr: u64, data: &[u32]) {
-    DRY_OVERLAY.with(|o| {
-        let mut o = o.borrow_mut();
-        for (i, &v) in data.iter().enumerate() {
-            o.insert(addr + 4 * i as u64, v);
-        }
-    });
+    DRY_OVERLAY.with(|o| o.borrow_mut().write(addr, data));
 }
 
 /// Forgets the overlay (the real writes are in guest memory now).
@@ -137,16 +197,7 @@ pub fn dry_read(addr: u64, out: &mut [u32]) {
 }
 
 fn dry_overlay(addr: u64, words: &mut [u32]) {
-    DRY_OVERLAY.with(|o| {
-        let o = o.borrow();
-        if !o.is_empty() {
-            for (i, w) in words.iter_mut().enumerate() {
-                if let Some(&v) = o.get(&(addr + 4 * i as u64)) {
-                    *w = v;
-                }
-            }
-        }
-    });
+    DRY_OVERLAY.with(|o| o.borrow().read(addr, words));
 }
 
 /// A dry preparation read `words` at `addr` (after `dry_overlay`): logged.

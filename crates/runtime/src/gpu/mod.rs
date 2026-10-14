@@ -397,6 +397,11 @@ pub fn submit(mut s: Submission) {
     }
 }
 
+/// TLG_PERF frame tail, summed over frames (ns after the graphics CP finished
+/// a frame): frames, its last batch's fence, its actions performed, the
+/// title's next submission, the CP taking it up.
+pub static TAIL_STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
 fn gfx_thread() {
     crate::log::set_thread_name("GPU-gfx");
     crate::thread::raise_priority();
@@ -407,6 +412,7 @@ fn gfx_thread() {
     let mut busy = std::time::Duration::ZERO;
     let mut processed: u64 = 0;
     let started = std::time::Instant::now();
+    let mut frame_end: Option<u64> = None;
     loop {
         set_phase(phase::IDLE, 0);
         let mut s = {
@@ -416,6 +422,19 @@ fn gfx_thread() {
             }
             g.pop_front().unwrap()
         };
+        // (TLG_PERF: what the graphics CP waited for since the last frame.)
+        if let Some(t0) = frame_end.take() {
+            let now = render::tail_ns();
+            let arrived = now.saturating_sub(s.submitted.elapsed().as_nanos() as u64);
+            let (fence, done) = render::tail_times();
+            if done != 0 {
+                TAIL_STATS[0].fetch_add(1, Ordering::Relaxed);
+                TAIL_STATS[1].fetch_add(fence.saturating_sub(t0), Ordering::Relaxed);
+                TAIL_STATS[2].fetch_add(done.saturating_sub(t0), Ordering::Relaxed);
+                TAIL_STATS[3].fetch_add(arrived.saturating_sub(t0), Ordering::Relaxed);
+                TAIL_STATS[4].fetch_add(now.saturating_sub(t0), Ordering::Relaxed);
+            }
+        }
         set_phase(phase::PACKET, s.dcb.first().map(|d| d.0).unwrap_or(0));
         if let Some(r) = render::RENDERER.lock().as_mut() {
             r.new_epoch(render::EpochKind::Graphics);
@@ -498,6 +517,12 @@ fn gfx_thread() {
             }
             let timing = crate::pacing::FlipTiming { submitted: s.submitted, queue: t_start.saturating_duration_since(s.submitted), process: t_start.elapsed() };
             crate::hle::libs::videoout::gpu_flip(f.handle, f.index, f.mode, f.arg, timing);
+            if render::perf_on() {
+                if let Some(seq) = render::RENDERER.lock().as_ref().map(|r| r.last_seq) {
+                    render::tail_mark(seq);
+                    frame_end = Some(render::tail_ns());
+                }
+            }
         }
         busy += t_start.elapsed();
         GFX_CPU_100NS.store(thread_cpu_100ns(), Ordering::Relaxed);
@@ -958,14 +983,20 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 recorder.push_str(&format!("; ring copies {} by the copy thread, {} waits for them ({} ms)", k.0 - pk.0, k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
             }
             // (Shader stages prepared ahead: used, none made, invalid.)
-            let pa: [u64; 12] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));
+            let pa: [u64; 15] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));
             if pa.iter().any(|&n| n != 0) {
                 recorder.push_str(&format!("; prepared ahead: {} used, {} without a result ({} none yet, {} none matching), {} invalid; CP writes into command memory {}, command reads after a CP write into them {}", pa[0], pa[1], pa[3], pa[4], pa[2], pa[5], pa[6]));
                 if pa[7] + pa[8] != 0 {
                     recorder.push_str(&format!("; decoded submissions: prepare-thread waits for CP writes {}, graphics-CP waits for decoding {} ({:.2} ms; at a submission's start {}, {:.2} ms)", pa[7], pa[8], pa[9] as f64 / 1e6, pa[10], pa[11] as f64 / 1e6));
                 }
+                recorder.push_str(&format!("; prepare thread on submissions {} ms, preparations over 200 us {} ({:.2} ms)", pa[14] / 1_000_000, pa[12], pa[13] as f64 / 1e6));
             }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
+            let ts: [u64; 5] = std::array::from_fn(|i| TAIL_STATS[i].swap(0, Ordering::Relaxed));
+            if ts[0] != 0 {
+                let ms = |v: u64| v as f64 / ts[0] as f64 / 1e6;
+                crate::info!("frame tail (ms per frame, after the graphics CP finished the frame): its last batch done on the GPU {:.2}, its end-of-pipe actions {:.2}, the title's next submission {:.2}, taken up {:.2} ({} frames)", ms(ts[1]), ms(ts[2]), ms(ts[3]), ms(ts[4]), ts[0]);
+            }
         }
         let mut fills: Vec<((u64, u64, &'static str), (u64, u64))> = render::VCACHE_FILL_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
         if !fills.is_empty() {
