@@ -1893,6 +1893,14 @@ pub fn perf_on() -> bool {
     *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some())
 }
 
+/// Per-binding site statistics (`TLG_PERF=2`): upload, forward and content
+/// statistics that cost per binding (hashing, formatting, map entries), so
+/// `TLG_PERF=1` runs measure close to what players run.
+pub fn perf_detail() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_PERF").is_ok_and(|v| v == "2"))
+}
+
 /// Images created (TLG_PERF): by (width, height, layers, levels, format) ->
 /// (count, last guest base), reported and cleared every second.
 pub static NEW_IMAGES: parking_lot::Mutex<Option<HashMap<(u32, u32, u32, u32, vk::Format), (u64, u64)>>> = parking_lot::Mutex::new(None);
@@ -4841,7 +4849,7 @@ impl Renderer {
             })
             .collect();
         self.upload_forwarded = !regions.is_empty();
-        if perf_on() && !regions.is_empty() {
+        if perf_detail() && !regions.is_empty() {
             let mut g = FORWARD_SITES.lock();
             let m = g.get_or_insert_with(HashMap::new);
             let over = |w: u64, n: u64| w < base + size && base < w + n;
@@ -4886,8 +4894,8 @@ impl Renderer {
             }
         }
         let r = self.upload_guest_ex(base, size, crate::tune::get(crate::tune::DEVCOPY_READS) != 0)?;
-        if perf_on() && !self.upload_devcopy && r.0 == self.ring.buffer {
-            // (TLG_PERF: copies whose guest bytes equal the previous copy's.)
+        if perf_detail() && !self.upload_devcopy && r.0 == self.ring.buffer {
+            // (TLG_PERF=2: copies whose guest bytes equal the previous copy's.)
             let h = resources::hash_slice(size, unsafe { std::slice::from_raw_parts(self.ring.ptr.add(r.1 as usize), size as usize) });
             let stamp = self.writes.stamp();
             let prev = {
@@ -5507,7 +5515,7 @@ impl Renderer {
                         }
                         let cause = if written { 0 } else if bias != 0 { 1 } else { 2 };
                         self.upload_bytes[cause] += size;
-                        if perf_on() {
+                        if perf_detail() {
                             let mut g = BUFFER_UPLOAD_SITES.lock();
                             let m = g.get_or_insert_with(HashMap::new);
                             if cause == 0 && size > 1 << 20 && !m.contains_key(&(base, size, true)) {
@@ -9108,6 +9116,9 @@ impl std::ops::DerefMut for TimedRenderer {
 
 impl Hooks for VkHooks {
     fn draw(&mut self, cp: &CommandProcessor, kind: &'static str, count: u32, index_addr: u64) {
+        if matches!(crate::tune::get(crate::tune::SKIP_CMDS), 1 | 2) {
+            return;
+        }
         // Shader preparation reads registers and guest memory only: before
         // the lock (its reads are checked under it). Not for patches.
         let prim = cp.regs.uconfig[(0xC242 - 0xC000) as usize];
@@ -9128,6 +9139,9 @@ impl Hooks for VkHooks {
         r.maybe_submit();
     }
     fn dispatch(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32) {
+        if matches!(crate::tune::get(crate::tune::SKIP_CMDS), 1 | 3) {
+            return;
+        }
         let pre = (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs }));
         let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return self.fallback.dispatch(cp, x, y, z) };
@@ -9139,7 +9153,7 @@ impl Hooks for VkHooks {
         r.maybe_submit();
     }
     fn dispatch_indirect(&mut self, cp: &CommandProcessor, addr: u64) -> bool {
-        if crate::tune::get(crate::tune::GPU_INDIRECT) == 0 {
+        if crate::tune::get(crate::tune::GPU_INDIRECT) == 0 || crate::tune::get(crate::tune::SKIP_CMDS) != 0 {
             return false;
         }
         let mut g = TimedRenderer::lock(cp.queue);
@@ -9157,6 +9171,9 @@ impl Hooks for VkHooks {
         done
     }
     fn draw_indirect_gpu(&mut self, cp: &CommandProcessor, addr: u64, indexed: bool, vtx_loc: u32, inst_loc: u32) -> bool {
+        if crate::tune::get(crate::tune::SKIP_CMDS) != 0 {
+            return false;
+        }
         let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return false };
         let done = match r.draw_indirect_gpu(cp, addr, indexed, vtx_loc, inst_loc) {

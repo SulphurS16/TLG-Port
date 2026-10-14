@@ -269,7 +269,12 @@ pub const DEVCOPY_READS: usize = 46;
 /// fps unchanged where the graphics CP is the limit.
 pub const CHAIN_WRITTEN: usize = 47;
 
-const TABLE: [(&str, &str, i64); 48] = [
+/// Measurement only (`TLG_SKIP_CMDS`, 0): 1 records no draws and no
+/// dispatches, 2 no draws, 3 no dispatches - what the title and the rest of
+/// the CP cost without that work (frames then show nothing valid).
+pub const SKIP_CMDS: usize = 48;
+
+const TABLE: [(&str, &str, i64); 49] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -318,6 +323,7 @@ const TABLE: [(&str, &str, i64); 48] = [
     ("prepare_unlocked", "TLG_PREPARE_UNLOCKED", 1),
     ("devcopy_reads", "TLG_DEVCOPY_READS", 0),
     ("chain_written", "TLG_CHAIN_WRITTEN", 1),
+    ("skip_cmds", "TLG_SKIP_CMDS", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
