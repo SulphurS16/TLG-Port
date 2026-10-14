@@ -211,7 +211,9 @@ pub const WAIT_TIMER_KEEP: usize = 38;
 pub const WB_LOCK_BUMP: usize = 39;
 
 /// The graphics CP hands the renderer lock to a waiting compute CP after each
-/// command (`TLG_LOCK_FAIR`, 0) instead of usually taking it again at once.
+/// command (`TLG_LOCK_FAIR` 1) instead of usually taking it again at once
+/// (0); 2: the compute CPs hand it to a waiting thread (the graphics CP)
+/// instead; 3: as 2, and compute CPs let a waiting graphics CP go first.
 pub const LOCK_FAIR: usize = 40;
 
 /// A memory wait met by another queue's queued (not yet committed)
@@ -274,7 +276,16 @@ pub const CHAIN_WRITTEN: usize = 47;
 /// the CP cost without that work (frames then show nothing valid).
 pub const SKIP_CMDS: usize = 48;
 
-const TABLE: [(&str, &str, i64); 49] = [
+/// Batches are recorded and submitted by the recorder thread
+/// (`TLG_RECORDER`, 1; `gpu::rec`) instead of by the CP threads under the
+/// renderer lock (0). Takes effect at the next batch.
+pub const RECORDER: usize = 49;
+
+/// Recorder operations the CPs collect before handing them over
+/// (`TLG_REC_BATCH`, 64; submits hand over at once).
+pub const REC_BATCH: usize = 50;
+
+const TABLE: [(&str, &str, i64); 51] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -324,6 +335,8 @@ const TABLE: [(&str, &str, i64); 49] = [
     ("devcopy_reads", "TLG_DEVCOPY_READS", 0),
     ("chain_written", "TLG_CHAIN_WRITTEN", 1),
     ("skip_cmds", "TLG_SKIP_CMDS", 0),
+    ("recorder", "TLG_RECORDER", 1),
+    ("rec_batch", "TLG_REC_BATCH", 64),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

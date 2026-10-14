@@ -66,7 +66,8 @@ pub fn checkpoint(cmd: vk::CommandBuffer, text: String) {
             n.pop_front();
         }
     }
-    unsafe { cp.cmd_set_checkpoint(cmd, seq as usize as *const std::ffi::c_void) };
+    // (In the batch's order: through the recorder.)
+    crate::gpu::rec::REC.raw(move |_| unsafe { cp.cmd_set_checkpoint(cmd, seq as usize as *const std::ffi::c_void) });
 }
 
 pub fn checkpoints_enabled() -> bool {

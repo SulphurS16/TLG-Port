@@ -6,6 +6,7 @@ use super::desc::{self, Tsharp};
 use super::tiling;
 use super::resources::{self, Image, ImageKey, Ring, Samplers};
 use super::shaders::{self, Prepared, ResolvedRes, StageRegs};
+use super::rec::REC;
 use super::vk::ctx;
 use ash::vk;
 use gcn::translate::{BindingKind, Stage, TessRole, TessSpec};
@@ -949,7 +950,8 @@ fn completion_thread() {
                 }
             }
             let now = std::time::Instant::now();
-            let start = c.submitted.max(last_done);
+            // (Deferred batches: from the recorder's submit.)
+            let start = super::rec::submit_time(c.seq).unwrap_or(c.submitted).max(last_done);
             GPU_BUSY_NS.fetch_add(now.saturating_duration_since(start).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             last_done = now;
             if c.exec != vk::QueryPool::null() {
@@ -1933,7 +1935,7 @@ pub static PASS_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomic
 fn prologue_barrier(cmd: vk::CommandBuffer) {
     PRO_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-    unsafe { ctx().device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
+    unsafe { REC.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
 }
 
 /// Prologue barriers recorded (TLG_PERF).
@@ -1947,12 +1949,11 @@ fn global_barrier(cmd: vk::CommandBuffer) {
         let line = std::panic::Location::caller().line();
         *BARRIER_SITES.lock().get_or_insert_with(HashMap::new).entry(line).or_default() += 1;
     }
-    let c = ctx();
     let mb = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     unsafe {
-        c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+        REC.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &[]);
     }
 }
 
@@ -2041,9 +2042,9 @@ impl Renderer {
         if self.recording {
             return;
         }
-        let c = ctx();
+        super::rec::set_mode(crate::tune::get(crate::tune::RECORDER) != 0);
         unsafe {
-            c.device.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+            REC.begin_command_buffer(self.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         }
         global_barrier(self.cmd);
         // The page bitmaps of this batch's write-backs, zeroed once here
@@ -2054,7 +2055,7 @@ impl Renderer {
         // with them and lost the device).
         self.bits_arena = match self.dring.alloc(BITS_ARENA_BYTES).filter(|_| crate::tune::get(crate::tune::BITS_ARENA) != 0) {
             Some(off) => {
-                unsafe { c.device.cmd_fill_buffer(self.cmd, self.dring.buffer, off, BITS_ARENA_BYTES, 0) };
+                unsafe { REC.cmd_fill_buffer(self.cmd, self.dring.buffer, off, BITS_ARENA_BYTES, 0) };
                 global_barrier(self.cmd);
                 (self.batch, off, 0, BITS_ARENA_BYTES / 4)
             }
@@ -2063,8 +2064,8 @@ impl Renderer {
         let exec = self.slots[self.cur].exec;
         if exec != vk::QueryPool::null() {
             unsafe {
-                c.device.cmd_reset_query_pool(self.cmd, exec, 0, 2);
-                c.device.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, exec, 0);
+                REC.cmd_reset_query_pool(self.cmd, exec, 0, 2);
+                REC.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, exec, 0);
             }
         }
         self.recording = true;
@@ -2075,8 +2076,8 @@ impl Renderer {
         let q = self.slots[self.cur].queries;
         if q != vk::QueryPool::null() {
             unsafe {
-                c.device.cmd_reset_query_pool(self.cmd, q, 0, PROFILE_QUERIES);
-                c.device.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, 0);
+                REC.cmd_reset_query_pool(self.cmd, q, 0, PROFILE_QUERIES);
+                REC.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, 0);
             }
             self.marks.push("(batch start)".into());
         }
@@ -2095,15 +2096,15 @@ impl Renderer {
         self.occl_next = self.occl_next.wrapping_add(1);
         let flags = if ctx().occl_precise { vk::QueryControlFlags::PRECISE } else { vk::QueryControlFlags::empty() };
         unsafe {
-            ctx().device.cmd_reset_query_pool(self.cmd, pool, q, 1);
-            ctx().device.cmd_begin_query(self.cmd, pool, q, flags);
+            REC.cmd_reset_query_pool(self.cmd, pool, q, 1);
+            REC.cmd_begin_query(self.cmd, pool, q, flags);
         }
         self.occl_active = Some(q);
     }
 
     fn occl_end_query(&mut self) {
         let (Some(&pool), Some(q)) = (OCCL_POOL.get(), self.occl_active.take()) else { return };
-        unsafe { ctx().device.cmd_end_query(self.cmd, pool, q) };
+        unsafe { REC.cmd_end_query(self.cmd, pool, q) };
         self.occl_ended.push(q);
     }
 
@@ -2138,14 +2139,14 @@ impl Renderer {
             super::vk::checkpoint(self.cmd, text.clone());
         }
         if profile {
-            unsafe { ctx().device.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, self.marks.len() as u32) };
+            unsafe { REC.cmd_write_timestamp(self.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, q, self.marks.len() as u32) };
             self.marks.push(text);
         }
     }
 
     fn end_rendering(&mut self) {
         if self.rendering.take().is_some() {
-            unsafe { ctx().device.cmd_end_rendering(self.cmd) };
+            unsafe { REC.cmd_end_rendering(self.cmd) };
             unordered!(self);
         }
     }
@@ -2187,7 +2188,7 @@ impl Renderer {
         self.begin();
         let pro = self.slots[self.cur].pro;
         if !self.pro_recording {
-            unsafe { ctx().device.begin_command_buffer(pro, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok() };
+            unsafe { REC.begin_command_buffer(pro, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok() };
             prologue_barrier(pro);
             self.pro_recording = true;
         }
@@ -2310,12 +2311,11 @@ impl Renderer {
             srcs.dedup();
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             unsafe {
-                let c = ctx();
                 for src in srcs {
                     let regions: Vec<vk::BufferCopy> = pending.iter().filter(|p| p.dev_buf == src && p.bits.is_none()).map(|p| vk::BufferCopy { src_offset: p.dev_off, dst_offset: p.host_off, size: p.size }).collect();
-                    c.device.cmd_copy_buffer(self.cmd, src, self.ring.buffer, &regions);
+                    REC.cmd_copy_buffer(self.cmd, src, self.ring.buffer, &regions);
                 }
-                c.device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
+                REC.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]);
             }
             self.mark(|| "buffer write-back copies".into());
         }
@@ -2335,7 +2335,7 @@ impl Renderer {
             // Shader writes to imported guest memory: visible to the host after the fence.
             self.end_rendering();
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
-            unsafe { ctx().device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
+            unsafe { REC.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
         }
         if !self.recording {
             if actions.is_empty() && writebacks.is_empty() {
@@ -2355,7 +2355,7 @@ impl Renderer {
         let mut waits = smallvec::SmallVec::<[(vk::Semaphore, vk::PipelineStageFlags); 1]>::new();
         if !self.sparse_binds.is_empty() {
             let binds = std::mem::take(&mut self.sparse_binds);
-            match c.bind_sparse(&binds, self.bind_sem) {
+            match REC.bind_sparse(binds, self.bind_sem) {
                 Ok(()) => waits.push((self.bind_sem, vk::PipelineStageFlags::ALL_COMMANDS)),
                 Err(e) => crate::error!("render: {e}"),
             }
@@ -2363,15 +2363,16 @@ impl Renderer {
         let slot = &mut self.slots[self.cur];
         unsafe {
             if slot.exec != vk::QueryPool::null() {
-                c.device.cmd_write_timestamp(slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.exec, 1);
+                REC.cmd_write_timestamp(slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.exec, 1);
             }
-            c.device.end_command_buffer(slot.cmd).ok();
+            REC.end_command_buffer(slot.cmd).ok();
+            let seq = self.last_seq + 1;
             let r = if self.pro_recording {
                 prologue_barrier(slot.pro);
-                c.device.end_command_buffer(slot.pro).ok();
-                c.submit_cmds(&[slot.pro, slot.cmd], &waits, &[], slot.fence)
+                REC.end_command_buffer(slot.pro).ok();
+                REC.submit(&[slot.pro, slot.cmd], &waits, slot.fence, lazy.last().copied(), seq)
             } else {
-                c.submit(slot.cmd, &waits, &[], slot.fence)
+                REC.submit(&[slot.cmd], &waits, slot.fence, lazy.last().copied(), seq)
             };
             self.pro_recording = false;
             if let Err(e) = r {
@@ -2380,9 +2381,6 @@ impl Renderer {
                     super::vk::report_device_lost();
                 }
             }
-        }
-        if let Some(&t) = lazy.last() {
-            super::lazywb::submitted(t);
         }
         self.last_seq += 1;
         slot.seq = self.last_seq;
@@ -2408,8 +2406,8 @@ impl Renderer {
             self.prof[6] += t0.elapsed();
             unsafe {
                 c.device.reset_fences(&[next.fence]).ok();
-                c.device.reset_command_buffer(next.cmd, vk::CommandBufferResetFlags::empty()).ok();
-                c.device.reset_command_buffer(next.pro, vk::CommandBufferResetFlags::empty()).ok();
+                REC.reset_command_buffer(next.cmd, vk::CommandBufferResetFlags::empty()).ok();
+                REC.reset_command_buffer(next.pro, vk::CommandBufferResetFlags::empty()).ok();
                 c.device.reset_descriptor_pool(next.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
             }
         }
@@ -2529,7 +2527,6 @@ impl Renderer {
         }
         self.begin();
         self.end_rendering();
-        let c = ctx();
         let b = vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::empty())
             .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
@@ -2546,7 +2543,7 @@ impl Renderer {
                 layer_count: vk::REMAINING_ARRAY_LAYERS,
             });
         unsafe {
-            c.device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[b]);
+            REC.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[b]);
             let range = vk::ImageSubresourceRange {
                 aspect_mask: resources::aspect(key.format),
                 base_mip_level: 0,
@@ -2559,9 +2556,9 @@ impl Renderer {
                 if key.format == vk::Format::D32_SFLOAT_S8_UINT {
                     r.aspect_mask |= vk::ImageAspectFlags::STENCIL;
                 }
-                c.device.cmd_clear_depth_stencil_image(self.cmd, img.image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 }, &[r]);
+                REC.cmd_clear_depth_stencil_image(self.cmd, img.image, vk::ImageLayout::GENERAL, &vk::ClearDepthStencilValue { depth: 1.0, stencil: 0 }, &[r]);
             } else if !matches!(key.format.as_raw(), 131..=146) {
-                c.device.cmd_clear_color_image(self.cmd, img.image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
+                REC.cmd_clear_color_image(self.cmd, img.image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]);
             }
         }
         unordered!(self);
@@ -2687,7 +2684,7 @@ impl Renderer {
                 vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: (old.width >> l).max(1), height: (old.height >> l).max(1), depth: 1 } }
             })
             .collect();
-        unsafe { ctx().device.cmd_copy_image(self.cmd, self.images[&old].image, vk::ImageLayout::GENERAL, self.images[&new].image, vk::ImageLayout::GENERAL, &regions) };
+        unsafe { REC.cmd_copy_image(self.cmd, self.images[&old].image, vk::ImageLayout::GENERAL, self.images[&new].image, vk::ImageLayout::GENERAL, &regions) };
         unordered!(self);
         self.mark(|| "level grow copy".into());
         // The new image takes over the old one's state and index entries.
@@ -2768,7 +2765,7 @@ impl Renderer {
         }
         let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: layers };
         let region = vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: w, height: h, depth: 1 } };
-        unsafe { ctx().device.cmd_copy_image(self.cmd, self.images[&src].image, vk::ImageLayout::GENERAL, self.images[&dst].image, vk::ImageLayout::GENERAL, &[region]) };
+        unsafe { REC.cmd_copy_image(self.cmd, self.images[&src].image, vk::ImageLayout::GENERAL, self.images[&dst].image, vk::ImageLayout::GENERAL, &[region]) };
         unordered!(self);
         self.mark(|| "alias copy".into());
         let last = self.images[&src].last_write;
@@ -2933,9 +2930,8 @@ impl Renderer {
         }
         self.end_rendering();
         global_barrier(self.cmd);
-        let c = ctx();
         for (dev_off, zbuf, zoff, size) in std::mem::take(&mut self.gpu_wb) {
-            unsafe { c.device.cmd_copy_buffer(self.cmd, self.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: dev_off, dst_offset: zoff, size }]) };
+            unsafe { REC.cmd_copy_buffer(self.cmd, self.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: dev_off, dst_offset: zoff, size }]) };
         }
         unordered!(self);
         self.mark(|| "written buffer write-back copies (GPU)".into());
@@ -3143,10 +3139,10 @@ impl Renderer {
             let bits = self.dring.alloc(words as u64 * 4).ok_or("device ring full: page bitmap")?;
             if crate::tune::get(crate::tune::PROLOGUE) != 0 {
                 let pro = self.prologue_cmd();
-                unsafe { ctx().device.cmd_fill_buffer(pro, self.dring.buffer, bits, words as u64 * 4, 0) };
+                unsafe { REC.cmd_fill_buffer(pro, self.dring.buffer, bits, words as u64 * 4, 0) };
             } else {
                 self.end_rendering();
-                unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, 0) };
+                unsafe { REC.cmd_fill_buffer(self.cmd, self.dring.buffer, bits, words as u64 * 4, 0) };
                 global_barrier(self.cmd);
             }
             bits
@@ -3219,7 +3215,7 @@ impl Renderer {
             let aspect = if skey.depth { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
             let sub = vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: skey.layers.max(1) };
             let region = vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: skey.width, height: skey.height, depth: 1 } };
-            unsafe { ctx().device.cmd_copy_image(self.cmd, self.images[&skey].image, vk::ImageLayout::GENERAL, self.images[&dkey].image, vk::ImageLayout::GENERAL, &[region]) };
+            unsafe { REC.cmd_copy_image(self.cmd, self.images[&skey].image, vk::ImageLayout::GENERAL, self.images[&dkey].image, vk::ImageLayout::GENERAL, &[region]) };
             unordered!(self);
             self.note_image_written(dkey);
             self.mark(|| "surface copy (image)".into());
@@ -3250,7 +3246,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         global_barrier(self.cmd);
-        unsafe { ctx().device.cmd_copy_buffer(self.cmd, sb, db, &[vk::BufferCopy { src_offset: so, dst_offset: doff, size: bytes }]) };
+        unsafe { REC.cmd_copy_buffer(self.cmd, sb, db, &[vk::BufferCopy { src_offset: so, dst_offset: doff, size: bytes }]) };
         unordered!(self);
         if !mirrored {
             self.zc_read(sv.base, sv.base + bytes);
@@ -3291,7 +3287,7 @@ impl Renderer {
                 self.barrier_needed = false;
             }
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: key.levels.max(1), base_array_layer: layers.0, layer_count: layers.1 };
-            unsafe { ctx().device.cmd_clear_color_image(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, &color, &[range]) };
+            unsafe { REC.cmd_clear_color_image(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, &color, &[range]) };
             unordered!(self);
             self.note_image_written(key);
             self.mark(|| "surface fill (clear)".into());
@@ -3327,7 +3323,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         global_barrier(self.cmd);
-        unsafe { ctx().device.cmd_fill_buffer(self.cmd, zbuf, zoff, bytes, pattern) };
+        unsafe { REC.cmd_fill_buffer(self.cmd, zbuf, zoff, bytes, pattern) };
         unordered!(self);
         if !mirrored {
             self.note_inplace_gpu_write(dv.base, bytes);
@@ -3375,7 +3371,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         global_barrier(self.cmd);
-        unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, zbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: zoff, size: bytes }]) };
+        unsafe { REC.cmd_copy_buffer(self.cmd, sbuf, zbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: zoff, size: bytes }]) };
         if sbuf != self.dring.buffer {
             self.zc_read(src, src + bytes);
         }
@@ -3413,7 +3409,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         global_barrier(self.cmd);
-        unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]) };
+        unsafe { REC.cmd_copy_buffer(self.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]) };
         unordered!(self);
         self.writes.note_gpu_write(dst, bytes);
         self.note_mirror_write(dbuf, dst, bytes);
@@ -3461,7 +3457,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         global_barrier(self.cmd);
-        unsafe { ctx().device.cmd_copy_buffer(self.cmd, sbuf, self.gds, &[vk::BufferCopy { src_offset: soff, dst_offset: o, size: n }]) };
+        unsafe { REC.cmd_copy_buffer(self.cmd, sbuf, self.gds, &[vk::BufferCopy { src_offset: soff, dst_offset: o, size: n }]) };
         if sbuf != self.dring.buffer {
             self.zc_read(src, src + n);
         }
@@ -3823,7 +3819,7 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
         };
-        unsafe { ctx().device.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
+        unsafe { REC.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
         unordered!(self);
         self.uploads += 1;
         self.gpu_tex_uploads += 1;
@@ -4152,7 +4148,7 @@ impl Renderer {
             self.end_rendering();
             global_barrier(self.cmd);
             if !regions.is_empty() {
-                unsafe { ctx().device.cmd_copy_buffer(self.cmd, src, vbuf, &regions) };
+                unsafe { REC.cmd_copy_buffer(self.cmd, src, vbuf, &regions) };
             }
             // Forwards land after the copy-in and earlier forwards they
             // overlap (a barrier then), in program order.
@@ -4171,7 +4167,7 @@ impl Renderer {
                         since.clear();
                     }
                     since.extend(over.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)));
-                    unsafe { ctx().device.cmd_copy_buffer(self.cmd, pbuf, vbuf, &over) };
+                    unsafe { REC.cmd_copy_buffer(self.cmd, pbuf, vbuf, &over) };
                     self.flushes[5] += 1;
                 }
             }
@@ -4358,7 +4354,6 @@ impl Renderer {
             let scratch = self.scratch_buffer(w as u64 * h as u64 * bpp)?;
             let off = 0;
             global_barrier(self.cmd);
-            let c = ctx();
             let to_buf = vk::BufferImageCopy {
                 buffer_offset: off,
                 buffer_row_length: 0,
@@ -4369,9 +4364,9 @@ impl Renderer {
             };
             let to_img = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, ..to_buf };
             unsafe {
-                c.device.cmd_copy_image_to_buffer(self.cmd, self.images[&src].image, vk::ImageLayout::GENERAL, scratch, &[to_buf]);
+                REC.cmd_copy_image_to_buffer(self.cmd, self.images[&src].image, vk::ImageLayout::GENERAL, scratch, &[to_buf]);
                 global_barrier(self.cmd);
-                c.device.cmd_copy_buffer_to_image(self.cmd, scratch, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[to_img]);
+                REC.cmd_copy_buffer_to_image(self.cmd, scratch, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[to_img]);
             }
             unordered!(self);
             self.mark(|| "depth copy for sampling".into());
@@ -4433,10 +4428,10 @@ impl Renderer {
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
             global_barrier(self.cmd);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
-            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-            c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
-            c.device.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
+            REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
+            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            REC.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
+            REC.cmd_dispatch(self.cmd, w.div_ceil(8), h.div_ceil(8), 1);
         }
         unordered!(self);
         Ok(true)
@@ -4487,7 +4482,7 @@ impl Renderer {
                     extent: vk::Extent3D { width: t.width, height: t.height, depth: 1 },
                 };
                 unsafe {
-                    ctx().device.cmd_copy_image(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[region]);
+                    REC.cmd_copy_image(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[region]);
                 }
             }
             unordered!(self);
@@ -4540,7 +4535,7 @@ impl Renderer {
             pos += lv.width as u64 * lv.height as u64 * (bpp / 8) as u64 * layers as u64;
         }
         unsafe {
-            ctx().device.cmd_copy_buffer_to_image(self.cmd, self.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions);
+            REC.cmd_copy_buffer_to_image(self.cmd, self.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions);
         }
         // TLG_MIP_CHECK=<n>: level-to-level correlations of the first n chains
         // per tile mode (chains whose level 1 correlates poorly are dumped).
@@ -4977,7 +4972,6 @@ impl Renderer {
         let regions = std::mem::take(&mut self.fwd_pending);
         self.begin();
         self.end_rendering();
-        let c = ctx();
         let mut since: smallvec::SmallVec<[(u64, u64); 8]> = smallvec::SmallVec::new();
         for (buf, r) in &regions {
             let (a, b) = (r.dst_offset, r.dst_offset + r.size);
@@ -4986,7 +4980,7 @@ impl Renderer {
                 since.clear();
             }
             since.push((a, b));
-            unsafe { c.device.cmd_copy_buffer(self.cmd, *buf, self.ring.buffer, std::slice::from_ref(r)) };
+            unsafe { REC.cmd_copy_buffer(self.cmd, *buf, self.ring.buffer, std::slice::from_ref(r)) };
         }
         unordered!(self);
         self.mark(|| "pending-write forwards".into());
@@ -5169,7 +5163,7 @@ impl Renderer {
                     image_offset: vk::Offset3D::default(),
                     image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
                 };
-                unsafe { ctx().device.cmd_copy_image_to_buffer(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, self.dring.buffer, &[region]) };
+                unsafe { REC.cmd_copy_image_to_buffer(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, self.dring.buffer, &[region]) };
                 match self.gpu_remap(&key, true, lin_off) {
                     Ok(true) => {
                         // (Mirror tiling registered its write-back itself.)
@@ -5210,7 +5204,7 @@ impl Renderer {
                 image_offset: vk::Offset3D::default(),
                 image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
             };
-            unsafe { ctx().device.cmd_copy_image_to_buffer(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
+            unsafe { REC.cmd_copy_image_to_buffer(self.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
             self.flush_for(1);
             let t0 = std::time::Instant::now();
             let lin = unsafe { std::slice::from_raw_parts(self.ring.ptr.add(off as usize), (lin_slice * key.layers as u64) as usize) };
@@ -5537,7 +5531,7 @@ impl Renderer {
                                 let dev_off = self.dring.alloc(size).ok_or("device ring full")?;
                                 self.end_rendering();
                                 global_barrier(self.cmd);
-                                unsafe { ctx().device.cmd_copy_buffer(self.cmd, zbuf, self.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: dev_off, size }]) };
+                                unsafe { REC.cmd_copy_buffer(self.cmd, zbuf, self.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: dev_off, size }]) };
                                 unordered!(self);
                                 self.gpu_wb.push((dev_off, zbuf, zoff, size));
                                 self.push_zc_write(base, size);
@@ -5588,13 +5582,13 @@ impl Renderer {
                             // (The guest data as copied now, into a range
                             // nothing used yet: ahead of the batch.)
                             let pro = self.prologue_cmd();
-                            unsafe { ctx().device.cmd_copy_buffer(pro, self.ring.buffer, self.dring.buffer, &[region]) };
+                            unsafe { REC.cmd_copy_buffer(pro, self.ring.buffer, self.dring.buffer, &[region]) };
                         } else {
                             self.end_rendering();
                             if forwarded {
                                 global_barrier(self.cmd);
                             }
-                            unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
+                            unsafe { REC.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[region]) };
                             unordered!(self);
                         }
                         self.push_writeback(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
@@ -6140,14 +6134,13 @@ impl Renderer {
             *self.write_gen.entry(d.key).or_default() += 1;
         }
         phase!(6);
-        let c = ctx();
         let cmd = self.cmd;
         unsafe {
             if pipeline != self.bound_gfx {
-                c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
+                REC.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 self.bound_gfx = pipeline;
             }
-            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
+            REC.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::GRAPHICS, layout, 0, &[set], &[]);
             self.set_dynamic_state(regs, extent, prim, depth.is_some());
             // Depth/stencil clears requested through DB_RENDER_CONTROL.
             let rc = regs.ctx(0xA000);
@@ -6166,7 +6159,7 @@ impl Renderer {
                         clear_value: vk::ClearValue { depth_stencil: vk::ClearDepthStencilValue { depth: f32r(regs.ctx(0xA00B)), stencil: regs.ctx(0xA00A) & 0xFF } },
                     };
                     let cr = vk::ClearRect { rect: vk::Rect2D { offset: vk::Offset2D::default(), extent: vk::Extent2D { width: extent.0, height: extent.1 } }, base_array_layer: 0, layer_count: 1 };
-                    c.device.cmd_clear_attachments(cmd, &[ca], &[cr]);
+                    REC.cmd_clear_attachments(cmd, &[ca], &[cr]);
                 }
                 if colors.iter().all(|c| c.is_none()) {
                     self.draws += 1;
@@ -6177,20 +6170,20 @@ impl Renderer {
             let instances = cp.num_instances.max(1);
             match indexed {
                 // One vertex per patch (PrimitiveId selects its factors and LDS).
-                _ if tess.is_some() => c.device.cmd_draw(cmd, tess.as_ref().map_or(0, |t| t.patches), 1, 0, 0),
+                _ if tess.is_some() => REC.cmd_draw(cmd, tess.as_ref().map_or(0, |t| t.patches), 1, 0, 0),
                 Some((buf, off, ty)) => {
-                    c.device.cmd_bind_index_buffer(cmd, buf, off, ty);
+                    REC.cmd_bind_index_buffer(cmd, buf, off, ty);
                     match indirect_slot {
-                        Some(slot) => c.device.cmd_draw_indexed_indirect(cmd, self.dring.buffer, slot, 1, 20),
+                        Some(slot) => REC.cmd_draw_indexed_indirect(cmd, self.dring.buffer, slot, 1, 20),
                         None => {
                             let base_vertex = regs.ctx(0xA102) as i32;
-                            c.device.cmd_draw_indexed(cmd, count, instances, 0, base_vertex, 0);
+                            REC.cmd_draw_indexed(cmd, count, instances, 0, base_vertex, 0);
                         }
                     }
                 }
                 None => match indirect_slot {
-                    Some(slot) => c.device.cmd_draw_indirect(cmd, self.dring.buffer, slot, 1, 16),
-                    None => c.device.cmd_draw(cmd, count, instances, 0, 0),
+                    Some(slot) => REC.cmd_draw_indirect(cmd, self.dring.buffer, slot, 1, 16),
+                    None => REC.cmd_draw(cmd, count, instances, 0, 0),
                 },
             }
         }
@@ -6412,7 +6405,7 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: k.width, height: k.height, depth: 1 },
         };
-        unsafe { ctx().device.cmd_copy_image_to_buffer(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
         self.flush();
         let raw = unsafe { std::slice::from_raw_parts(self.ring.ptr.add(off as usize) as *const f32, (size / 4) as usize) };
         static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -6474,7 +6467,7 @@ impl Renderer {
                 ri = ri.stencil_attachment(d);
             }
         }
-        unsafe { ctx().device.cmd_begin_rendering(self.cmd, &ri) };
+        unsafe { REC.cmd_begin_rendering(self.cmd, &ri) };
         self.rendering = Some(Rendering { colors: colors.iter().copied().collect(), depth, extent });
         Ok(())
     }
@@ -6580,74 +6573,73 @@ impl Renderer {
         if o == Some(n) {
             return;
         }
-        let c = ctx();
         let cmd = self.cmd;
         unsafe {
             if o.is_none() {
                 // Fixed for every draw.
-                c.device.cmd_set_rasterizer_discard_enable(cmd, false);
-                c.device.cmd_set_line_width(cmd, 1.0);
+                REC.cmd_set_rasterizer_discard_enable(cmd, false);
+                REC.cmd_set_line_width(cmd, 1.0);
             }
             if o.is_none_or(|o| o.viewport != n.viewport) {
-                c.device.cmd_set_viewport(cmd, 0, &[vp]);
+                REC.cmd_set_viewport(cmd, 0, &[vp]);
             }
             if o.is_none_or(|o| o.scissor != n.scissor) {
                 let sc = vk::Rect2D { offset: vk::Offset2D { x: n.scissor[0], y: n.scissor[1] }, extent: vk::Extent2D { width: n.scissor[2] as u32, height: n.scissor[3] as u32 } };
-                c.device.cmd_set_scissor(cmd, 0, &[sc]);
+                REC.cmd_set_scissor(cmd, 0, &[sc]);
             }
             if o.is_none_or(|o| o.cull != n.cull) {
-                c.device.cmd_set_cull_mode(cmd, cull);
+                REC.cmd_set_cull_mode(cmd, cull);
             }
             if o.is_none_or(|o| o.front_cw != n.front_cw) {
-                c.device.cmd_set_front_face(cmd, if n.front_cw { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE });
+                REC.cmd_set_front_face(cmd, if n.front_cw { vk::FrontFace::CLOCKWISE } else { vk::FrontFace::COUNTER_CLOCKWISE });
             }
             if o.is_none_or(|o| o.topology != n.topology) {
-                c.device.cmd_set_primitive_topology(cmd, topo);
+                REC.cmd_set_primitive_topology(cmd, topo);
             }
             if o.is_none_or(|o| o.restart != n.restart) {
-                c.device.cmd_set_primitive_restart_enable(cmd, n.restart);
+                REC.cmd_set_primitive_restart_enable(cmd, n.restart);
             }
             if o.is_none_or(|o| o.depth_test != n.depth_test) {
-                c.device.cmd_set_depth_test_enable(cmd, n.depth_test);
+                REC.cmd_set_depth_test_enable(cmd, n.depth_test);
             }
             if o.is_none_or(|o| o.depth_write != n.depth_write) {
-                c.device.cmd_set_depth_write_enable(cmd, n.depth_write);
+                REC.cmd_set_depth_write_enable(cmd, n.depth_write);
             }
             if o.is_none_or(|o| o.depth_op != n.depth_op) {
-                c.device.cmd_set_depth_compare_op(cmd, vk::CompareOp::from_raw(n.depth_op));
+                REC.cmd_set_depth_compare_op(cmd, vk::CompareOp::from_raw(n.depth_op));
             }
             if o.is_none_or(|o| o.bounds_test != n.bounds_test) {
-                c.device.cmd_set_depth_bounds_test_enable(cmd, n.bounds_test);
+                REC.cmd_set_depth_bounds_test_enable(cmd, n.bounds_test);
             }
             if n.bounds_test && o.is_none_or(|o| o.bounds != n.bounds || !o.bounds_test) {
-                c.device.cmd_set_depth_bounds(cmd, blo, bhi);
+                REC.cmd_set_depth_bounds(cmd, blo, bhi);
             }
             if o.is_none_or(|o| o.stencil_test != n.stencil_test) {
-                c.device.cmd_set_stencil_test_enable(cmd, n.stencil_test);
+                REC.cmd_set_stencil_test_enable(cmd, n.stencil_test);
             }
             for (i, face) in [vk::StencilFaceFlags::FRONT, vk::StencilFaceFlags::BACK].into_iter().enumerate() {
                 if o.is_none_or(|o| o.stencil_ops[i] != n.stencil_ops[i]) {
                     let p = n.stencil_ops[i];
-                    c.device.cmd_set_stencil_op(cmd, face, vk::StencilOp::from_raw(p[0]), vk::StencilOp::from_raw(p[1]), vk::StencilOp::from_raw(p[2]), vk::CompareOp::from_raw(p[3]));
+                    REC.cmd_set_stencil_op(cmd, face, vk::StencilOp::from_raw(p[0]), vk::StencilOp::from_raw(p[1]), vk::StencilOp::from_raw(p[2]), vk::CompareOp::from_raw(p[3]));
                 }
                 if o.is_none_or(|o| o.stencil_ref[i] != n.stencil_ref[i]) {
-                    c.device.cmd_set_stencil_reference(cmd, face, n.stencil_ref[i]);
+                    REC.cmd_set_stencil_reference(cmd, face, n.stencil_ref[i]);
                 }
                 if o.is_none_or(|o| o.stencil_compare[i] != n.stencil_compare[i]) {
-                    c.device.cmd_set_stencil_compare_mask(cmd, face, n.stencil_compare[i]);
+                    REC.cmd_set_stencil_compare_mask(cmd, face, n.stencil_compare[i]);
                 }
                 if o.is_none_or(|o| o.stencil_write[i] != n.stencil_write[i]) {
-                    c.device.cmd_set_stencil_write_mask(cmd, face, n.stencil_write[i]);
+                    REC.cmd_set_stencil_write_mask(cmd, face, n.stencil_write[i]);
                 }
             }
             if o.is_none_or(|o| o.bias_enable != n.bias_enable) {
-                c.device.cmd_set_depth_bias_enable(cmd, n.bias_enable);
+                REC.cmd_set_depth_bias_enable(cmd, n.bias_enable);
             }
             if n.bias_enable && o.is_none_or(|o| o.bias != n.bias || !o.bias_enable) {
-                c.device.cmd_set_depth_bias(cmd, bias[0], bias[1], bias[2]);
+                REC.cmd_set_depth_bias(cmd, bias[0], bias[1], bias[2]);
             }
             if o.is_none_or(|o| o.blend_constants != n.blend_constants) {
-                c.device.cmd_set_blend_constants(cmd, &n.blend_constants.map(f32::from_bits));
+                REC.cmd_set_blend_constants(cmd, &n.blend_constants.map(f32::from_bits));
             }
         }
         self.dyn_state = Some(n);
@@ -6900,11 +6892,10 @@ impl Renderer {
         let (set, _) = self.descriptors_with_retry(set_layout, &[p])?;
         self.end_rendering();
         global_barrier(self.cmd);
-        let c = ctx();
         unsafe {
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
-            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-            c.device.cmd_dispatch(self.cmd, groups, 1, 1);
+            REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
+            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            REC.cmd_dispatch(self.cmd, groups, 1, 1);
         }
         self.mark(|| format!("{} {:#x}", if p.tess == TessRole::Ls { "ls" } else { "hs" }, p.addr));
         unordered!(self);
@@ -7095,21 +7086,20 @@ impl Renderer {
             self.cur_access = acc;
             self.hz_unknown |= self.cur_unknown;
         }
-        let c = ctx();
         let regs = &cp.regs;
         let (sx, sy, sz) = (regs.sh(0x2E04), regs.sh(0x2E05), regs.sh(0x2E06));
         unsafe {
             if pipeline != self.bound_cs {
-                c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.bound_cs = pipeline;
             }
-            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             if let Some(slot) = args_slot {
-                c.device.cmd_dispatch_indirect(self.cmd, self.dring.buffer, slot);
+                REC.cmd_dispatch_indirect(self.cmd, self.dring.buffer, slot);
             } else if sx | sy | sz != 0 {
-                c.device.cmd_dispatch_base(self.cmd, sx, sy, sz, x.saturating_sub(sx), y.saturating_sub(sy), z.saturating_sub(sz));
+                REC.cmd_dispatch_base(self.cmd, sx, sy, sz, x.saturating_sub(sx), y.saturating_sub(sy), z.saturating_sub(sz));
             } else {
-                c.device.cmd_dispatch(self.cmd, x, y, z);
+                REC.cmd_dispatch(self.cmd, x, y, z);
             }
         }
         self.mark(|| format!("cs {:#x}", cs.addr));
@@ -7253,13 +7243,13 @@ impl Renderer {
             let per_layer = lin_sizes[i] / layers as u64;
             unsafe {
                 c.device.update_descriptor_sets(&writes, &[]);
-                c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, detile); self.bound_cs = vk::Pipeline::null();
-                c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, detile); self.bound_cs = vk::Pipeline::null();
+                REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
                 for s in 0..layers as u64 {
                     let pc = [n as u32, bpp / 32, ((l.offset + s * l.slice_bytes) / 4) as u32, ((lin_at + s * per_layer) / 4) as u32];
                     let pcb: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
-                    c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pcb);
-                    c.device.cmd_dispatch(self.cmd, (n as u32).div_ceil(64), 1, 1);
+                    REC.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pcb);
+                    REC.cmd_dispatch(self.cmd, (n as u32).div_ceil(64), 1, 1);
                 }
             }
             lin_at += lin_sizes[i];
@@ -7287,7 +7277,7 @@ impl Renderer {
             });
             pos += lin_sizes[i];
         }
-        unsafe { c.device.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions) };
+        unsafe { REC.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions) };
         unordered!(self);
         self.uploads += 1;
         self.gpu_tex_uploads += 1;
@@ -7330,7 +7320,7 @@ impl Renderer {
                 });
                 pos += l.width as u64 * l.height as u64 * eb * layers as u64;
             }
-            unsafe { ctx().device.cmd_copy_image_to_buffer(self.cmd, image, vk::ImageLayout::GENERAL, self.ring.buffer, &regions) };
+            unsafe { REC.cmd_copy_image_to_buffer(self.cmd, image, vk::ImageLayout::GENERAL, self.ring.buffer, &regions) };
             let ring_ptr = self.ring.ptr;
             self.flush();
             let gpu = unsafe { std::slice::from_raw_parts(ring_ptr.add(host as usize), total as usize) };
@@ -7396,7 +7386,7 @@ impl Renderer {
         }
         self.end_rendering();
         global_barrier(self.cmd);
-        unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[vk::BufferCopy { src_offset: up, dst_offset: dev, size }]) };
+        unsafe { REC.cmd_copy_buffer(self.cmd, self.ring.buffer, self.dring.buffer, &[vk::BufferCopy { src_offset: up, dst_offset: dev, size }]) };
         unordered!(self);
         Ok(Some((self.dring.buffer, dev)))
     }
@@ -7505,9 +7495,8 @@ impl Renderer {
     /// bitmap: their marked pages (device -> host ring) and the bitmaps.
     fn record_dirty_copies(&mut self, pending: &[PendingWrite]) -> Result<(), String> {
         let (_, layout, pipeline, _) = self.dirty_pipe()?;
-        let c = ctx();
         let mut bitmaps = Vec::new();
-        unsafe { c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline) };
+        unsafe { REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline) };
         self.bound_cs = vk::Pipeline::null();
         for p in pending {
             let Some((bits, bits_host, words)) = p.bits else { continue };
@@ -7517,14 +7506,14 @@ impl Renderer {
             let pc = [pages, head as u32, p.size as u32, (p.dev_off / 4) as u32, (p.host_off / 4) as u32, (bits / 4) as u32];
             let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
             unsafe {
-                c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-                c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-                c.device.cmd_dispatch(self.cmd, pages, 1, 1);
+                REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                REC.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+                REC.cmd_dispatch(self.cmd, pages, 1, 1);
             }
             bitmaps.push(vk::BufferCopy { src_offset: bits, dst_offset: bits_host, size: words as u64 * 4 });
         }
         if !bitmaps.is_empty() {
-            unsafe { c.device.cmd_copy_buffer(self.cmd, self.dring.buffer, self.ring.buffer, &bitmaps) };
+            unsafe { REC.cmd_copy_buffer(self.cmd, self.dring.buffer, self.ring.buffer, &bitmaps) };
         }
         self.bound_gfx = vk::Pipeline::null();
         Ok(())
@@ -7617,10 +7606,10 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
-            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-            c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-            c.device.cmd_dispatch(self.cmd, 1, 1, 1);
+            REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
+            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            REC.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            REC.cmd_dispatch(self.cmd, 1, 1, 1);
         }
         unordered!(self);
         // (Read in place: CP writes of the arguments wait for this batch.)
@@ -7740,10 +7729,10 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
-            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-            c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-            c.device.cmd_dispatch(self.cmd, 1, 1, 1);
+            REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.bound_cs = vk::Pipeline::null();
+            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            REC.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            REC.cmd_dispatch(self.cmd, 1, 1, 1);
         }
         global_barrier(self.cmd);
         self.mark(|| "indirect draw arguments".into());
@@ -7826,7 +7815,7 @@ impl Renderer {
                 (sb, 0)
             }
         };
-        unsafe { ctx().device.cmd_copy_buffer(self.cmd, src, buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: 0, size: bytes.len() as u64 }]) };
+        unsafe { REC.cmd_copy_buffer(self.cmd, src, buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: 0, size: bytes.len() as u64 }]) };
         global_barrier(self.cmd);
         self.tile_maps.insert(mk, (buf, n));
         self.tile_map_bytes += bytes.len() as u64;
@@ -7886,7 +7875,7 @@ impl Renderer {
             // Surface padding (tiled elements outside the image) keeps its
             // guest contents.
             if n * (bpp / 8) as u64 > lin_slice {
-                unsafe { ctx().device.cmd_copy_buffer(self.cmd, zbuf, self.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: o, size: total }]) };
+                unsafe { REC.cmd_copy_buffer(self.cmd, zbuf, self.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: o, size: total }]) };
                 global_barrier(self.cmd);
             }
             Some(o)
@@ -7907,18 +7896,18 @@ impl Renderer {
         let c = ctx();
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, if tile { tilep } else { detile }); self.bound_cs = vk::Pipeline::null();
-            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, if tile { tilep } else { detile }); self.bound_cs = vk::Pipeline::null();
+            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             for l in 0..layers {
                 let pc = [n as u32, bpp / 32, (l * slice / 4) as u32, (l * lin_slice / 4) as u32];
                 let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
-                c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-                c.device.cmd_dispatch(self.cmd, (n as u32).div_ceil(64), 1, 1);
+                REC.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+                REC.cmd_dispatch(self.cmd, (n as u32).div_ceil(64), 1, 1);
             }
         }
         global_barrier(self.cmd);
         if let Some(o) = tiled_off {
-            unsafe { c.device.cmd_copy_buffer(self.cmd, self.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: total }]) };
+            unsafe { REC.cmd_copy_buffer(self.cmd, self.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: total }]) };
             global_barrier(self.cmd);
         }
         if mirrored {
@@ -7994,7 +7983,7 @@ impl Renderer {
                         image_offset: vk::Offset3D::default(),
                         image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
                     };
-                    unsafe { ctx().device.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
+                    unsafe { REC.cmd_copy_buffer_to_image(self.cmd, self.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
                     unordered!(self);
                     *self.write_gen.entry(key).or_default() += 1;
                     self.images.get_mut(&key).unwrap().last_write = self.draws + self.dispatches + 1;
@@ -8036,7 +8025,7 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
         };
-        unsafe { ctx().device.cmd_copy_buffer_to_image(self.cmd, self.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
+        unsafe { REC.cmd_copy_buffer_to_image(self.cmd, self.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
         unordered!(self);
         // Shadow copies of the old contents are out of date.
         *self.write_gen.entry(key).or_default() += 1;
@@ -8131,7 +8120,6 @@ impl Renderer {
             if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
                 crate::info!("metadata of {:#x} ({}) written: {:#x}+{:#x} sample {:08x?}", key.base, if slot.is_some() { "CMASK" } else { "HTILE" }, mbase, msize, &words[..4.min(words.len())]);
             }
-            let c = ctx();
             let img = self.images[&key].image;
             match slot {
                 None => {
@@ -8155,7 +8143,7 @@ impl Renderer {
                     self.end_rendering();
                     global_barrier(self.cmd);
                     let range = vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: key.layers };
-                    unsafe { c.device.cmd_clear_depth_stencil_image(self.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
+                    unsafe { REC.cmd_clear_depth_stencil_image(self.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
                     unordered!(self);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -8178,7 +8166,7 @@ impl Renderer {
                     self.end_rendering();
                     global_barrier(self.cmd);
                     let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: key.layers };
-                    unsafe { c.device.cmd_clear_color_image(self.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
+                    unsafe { REC.cmd_clear_color_image(self.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
                     unordered!(self);
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
@@ -8314,18 +8302,18 @@ impl Renderer {
         global_barrier(self.cmd);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, probe); self.bound_cs = vk::Pipeline::null();
-            c.device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
-            c.device.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
-            c.device.cmd_dispatch(self.cmd, 1, 1, 1);
+            REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, probe); self.bound_cs = vk::Pipeline::null();
+            REC.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+            REC.cmd_push_constants(self.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            REC.cmd_dispatch(self.cmd, 1, 1, 1);
         }
         // (The predicates: visible to the expand kernel and to conditional
         // rendering; the probe's reads precede the expanded state's writes.)
         global_barrier(self.cmd);
         unsafe {
             // (Same layout: the set and push constants stay bound.)
-            c.device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, expand); self.bound_cs = vk::Pipeline::null();
-            c.device.cmd_dispatch(self.cmd, n.div_ceil(64), 1, 1);
+            REC.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, expand); self.bound_cs = vk::Pipeline::null();
+            REC.cmd_dispatch(self.cmd, n.div_ceil(64), 1, 1);
         }
         // The clears, each gated by its predicate.
         let extent = (key.width, key.height);
@@ -8345,12 +8333,13 @@ impl Renderer {
             }
         }
         for (off, ca) in clears {
-            let info = vk::ConditionalRenderingBeginInfoEXT::default().buffer(self.dring.buffer).offset(pred + off);
-            unsafe {
-                (cond.fp().cmd_begin_conditional_rendering_ext)(self.cmd, &info);
-                c.device.cmd_clear_attachments(self.cmd, &[ca], &[rect]);
-                (cond.fp().cmd_end_conditional_rendering_ext)(self.cmd);
-            }
+            let (cmd, buf, off) = (self.cmd, self.dring.buffer, pred + off);
+            REC.raw(move |d| unsafe {
+                let info = vk::ConditionalRenderingBeginInfoEXT::default().buffer(buf).offset(off);
+                (cond.fp().cmd_begin_conditional_rendering_ext)(cmd, &info);
+                d.cmd_clear_attachments(cmd, &[ca], &[rect]);
+                (cond.fp().cmd_end_conditional_rendering_ext)(cmd);
+            });
         }
         self.end_rendering();
         unordered!(self);
@@ -8401,7 +8390,7 @@ impl Renderer {
                 self.begin();
                 self.end_rendering();
                 global_barrier(self.cmd);
-                unsafe { ctx().device.cmd_fill_buffer(self.cmd, self.gds, o, n, value) };
+                unsafe { REC.cmd_fill_buffer(self.cmd, self.gds, o, n, value) };
             }
             GdsOp::Load { offset, src, bytes } => {
                 let Some((o, n)) = clamp(offset, bytes) else { return Ok(()) };
@@ -8412,7 +8401,7 @@ impl Renderer {
                 self.end_rendering();
                 global_barrier(self.cmd);
                 let region = vk::BufferCopy { src_offset: off, dst_offset: o, size: n };
-                unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.ring.buffer, self.gds, &[region]) };
+                unsafe { REC.cmd_copy_buffer(self.cmd, self.ring.buffer, self.gds, &[region]) };
             }
             GdsOp::Store { offset, dst, bytes } => {
                 let Some((o, n)) = clamp(offset, bytes) else { return Ok(()) };
@@ -8426,7 +8415,7 @@ impl Renderer {
                 if let Some((zbuf, zoff, _)) = self.zc_binding(dst, n).filter(|z| z.2 >= n && in_place) {
                     self.end_rendering();
                     global_barrier(self.cmd);
-                    unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.gds, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: n }]) };
+                    unsafe { REC.cmd_copy_buffer(self.cmd, self.gds, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: n }]) };
                     self.note_inplace_gpu_write(dst, n);
                     unordered!(self);
                     return Ok(());
@@ -8438,7 +8427,7 @@ impl Renderer {
                 self.end_rendering();
                 global_barrier(self.cmd);
                 let region = vk::BufferCopy { src_offset: o, dst_offset: dev_off, size: n };
-                unsafe { ctx().device.cmd_copy_buffer(self.cmd, self.gds, self.dring.buffer, &[region]) };
+                unsafe { REC.cmd_copy_buffer(self.cmd, self.gds, self.dring.buffer, &[region]) };
                 self.push_writeback(PendingWrite { base: dst, size: n, host_off, dev_off, dev_buf: self.dring.buffer, mirror: false, bits: None });
                 self.writes.note_gpu_write(dst, n);
                 self.note_pending_gpu_write(dst, n);
@@ -8740,7 +8729,7 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
         };
-        unsafe { ctx().device.cmd_copy_image_to_buffer(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
         self.flush();
         let mut px = unsafe { std::slice::from_raw_parts(self.ring.ptr.add(off as usize), (w * h * 4) as usize) }.to_vec();
         if matches!(k.format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB) {
@@ -8819,7 +8808,7 @@ impl Renderer {
             image_offset: vk::Offset3D { x: 0, y: 0, z: if k.ty3d { layer as i32 } else { 0 } },
             image_extent: vk::Extent3D { width: k.width, height: k.height, depth: 1 },
         };
-        unsafe { ctx().device.cmd_copy_image_to_buffer(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.ring.buffer, &[region]) };
         self.flush();
         let raw = unsafe { std::slice::from_raw_parts(self.ring.ptr.add(off as usize), size as usize) }.to_vec();
         let (rgba, stats) = to_viewable(view_fmt, &raw, k.width, k.height);
@@ -9071,6 +9060,9 @@ pub static QUEUE_LOCK_HOLD_NS: [std::sync::atomic::AtomicU64; 64] = [const { std
 pub static QUEUE_WAIT_REG_NS: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
 
 /// The renderer lock taken for queue `q`, timed (see `QUEUE_LOCK_WAIT_NS`).
+/// The graphics CP is waiting for the renderer lock (`tune lock_fair 3`).
+static GFX_LOCK_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 struct TimedRenderer {
     g: std::mem::ManuallyDrop<parking_lot::MutexGuard<'static, Option<Renderer>>>,
     q: usize,
@@ -9080,7 +9072,19 @@ struct TimedRenderer {
 impl TimedRenderer {
     fn lock(q: usize) -> TimedRenderer {
         let t0 = std::time::Instant::now();
+        // (`tune lock_fair 3`: the graphics CP, the frame's critical path,
+        // goes first while it waits.)
+        if q == 0 {
+            GFX_LOCK_WAITING.store(true, std::sync::atomic::Ordering::Relaxed);
+        } else if crate::tune::get(crate::tune::LOCK_FAIR) == 3 {
+            while GFX_LOCK_WAITING.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::yield_now();
+            }
+        }
         let g = RENDERER.lock();
+        if q == 0 {
+            GFX_LOCK_WAITING.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
         let since = std::time::Instant::now();
         QUEUE_LOCK_WAIT_NS[q & 63].fetch_add((since - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         TimedRenderer { g: std::mem::ManuallyDrop::new(g), q, since }
@@ -9092,8 +9096,10 @@ impl Drop for TimedRenderer {
         QUEUE_LOCK_HOLD_NS[self.q & 63].fetch_add(self.since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         // SAFETY: `g` is not used after this.
         let g = unsafe { std::mem::ManuallyDrop::take(&mut self.g) };
-        // (`tune lock_fair`: the graphics CP lets a waiting compute CP in.)
-        if self.q == 0 && crate::tune::get(crate::tune::LOCK_FAIR) != 0 {
+        // (`tune lock_fair`: 1, the graphics CP lets a waiting compute CP in;
+        // 2-3, the compute CPs let a waiting graphics CP in.)
+        let fair = crate::tune::get(crate::tune::LOCK_FAIR);
+        if (self.q == 0 && fair == 1) || (self.q != 0 && fair >= 2) {
             parking_lot::MutexGuard::unlock_fair(g);
         } else {
             drop(g);

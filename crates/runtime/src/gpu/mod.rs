@@ -5,6 +5,7 @@ pub mod cpuwatch;
 pub mod desc;
 pub mod lazywb;
 pub mod pm4;
+pub mod rec;
 pub mod render;
 pub mod resources;
 pub mod shaders;
@@ -920,7 +921,13 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                     (d.iter().any(|&v| v > 0)).then(|| format!("{} lock wait {} hold {} wait-reg {}", if q == 0 { "gfx".to_string() } else { format!("q{q}") }, d[0], d[1], d[2]))
                 })
                 .collect();
-            crate::info!("queues/s (ms): {}", qs.join("; "));
+            // (Deferred recording: the recorder thread's operations, its time
+            // in them, and how often it had to be woken.)
+            static LAST_REC: Mutex<(u64, u64, u64)> = Mutex::new((0, 0, 0));
+            let r = (rec::OPS.load(Ordering::Relaxed), rec::BUSY_NS.load(Ordering::Relaxed), rec::WAKES.load(Ordering::Relaxed));
+            let pr = std::mem::replace(&mut *LAST_REC.lock(), r);
+            let recorder = if r.0 > pr.0 { format!("; recorder {} ops, busy {} ms, woken {}x", r.0 - pr.0, (r.1 - pr.1) / 1_000_000, r.2 - pr.2) } else { String::new() };
+            crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
         }
         let mut fills: Vec<((u64, u64, &'static str), (u64, u64))> = render::VCACHE_FILL_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
         if !fills.is_empty() {
