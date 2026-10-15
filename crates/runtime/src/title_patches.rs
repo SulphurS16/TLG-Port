@@ -269,10 +269,14 @@ pub fn add_camera_turn(yaw: f32, pitch: f32) -> bool {
 /// ("RestartStageFromMenu", "LoadCheckPoint", "=====RESTART=====") or a
 /// load (`in_menu`).
 static TITLE: AtomicBool = AtomicBool::new(true);
+/// The title screen's marker was seen since boot (before it, loads do not
+/// end the title context: boot loads before the logos).
+static TITLE_SHOWN: AtomicBool = AtomicBool::new(false);
 
 /// Notes the title screen's script markers in a print's text.
 fn note_script(text: &str) {
     if text.starts_with("Change Clut : titleScreen") {
+        TITLE_SHOWN.store(true, Ordering::Relaxed);
         if !TITLE.swap(true, Ordering::Relaxed) {
             crate::info!("input: the title screen shows");
         }
@@ -305,7 +309,7 @@ pub fn in_menu() -> Option<bool> {
         }
         if flip >= seen.2 + 3 { now - seen.1 } else { 0.0 }
     };
-    if still_ms > 3000.0 && TITLE.swap(false, Ordering::Relaxed) {
+    if still_ms > 3000.0 && TITLE_SHOWN.load(Ordering::Relaxed) && TITLE.swap(false, Ordering::Relaxed) {
         crate::info!("input: the title screen ended (a load)");
     }
     Some(TITLE.load(Ordering::Relaxed) || still_ms > 500.0)
