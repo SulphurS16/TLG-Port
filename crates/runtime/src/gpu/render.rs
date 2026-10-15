@@ -7148,7 +7148,7 @@ impl Renderer {
                 self.trace_timing("draw");
             }
             if let Some(p) = &ps {
-                self.dump_after(p.addr, &colors, depth);
+                self.dump_after(p, &colors, depth);
             }
             // TLG_TRACE_DEPTH=<threshold, default 0.985>: how much of the depth
             // target is nearer than the threshold after each draw of the
@@ -9779,7 +9779,11 @@ impl Renderer {
             vk::Format::D16_UNORM => (2, vk::ImageAspectFlags::DEPTH, vk::Format::R16_UNORM),
             f => match format_class(f) {
                 c @ (1 | 2 | 4 | 8 | 16) => (c, vk::ImageAspectFlags::COLOR, f),
-                _ => return,
+                // (Formats outside the compatibility classes.)
+                _ => match f {
+                    vk::Format::R16G16_SNORM | vk::Format::R16G16_SINT => (4, vk::ImageAspectFlags::COLOR, f),
+                    _ => return,
+                },
             },
         };
         let size = (k.width * k.height * texel) as u64;
@@ -9812,7 +9816,8 @@ impl Renderer {
 
     /// Frame trace with `TLG_DUMP_AFTER=<ps addrs>`: dumps the color targets of
     /// draws using one of the listed pixel shaders right after the draw.
-    fn dump_after(&mut self, ps: u64, colors: &[Option<Attachment>], depth: Option<Attachment>) {
+    fn dump_after(&mut self, p: &Prepared, colors: &[Option<Attachment>], depth: Option<Attachment>) {
+        let ps = p.addr;
         let n = {
             let mut d = DUMP_AFTER.lock();
             let d = d.get_or_insert_with(|| {
@@ -9829,8 +9834,22 @@ impl Renderer {
         let Some(dir) = super::shader_dump::DIR.get().and_then(|d| d.parent()).map(|d| d.join("after")) else { return };
         let _ = std::fs::create_dir_all(&dir);
         self.end_rendering();
+        let mut done: Vec<ImageKey> = Vec::new();
         for a in colors.iter().flatten().chain(depth.iter()) {
             self.dump_image(&dir, a.key, 0, &format!("{n:03}_ps{ps:x}_"));
+            done.push(a.key);
+        }
+        // The GPU-written images at the bases the shader samples ("tex" in
+        // the names).
+        for r in &p.resources {
+            let ResolvedRes::Image(t) = r else { continue };
+            let keys: Vec<ImageKey> = self.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| self.images[k].gpu_written).collect()).unwrap_or_default();
+            for k in keys {
+                if !done.contains(&k) {
+                    done.push(k);
+                    self.dump_image(&dir, k, 0, &format!("{n:03}_ps{ps:x}_tex_"));
+                }
+            }
         }
     }
 }
@@ -9906,6 +9925,14 @@ fn to_viewable(f: vk::Format, raw: &[u8], w: u32, h: u32) -> (Option<Vec<u8>>, S
         })),
         F::R16G16_SFLOAT => chans.extend(raw.chunks_exact(4).map(|p| {
             let g = |i: usize| half(u16::from_le_bytes([p[i], p[i + 1]]));
+            [g(0), g(2), 0.0, 1.0]
+        })),
+        F::R16G16_SNORM => chans.extend(raw.chunks_exact(4).map(|p| {
+            let g = |i: usize| (i16::from_le_bytes([p[i], p[i + 1]]) as f32 / 32767.0).max(-1.0);
+            [g(0), g(2), 0.0, 1.0]
+        })),
+        F::R16G16_UNORM => chans.extend(raw.chunks_exact(4).map(|p| {
+            let g = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]) as f32 / 65535.0;
             [g(0), g(2), 0.0, 1.0]
         })),
         F::R16_SFLOAT => chans.extend(raw.chunks_exact(2).map(|p| {
@@ -10367,6 +10394,9 @@ pub static DEPTH_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::
 pub static SHADOW_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// Debug: image dumps also write the raw texels (control `dumpraw 1`).
 pub static DUMP_RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Debug: shaders whose buffers traces show whole (`TLG_TRACE_FULL`, control
+/// `tracefull`); None until first read.
+pub static TRACE_FULL_ADDRS: Mutex<Option<Vec<u64>>> = Mutex::new(None);
 
 /// "0x1a2b,3c4d" -> addresses.
 pub fn parse_hex_list(v: &str) -> Vec<u64> {
@@ -10426,11 +10456,10 @@ fn stage_res_summary(p: &Prepared) -> Vec<String> {
         Stage::Compute => "cs",
     };
     let ud: Vec<String> = p.sgpr_data.iter().take(16).map(|w| format!("{w:x}")).collect();
-    // TLG_TRACE_FULL=<shader addrs>: whole buffers (up to 256 dwords) of
-    // these shaders' resources in traces.
-    static FULL: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
-    let full = FULL.get_or_init(|| std::env::var("TLG_TRACE_FULL").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default());
-    TRACE_FULL.with(|f| f.set(full.contains(&p.addr)));
+    // TLG_TRACE_FULL=<shader addrs> (or control `tracefull`): whole buffers
+    // (up to 256 dwords) of these shaders' resources in traces.
+    let full = TRACE_FULL_ADDRS.lock().get_or_insert_with(|| std::env::var("TLG_TRACE_FULL").map(|v| parse_hex_list(&v)).unwrap_or_default()).contains(&p.addr);
+    TRACE_FULL.with(|f| f.set(full));
     let reads: Vec<String> = p.mem_reads.iter().map(|a| format!("{a:x}")).collect();
     let out = std::iter::once(format!("{tag}ud [{}] reads [{}]", ud.join(" "), reads.join(" ")))
         .chain(p.resources.iter().enumerate().map(|(i, r)| {

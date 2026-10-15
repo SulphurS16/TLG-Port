@@ -52,9 +52,17 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
                 let n = PS_INPUT_VGPRS[bit];
                 for k in 0..n {
                     let val = match bit {
-                        8..=11 => {
+                        8..=10 => {
                             let c = e(tr.b.composite_extract(tr.t.f32, None, fcv, [(bit - 8) as u32]))?;
                             tr.to_u(c)?
+                        }
+                        11 => {
+                            // POS_W_FLOAT holds the clip-space w; FragCoord.w
+                            // is its reciprocal.
+                            let c = e(tr.b.composite_extract(tr.t.f32, None, fcv, [3]))?;
+                            let one = tr.f(1.0);
+                            let w = e(tr.b.f_div(tr.t.f32, None, one, c))?;
+                            tr.to_u(w)?
                         }
                         12 => {
                             let f = e(tr.b.load(tr.t.bool_, None, ff, None, []))?;

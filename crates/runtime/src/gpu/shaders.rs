@@ -697,11 +697,13 @@ pub static DEBUG_CAPTURES: Mutex<Option<CaptureSpecs>> = Mutex::new(None);
 
 /// Debug (`TLG_PS_DEBUG` / `psdebug`, syntax of `parse_debug_capture`):
 /// export v[N..N+2] captured after the instruction at `pc` instead of the
-/// shader's outputs (first capture to MRT0, second to MRT1 and beyond).
-fn debug_capture(addr: u64) -> Vec<(u32, u32, bool)> {
+/// shader's outputs (first capture to MRT0, second to MRT1 and beyond). The
+/// shader is named by its address or by its key without captures (the hash
+/// in its dump's .spv name, stable across runs).
+fn debug_capture(addr: u64, base_key: u64) -> Vec<(u32, u32, bool)> {
     let mut g = DEBUG_CAPTURES.lock();
     let specs = g.get_or_insert_with(|| std::env::var("TLG_PS_DEBUG").map(|v| parse_debug_capture(&v)).unwrap_or_default());
-    specs.iter().find(|(a, _)| *a == addr).map(|(_, c)| c.clone()).unwrap_or_default()
+    specs.iter().find(|(a, _)| *a == addr || *a == base_key).map(|(_, c)| c.clone()).unwrap_or_default()
 }
 
 /// TLG_VS_CAPTURE=<pc>:v<N>,... (with TLG_VS_POS): registers of the debugged
@@ -943,7 +945,8 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         resources: specs,
         buffer_strides: strides,
         binding_base: if sr.stage == Stage::Fragment { PS_BINDING_BASE } else { 0 },
-        debug_capture: if sr.stage == Stage::Vertex && debug_vs_pos(addr) { debug_vs_capture() } else { debug_capture(addr) },
+        // (Set below, once the rest of the key is known.)
+        debug_capture: Vec::new(),
     };
     match sr.stage {
         Stage::Fragment => {
@@ -993,11 +996,17 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
             }
         }
     }
-    let key_hash = {
+    let hash_spec = |spec: &Spec| {
         let mut h = super::render::FxHasher::default();
         spec.hash(&mut h);
         h.finish()
     };
+    // The key without debug captures names the translation in shader dumps
+    // (`<stage>_<addr>_<key>.spv`): the same in every run, while the address
+    // may differ, so captures can name a shader by it.
+    let base_key = hash_spec(&spec);
+    spec.debug_capture = if sr.stage == Stage::Vertex && debug_vs_pos(addr) { debug_vs_capture() } else { debug_capture(addr, base_key) };
+    let key_hash = if spec.debug_capture.is_empty() { base_key } else { hash_spec(&spec) };
     let translated = {
         let mut g = CACHE.lock();
         let map = g.get_or_insert_with(FastMap::default);
@@ -1006,6 +1015,16 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
             None => {
                 super::shader_dump::dump(stage_name, addr, &user);
                 let out = translate::translate(code, plan, &spec).map_err(|e| format!("{:?} shader {addr:#x}: {e}", sr.stage))?;
+                if !spec.debug_capture.is_empty() {
+                    crate::info!("{:?} shader {addr:#x} (key {base_key:016x}): translated with debug captures {:x?}", sr.stage, spec.debug_capture);
+                }
+                // Pixel shaders with the clip-space w as an input (POS_W_FLOAT).
+                if sr.stage == Stage::Fragment && spec.ps_input_addr & 0x800 != 0 {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 64 {
+                        crate::info!("Fragment shader {addr:#x} (key {base_key:016x}): input POS_W_FLOAT (ps input addr {:#x})", spec.ps_input_addr);
+                    }
+                }
                 for w in &out.warnings {
                     crate::warn!("{:?} shader {addr:#x}: {w}", sr.stage);
                 }

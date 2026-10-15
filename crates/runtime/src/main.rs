@@ -408,6 +408,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 *gpu::render::SKIP_CS.lock() = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
                 Ok(())
             }
+            "tracefull" => {
+                // tracefull <shader,...>: traces show these shaders' buffers whole.
+                *gpu::render::TRACE_FULL_ADDRS.lock() = Some(gpu::render::parse_hex_list(parts.next().unwrap_or("")));
+                Ok(())
+            }
             "dumpraw" => {
                 // dumpraw 1|0: image dumps also write the raw texels (.bin).
                 gpu::render::DUMP_RAW.store(parts.next() == Some("1"), std::sync::atomic::Ordering::Relaxed);
