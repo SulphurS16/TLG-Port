@@ -828,53 +828,83 @@ fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MA
 /// Mixes `src` (`src_ch` channels) of voice `vh` along its patches into the
 /// destination voices' input buses.
 fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
+    let src_ch = src_ch.min(MAX_CH);
     let Some(v) = s.voices.get(&vh) else { return };
-    let patches = v.patches.clone();
-    let vol = v.port_volume;
-    let pm = v.port_matrix;
-    let matrices: Vec<(i32, Vec<f32>)> = patches.iter().filter_map(|p| v.matrices.get(&pm[p.port as usize & 3]).map(|m| (pm[p.port as usize & 3], m.clone()))).collect();
-    for p in patches {
+    // Each patch's destination, its channels, the port's gain and level
+    // matrix (rows per destination channel), before the destinations are
+    // borrowed for mixing.
+    let mut jobs: Vec<(u64, usize, f32, Option<[[f32; MAX_CH]; MAX_CH]>)> = Vec::with_capacity(v.patches.len());
+    for p in &v.patches {
         // The title patches to rack handles of one-voice racks (mastering,
         // submixers): their first voice.
         let dest = if s.voices.contains_key(&p.dest) { p.dest } else { match s.racks.get(&p.dest).and_then(|r| r.voices.first().copied()) { Some(v) => v, None => continue } };
-        let Some(d) = s.voices.get_mut(&dest) else { continue };
+        let Some(d) = s.voices.get(&dest) else { continue };
         if d.kind == Kind::Sampler {
             continue;
         }
         let dch = (d.channels as usize).clamp(1, MAX_CH);
+        let port = p.port as usize & 3;
+        // Levels per destination channel, source channels inner (aLevel[dst * src_ch + src]).
+        let rows = v.matrices.get(&v.port_matrix[port]).filter(|m| m.len() >= src_ch * dch).map(|m| {
+            let mut rows = [[0f32; MAX_CH]; MAX_CH];
+            for (oc, row) in rows.iter_mut().enumerate().take(dch) {
+                row[..src_ch].copy_from_slice(&m[oc * src_ch..oc * src_ch + src_ch]);
+            }
+            rows
+        });
+        jobs.push((dest, dch, v.port_volume[port], rows));
+    }
+    for (dest, dch, g, rows) in jobs {
+        let Some(d) = s.voices.get_mut(&dest) else { continue };
         if d.input.len() < src.len() {
             d.input.resize(src.len(), [0.0; MAX_CH]);
         }
-        let g = vol[p.port as usize & 3];
-        let mid = pm[p.port as usize & 3];
-        let matrix = matrices.iter().find(|(id, _)| *id == mid).map(|(_, m)| m);
-        for (i, fr) in src.iter().enumerate() {
-            let o = &mut d.input[i];
-            match matrix {
-                // Levels per destination channel, source channels inner (aLevel[dst * src_ch + src]).
-                Some(m) if m.len() >= src_ch * dch => {
-                    for oc in 0..dch {
+        let frames = d.input.iter_mut().zip(src);
+        match &rows {
+            Some(rows) => {
+                for (o, fr) in frames {
+                    for (oc, row) in rows.iter().enumerate().take(dch) {
                         let mut acc = 0.0;
                         for ic in 0..src_ch {
-                            acc += fr[ic] * m[oc * src_ch + ic];
+                            acc += fr[ic] * row[ic];
                         }
                         o[oc] += acc * g;
                     }
                 }
-                _ => {
-                    // No matrix: channel to channel; mono feeds the front pair.
-                    if src_ch == 1 && dch >= 2 {
-                        o[0] += fr[0] * g;
-                        o[1] += fr[0] * g;
-                    } else {
-                        for c in 0..src_ch.min(dch) {
-                            o[c] += fr[c] * g;
-                        }
+            }
+            // No matrix: channel to channel; mono feeds the front pair.
+            None if src_ch == 1 && dch >= 2 => {
+                for (o, fr) in frames {
+                    o[0] += fr[0] * g;
+                    o[1] += fr[0] * g;
+                }
+            }
+            None => {
+                let n = src_ch.min(dch);
+                for (o, fr) in frames {
+                    for c in 0..n {
+                        o[c] += fr[c] * g;
                     }
                 }
             }
         }
     }
+}
+
+/// The largest |x| in the first `ch` channels of `frames` (what folding
+/// `f32::max` gives: NaNs are passed over).
+fn peak_of(frames: &[[f32; MAX_CH]], ch: usize) -> f32 {
+    let ch = ch.min(MAX_CH);
+    let mut m = 0f32;
+    for f in frames {
+        for &x in &f[..ch] {
+            let a = x.abs();
+            if a > m {
+                m = a;
+            }
+        }
+    }
+    m
 }
 
 /// One grain of the system: samplers, then mixing voices in patch order, then
@@ -906,7 +936,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             let v = s.voices.get_mut(vh).unwrap();
             render_sampler(v, grain, rate, &mut buf);
             let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
-            v.peak = buf.iter().flat_map(|f| f[..ch].iter()).fold(0f32, |m, &x| m.max(x.abs()));
+            v.peak = peak_of(&buf, ch);
             v.peak_win = v.peak_win.max(v.peak);
             ch
         };
@@ -938,7 +968,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             let ch = v.channels as usize;
             let mut input = std::mem::take(&mut v.input);
             run_user_fx(v, &mut input, rate);
-            let pk = input.iter().flat_map(|f| f[..ch.clamp(1, MAX_CH)].iter()).fold(0f32, |m, &x| m.max(x.abs()));
+            let pk = peak_of(&input, ch.clamp(1, MAX_CH));
             v.peak_win = v.peak_win.max(pk);
             (input, ch)
         };
@@ -954,7 +984,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
         if v.kind != Kind::Mastering {
             continue;
         }
-        let pk = v.input.iter().take(grain).flat_map(|f| f.iter()).fold(0f32, |m, &x| m.max(x.abs()));
+        let pk = peak_of(&v.input[..v.input.len().min(grain)], MAX_CH);
         if let Some(m) = s.voices.get_mut(vh) {
             m.peak_win = m.peak_win.max(pk);
         }
@@ -1182,4 +1212,29 @@ pub fn register(r: &mut Registry) {
         sceNgs2RackGetVoiceHandle, sceNgs2VoiceControl, sceNgs2VoiceGetStateFlags, sceNgs2VoiceGetState,
         sceNgs2SystemRender,
     ]);
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn peak_matches_folding_max() {
+        let mut frames = vec![[0f32; MAX_CH]; 64];
+        let mut x = 0x1234_5678u32;
+        for f in frames.iter_mut() {
+            for c in f.iter_mut() {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *c = (x as i32) as f32 / 1e9;
+            }
+        }
+        frames[7][2] = f32::NAN;
+        frames[9][0] = -0.0;
+        for ch in 0..=MAX_CH {
+            let want = frames.iter().flat_map(|f| f[..ch].iter()).fold(0f32, |m, &x| m.max(x.abs()));
+            assert_eq!(peak_of(&frames, ch).to_bits(), want.to_bits(), "{ch} channels");
+        }
+        assert_eq!(peak_of(&[], 2), 0.0);
+    }
 }

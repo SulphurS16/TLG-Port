@@ -32,6 +32,15 @@
 //! `tlg_lua_print`, which logs its arguments ("lua: ...") converted by the
 //! engine's own `tolstring` (eboot 0xe75cd0: lua_State, TValue*, size_t*).
 //! Applied only when the code bytes are the expected ones.
+//!
+//! Render-kick wait: the job that hands a frame to the ps4render thread
+//! (eboot 0xd0afa0) then waits for that thread's state ([obj+0x31ef8]) to
+//! reach 2 in a loop with no pause instruction (0xd0afe4..0xd0affe), on one
+//! of the job workers, for as long as ps4render is busy - while the title
+//! waits for our GPU work, most of a frame. The loop is detoured to
+//! `tlg_kick_wait`, which waits for the same condition with a short spin and
+//! then sleeps between polls (`tune kick_wait`). Applied only when the code
+//! bytes are the expected ones.
 
 use crate::patch::Patcher;
 use crate::sysv;
@@ -60,6 +69,10 @@ static BASE: AtomicU64 = AtomicU64::new(0);
 pub fn apply(p: &mut Patcher, name: &str) {
     if std::env::var("TLG_LUA_LOG").is_ok_and(|v| v == "1") {
         patch_gaprint(p, name);
+    }
+    match patch_kick_wait(p) {
+        Ok(()) => crate::info!("render-kick wait: busy loop at {name}+{KICK_SITE:#x} detoured to a polling wait"),
+        Err(e) => crate::warn!("render-kick wait: {name}: {e}; not patched"),
     }
     if !std::env::var("TLG_MOUSE_CAMERA").is_ok_and(|v| v == "0") {
         match patch_mouse_camera(p) {
@@ -267,6 +280,70 @@ fn patch_gaprint(p: &mut Patcher, name: &str) {
     crate::info!("TLG_LUA_LOG: script logging restored (GaPrint at {name}+{GAPRINT:#x})");
 }
 
+/// The render-kick job's spin-counter reset, its first test of the
+/// ps4render state and its busy loop (module docs), and where it continues.
+const KICK_SITE: usize = 0xd0afdd;
+const KICK_BYTES: [u8; 33] = [
+    0xC7, 0x45, 0xE4, 0x00, 0x00, 0x00, 0x00, // mov dword [rbp-1Ch], 0
+    0x8B, 0x83, 0xF8, 0x1E, 0x03, 0x00, // mov eax, [rbx+31EF8h]
+    0x83, 0xF8, 0x01, // cmp eax, 1
+    0x7F, 0x0F, // jg done
+    0x90, // nop
+    0xFF, 0x45, 0xE4, // spin: inc dword [rbp-1Ch]
+    0x8B, 0x83, 0xF8, 0x1E, 0x03, 0x00, // mov eax, [rbx+31EF8h]
+    0x83, 0xF8, 0x02, // cmp eax, 2
+    0x7C, 0xF2, // jl spin
+];
+const KICK_DONE: u64 = 0xd0affe;
+const KICK_STATE: i32 = 0x31ef8;
+
+/// Render-kick waits that had to wait, and their time (ns).
+pub static KICK_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+fn patch_kick_wait(p: &mut Patcher) -> Result<(), String> {
+    use iced_x86::code_asm::*;
+    if p.image.get(KICK_SITE..KICK_SITE + KICK_BYTES.len()) != Some(&KICK_BYTES[..]) {
+        return Err(format!("unexpected code at +{KICK_SITE:#x} (not update 01.03?)"));
+    }
+    let base = p.base;
+    let target = tlg_kick_wait as *const () as usize as u64;
+    // (rsp is 16-byte aligned here; past the loop only rbx, r14 and rbp
+    // are live, and the flags are set again.)
+    p.detour(KICK_SITE, &KICK_BYTES[..7], |a, ins| {
+        a.add_instruction(*ins)?;
+        a.lea(rdi, ptr(rbx + KICK_STATE))?;
+        a.mov(rax, target)?;
+        a.call(rax)?;
+        a.jmp(base + KICK_DONE)
+    })?;
+    Ok(())
+}
+
+/// Waits until the dword at `state` is at least 2 (the loop it replaces).
+fn kick_wait(state: u64) {
+    // SAFETY: the title's object field the original loop reads.
+    let a = unsafe { &*(state as *const std::sync::atomic::AtomicI32) };
+    if a.load(Ordering::Acquire) >= 2 {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let poll = crate::tune::get(crate::tune::KICK_WAIT);
+    let mut n = 0u32;
+    while a.load(Ordering::Acquire) < 2 {
+        if poll <= 0 {
+            continue; // (busy, as the title)
+        }
+        n += 1;
+        if n <= 64 {
+            std::hint::spin_loop();
+        } else {
+            std::thread::sleep(std::time::Duration::from_micros(poll as u64));
+        }
+    }
+    KICK_STATS[0].fetch_add(1, Ordering::Relaxed);
+    KICK_STATS[1].fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
 /// A NUL-terminated guest string (at most `max` bytes).
 unsafe fn cstr(p: u64, max: usize) -> String {
     let mut v = Vec::new();
@@ -307,6 +384,10 @@ sysv! {
         lua_print(l);
         0
     }
+    fn tlg_kick_wait(state: u64) -> i32 {
+        kick_wait(state);
+        0
+    }
 }
 
 #[cfg(test)]
@@ -330,6 +411,33 @@ mod tests {
                 return v;
             }
         }
+    }
+
+    #[test]
+    fn kick_wait_stub() {
+        let base = 0x6000_0000u64;
+        let mut image = vec![0x90u8; 0xd1_0000];
+        image[KICK_SITE..KICK_SITE + KICK_BYTES.len()].copy_from_slice(&KICK_BYTES);
+        let mut tramp = vec![0u8; 0x1_0000];
+        let tbase = base + 0xe0_0000;
+        {
+            let mut p = Patcher { image: &mut image, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp, tramp_used: 0, data_used: 0 };
+            patch_kick_wait(&mut p).unwrap();
+        }
+        let v = stub(&image, &tramp, base, tbase, KICK_SITE);
+        // The counter reset, rdi = the state field, the call, then past the loop.
+        assert_eq!(&tramp[(v[0].ip() - tbase) as usize..][..7], &KICK_BYTES[..7]);
+        assert!(v.iter().any(|i| i.mnemonic() == iced_x86::Mnemonic::Lea && i.op0_register() == iced_x86::Register::RDI && i.memory_base() == iced_x86::Register::RBX && i.memory_displacement64() == KICK_STATE as u64));
+        assert!(v.iter().any(|i| i.mnemonic() == iced_x86::Mnemonic::Call));
+        assert_eq!(v.last().unwrap().near_branch_target(), base + KICK_DONE);
+        // Other bytes: not patched.
+        let mut image2 = vec![0x90u8; 0xd1_0000];
+        image2[KICK_SITE..KICK_SITE + KICK_BYTES.len()].copy_from_slice(&KICK_BYTES);
+        image2[KICK_SITE + 30] = 0x03;
+        let mut tramp2 = vec![0u8; 0x1_0000];
+        let mut p = Patcher { image: &mut image2, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp2, tramp_used: 0, data_used: 0 };
+        assert!(patch_kick_wait(&mut p).is_err());
+        assert_eq!(p.image[KICK_SITE], 0xC7);
     }
 
     #[test]

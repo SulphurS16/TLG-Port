@@ -9555,6 +9555,16 @@ impl Renderer {
     }
 
     /// One line of VRAM accounting for the periodic statistics.
+    /// Images per guest base (`by_base`, walked by texture bindings): bases,
+    /// the most at one base, bases with 4 or more, and the bases with most.
+    pub fn base_report(&self) -> String {
+        let mut counts: Vec<(usize, u64)> = self.by_base.iter().map(|(b, ks)| (ks.len(), *b)).collect();
+        counts.sort_unstable_by(|a, b| b.cmp(a));
+        let many = counts.iter().filter(|c| c.0 >= 4).count();
+        let top: Vec<String> = counts.iter().take(5).map(|(n, b)| format!("{b:#x} {n}")).collect();
+        format!("images by guest base: {} bases, {} images, at most {} at one base, {} bases with 4 or more (most: {})", counts.len(), self.images.len(), counts.first().map_or(0, |c| c.0), many, top.join(", "))
+    }
+
     pub fn vram_report(&self) -> String {
         let (mut tex, mut gpu, mut shadow) = (0u64, 0u64, 0u64);
         for (k, i) in &self.images {

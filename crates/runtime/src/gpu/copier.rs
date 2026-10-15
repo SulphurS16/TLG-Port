@@ -144,11 +144,8 @@ fn run() {
                 drop(q);
                 // (Copies arrive within microseconds of each other while a
                 // CP records: stay awake briefly, `tune copy_spin_us`.)
-                let t0 = std::time::Instant::now();
                 let spin = std::time::Duration::from_micros(crate::tune::get(crate::tune::COPY_SPIN_US).max(0) as u64);
-                while QUEUED.load(Ordering::Acquire) == DONE.load(Ordering::Acquire) && t0.elapsed() < spin {
-                    std::hint::spin_loop();
-                }
+                crate::thread::spin_until(spin, || QUEUED.load(Ordering::Acquire) != DONE.load(Ordering::Acquire));
                 q = QUEUE.lock();
                 while q.is_empty() {
                     SLEEPING.store(true, Ordering::SeqCst);

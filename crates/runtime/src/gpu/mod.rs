@@ -561,6 +561,7 @@ fn gfx_thread() {
                     crate::info!("VRAM mirrors: {mib} MiB in {n} windows; {copied} MiB copied in; {hits} bindings served");
                 }
                 crate::info!("{}", r.vram_report());
+                crate::info!("{}", r.base_report());
                 crate::info!("EVENT_WRITE types: {}", cp::event_type_counts());
                 let k: Vec<u64> = render::SYNC_WAIT_KIND_NS.iter().map(|a| a.load(Ordering::Relaxed) / 1_000_000).collect();
                 crate::info!("CP sync waits (ms, total): for eop actions {}, write-backs {}, huge in-place writes {}, in-place writes {}; CP writes behind in-place reads {}; virtual waits {}, in-batch waits {}, waits met by other queues' queued writes {}; label writes queued behind end-of-pipe writes {}", k[0], k[1], k[2], k[3], k[4], cp.stats.virtual_waits, cp.stats.inbatch_waits, cp.stats.cross_waits, cp::DEFERRED_WRITES.load(Ordering::Relaxed));

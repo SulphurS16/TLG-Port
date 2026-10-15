@@ -342,6 +342,10 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 thread::dump_threads("control");
                 Ok(())
             }
+            "cpu" => {
+                thread::cpu_report();
+                Ok(())
+            }
             "sample" => {
                 let ms = parts.next().and_then(|v| v.parse().ok()).unwrap_or(3000);
                 thread::sample_threads(ms);

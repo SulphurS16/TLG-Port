@@ -90,9 +90,6 @@ pub struct GMutex {
     cv: Condvar,
 }
 
-/// Spins (pause instructions) before a contended lock parks.
-const MUTEX_SPINS: u32 = 4000;
-
 #[repr(C)]
 struct MutexAttr {
     magic: u64,
@@ -122,7 +119,8 @@ impl GMutex {
     /// Acquires for `me` (not already the owner); false on timeout.
     fn acquire(&self, me: u64, deadline: Option<Instant>) -> bool {
         loop {
-            for _ in 0..MUTEX_SPINS {
+            // (Pause instructions before parking, `tune mutex_spins`.)
+            for _ in 0..crate::tune::get(crate::tune::MUTEX_SPINS).max(0) {
                 if self.owner.load(Ordering::Relaxed) == 0 && self.try_take(me) {
                     return true;
                 }
@@ -481,12 +479,111 @@ impl GRwLock {
 // ---------------------------------------------------------------------------
 // Semaphore
 
+/// Semaphore: the count and the waiting threads in arrival order. A signal
+/// hands the count to the waiters it satisfies (queue order; a waiter that
+/// needs more than is left is passed over) and wakes only those (`tune
+/// sema_wake`; 0: every waiter wakes and races for the count).
 pub struct GSema {
     magic: u64,
     name: String,
-    count: Mutex<i32>,
+    st: Mutex<SemaState>,
     max: i32,
-    cv: Condvar,
+}
+
+struct SemaState {
+    count: i32,
+    waiters: std::collections::VecDeque<std::sync::Arc<SemaWaiter>>,
+}
+
+struct SemaWaiter {
+    need: i32,
+    /// SW_WAITING, or why the wait ended.
+    state: std::sync::atomic::AtomicU32,
+    thread: std::thread::Thread,
+}
+
+const SW_WAITING: u32 = 0;
+const SW_GRANTED: u32 = 1;
+const SW_CANCELED: u32 = 2;
+const SW_DELETED: u32 = 3;
+
+impl GSema {
+    /// Ends every wait with `why`; returns how many there were.
+    fn end_waits(st: &mut SemaState, why: u32) -> i32 {
+        let n = st.waiters.len() as i32;
+        for w in st.waiters.drain(..) {
+            w.state.store(why, Ordering::Release);
+            w.thread.unpark();
+        }
+        n
+    }
+
+    /// After the count grew: grants the waiters it satisfies, or (`sema_wake
+    /// 0`) wakes them all to race for it.
+    fn hand_out(st: &mut SemaState) {
+        if crate::tune::get(crate::tune::SEMA_WAKE) == 0 {
+            for w in &st.waiters {
+                w.thread.unpark();
+            }
+            return;
+        }
+        let mut i = 0;
+        while i < st.waiters.len() && st.count > 0 {
+            if st.waiters[i].need <= st.count {
+                let w = st.waiters.remove(i).unwrap();
+                st.count -= w.need;
+                w.state.store(SW_GRANTED, Ordering::Release);
+                w.thread.unpark();
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn wait(&self, need: i32, deadline: Option<Instant>) -> i32 {
+        let w = {
+            let mut st = self.st.lock();
+            if st.count >= need {
+                st.count -= need;
+                return 0;
+            }
+            let w = std::sync::Arc::new(SemaWaiter { need, state: std::sync::atomic::AtomicU32::new(SW_WAITING), thread: std::thread::current() });
+            st.waiters.push_back(w.clone());
+            w
+        };
+        loop {
+            match w.state.load(Ordering::Acquire) {
+                SW_WAITING => {}
+                SW_GRANTED => return 0,
+                SW_CANCELED => return ECANCELED,
+                _ => return EACCES,
+            }
+            match deadline {
+                Some(d) => {
+                    let now = Instant::now();
+                    if now >= d {
+                        let mut st = self.st.lock();
+                        if w.state.load(Ordering::Acquire) != SW_WAITING {
+                            continue;
+                        }
+                        st.waiters.retain(|x| !std::sync::Arc::ptr_eq(x, &w));
+                        return ETIMEDOUT;
+                    }
+                    std::thread::park_timeout(d - now);
+                }
+                None => std::thread::park(),
+            }
+            // (Woken to race for the count, `sema_wake 0`, or spuriously.)
+            if w.state.load(Ordering::Acquire) == SW_WAITING {
+                let mut st = self.st.lock();
+                if w.state.load(Ordering::Acquire) == SW_WAITING && st.count >= need {
+                    st.count -= need;
+                    st.waiters.retain(|x| !std::sync::Arc::ptr_eq(x, &w));
+                    return 0;
+                }
+            }
+        }
+    }
 }
 
 unsafe fn sema_from<'a>(h: u64) -> Option<&'a GSema> {
@@ -726,55 +823,44 @@ sysv! {
     // Semaphores
     fn sceKernelCreateSema(out: *mut u64, name: *const u8, attr: u32, init: i32, max: i32, opt: u64) -> i32 {
         if out.is_null() || init < 0 || max <= 0 || init > max { return sce(EINVAL); }
-        let s: &'static GSema = Box::leak(Box::new(GSema { magic: SEMA_MAGIC, name: cstr(name).to_string(), count: Mutex::new(init), max, cv: Condvar::new() }));
+        let st = Mutex::new(SemaState { count: init, waiters: std::collections::VecDeque::new() });
+        let s: &'static GSema = Box::leak(Box::new(GSema { magic: SEMA_MAGIC, name: cstr(name).to_string(), st, max }));
         *out = s as *const _ as u64;
         0
     }
-    fn sceKernelDeleteSema(h: u64) -> i32 { match sema_from(h) { Some(s) => { s.cv.notify_all(); 0 } None => sce(ESRCH) } }
+    fn sceKernelDeleteSema(h: u64) -> i32 { match sema_from(h) { Some(s) => { GSema::end_waits(&mut s.st.lock(), SW_DELETED); 0 } None => sce(ESRCH) } }
     fn sceKernelWaitSema(h: u64, need: i32, timeout: *mut u32) -> i32 {
         let Some(s) = sema_from(h) else { return sce(ESRCH) };
         if need < 1 || need > s.max { return sce(EINVAL); }
         let start = Instant::now();
         let deadline = if timeout.is_null() { None } else { Some(deadline_us(*timeout as u64)) };
-        let mut c = s.count.lock();
-        while *c < need {
-            match deadline {
-                Some(d) => {
-                    if s.cv.wait_until(&mut c, d).timed_out() && *c < need {
-                        *timeout = 0;
-                        return sce(ETIMEDOUT);
-                    }
-                }
-                None => s.cv.wait(&mut c),
-            }
-        }
-        *c -= need;
+        let r = s.wait(need, deadline);
         if !timeout.is_null() {
-            let el = start.elapsed().as_micros() as u32;
-            *timeout = (*timeout).saturating_sub(el);
+            *timeout = if r == ETIMEDOUT { 0 } else { (*timeout).saturating_sub(start.elapsed().as_micros() as u32) };
         }
-        0
+        sce_ret(r)
     }
     fn sceKernelPollSema(h: u64, need: i32) -> i32 {
         let Some(s) = sema_from(h) else { return sce(ESRCH) };
-        let mut c = s.count.lock();
-        if *c < need { return sce(EBUSY); }
-        *c -= need;
+        let mut st = s.st.lock();
+        if st.count < need { return sce(EBUSY); }
+        st.count -= need;
         0
     }
     fn sceKernelSignalSema(h: u64, n: i32) -> i32 {
         let Some(s) = sema_from(h) else { return sce(ESRCH) };
-        let mut c = s.count.lock();
-        if *c + n > s.max { return sce(EINVAL); }
-        *c += n;
-        s.cv.notify_all();
+        let mut st = s.st.lock();
+        if n < 0 || st.count + n > s.max { return sce(EINVAL); }
+        st.count += n;
+        GSema::hand_out(&mut st);
         0
     }
     fn sceKernelCancelSema(h: u64, count: i32, waiters: *mut i32) -> i32 {
         let Some(s) = sema_from(h) else { return sce(ESRCH) };
-        if !waiters.is_null() { *waiters = 0; }
-        if count >= 0 { *s.count.lock() = count; }
-        s.cv.notify_all();
+        let mut st = s.st.lock();
+        let n = GSema::end_waits(&mut st, SW_CANCELED);
+        if !waiters.is_null() { *waiters = n; }
+        if count >= 0 { st.count = count.min(s.max); }
         0
     }
 

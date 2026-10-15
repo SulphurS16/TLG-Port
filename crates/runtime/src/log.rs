@@ -59,6 +59,11 @@ pub fn enabled(level: Level) -> bool {
     level as u8 <= LEVEL.load(Ordering::Relaxed)
 }
 
+/// When logging started (the run's time origin).
+pub fn start_instant() -> Instant {
+    *START.get_or_init(Instant::now)
+}
+
 pub fn elapsed_ms() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }

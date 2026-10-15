@@ -176,6 +176,9 @@ struct Timer {
 static TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
 static TIMER_CV: Condvar = Condvar::new();
 static TIMER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// HR timers added, their requested time (us) and the timer thread's final
+/// spins (us) - the `cpu` report.
+pub static HRT_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 fn schedule_timer(queue: u64, ident: u64, timer_gen: u64, at: Instant) {
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -215,9 +218,9 @@ fn timer_thread() {
                     if rem > Duration::from_micros(300) {
                         std::thread::sleep(rem - Duration::from_micros(200));
                     }
-                    while Instant::now() < at {
-                        std::hint::spin_loop();
-                    }
+                    let t0 = Instant::now();
+                    crate::thread::spin_until(at.saturating_duration_since(t0), || false);
+                    HRT_STATS[2].fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
                     g = TIMERS.lock();
                 }
             }
@@ -275,6 +278,8 @@ sysv! {
         let (sec, nsec) = (*ts, *ts.add(1));
         if sec < 0 || !(0..1_000_000_000).contains(&nsec) { return sce(EINVAL); }
         let timer_gen = TIMER_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HRT_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        HRT_STATS[1].fetch_add(sec as u64 * 1_000_000 + nsec as u64 / 1000, std::sync::atomic::Ordering::Relaxed);
         q.add_timed(id as u64, EVFILT_HRTIMER, EV_ONESHOT, udata, timer_gen);
         schedule_timer(h, id as u64, timer_gen, Instant::now() + Duration::new(sec as u64, nsec as u32));
         0

@@ -113,6 +113,101 @@ pub fn dump_threads(why: &str) {
     crate::gpu::dump_state();
 }
 
+/// Every thread's CPU time (user + kernel) since the previous call, or since
+/// it started, in ms per second of wall time, busiest first and summed by
+/// name (`cpu` control command): who shares the cores and the power budget
+/// with the command processors.
+pub fn cpu_report() {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, THREADENTRY32, TH32CS_SNAPTHREAD, Thread32First, Thread32Next};
+    use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetThreadDescription, GetThreadTimes, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    static LAST: Mutex<Option<(std::time::Instant, std::collections::HashMap<u32, u64>)>> = Mutex::new(None);
+    let ft = |f: &FILETIME| ((f.dwHighDateTime as u64) << 32) | f.dwLowDateTime as u64;
+    let mut now: std::collections::HashMap<u32, (String, u64)> = std::collections::HashMap::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return;
+        }
+        let pid = GetCurrentProcessId();
+        let mut e: THREADENTRY32 = std::mem::zeroed();
+        e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+        let mut ok = Thread32First(snap, &mut e) != 0;
+        while ok {
+            if e.th32OwnerProcessID == pid {
+                let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, e.th32ThreadID);
+                if !h.is_null() {
+                    let (mut c, mut x, mut k, mut u) = (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+                    if GetThreadTimes(h, &mut c, &mut x, &mut k, &mut u) != 0 {
+                        let mut name = String::new();
+                        let mut w: *mut u16 = std::ptr::null_mut();
+                        if GetThreadDescription(h, &mut w) >= 0 && !w.is_null() {
+                            let n = (0..).take_while(|&i| *w.add(i) != 0).count();
+                            name = String::from_utf16_lossy(std::slice::from_raw_parts(w, n));
+                            windows_sys::Win32::Foundation::LocalFree(w as _);
+                        }
+                        if name.is_empty() {
+                            name = format!("tid {}", e.th32ThreadID);
+                        }
+                        now.insert(e.th32ThreadID, (name, ft(&k) + ft(&u)));
+                    }
+                    CloseHandle(h);
+                }
+            }
+            ok = Thread32Next(snap, &mut e) != 0;
+        }
+        CloseHandle(snap);
+    }
+    let mut last = LAST.lock();
+    let (since, prev) = last.take().unwrap_or_else(|| (crate::log::start_instant(), std::collections::HashMap::new()));
+    let secs = since.elapsed().as_secs_f64().max(1e-3);
+    let mut by_name: std::collections::HashMap<String, (f64, usize)> = std::collections::HashMap::new();
+    for (tid, (name, t)) in &now {
+        let ms = t.saturating_sub(prev.get(tid).copied().unwrap_or(0)) as f64 / 1e4 / secs;
+        // Numbered siblings (job workers) summed under one name.
+        let key = name.trim_end_matches(|c: char| c.is_ascii_digit()).to_string();
+        let v = by_name.entry(key).or_default();
+        v.0 += ms;
+        v.1 += 1;
+    }
+    let total: f64 = by_name.values().map(|v| v.0).sum();
+    let mut rows: Vec<(String, (f64, usize))> = by_name.into_iter().filter(|r| r.1.0 >= 5.0).collect();
+    rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    let list: Vec<String> = rows.iter().map(|(n, (ms, k))| if *k > 1 { format!("{n}* x{k} {ms:.0}") } else { format!("{n} {ms:.0}") }).collect();
+    let kick = [crate::title_patches::KICK_STATS[0].swap(0, Ordering::Relaxed), crate::title_patches::KICK_STATS[1].swap(0, Ordering::Relaxed)];
+    let hrt: [u64; 3] = std::array::from_fn(|i| crate::hle::kernel::equeue::HRT_STATS[i].swap(0, Ordering::Relaxed));
+    crate::info!(
+        "thread CPU over {secs:.1} s (ms per s; threads under 5 left out): total {total:.0}; {}; render-kick waits {:.0}/s ({:.0} ms per s); HR timers {:.0}/s ({:.0} us each, final spins {:.0} ms per s)",
+        list.join(", "),
+        kick[0] as f64 / secs,
+        kick[1] as f64 / 1e6 / secs,
+        hrt[0] as f64 / secs,
+        hrt[1] as f64 / hrt[0].max(1) as f64,
+        hrt[2] as f64 / 1e3 / secs
+    );
+    *last = Some((std::time::Instant::now(), now.into_iter().map(|(k, v)| (k, v.1)).collect()));
+}
+
+/// Spins until `done()` holds or `limit` has passed; returns `done()`.
+/// Mostly pause instructions: the clock is read once per `tune spin_pauses`
+/// of them.
+#[inline]
+pub fn spin_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
+    let t0 = std::time::Instant::now();
+    let per = crate::tune::get(crate::tune::SPIN_PAUSES).max(1);
+    loop {
+        for _ in 0..per {
+            if done() {
+                return true;
+            }
+            std::hint::spin_loop();
+        }
+        if t0.elapsed() >= limit {
+            return done();
+        }
+    }
+}
+
 /// Gives the calling host thread above-normal priority: the command
 /// processors, the renderer and its completion thread are the frame's
 /// critical path, while the title's job workers poll their queue lock on

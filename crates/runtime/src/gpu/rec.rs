@@ -258,11 +258,8 @@ fn run() {
                 drop(q);
                 // Briefly busy: CPs recording queue more within microseconds
                 // (`tune rec_spin_us`).
-                let t0 = std::time::Instant::now();
                 let spin = std::time::Duration::from_micros(crate::tune::get(crate::tune::REC_SPIN_US).max(0) as u64);
-                while PUSHED.load(Ordering::Acquire) == DONE.load(Ordering::Acquire) && t0.elapsed() < spin {
-                    std::hint::spin_loop();
-                }
+                crate::thread::spin_until(spin, || PUSHED.load(Ordering::Acquire) != DONE.load(Ordering::Acquire));
                 q = QUEUE.lock();
                 while q.ops.is_empty() {
                     SLEEPING.store(true, Ordering::SeqCst);

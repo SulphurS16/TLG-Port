@@ -441,7 +441,26 @@ pub const VBIND_PART_KIB: usize = 74;
 /// queue yield).
 pub const YIELD_QUEUES: usize = 75;
 
-const TABLE: [(&str, &str, i64); 76] = [
+/// Semaphore signals hand the count to waiting threads in queue order and
+/// wake only those (`TLG_SEMA_WAKE`, 1); 0 wakes every waiter to race for it
+/// (the title's seven job workers wait on one semaphore).
+pub const SEMA_WAKE: usize = 76;
+
+/// Pause instructions a contended guest mutex spins before parking
+/// (`TLG_MUTEX_SPINS`, 4000; ~140 cycles each on this CPU).
+pub const MUTEX_SPINS: usize = 77;
+
+/// The title's render-kick job waits for ps4render in a loop without a pause
+/// (eboot 0xd0aff0, patched): poll interval in microseconds after a short
+/// spin (`TLG_KICK_WAIT`, 100); 0 busy-waits as the title does.
+pub const KICK_WAIT: usize = 78;
+
+/// Pause instructions between clock reads in the helper threads' spin
+/// loops (`TLG_SPIN_PAUSES`, 1): a performance-counter read and its 128-bit
+/// division cost more than a pause, also to the core's other hyperthread.
+pub const SPIN_PAUSES: usize = 79;
+
+const TABLE: [(&str, &str, i64); 80] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -518,6 +537,10 @@ const TABLE: [(&str, &str, i64); 76] = [
     ("rec_spin_us", "TLG_REC_SPIN_US", 1000),
     ("vbind_part_kib", "TLG_VBIND_PART_KIB", 64),
     ("yield_queues", "TLG_YIELD_QUEUES", 0),
+    ("sema_wake", "TLG_SEMA_WAKE", 1),
+    ("mutex_spins", "TLG_MUTEX_SPINS", 4000),
+    ("kick_wait", "TLG_KICK_WAIT", 100),
+    ("spin_pauses", "TLG_SPIN_PAUSES", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
