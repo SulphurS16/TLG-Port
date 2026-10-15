@@ -213,6 +213,10 @@ fn timer_thread() {
                 let rem = at - now;
                 if rem > Duration::from_micros(1500) {
                     TIMER_CV.wait_for(&mut g, rem - Duration::from_millis(1));
+                } else if crate::tune::get(crate::tune::HRT_SPIN) == 0 {
+                    drop(g);
+                    std::thread::sleep(rem);
+                    g = TIMERS.lock();
                 } else {
                     drop(g);
                     if rem > Duration::from_micros(300) {

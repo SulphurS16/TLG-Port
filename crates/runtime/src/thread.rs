@@ -208,6 +208,113 @@ pub fn spin_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) ->
     }
 }
 
+/// Gives the calling thread physical core `core` alone (`tune gfx_core`):
+/// it runs on that core's first logical processor and the process's other
+/// threads on every processor but that core's; -1 undoes it. -2 picks the
+/// third of the fastest cores (highest efficiency class: performance cores
+/// on hybrid CPUs; core 0 takes most interrupts), and only when at least 8
+/// logical processors remain for the rest. Returns what it did.
+pub fn dedicate_core(core: i64, soft: bool) -> String {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, THREADENTRY32, TH32CS_SNAPTHREAD, Thread32First, Thread32Next};
+    use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, OpenThread, SetProcessDefaultCpuSets, SetThreadSelectedCpuSets, THREAD_SET_LIMITED_INFORMATION};
+    // The process's other threads, as they are now (later ones take the
+    // process default).
+    let others = |sets: &[u32]| -> u32 {
+        let mut n = 0;
+        unsafe {
+            let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+            if snap == INVALID_HANDLE_VALUE {
+                return 0;
+            }
+            let (pid, me) = (GetCurrentProcessId(), GetCurrentThreadId());
+            let mut e: THREADENTRY32 = std::mem::zeroed();
+            e.dwSize = std::mem::size_of::<THREADENTRY32>() as u32;
+            let mut ok = Thread32First(snap, &mut e) != 0;
+            while ok {
+                if e.th32OwnerProcessID == pid && e.th32ThreadID != me {
+                    let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, e.th32ThreadID);
+                    if !h.is_null() {
+                        n += (SetThreadSelectedCpuSets(h, if sets.is_empty() { std::ptr::null() } else { sets.as_ptr() }, sets.len() as u32) != 0) as u32;
+                        CloseHandle(h);
+                    }
+                }
+                ok = Thread32Next(snap, &mut e) != 0;
+            }
+            CloseHandle(snap);
+        }
+        n
+    };
+    unsafe {
+        if core < 0 && core != -2 {
+            SetThreadSelectedCpuSets(GetCurrentThread(), std::ptr::null(), 0);
+            SetProcessDefaultCpuSets(GetCurrentProcess(), std::ptr::null(), 0);
+            let n = others(&[]);
+            return format!("every core shared again ({n} threads)");
+        }
+        let mut len = 0u32;
+        GetSystemCpuSetInformation(std::ptr::null_mut(), 0, &mut len, GetCurrentProcess(), 0);
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        if GetSystemCpuSetInformation(buf.as_mut_ptr() as _, len, &mut len, GetCurrentProcess(), 0) == 0 {
+            return "GetSystemCpuSetInformation failed".into();
+        }
+        // SYSTEM_CPU_SET_INFORMATION: Size u32, Type u32, then the CpuSet
+        // fields: Id u32 (+8), Group u16, LogicalProcessorIndex u8 (+14),
+        // CoreIndex u8 (+15), LastLevelCacheIndex, NumaNodeIndex,
+        // EfficiencyClass u8 (+18).
+        let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const u8, len as usize);
+        let mut sets: Vec<(u32, u8, u8, u8)> = Vec::new();
+        let mut at = 0usize;
+        while at + 19 <= bytes.len() {
+            let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+            if size < 19 {
+                break;
+            }
+            let id = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap());
+            sets.push((id, bytes[at + 14], bytes[at + 15], bytes[at + 18]));
+            at += size;
+        }
+        let mut cores: Vec<u8> = sets.iter().map(|s| s.2).collect();
+        cores.sort_unstable();
+        cores.dedup();
+        let c = if core == -2 {
+            let best = sets.iter().map(|s| s.3).max().unwrap_or(0);
+            let fast: Vec<u8> = cores.iter().copied().filter(|&c| sets.iter().any(|s| s.2 == c && s.3 == best)).collect();
+            let Some(&c) = fast.get(2.min(fast.len().saturating_sub(1))) else { return "no cores listed".into() };
+            if sets.iter().filter(|s| s.2 != c).count() < 8 {
+                return format!("left to Windows ({} logical processors)", sets.len());
+            }
+            c
+        } else {
+            let Some(&c) = cores.get(core as usize) else { return format!("no core {core} ({} cores)", cores.len()) };
+            c
+        };
+        let mine: Vec<u32> = sets.iter().filter(|s| s.2 == c).map(|s| s.0).collect();
+        let rest: Vec<u32> = sets.iter().filter(|s| s.2 != c).map(|s| s.0).collect();
+        if mine.is_empty() || rest.is_empty() {
+            return format!("core {core}: nothing to split");
+        }
+        let ok1 = if soft {
+            // Anywhere, preferably there.
+            use windows_sys::Win32::System::Kernel::PROCESSOR_NUMBER;
+            use windows_sys::Win32::System::Threading::SetThreadIdealProcessorEx;
+            // (Its own set of every processor: the process default would
+            // leave that core out for it too.)
+            let lp = sets.iter().find(|s| s.0 == mine[0]).map_or(0, |s| s.1);
+            let all: Vec<u32> = sets.iter().map(|s| s.0).collect();
+            let mut ideal = PROCESSOR_NUMBER { Group: 0, Number: lp, Reserved: 0 };
+            SetThreadSelectedCpuSets(GetCurrentThread(), all.as_ptr(), all.len() as u32) != 0 && SetThreadIdealProcessorEx(GetCurrentThread(), &mut ideal, std::ptr::null_mut()) != 0
+        } else {
+            SetThreadSelectedCpuSets(GetCurrentThread(), mine.as_ptr(), 1) != 0
+        };
+        let ok2 = SetProcessDefaultCpuSets(GetCurrentProcess(), rest.as_ptr(), rest.len() as u32) != 0;
+        let n = others(&rest);
+        let lps: Vec<u8> = sets.iter().filter(|s| s.2 == c).map(|s| s.1).collect();
+        format!("the core of logical processors {lps:?} dedicated{}: thread {ok1}, process default {ok2}, {n} other threads on the other {} sets", if soft { " (preferred only)" } else { "" }, rest.len())
+    }
+}
+
 /// Gives the calling host thread above-normal priority: the command
 /// processors, the renderer and its completion thread are the frame's
 /// critical path, while the title's job workers poll their queue lock on

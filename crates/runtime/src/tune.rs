@@ -460,7 +460,26 @@ pub const KICK_WAIT: usize = 78;
 /// division cost more than a pause, also to the core's other hyperthread.
 pub const SPIN_PAUSES: usize = 79;
 
-const TABLE: [(&str, &str, i64); 80] = [
+/// The HR-timer thread's last stretch before a deadline (`TLG_HRT_SPIN`, 0):
+/// 1 sleeps to ~200 us before it and spins the rest; 0 only sleeps (a
+/// high-resolution sleep, later by up to a few hundred microseconds). The
+/// title's job workers arm ~4,000-6,000 timers of 100 us per second while
+/// idle; without the spins -0.27 core, fps equal (LOG: the CPU budget).
+pub const HRT_SPIN: usize = 80;
+
+/// The graphics CP thread runs on a physical core alone (`TLG_GFX_CORE`, -2:
+/// chosen, see `thread::dedicate_core`; N: core N; -1: Windows schedules
+/// it): on one of the core's logical processors while the process's other
+/// threads avoid both (CPU sets). It lost ~10% to busy hyperthread
+/// siblings: graphics CP -10 to -12% per frame (LOG: the CPU budget).
+pub const GFX_CORE: usize = 81;
+
+/// With `gfx_core`: 1 only prefers that core for the graphics CP thread
+/// (ideal processor; it may run elsewhere) while the other threads still
+/// avoid it (`TLG_GFX_CORE_SOFT`, 0).
+pub const GFX_CORE_SOFT: usize = 82;
+
+const TABLE: [(&str, &str, i64); 83] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -541,6 +560,9 @@ const TABLE: [(&str, &str, i64); 80] = [
     ("mutex_spins", "TLG_MUTEX_SPINS", 4000),
     ("kick_wait", "TLG_KICK_WAIT", 100),
     ("spin_pauses", "TLG_SPIN_PAUSES", 1),
+    ("hrt_spin", "TLG_HRT_SPIN", 0),
+    ("gfx_core", "TLG_GFX_CORE", -2),
+    ("gfx_core_soft", "TLG_GFX_CORE_SOFT", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

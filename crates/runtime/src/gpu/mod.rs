@@ -421,7 +421,14 @@ fn gfx_thread() {
     let mut processed: u64 = 0;
     let started = std::time::Instant::now();
     let mut frame_end: Option<u64> = None;
+    // (Experiment `tune gfx_core`: applied when it changes.)
+    let mut core = (-1i64, 0i64);
     loop {
+        let want = (crate::tune::get(crate::tune::GFX_CORE), crate::tune::get(crate::tune::GFX_CORE_SOFT));
+        if want != core {
+            core = want;
+            crate::info!("gfx_core: {}", crate::thread::dedicate_core(core.0, core.1 != 0));
+        }
         set_phase(phase::IDLE, 0);
         let mut s = {
             let mut g = q.pending.lock();
