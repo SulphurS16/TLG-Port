@@ -8,3 +8,4 @@
 *.prx
 eboot.bin
 __pycache__/
+/dist/

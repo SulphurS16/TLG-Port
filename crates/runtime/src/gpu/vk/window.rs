@@ -1,15 +1,29 @@
 //! Output window (Win32) running its own message loop thread.
 //!
+//! Display modes (settings.txt, `config`): windowed (resizable), borderless
+//! (the monitor's whole area, no mode change) and fullscreen (exclusive:
+//! the monitor switches to the chosen resolution and refresh rate while the
+//! window is active; the desktop mode comes back on Alt+Tab and at exit).
+//! Alt+Enter or F11 switches between windowed and full screen (borderless,
+//! or exclusive when that is the configured mode); the choice is kept in
+//! settings.txt. The process is per-monitor DPI aware (main.rs): sizes are
+//! physical pixels, and a window moved to a monitor of another scale takes
+//! the size Windows suggests. Display changes (resolution, monitors added or
+//! removed) refit full-screen windows to their monitor.
+//!
 //! Keyboard state comes from key messages (left/right modifiers kept apart).
 //! The mouse is read as raw input (relative counts, no pointer acceleration)
 //! while it is captured: a click into the window captures it (cursor hidden
 //! and confined), losing focus or the release key (`input.txt`) frees it.
 
+use crate::config::DisplayMode;
+use parking_lot::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, Ordering};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
-use windows_sys::Win32::Graphics::Gdi::ClientToScreen;
+use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::HiDpi::{AdjustWindowRectExForDpi, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VSC_TO_VK_EX, MapVirtualKeyW};
 use windows_sys::Win32::UI::Input::{GetRawInputData, HRAWINPUT, RAWINPUT, RAWINPUTDEVICE, RAWINPUTHEADER, RID_INPUT, RIM_TYPEMOUSE, RegisterRawInputDevices};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -39,6 +53,40 @@ static WHEEL: AtomicI32 = AtomicI32::new(0);
 pub static MOUSE_BUTTONS: AtomicU32 = AtomicU32::new(0);
 /// Virtual key that releases the captured mouse (set from `input.txt`).
 pub static RELEASE_KEY: AtomicU32 = AtomicU32::new(0x70); // F1
+
+/// The window's display state (the ui thread changes it).
+struct Display {
+    mode: DisplayMode,
+    /// The full-screen mode Alt+Enter switches to.
+    full: DisplayMode,
+    /// The windowed placement to return to from full screen.
+    windowed: Option<RECT>,
+    /// Exclusive mode: (width, height, refresh Hz; 0 = current).
+    exclusive: (u32, u32, u32),
+}
+
+static DISPLAY: Mutex<Display> = Mutex::new(Display { mode: DisplayMode::Windowed, full: DisplayMode::Borderless, windowed: None, exclusive: (0, 0, 0) });
+
+/// Posted to the window: switch the display mode (WPARAM 0 toggle, 1
+/// windowed, 2 borderless, 3 fullscreen).
+const WM_APP_DISPLAY: u32 = WM_APP + 10;
+
+/// Switches the display mode from another thread (control `display`):
+/// None toggles as Alt+Enter does.
+pub fn request_mode(m: Option<DisplayMode>) -> Result<(), String> {
+    let w = WINDOW.get().ok_or("no window (headless run)")?;
+    let code = match m {
+        None => 0,
+        Some(DisplayMode::Windowed) => 1,
+        Some(DisplayMode::Borderless) => 2,
+        Some(DisplayMode::Fullscreen) => 3,
+    };
+    unsafe { PostMessageW(w.hwnd as HWND, WM_APP_DISPLAY, code, 0) };
+    Ok(())
+}
+
+/// The monitor whose display mode was switched (device name, NUL-terminated).
+static SWITCHED: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 
 pub fn get() -> Option<&'static Window> {
     WINDOW.get()
@@ -83,6 +131,9 @@ pub fn mouse_live() -> bool {
 const VK_SHIFT: usize = 0x10;
 const VK_CONTROL: usize = 0x11;
 const VK_MENU: usize = 0x12;
+const VK_RETURN: u32 = 0x0D;
+const VK_F4: u32 = 0x73;
+const VK_F11: u32 = 0x7A;
 
 /// The left/right-specific key of a key message (Shift by scan code, Ctrl
 /// and Alt by the extended-key flag).
@@ -205,6 +256,222 @@ unsafe fn raw_input(lp: LPARAM) {
     }
 }
 
+fn wide(s: &str) -> Vec<u16> {
+    s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// A monitor: its handle, whole area, work area (without the taskbar) and
+/// device name (NUL-terminated).
+struct Monitor {
+    handle: HMONITOR,
+    rect: RECT,
+    work: RECT,
+    device: Vec<u16>,
+}
+
+unsafe fn monitor_info(h: HMONITOR) -> Option<Monitor> {
+    let mut mi: MONITORINFOEXW = unsafe { std::mem::zeroed() };
+    mi.monitorInfo.cbSize = std::mem::size_of::<MONITORINFOEXW>() as u32;
+    if unsafe { GetMonitorInfoW(h, &mut mi as *mut MONITORINFOEXW as *mut MONITORINFO) } == 0 {
+        return None;
+    }
+    let n = mi.szDevice.iter().position(|&c| c == 0).unwrap_or(mi.szDevice.len());
+    let mut device = mi.szDevice[..n].to_vec();
+    device.push(0);
+    Some(Monitor { handle: h, rect: mi.monitorInfo.rcMonitor, work: mi.monitorInfo.rcWork, device })
+}
+
+unsafe extern "system" fn enum_monitor(h: HMONITOR, _dc: HDC, _r: *mut RECT, data: LPARAM) -> windows_sys::core::BOOL {
+    let v = unsafe { &mut *(data as *mut Vec<HMONITOR>) };
+    v.push(h);
+    1
+}
+
+/// The monitor named in settings (a device name such as \\.\DISPLAY2), or
+/// the primary one.
+unsafe fn find_monitor(name: &str) -> Option<Monitor> {
+    let mut hs: Vec<HMONITOR> = Vec::new();
+    unsafe { EnumDisplayMonitors(std::ptr::null_mut(), std::ptr::null(), Some(enum_monitor), &mut hs as *mut Vec<HMONITOR> as LPARAM) };
+    let all: Vec<Monitor> = hs.into_iter().filter_map(|h| unsafe { monitor_info(h) }).collect();
+    let dev = |m: &Monitor| String::from_utf16_lossy(&m.device[..m.device.len() - 1]);
+    if !name.eq_ignore_ascii_case("primary") {
+        if let Some(i) = all.iter().position(|m| dev(m).eq_ignore_ascii_case(name)) {
+            return all.into_iter().nth(i);
+        }
+        crate::warn!("display: monitor '{name}' not found; using the primary monitor");
+    }
+    let primary = unsafe { MonitorFromWindow(std::ptr::null_mut(), MONITOR_DEFAULTTOPRIMARY) };
+    unsafe { monitor_info(primary) }
+}
+
+unsafe fn window_monitor(hwnd: HWND) -> Option<Monitor> {
+    unsafe { monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) }
+}
+
+const WINDOWED_STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
+const FULL_STYLE: WINDOW_STYLE = WS_POPUP;
+
+/// The window rect for a client size at the window's DPI.
+unsafe fn frame_for_client(hwnd: HWND, w: i32, h: i32) -> (i32, i32) {
+    let mut r = RECT { left: 0, top: 0, right: w, bottom: h };
+    let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+    unsafe { AdjustWindowRectExForDpi(&mut r, WINDOWED_STYLE, 0, 0, dpi) };
+    (r.right - r.left, r.bottom - r.top)
+}
+
+/// The default windowed client size on a monitor: settings, else the
+/// largest 16:9 area within 3/4 of its work area.
+fn windowed_client(m: &Monitor) -> (i32, i32) {
+    let s = crate::config::settings();
+    let (ww, wh) = (m.work.right - m.work.left, m.work.bottom - m.work.top);
+    if s.window_width >= 320 && s.window_height >= 180 {
+        return ((s.window_width as i32).min(ww), (s.window_height as i32).min(wh));
+    }
+    let w = ((ww * 3 / 4) as i64).min((wh * 3 / 4) as i64 * 16 / 9) as i32;
+    (w.max(320) & !7, (w.max(320) * 9 / 16) & !1)
+}
+
+/// Switches the monitor to the exclusive mode (only what differs from its
+/// current mode); false if Windows refused.
+unsafe fn switch_display(m: &Monitor, mode: (u32, u32, u32)) -> bool {
+    let mut dm: DEVMODEW = unsafe { std::mem::zeroed() };
+    dm.dmSize = std::mem::size_of::<DEVMODEW>() as u16;
+    if unsafe { EnumDisplaySettingsW(m.device.as_ptr(), ENUM_CURRENT_SETTINGS, &mut dm) } == 0 {
+        return false;
+    }
+    let (w, h, hz) = mode;
+    let want_w = if w > 0 { w } else { dm.dmPelsWidth };
+    let want_h = if h > 0 { h } else { dm.dmPelsHeight };
+    let want_hz = if hz > 0 { hz } else { dm.dmDisplayFrequency };
+    if (want_w, want_h, want_hz) == (dm.dmPelsWidth, dm.dmPelsHeight, dm.dmDisplayFrequency) {
+        return true;
+    }
+    dm.dmPelsWidth = want_w;
+    dm.dmPelsHeight = want_h;
+    dm.dmDisplayFrequency = want_hz;
+    dm.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT | DM_DISPLAYFREQUENCY;
+    let r = unsafe { ChangeDisplaySettingsExW(m.device.as_ptr(), &dm, std::ptr::null_mut(), CDS_FULLSCREEN, std::ptr::null()) };
+    if r == DISP_CHANGE_SUCCESSFUL {
+        crate::info!("display: {} switched to {want_w}x{want_h} @ {want_hz} Hz", String::from_utf16_lossy(&m.device[..m.device.len() - 1]));
+        *SWITCHED.lock() = Some(m.device.clone());
+        true
+    } else {
+        crate::warn!("display: switching to {want_w}x{want_h} @ {want_hz} Hz failed ({r}); staying at the desktop mode");
+        false
+    }
+}
+
+/// Returns a monitor switched for exclusive fullscreen to its desktop mode
+/// (any thread; also at exit and after a crash). True if one was switched.
+pub fn restore_display() -> bool {
+    let dev = SWITCHED.lock().take();
+    let Some(dev) = dev else { return false };
+    unsafe { ChangeDisplaySettingsExW(dev.as_ptr(), std::ptr::null(), std::ptr::null_mut(), 0, std::ptr::null()) };
+    crate::info!("display: desktop mode restored");
+    true
+}
+
+/// Puts the window into `mode` (ui thread). (No lock is held across calls
+/// that send messages: the window procedure takes the same locks.)
+unsafe fn apply_mode(hwnd: HWND, mode: DisplayMode) {
+    let (was, exclusive) = {
+        let d = DISPLAY.lock();
+        (d.mode, d.exclusive)
+    };
+    unsafe {
+        if was == DisplayMode::Windowed && mode != DisplayMode::Windowed {
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetWindowRect(hwnd, &mut r);
+            DISPLAY.lock().windowed = Some(r);
+        }
+        if was == DisplayMode::Fullscreen && mode != DisplayMode::Fullscreen {
+            restore_display();
+        }
+        let windowed = {
+            let mut d = DISPLAY.lock();
+            d.mode = mode;
+            d.windowed
+        };
+        match mode {
+            DisplayMode::Windowed => {
+                SetWindowLongPtrW(hwnd, GWL_STYLE, (WINDOWED_STYLE | WS_VISIBLE) as isize);
+                let r = match windowed {
+                    Some(r) => r,
+                    None => {
+                        let m = window_monitor(hwnd).unwrap_or_else(|| find_monitor("primary").expect("a monitor"));
+                        let (cw, ch) = windowed_client(&m);
+                        let (fw, fh) = frame_for_client(hwnd, cw, ch);
+                        let x = m.work.left + ((m.work.right - m.work.left) - fw).max(0) / 2;
+                        let y = m.work.top + ((m.work.bottom - m.work.top) - fh).max(0) / 2;
+                        RECT { left: x, top: y, right: x + fw, bottom: y + fh }
+                    }
+                };
+                SetWindowPos(hwnd, HWND_NOTOPMOST, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            }
+            DisplayMode::Borderless | DisplayMode::Fullscreen => {
+                let Some(mut m) = window_monitor(hwnd) else { return };
+                if mode == DisplayMode::Fullscreen && switch_display(&m, exclusive) {
+                    // (The monitor's area changes with its mode.)
+                    m = monitor_info(m.handle).unwrap_or(m);
+                }
+                SetWindowLongPtrW(hwnd, GWL_STYLE, (FULL_STYLE | WS_VISIBLE) as isize);
+                let r = m.rect;
+                SetWindowPos(hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            }
+        }
+    }
+    crate::info!("display: {mode:?}");
+    RESIZED.store(true, Ordering::SeqCst);
+}
+
+fn mode_name(m: DisplayMode) -> &'static str {
+    match m {
+        DisplayMode::Windowed => "windowed",
+        DisplayMode::Borderless => "borderless",
+        DisplayMode::Fullscreen => "fullscreen",
+    }
+}
+
+/// Alt+Enter / F11: windowed <-> the full-screen mode.
+unsafe fn toggle_full(hwnd: HWND) {
+    let (cur, full) = {
+        let d = DISPLAY.lock();
+        (d.mode, d.full)
+    };
+    let next = if cur == DisplayMode::Windowed { full } else { DisplayMode::Windowed };
+    unsafe { apply_mode(hwnd, next) };
+    crate::config::persist("display_mode", mode_name(next));
+}
+
+/// Keeps a full-screen window covering its monitor (after display changes).
+unsafe fn refit(hwnd: HWND) {
+    let mode = DISPLAY.lock().mode;
+    if mode == DisplayMode::Windowed {
+        return;
+    }
+    unsafe {
+        if let Some(m) = window_monitor(hwnd) {
+            let r = m.rect;
+            SetWindowPos(hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+    RESIZED.store(true, Ordering::SeqCst);
+}
+
+/// Records the windowed client size in settings.txt (after a resize by the user).
+unsafe fn remember_size(hwnd: HWND) {
+    if DISPLAY.lock().mode != DisplayMode::Windowed {
+        return;
+    }
+    let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+    unsafe { GetClientRect(hwnd, &mut r) };
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    if w >= 320 && h >= 180 {
+        crate::config::persist("window_width", &w.to_string());
+        crate::config::persist("window_height", &h.to_string());
+    }
+}
+
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_CLOSE => {
@@ -230,12 +497,48 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
-        WM_INPUT => {
-            unsafe {
-                raw_input(lp);
-                DefWindowProcW(hwnd, msg, wp, lp)
-            }
+        WM_EXITSIZEMOVE => {
+            unsafe { remember_size(hwnd) };
+            0
         }
+        WM_GETMINMAXINFO => {
+            let mi = unsafe { &mut *(lp as *mut MINMAXINFO) };
+            mi.ptMinTrackSize = POINT { x: 320, y: 200 };
+            0
+        }
+        WM_DPICHANGED => {
+            // Windows' suggestion keeps the window's size on the new scale.
+            if DISPLAY.lock().mode == DisplayMode::Windowed {
+                let r = unsafe { &*(lp as *const RECT) };
+                unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE) };
+            } else {
+                unsafe { refit(hwnd) };
+            }
+            0
+        }
+        WM_DISPLAYCHANGE => {
+            unsafe { refit(hwnd) };
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_ACTIVATEAPP => {
+            // Exclusive fullscreen: the desktop mode while switched away.
+            let active = wp != 0;
+            if DISPLAY.lock().mode == DisplayMode::Fullscreen {
+                if active {
+                    unsafe {
+                        ShowWindow(hwnd, SW_RESTORE);
+                        apply_mode(hwnd, DisplayMode::Fullscreen);
+                    }
+                } else if restore_display() {
+                    unsafe { ShowWindow(hwnd, SW_MINIMIZE) };
+                }
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
+        }
+        WM_INPUT => unsafe {
+            raw_input(lp);
+            DefWindowProcW(hwnd, msg, wp, lp)
+        },
         WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
             // The first click captures the mouse; it is not a game input.
             if !CAPTURED.load(Ordering::Relaxed) && crate::input::mouse_capture_enabled() {
@@ -245,19 +548,39 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_KEYDOWN | WM_SYSKEYDOWN => {
             let vk = (wp & 0xFF) as u32;
+            let alt = (lp >> 29) & 1 != 0;
+            let repeat = (lp >> 30) & 1 != 0;
             if vk == RELEASE_KEY.load(Ordering::Relaxed) && CAPTURED.load(Ordering::Relaxed) {
                 unsafe { release() };
                 return 0;
             }
+            // Alt+Enter and F11 switch the display mode (not game input).
+            if (vk == VK_RETURN && alt) || vk == VK_F11 {
+                if !repeat {
+                    unsafe { toggle_full(hwnd) };
+                }
+                return 0;
+            }
             set_key(wp, lp, true);
             // Alt+F4 still closes the window.
-            if msg == WM_SYSKEYDOWN && vk == 0x73 {
+            if msg == WM_SYSKEYDOWN && vk == VK_F4 {
                 return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
             }
             0
         }
         WM_KEYUP | WM_SYSKEYUP => {
             set_key(wp, lp, false);
+            0
+        }
+        // (No menu beep for Alt+key combinations.)
+        WM_SYSCHAR => 0,
+        WM_APP_DISPLAY => {
+            match wp {
+                0 => unsafe { toggle_full(hwnd) },
+                1 => unsafe { apply_mode(hwnd, DisplayMode::Windowed) },
+                2 => unsafe { apply_mode(hwnd, DisplayMode::Borderless) },
+                _ => unsafe { apply_mode(hwnd, DisplayMode::Fullscreen) },
+            }
             0
         }
         WM_ACTIVATE => {
@@ -276,12 +599,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     }
 }
 
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// Creates the window on a dedicated thread and waits until it exists.
-pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, String> {
+/// Creates the window on a dedicated thread (in the display mode of the
+/// settings) and waits until it exists.
+pub fn create(title: &str) -> Result<&'static Window, String> {
     if let Some(w) = WINDOW.get() {
         return Ok(w);
     }
@@ -291,6 +611,12 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
         .name("ui".into())
         .spawn(move || unsafe {
             crate::log::set_thread_name("ui");
+            let s = crate::config::settings();
+            {
+                let mut d = DISPLAY.lock();
+                d.full = if s.display_mode == DisplayMode::Fullscreen { DisplayMode::Fullscreen } else { DisplayMode::Borderless };
+                d.exclusive = (s.resolution.map_or(0, |r| r.0), s.resolution.map_or(0, |r| r.1), s.refresh_rate);
+            }
             let hinst = GetModuleHandleW(std::ptr::null());
             let class = wide("tlg_window");
             let wc = WNDCLASSEXW {
@@ -300,27 +626,31 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
                 cbClsExtra: 0,
                 cbWndExtra: 0,
                 hInstance: hinst,
-                hIcon: std::ptr::null_mut(),
+                // (Resource 1, when the executable has an icon.)
+                hIcon: LoadIconW(hinst, 1 as _),
                 hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
-                hbrBackground: std::ptr::null_mut(),
+                hbrBackground: GetStockObject(BLACK_BRUSH) as HBRUSH,
                 lpszMenuName: std::ptr::null(),
                 lpszClassName: class.as_ptr(),
                 hIconSm: std::ptr::null_mut(),
             };
             RegisterClassExW(&wc);
-            let style = WS_OVERLAPPEDWINDOW;
-            let mut rect = RECT { left: 0, top: 0, right: width as i32, bottom: height as i32 };
-            AdjustWindowRect(&mut rect, style, 0);
+            let Some(m) = find_monitor(&s.monitor) else {
+                let _ = tx.send(Err("no monitor found".into()));
+                return;
+            };
+            let (cw, ch) = windowed_client(&m);
             let t = wide(&title);
+            // Created hidden at the monitor's work area, sized for its DPI below.
             let hwnd = CreateWindowExW(
                 0,
                 class.as_ptr(),
                 t.as_ptr(),
-                style,
-                CW_USEDEFAULT,
-                CW_USEDEFAULT,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
+                WINDOWED_STYLE,
+                m.work.left,
+                m.work.top,
+                cw,
+                ch,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 hinst,
@@ -335,9 +665,25 @@ pub fn create(title: &str, width: u32, height: u32) -> Result<&'static Window, S
             if RegisterRawInputDevices(&dev, 1, std::mem::size_of::<RAWINPUTDEVICE>() as u32) == 0 {
                 crate::warn!("raw mouse input unavailable: mouse look disabled");
             }
-            CLIENT_W.store(width, Ordering::Relaxed);
-            CLIENT_H.store(height, Ordering::Relaxed);
+            let (fw, fh) = frame_for_client(hwnd, cw, ch);
+            let x = m.work.left + ((m.work.right - m.work.left) - fw).max(0) / 2;
+            let y = m.work.top + ((m.work.bottom - m.work.top) - fh).max(0) / 2;
+            SetWindowPos(hwnd, std::ptr::null_mut(), x, y, fw, fh, SWP_NOZORDER | SWP_NOACTIVATE);
+            DISPLAY.lock().windowed = Some(RECT { left: x, top: y, right: x + fw, bottom: y + fh });
+            crate::info!(
+                "display: monitor {} ({}x{}, DPI {}), windowed client {cw}x{ch}",
+                String::from_utf16_lossy(&m.device[..m.device.len() - 1]),
+                m.rect.right - m.rect.left,
+                m.rect.bottom - m.rect.top,
+                GetDpiForWindow(hwnd)
+            );
+            apply_mode(hwnd, s.display_mode);
+            let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+            GetClientRect(hwnd, &mut r);
+            CLIENT_W.store((r.right - r.left).max(1) as u32, Ordering::Relaxed);
+            CLIENT_H.store((r.bottom - r.top).max(1) as u32, Ordering::Relaxed);
             ShowWindow(hwnd, SW_SHOW);
+            SetForegroundWindow(hwnd);
             let _ = tx.send(Ok((hwnd as isize, hinst as isize)));
             let mut msg: MSG = std::mem::zeroed();
             while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {

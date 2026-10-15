@@ -148,6 +148,65 @@ unsafe extern "system" fn debug_cb(
     vk::FALSE
 }
 
+/// What a device lacks of the API version, extensions and features
+/// `init` enables unconditionally (empty: usable).
+unsafe fn missing_requirements(instance: &ash::Instance, pd: vk::PhysicalDevice, props: &vk::PhysicalDeviceProperties) -> Vec<String> {
+    let mut m = Vec::new();
+    if props.api_version < vk::API_VERSION_1_3 {
+        m.push(format!("Vulkan 1.3 (has {}.{})", vk::api_version_major(props.api_version), vk::api_version_minor(props.api_version)));
+        return m;
+    }
+    let exts = unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
+    for e in [ash::khr::swapchain::NAME, ash::khr::push_descriptor::NAME] {
+        if !exts.iter().any(|x| unsafe { CStr::from_ptr(x.extension_name.as_ptr()) } == e) {
+            m.push(e.to_string_lossy().into_owned());
+        }
+    }
+    let f = unsafe { instance.get_physical_device_features(pd) };
+    let base = [
+        ("robustBufferAccess", f.robust_buffer_access),
+        ("depthBounds", f.depth_bounds),
+        ("geometryShader", f.geometry_shader),
+        ("tessellationShader", f.tessellation_shader),
+        ("independentBlend", f.independent_blend),
+        ("dualSrcBlend", f.dual_src_blend),
+        ("logicOp", f.logic_op),
+        ("fillModeNonSolid", f.fill_mode_non_solid),
+        ("depthClamp", f.depth_clamp),
+        ("depthBiasClamp", f.depth_bias_clamp),
+        ("samplerAnisotropy", f.sampler_anisotropy),
+        ("textureCompressionBC", f.texture_compression_bc),
+        ("imageCubeArray", f.image_cube_array),
+        ("shaderInt64", f.shader_int64),
+        ("shaderStorageImageWriteWithoutFormat", f.shader_storage_image_write_without_format),
+        ("shaderStorageImageReadWithoutFormat", f.shader_storage_image_read_without_format),
+        ("vertexPipelineStoresAndAtomics", f.vertex_pipeline_stores_and_atomics),
+        ("fragmentStoresAndAtomics", f.fragment_stores_and_atomics),
+        ("multiDrawIndirect", f.multi_draw_indirect),
+        ("sampleRateShading", f.sample_rate_shading),
+    ];
+    m.extend(base.iter().filter(|(_, v)| *v == 0).map(|(n, _)| n.to_string()));
+    let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
+    {
+        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12).push_next(&mut f13);
+        unsafe { instance.get_physical_device_features2(pd, &mut f2) };
+    }
+    let newer = [
+        ("timelineSemaphore", f12.timeline_semaphore),
+        ("scalarBlockLayout", f12.scalar_block_layout),
+        ("shaderFloat16", f12.shader_float16),
+        ("storageBuffer8BitAccess", f12.storage_buffer8_bit_access),
+        ("uniformAndStorageBuffer8BitAccess", f12.uniform_and_storage_buffer8_bit_access),
+        ("shaderInt8", f12.shader_int8),
+        ("dynamicRendering", f13.dynamic_rendering),
+        ("synchronization2", f13.synchronization2),
+        ("maintenance4", f13.maintenance4),
+    ];
+    m.extend(newer.iter().filter(|(_, v)| *v == 0).map(|(n, _)| n.to_string()));
+    m
+}
+
 pub fn init() -> Result<(), String> {
     if CTX.get().is_some() {
         return Ok(());
@@ -182,21 +241,51 @@ pub fn init() -> Result<(), String> {
                 .pfn_user_callback(Some(debug_cb));
             let _ = du.create_debug_utils_messenger(&mci, None);
         }
-        // Pick a discrete GPU with a graphics+compute queue.
+        // The GPU: settings.txt `gpu` (or TLG_GPU) names one by part of its
+        // name or its index; else a discrete GPU with a graphics+compute queue
+        // and everything tlg needs, else any such device.
         let pdevs = instance.enumerate_physical_devices().map_err(|e| format!("enumerate devices: {e}"))?;
-        let mut chosen = None;
-        for &pd in &pdevs {
+        let want = std::env::var("TLG_GPU").unwrap_or_else(|_| crate::config::settings().gpu.clone());
+        let want = want.trim().to_ascii_lowercase();
+        let auto = want.is_empty() || want == "auto";
+        let mut chosen: Option<(vk::PhysicalDevice, u32, vk::PhysicalDeviceProperties, Vec<String>)> = None;
+        let mut named = None;
+        for (i, &pd) in pdevs.iter().enumerate() {
             let props = instance.get_physical_device_properties(pd);
+            let name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
             let qfs = instance.get_physical_device_queue_family_properties(pd);
-            if let Some(qf) = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)) {
-                let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
-                if chosen.is_none() || discrete {
-                    chosen = Some((pd, qf as u32, props));
-                }
+            let missing = missing_requirements(&instance, pd, &props);
+            crate::info!(
+                "Vulkan device {i}: {name} ({:?}, API {}.{}.{}, driver {:#x}, vendor {:#06x}){}",
+                props.device_type,
+                vk::api_version_major(props.api_version),
+                vk::api_version_minor(props.api_version),
+                vk::api_version_patch(props.api_version),
+                props.driver_version,
+                props.vendor_id,
+                if missing.is_empty() { String::new() } else { format!(" lacks {}", missing.join(", ")) }
+            );
+            let Some(qf) = qfs.iter().position(|q| q.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)) else { continue };
+            if !auto && named.is_none() && (want.parse::<usize>().ok() == Some(i) || name.to_ascii_lowercase().contains(&want)) {
+                named = Some((pd, qf as u32, props, missing.clone()));
+            }
+            let discrete = props.device_type == vk::PhysicalDeviceType::DISCRETE_GPU;
+            let better = match &chosen {
+                None => true,
+                Some((_, _, cp, cm)) => (missing.is_empty(), discrete) > (cm.is_empty(), cp.device_type == vk::PhysicalDeviceType::DISCRETE_GPU),
+            };
+            if better {
+                chosen = Some((pd, qf as u32, props, missing));
             }
         }
-        let (pdev, qf, props) = chosen.ok_or("no Vulkan device with graphics+compute")?;
+        if !auto && named.is_none() {
+            crate::warn!("Vulkan: no device matches gpu = '{want}'; choosing automatically");
+        }
+        let (pdev, qf, props, missing) = named.or(chosen).ok_or("no Vulkan device with a graphics and compute queue")?;
         let device_name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
+        if !missing.is_empty() {
+            return Err(format!("{device_name} lacks Vulkan features tlg needs: {} (a newer driver may add them)", missing.join(", ")));
+        }
         let prio = [1.0f32];
         let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
         let host_import = instance

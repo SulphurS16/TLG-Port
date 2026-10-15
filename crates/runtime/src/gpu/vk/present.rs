@@ -95,13 +95,22 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
 /// The swapchain's present mode: FIFO (vsync), or `TLG_PRESENT=mailbox`
 /// (vsync without back-pressure: the newest frame is shown, for uncapped
 /// rates above the display's) or `TLG_PRESENT=immediate` (no vsync, tears)
-/// when the surface supports them.
+/// when the surface supports them; else settings.txt `vsync`.
 fn present_mode(surface: vk::SurfaceKHR) -> vk::PresentModeKHR {
+    use crate::config::VSync;
     let want = match std::env::var("TLG_PRESENT").as_deref() {
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
-        _ => return vk::PresentModeKHR::FIFO,
+        Ok("fifo") => vk::PresentModeKHR::FIFO,
+        _ => match crate::config::settings().vsync {
+            VSync::On => vk::PresentModeKHR::FIFO,
+            VSync::Off => vk::PresentModeKHR::IMMEDIATE,
+            VSync::Fast => vk::PresentModeKHR::MAILBOX,
+        },
     };
+    if want == vk::PresentModeKHR::FIFO {
+        return want;
+    }
     let c = ctx();
     let modes = unsafe { c.surface_i.get_physical_device_surface_present_modes(c.pdev, surface) }.unwrap_or_default();
     if modes.contains(&want) {
@@ -114,7 +123,7 @@ fn present_mode(surface: vk::SurfaceKHR) -> vk::PresentModeKHR {
 
 pub fn init(title: &str) -> Result<(), String> {
     super::init()?;
-    let w = window::create(title, 1280, 720)?;
+    let w = window::create(title)?;
     let c = ctx();
     unsafe {
         let sci = vk::Win32SurfaceCreateInfoKHR::default().hinstance(w.hinstance).hwnd(w.hwnd);
@@ -164,6 +173,37 @@ fn barrier(c: &super::Ctx, cmd: vk::CommandBuffer, img: vk::Image, old: vk::Imag
         .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 });
     unsafe {
         c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[b]);
+    }
+}
+
+/// Where a `sw` x `sh` frame goes in a `dw` x `dh` image: all of it
+/// (`scaling = stretch`), or the largest centred area of the frame's shape
+/// (`fit`; the rest black).
+fn dst_rect(sw: u32, sh: u32, dw: u32, dh: u32) -> (i32, i32, i32, i32) {
+    if crate::config::settings().scaling == crate::config::Scaling::Stretch || sw == 0 || sh == 0 {
+        return (0, 0, dw as i32, dh as i32);
+    }
+    fit_rect(sw, sh, dw, dh)
+}
+
+fn fit_rect(sw: u32, sh: u32, dw: u32, dh: u32) -> (i32, i32, i32, i32) {
+    let (sw, sh, dw, dh) = (sw as u64, sh as u64, dw as u64, dh as u64);
+    // Width-limited if the target is relatively narrower than the frame.
+    let (w, h) = if dw * sh <= dh * sw { (dw, (dw * sh + sw / 2) / sw) } else { ((dh * sw + sh / 2) / sh, dh) };
+    let (x, y) = ((dw - w) / 2, (dh - h) / 2);
+    (x as i32, y as i32, (x + w) as i32, (y + h) as i32)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn fit() {
+        assert_eq!(super::fit_rect(1920, 1080, 1920, 1080), (0, 0, 1920, 1080));
+        assert_eq!(super::fit_rect(1920, 1080, 2560, 1440), (0, 0, 2560, 1440));
+        // 16:10: bars above and below; 21:9: at the sides.
+        assert_eq!(super::fit_rect(1920, 1080, 1920, 1200), (0, 60, 1920, 1140));
+        assert_eq!(super::fit_rect(1920, 1080, 3440, 1440), (440, 0, 3000, 1440));
+        assert_eq!(super::fit_rect(1920, 1080, 1280, 1024), (0, 152, 1280, 872));
     }
 }
 
@@ -217,13 +257,25 @@ pub fn present(src: Source) -> bool {
                 }
             },
         };
+        let (dx0, dy0, dx1, dy1) = dst_rect(sw, sh, p.extent.width, p.extent.height);
+        if (dx0, dy0, dx1, dy1) != (0, 0, p.extent.width as i32, p.extent.height as i32) {
+            // Black bars around the frame.
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            c.device.cmd_clear_color_image(cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [0.0, 0.0, 0.0, 1.0] }, &[range]);
+            let b = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+            c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[b], &[], &[]);
+        }
         let blit = vk::ImageBlit {
             src_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
             src_offsets: [vk::Offset3D::default(), vk::Offset3D { x: sw as i32, y: sh as i32, z: 1 }],
             dst_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-            dst_offsets: [vk::Offset3D::default(), vk::Offset3D { x: p.extent.width as i32, y: p.extent.height as i32, z: 1 }],
+            dst_offsets: [vk::Offset3D { x: dx0, y: dy0, z: 0 }, vk::Offset3D { x: dx1, y: dy1, z: 1 }],
         };
-        c.device.cmd_blit_image(cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+        let filter = match crate::config::settings().filter {
+            crate::config::Filter::Smooth => vk::Filter::LINEAR,
+            crate::config::Filter::Sharp => vk::Filter::NEAREST,
+        };
+        c.device.cmd_blit_image(cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
         if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL && src_img != vk::Image::null() {
             barrier(c, cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, src_layout);
         }

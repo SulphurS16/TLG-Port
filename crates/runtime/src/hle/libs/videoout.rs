@@ -94,16 +94,55 @@ fn immediate_flips() -> bool {
     })
 }
 
+/// The frame-rate limit of immediate flips: flips no closer than the
+/// title's flip rate allows (rate n: every n+1 vblanks at 60 Hz, 30 fps for
+/// update 01.03's rate 1), as the console's vblank-timed flips. On a fixed
+/// schedule, so their average interval is exact (the title's time step
+/// snaps to 1/30 s near it); a late frame restarts the schedule. None:
+/// no limit (`frame_cap = off`, `tune frame_cap 0`).
+fn flip_interval(rate: u32) -> Option<Duration> {
+    let on = match crate::tune::get(crate::tune::FRAME_CAP) {
+        -1 => crate::config::settings().frame_cap == crate::config::FrameCap::Game,
+        v => v != 0,
+    };
+    on.then(|| Duration::from_nanos(16_666_667 * (rate as u64 + 1)))
+}
+
+/// How late a flip may be and still keep the schedule (the next one then
+/// comes that much sooner).
+const SCHEDULE_SLACK: Duration = Duration::from_millis(4);
+
 fn vblank_thread() {
     crate::log::set_thread_name("vblank");
     let period = Duration::from_nanos(16_666_667);
     let mut next = Instant::now() + period;
     let immediate = immediate_flips();
+    // (Immediate mode with a limit: the earliest time of the next flip.)
+    let mut flip_at: Option<Instant> = None;
     loop {
-        // The next vblank, or (immediate mode) a queued flip before it.
+        // The next vblank, or (immediate mode) a queued flip before it - not
+        // before its scheduled time.
         {
             let mut g = PORT.lock();
-            while Instant::now() < next && !(immediate && g.as_ref().is_some_and(|p| !p.pending.is_empty())) {
+            loop {
+                let now = Instant::now();
+                if now >= next {
+                    break;
+                }
+                let pending = immediate && g.as_ref().is_some_and(|p| !p.pending.is_empty());
+                if pending {
+                    match flip_at {
+                        Some(t) if t > now => {
+                            // (High-resolution sleep: std uses a high-resolution waitable timer.)
+                            let wake = t.min(next);
+                            drop(g);
+                            std::thread::sleep(wake - now);
+                            g = PORT.lock();
+                            continue;
+                        }
+                        _ => break,
+                    }
+                }
                 QUEUED_CV.wait_until(&mut g, next);
             }
         }
@@ -121,7 +160,15 @@ fn vblank_thread() {
                 VBLANK_CV.notify_all();
             }
             let interval = p.flip_rate as u64 + 1;
-            if !p.pending.is_empty() && (immediate || p.vblanks - p.last_flip_vblank >= interval) {
+            let now = Instant::now();
+            let due = flip_at.is_none_or(|t| now >= t);
+            if !p.pending.is_empty() && ((immediate && due) || (!immediate && p.vblanks - p.last_flip_vblank >= interval)) {
+                if immediate {
+                    flip_at = flip_interval(p.flip_rate).map(|iv| match flip_at {
+                        Some(t) if now < t + SCHEDULE_SLACK => t + iv,
+                        _ => now + iv,
+                    });
+                }
                 let f = p.pending.pop_front().unwrap();
                 if f.index >= 0 {
                     p.pending_per_buffer[f.index as usize] -= 1;

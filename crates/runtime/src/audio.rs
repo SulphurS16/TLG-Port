@@ -7,7 +7,11 @@
 //! mixer is paced by the audio device, as it is by the hardware.
 //!
 //! Without a device (none present, initialization failed, or TLG_AUDIO=0) the
-//! caller paces output in real time and the audio is discarded.
+//! caller paces output in real time and the audio is discarded. When the
+//! device goes away (unplugged, default device changed) the device thread
+//! opens the default device again (every 2 s until one works). The mix is
+//! scaled by the master volume of settings.txt (`volume`, 0-100: gain
+//! (v/100)^2).
 //! TLG_AUDIO_DUMP=<dir>: each port's stereo stream is also written to
 //! `<dir>/port<N>.f32` (interleaved little-endian float32, 48 kHz).
 
@@ -148,20 +152,37 @@ fn mix(out: &mut [f32]) {
             frame[1] += s[1];
         }
     }
+    let gain = master_gain();
     for v in out.iter_mut() {
-        *v = v.clamp(-1.0, 1.0);
+        *v = (*v * gain).clamp(-1.0, 1.0);
     }
     drop(m);
     CV.notify_all();
 }
 
+fn master_gain() -> f32 {
+    static G: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *G.get_or_init(|| {
+        let v = crate::config::settings().volume.min(100) as f32 / 100.0;
+        v * v
+    })
+}
+
 fn device_thread() {
     crate::log::set_thread_name("audio-out");
-    if let Err(e) = unsafe { run_device() } {
-        crate::warn!("audio: host output unavailable ({e}); audio is paced in real time without sound");
+    let mut failures = 0u32;
+    loop {
+        let r = unsafe { run_device() };
+        MIXER.lock().playing = false;
+        CV.notify_all();
+        if let Err(e) = r {
+            if failures == 0 {
+                crate::warn!("audio: host output unavailable or lost ({e}); audio is paced in real time without sound until a device works");
+            }
+            failures += 1;
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
     }
-    MIXER.lock().playing = false;
-    CV.notify_all();
 }
 
 unsafe fn run_device() -> windows::core::Result<()> {
@@ -197,7 +218,7 @@ unsafe fn run_device() -> windows::core::Result<()> {
     let render: IAudioRenderClient = client.GetService()?;
     let total = client.GetBufferSize()?;
     client.Start()?;
-    crate::info!("audio: WASAPI shared-mode output, 48 kHz float stereo, buffer {total} frames");
+    crate::info!("audio: WASAPI shared-mode output, 48 kHz float stereo, buffer {total} frames, volume {}%", crate::config::settings().volume);
     MIXER.lock().playing = true;
     CV.notify_all();
     let mut buf = vec![0f32; total as usize * 2];

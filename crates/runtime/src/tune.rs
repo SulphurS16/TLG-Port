@@ -523,7 +523,12 @@ pub const VBIND_RECHECK: usize = 88;
 /// all their copies.
 pub const HZ_DEDUPE: usize = 89;
 
-const TABLE: [(&str, &str, i64); 90] = [
+/// Flips no closer than the title's flip rate allows (`TLG_FRAME_CAP`; -1 =
+/// settings.txt `frame_cap`, 1 on, 0 off: development measurements above
+/// the game's own rate).
+pub const FRAME_CAP: usize = 90;
+
+const TABLE: [(&str, &str, i64); 91] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -614,6 +619,7 @@ const TABLE: [(&str, &str, i64); 90] = [
     ("ring_bytes_ahead", "TLG_RING_BYTES_AHEAD", 1),
     ("vbind_recheck", "TLG_VBIND_RECHECK", 1),
     ("hz_dedupe", "TLG_HZ_DEDUPE", 1),
+    ("frame_cap", "TLG_FRAME_CAP", -1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -25,13 +25,15 @@
 //! yaw change, stick up a positive pitch change (looks up). Applied only
 //! when all seven sites hold the expected bytes.
 //!
-//! Diagnostics (opt-in): TLG_LUA_LOG=1 restores the game scripts' logging.
-//! Every `log(fmt, ...)` and `GaPrint(...)` in the Lua (Havok Script) game
-//! scripts ends in the C function `GaPrint`, which the retail build compiled
-//! out (`xor eax, eax; ret` at eboot 0xd51780). The patch routes it to
-//! `tlg_lua_print`, which logs its arguments ("lua: ...") converted by the
-//! engine's own `tolstring` (eboot 0xe75cd0: lua_State, TValue*, size_t*).
-//! Applied only when the code bytes are the expected ones.
+//! Script prints: every `log(fmt, ...)` and `GaPrint(...)` in the Lua (Havok
+//! Script) game scripts ends in the C function `GaPrint`, which the retail
+//! build compiled out (`xor eax, eax; ret` at eboot 0xd51780). The patch
+//! routes it to `tlg_lua_print`, which converts its arguments with the
+//! engine's own `tolstring` (eboot 0xe75cd0: lua_State, TValue*, size_t*),
+//! notes the title screen's markers (`in_menu`) and, with TLG_LUA_LOG=1,
+//! logs them ("lua: ..."). It returns 0 as the retail function does (about
+//! one call a second). Applied only when the code bytes are the expected
+//! ones.
 //!
 //! Render-kick wait: the job that hands a frame to the ps4render thread
 //! (eboot 0xd0afa0) then waits for that thread's state ([obj+0x31ef8]) to
@@ -44,7 +46,7 @@
 
 use crate::patch::Patcher;
 use crate::sysv;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The title's own measured frame time, where a patch exposes it.
 pub fn guest_frame_ms() -> Option<f32> {
@@ -67,9 +69,7 @@ const TOLSTRING_BYTES: [u8; 8] = [0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56
 static BASE: AtomicU64 = AtomicU64::new(0);
 
 pub fn apply(p: &mut Patcher, name: &str) {
-    if std::env::var("TLG_LUA_LOG").is_ok_and(|v| v == "1") {
-        patch_gaprint(p, name);
-    }
+    patch_gaprint(p, name);
     match patch_kick_wait(p) {
         Ok(()) => crate::info!("render-kick wait: busy loop at {name}+{KICK_SITE:#x} detoured to a polling wait"),
         Err(e) => crate::warn!("render-kick wait: {name}: {e}; not patched"),
@@ -264,10 +264,57 @@ pub fn add_camera_turn(yaw: f32, pitch: f32) -> bool {
     true
 }
 
+/// The title screen and its menus show: from boot (logos, title) and the
+/// scripts' "Change Clut : titleScreen" until a stage starts from the menu
+/// ("RestartStageFromMenu", "LoadCheckPoint", "=====RESTART=====") or a
+/// load (`in_menu`).
+static TITLE: AtomicBool = AtomicBool::new(true);
+
+/// Notes the title screen's script markers in a print's text.
+fn note_script(text: &str) {
+    if text.starts_with("Change Clut : titleScreen") {
+        if !TITLE.swap(true, Ordering::Relaxed) {
+            crate::info!("input: the title screen shows");
+        }
+    } else if text.starts_with("RestartStageFromMenu") || text.starts_with("LoadCheckPoint") || text.contains("=====RESTART=====") {
+        if TITLE.swap(false, Ordering::Relaxed) {
+            crate::info!("input: a stage starts from the title menu");
+        }
+    }
+}
+
+/// Keyboard/mouse context: a menu shows - the title screen and main menu
+/// (script markers; a load of over 3 s - the camera still - also ends
+/// them, e.g. New Game), or the game camera stands still (no update for
+/// half a second and 3 frames: the pause menu, loading screens, most
+/// cutscenes). None without the camera hook.
+pub fn in_menu() -> Option<bool> {
+    use std::sync::atomic::AtomicU32;
+    let s = CAM_SLOTS.load(Ordering::Relaxed);
+    if s == 0 {
+        return None;
+    }
+    // SAFETY: as in add_camera_turn.
+    let updates = unsafe { &*((s + 8) as *const AtomicU32) }.load(Ordering::Relaxed);
+    let now = crate::log::elapsed_ms();
+    let flip = crate::gpu::FRAMES.load(Ordering::Relaxed);
+    let still_ms = {
+        let mut seen = CAM_SEEN.lock();
+        if updates != seen.0 || seen.1 == 0.0 {
+            *seen = (updates, now, flip);
+        }
+        if flip >= seen.2 + 3 { now - seen.1 } else { 0.0 }
+    };
+    if still_ms > 3000.0 && TITLE.swap(false, Ordering::Relaxed) {
+        crate::info!("input: the title screen ended (a load)");
+    }
+    Some(TITLE.load(Ordering::Relaxed) || still_ms > 500.0)
+}
+
 fn patch_gaprint(p: &mut Patcher, name: &str) {
     let t = TOLSTRING as usize;
     if p.image.get(GAPRINT..GAPRINT + 16) != Some(&GAPRINT_BYTES[..]) || p.image.get(t..t + 8) != Some(&TOLSTRING_BYTES[..]) {
-        crate::warn!("TLG_LUA_LOG: {name} is not the expected executable (GaPrint/tolstring bytes differ): not patched");
+        crate::warn!("script prints: {name} is not the expected executable (GaPrint/tolstring bytes differ): not patched");
         return;
     }
     // mov rax, imm64; jmp rax (12 bytes; the rest stays padding).
@@ -277,7 +324,7 @@ fn patch_gaprint(p: &mut Patcher, name: &str) {
     code.extend_from_slice(&[0xFF, 0xE0]);
     p.image[GAPRINT..GAPRINT + code.len()].copy_from_slice(&code);
     BASE.store(p.base, Ordering::Relaxed);
-    crate::info!("TLG_LUA_LOG: script logging restored (GaPrint at {name}+{GAPRINT:#x})");
+    crate::info!("script prints: GaPrint at {name}+{GAPRINT:#x} routed to tlg (logged with TLG_LUA_LOG=1)");
 }
 
 /// The render-kick job's spin-counter reset, its first test of the
@@ -376,7 +423,12 @@ unsafe fn lua_print(l: u64) {
         let s = unsafe { crate::hle::call_guest(base_mod + TOLSTRING, &[l, base + i * 16, 0]) };
         parts.push(if s != 0 { unsafe { cstr(s, 2048) } } else { "<?>".to_string() });
     }
-    crate::info!("lua: {}", parts.join(" "));
+    let text = parts.join(" ");
+    note_script(&text);
+    static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *LOG.get_or_init(|| std::env::var("TLG_LUA_LOG").is_ok_and(|v| v == "1")) {
+        crate::info!("lua: {text}");
+    }
 }
 
 sysv! {

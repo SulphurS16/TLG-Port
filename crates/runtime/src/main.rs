@@ -1,9 +1,16 @@
 //! tlg: runs the PS4 The Last Guardian executable natively on Windows x86-64
 //! with high-level emulation of the PS4 system libraries.
+//!
+//! A windowed (GUI subsystem) program: no console window. Development runs
+//! redirect stdout/stderr (tools/run.ps1, drive.ps1); the command-line tools
+//! (--decode-at9, --probe-media) attach to the starting console.
+
+#![windows_subsystem = "windows"]
 
 #[macro_use]
 mod log;
 mod audio;
+mod config;
 mod debug_mem;
 mod sampler;
 mod tune;
@@ -28,13 +35,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 pub struct Config {
-    pub root: PathBuf,
-    /// Machine-local data directory (`<root>/local`): runs, saves, caches, runtime dirs.
-    pub data: PathBuf,
-    /// Application directories mounted at /app0, highest priority first
-    /// (an optional update overlay, then the prepared base game).
-    pub app_dirs: Vec<PathBuf>,
-    pub run_dir: PathBuf,
+    /// Where this build keeps settings, saves, caches and logs.
+    pub paths: config::Paths,
+    /// Game folders from the command line (else settings.txt, else the defaults).
+    pub game: Option<PathBuf>,
+    pub update: Option<PathBuf>,
+    pub no_update: bool,
     pub seconds: Option<u64>,
     /// Development control channel (see `poll_control`).
     pub control: Option<PathBuf>,
@@ -42,20 +48,25 @@ pub struct Config {
     pub lenient: bool,
     pub debug: bool,
     pub headless: bool,
+    /// Default settings and bindings, the files left alone.
+    pub safe_mode: bool,
+    /// Started by the launcher (`--launcher`), which reports crashes itself.
+    pub launcher: bool,
+    /// Player-facing message boxes (off with `--no-dialogs` and in scripted
+    /// or development runs).
+    pub dialogs: bool,
 }
 
 static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-static DATA_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// This run's directory (logs, screenshots, profiles).
 pub fn run_dir() -> Option<&'static Path> {
     RUN_DIR.get().map(|p| p.as_path())
 }
 
-/// The machine-local data directory (`Config::data`): user settings such as
-/// `input.txt` live there.
+/// The user settings directory: `input.txt`, `settings.txt`, saves.
 pub fn data_dir() -> Option<&'static Path> {
-    DATA_DIR.get().map(|p| p.as_path())
+    config::try_paths().map(|p| p.user.as_path())
 }
 
 fn utc_stamp() -> String {
@@ -76,24 +87,8 @@ fn utc_stamp() -> String {
     format!("{:04}{:02}{:02}-{:02}{:02}{:02}", y, m, d, rem / 3600, (rem / 60) % 60, rem % 60)
 }
 
-/// The project root: the nearest ancestor of the executable holding `local/` or the
-/// workspace `Cargo.toml` (development builds live in target/<triple>/<profile>/);
-/// otherwise the executable's own directory (a distributed build).
-fn default_root() -> PathBuf {
-    let exe = std::env::current_exe().unwrap();
-    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
-    let mut p = Some(dir.as_path());
-    while let Some(d) = p {
-        if d.join("local").is_dir() || d.join("Cargo.toml").is_file() {
-            return d.to_path_buf();
-        }
-        p = d.parent();
-    }
-    dir
-}
-
 fn parse_args() -> Config {
-    let mut root = default_root();
+    let mut paths = config::Paths::current();
     let mut game: Option<PathBuf> = None;
     let mut update: Option<PathBuf> = None;
     let mut no_update = false;
@@ -103,6 +98,9 @@ fn parse_args() -> Config {
     let mut debug = false;
     let mut headless = false;
     let mut control = None;
+    let mut safe_mode = false;
+    let mut launcher = false;
+    let mut no_dialogs = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -126,40 +124,58 @@ fn parse_args() -> Config {
             "--lenient" => lenient = true,
             "--debug" => debug = true,
             "--headless" => headless = true,
-            "--root" => root = PathBuf::from(args.next().expect("--root needs a path")),
+            // A development checkout's root (its `local\` holds everything).
+            "--root" => {
+                let local = PathBuf::from(args.next().expect("--root needs a path")).join("local");
+                paths = config::Paths { layout: config::Layout::Dev, exe_dir: paths.exe_dir.clone(), user: local.clone(), cache: local.clone(), game_root: local.join("game") };
+            }
             "--game" => game = Some(PathBuf::from(args.next().expect("--game needs a path"))),
             "--update" => update = Some(PathBuf::from(args.next().expect("--update needs a path"))),
             // The base application alone (01.00), ignoring a prepared update overlay.
             "--no-update" => no_update = true,
             "--control" => control = Some(PathBuf::from(args.next().expect("--control needs a path"))),
+            "--safe-mode" => safe_mode = true,
+            "--launcher" => launcher = true,
+            "--no-dialogs" => no_dialogs = true,
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
             }
         }
     }
-    let data = root.join("local");
-    // Default baseline: the prepared update (01.03) over the base application (01.00).
-    let default_update = data.join("game").join("CUSA03627-patch");
-    if update.is_none() && !no_update && default_update.join("eboot.bin").is_file() {
-        update = Some(default_update);
-    }
-    if no_update {
-        update = None;
-    }
-    let mut app_dirs: Vec<PathBuf> = update.into_iter().collect();
-    app_dirs.push(game.unwrap_or_else(|| data.join("game").join("CUSA03627")));
-    Config {
-        app_dirs,
-        run_dir: data.join("runs").join(utc_stamp()),
-        data,
-        root,
-        seconds,
-        trace,
-        lenient,
-        debug,
-        headless,
-        control,
+    let dialogs = !no_dialogs && !headless && control.is_none() && seconds.is_none() && paths.layout != config::Layout::Dev;
+    Config { paths, game, update, no_update, seconds, trace, lenient, debug, headless, control, safe_mode, launcher, dialogs }
+}
+
+/// The folders mounted at /app0, highest priority first: the update (01.03)
+/// over the base application (01.00). Command line, then settings.txt, then
+/// the layout's default folders.
+fn app_dirs(cfg: &Config, s: &config::Settings) -> Vec<PathBuf> {
+    let base = cfg.game.clone().or_else(|| s.game_dir.clone()).unwrap_or_else(|| cfg.paths.default_base());
+    let update = match (cfg.no_update, cfg.update.clone().or_else(|| s.update_dir.clone())) {
+        (true, _) => None,
+        (false, Some(u)) => Some(u),
+        (false, None) => Some(cfg.paths.default_update()).filter(|u| u.join("eboot.bin").is_file()),
+    };
+    update.into_iter().chain([base]).collect()
+}
+
+/// Only one game process at a time (both would write the same saves).
+fn single_instance() -> bool {
+    use windows_sys::Win32::Foundation::{ERROR_ALREADY_EXISTS, GetLastError};
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+    let name: Vec<u16> = "Local\\tlg-the-last-guardian-runtime".encode_utf16().chain([0]).collect();
+    let h = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    // (The handle stays open for the process lifetime.)
+    !h.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
+}
+
+/// Per-monitor DPI awareness (v2): the window's pixels are the screen's,
+/// not scaled by Windows.
+fn dpi_aware() {
+    use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext};
+    unsafe {
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     }
 }
 
@@ -346,6 +362,20 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 thread::cpu_report();
                 Ok(())
             }
+            "display" => {
+                // display windowed|borderless|fullscreen|toggle: as Alt+Enter / settings.
+                let m = match parts.next().unwrap_or("") {
+                    "windowed" => Some(Some(config::DisplayMode::Windowed)),
+                    "borderless" => Some(Some(config::DisplayMode::Borderless)),
+                    "fullscreen" => Some(Some(config::DisplayMode::Fullscreen)),
+                    "toggle" => Some(None),
+                    _ => None,
+                };
+                match m {
+                    Some(m) => gpu::vk::window::request_mode(m),
+                    None => Err("display: windowed, borderless, fullscreen or toggle".into()),
+                }
+            }
             "sample" => {
                 let ms = parts.next().and_then(|v| v.parse().ok()).unwrap_or(3000);
                 thread::sample_threads(ms);
@@ -400,7 +430,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
 pub fn fatal_report(text: &str) {
     crate::log::write(crate::log::Level::Error, format_args!("{text}"));
     if let Some(dir) = RUN_DIR.get() {
-        let _ = std::fs::write(dir.join("crash.txt"), text);
+        let _ = std::fs::write(dir.join("crash.txt"), crate::log::redact(text).as_bytes());
     }
 }
 
@@ -424,6 +454,8 @@ fn thread_summary() -> String {
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
     crate::log::write(crate::log::Level::Error, format_args!("terminating: {reason}\n{}", thread_summary()));
     crate::log::try_flush();
+    // (A display mode switched for exclusive fullscreen goes back.)
+    gpu::vk::window::restore_display();
     unsafe {
         windows_sys::Win32::System::Threading::TerminateProcess(windows_sys::Win32::System::Threading::GetCurrentProcess(), code);
     }
@@ -432,9 +464,21 @@ pub fn fatal_exit(code: u32, reason: &str) -> ! {
     }
 }
 
+/// Player-facing startup failure: logged, shown (with dialogs on), exit.
+fn startup_failure(title: &str, text: &str, code: u32) -> ! {
+    config::user_error(title, text);
+    fatal_exit(code, title);
+}
+
 pub fn shutdown(code: i32) -> ! {
+    // A save being written finishes first.
+    hle::libs::savedata::wait_writes(Duration::from_secs(3));
+    gpu::vk::window::restore_display();
     if code == 0 {
         gpu::render::save_pipeline_cache(Duration::ZERO);
+        if let Some(p) = config::try_paths() {
+            let _ = std::fs::remove_file(p.running_marker());
+        }
     }
     pacing::finish();
     info!("shutdown with status {code}\n{}", thread_summary());
@@ -489,14 +533,29 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if std::env::args().any(|a| a == "--decode-at9" || a == "--probe-media") {
+        unsafe { windows_sys::Win32::System::Console::AttachConsole(windows_sys::Win32::System::Console::ATTACH_PARENT_PROCESS) };
+    }
+    dpi_aware();
     let cfg = parse_args();
-    let runs = cfg.data.join("runs");
-    prune_runs(&runs, 30);
-    std::fs::create_dir_all(&cfg.run_dir).expect("create run dir");
-    RUN_DIR.set(cfg.run_dir.clone()).ok();
-    DATA_DIR.set(cfg.data.clone()).ok();
-    log::init(&cfg.run_dir.join("tlg.log")).expect("open log");
+    let setting_errors = config::init(cfg.paths.clone(), cfg.safe_mode, cfg.dialogs);
+    if !single_instance() {
+        config::user_error("The Last Guardian (tlg)", "The game is already running.");
+        std::process::exit(1);
+    }
+    let paths = config::paths();
+    let runs = paths.logs();
+    prune_runs(&runs, paths.logs_kept());
+    let run_dir = runs.join(utc_stamp());
+    if let Err(e) = std::fs::create_dir_all(&run_dir).and_then(|_| log::init(&run_dir.join("tlg.log"))) {
+        config::user_error("The Last Guardian (tlg)", &format!("Cannot write the log folder {}: {e}", run_dir.display()));
+        std::process::exit(1);
+    }
+    RUN_DIR.set(run_dir.clone()).ok();
     log::set_thread_name("host");
+    // (Left behind if this run does not exit cleanly: the launcher offers safe mode.)
+    let _ = std::fs::write(paths.running_marker(), format!("pid {}\nrun {}\n", std::process::id(), run_dir.display()));
+    let app_dirs = app_dirs(&cfg, config::settings());
     if cfg.debug || cfg.trace {
         log::LEVEL.store(log::Level::Debug as u8, std::sync::atomic::Ordering::Relaxed);
     }
@@ -506,9 +565,27 @@ fn main() {
         info!("logging HLE calls of {ms} ms or more");
     }
     hle::LENIENT_IMPORTS.store(cfg.lenient, std::sync::atomic::Ordering::Relaxed);
-    info!("tlg {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), cfg.run_dir.display(), slot);
+    info!("tlg {} | run dir {} | TLS slot {}", env!("CARGO_PKG_VERSION"), run_dir.display(), slot);
+    info!(
+        "layout {:?}: settings and saves {}, caches {}{}{}",
+        paths.layout,
+        paths.user.display(),
+        paths.cache.display(),
+        if cfg.safe_mode { " | SAFE MODE (default settings)" } else { "" },
+        if cfg.launcher { " | started by the launcher" } else { "" }
+    );
+    for e in &setting_errors {
+        warn!("{e} (default used)");
+    }
+    {
+        let s = config::settings();
+        info!(
+            "settings: {:?} on {} (window {}x{}, fullscreen {:?} @ {} Hz), vsync {:?}, scaling {:?} {:?}, frame cap {:?}, gpu {}, volume {}",
+            s.display_mode, s.monitor, s.window_width, s.window_height, s.resolution, s.refresh_rate, s.vsync, s.scaling, s.filter, s.frame_cap, s.gpu, s.volume
+        );
+    }
     exception::install();
-    gpu::shader_dump::DIR.set(cfg.run_dir.join("shaders")).ok();
+    gpu::shader_dump::DIR.set(run_dir.join("shaders")).ok();
     if std::env::var_os("TLG_TEST_FAULT").is_some() {
         info!("TLG_TEST_FAULT: writing to an invalid address from host code");
         unsafe { std::ptr::write_volatile(0x32c3be8 as *mut u64, 1) };
@@ -526,8 +603,21 @@ fn main() {
     }
     // The renderer runs whether or not frames reach a window: headless runs (and a
     // window that could not be shown) render offscreen; screenshots still work.
+    // The game files first: nothing else is worth starting without them.
+    info!("game folders (highest priority first): {:?}", app_dirs);
+    let Some(eboot_path) = app_dirs.iter().map(|d| d.join("eboot.bin")).find(|p| p.exists()) else {
+        let dirs: Vec<String> = app_dirs.iter().map(|d| format!("  {}", d.display())).collect();
+        startup_failure(
+            "Game files not found",
+            &format!("No prepared game files (eboot.bin) were found in:\n{}\n\nStart the launcher (tlg-launcher.exe) and run its game-file setup, or point settings.txt (game_dir, update_dir) at your prepared copy.", dirs.join("\n")),
+            1,
+        );
+    };
+    // The renderer runs whether or not frames reach a window: headless runs (and a
+    // window that could not be shown) render offscreen; screenshots still work.
     if !cfg.headless {
-        if let Err(e) = gpu::vk::present::init("The Last Guardian (tlg)") {
+        let title = format!("The Last Guardian - tlg {}{}", env!("CARGO_PKG_VERSION"), if cfg.safe_mode { " (safe mode)" } else { "" });
+        if let Err(e) = gpu::vk::present::init(&title) {
             warn!("no presentation window ({e}): rendering offscreen");
         }
     }
@@ -535,47 +625,42 @@ fn main() {
         // (TLG_PIPELINE_CACHE=0: none - pipelines compile afresh, e.g. to
         // measure compile times.)
         if std::env::var("TLG_PIPELINE_CACHE").map_or(true, |v| v != "0") {
-            gpu::render::set_pipeline_cache_path(cfg.data.join("pipeline-cache.bin"));
+            gpu::render::set_pipeline_cache_path(paths.pipeline_cache());
         }
         gpu::render::init()
     }) {
-        error!("renderer unavailable: {e}");
-        fatal_exit(1, "no Vulkan renderer");
+        startup_failure(
+            "Graphics unavailable",
+            &format!("The Vulkan renderer could not start:\n{e}\n\ntlg needs a graphics card and driver with Vulkan 1.3 (NVIDIA, AMD or Intel; update the graphics driver)."),
+            1,
+        );
     }
 
     // Guest file system.
-    let rt = cfg.data.join("runtime");
+    let rt = paths.runtime();
     for d in ["temp0", "download0", "data", "savedata"] {
         hle::kernel::fs::ensure_dir(&rt.join(d));
     }
-    hle::kernel::fs::mount("/app0", cfg.app_dirs.clone(), false);
-    hle::kernel::fs::mount("/hostapp", cfg.app_dirs.clone(), false);
+    hle::kernel::fs::mount("/app0", app_dirs.clone(), false);
+    hle::kernel::fs::mount("/hostapp", app_dirs.clone(), false);
     hle::kernel::fs::mount("/temp0", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/temp", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/download0", vec![rt.join("download0")], true);
     hle::kernel::fs::mount("/data", vec![rt.join("data")], true);
-    hle::libs::savedata::init(cfg.data.join("saves"));
+    hle::libs::savedata::init(paths.saves(), paths.save_backups());
 
     // Modules.
     let t0 = Instant::now();
-    let Some(eboot_path) = cfg.app_dirs.iter().map(|d| d.join("eboot.bin")).find(|p| p.exists()) else {
-        error!("no eboot.bin in {:?}", cfg.app_dirs);
-        fatal_exit(1, "game files missing");
-    };
     let eboot = loader::load(&eboot_path, true).unwrap_or_else(|e| {
-        error!("loading eboot failed: {e}");
-        fatal_exit(1, "load failure");
+        startup_failure("Game files unusable", &format!("Loading {} failed: {e}\n\nCheck the game files with the launcher's Verify.", eboot_path.display()), 1);
     });
     let mut libs: Vec<Arc<loader::LoadedModule>> = Vec::new();
     for name in ["libc.prx", "libSceFios2.prx"] {
-        let p = cfg.app_dirs.iter().map(|d| d.join("sce_module").join(name)).find(|p| p.exists());
+        let p = app_dirs.iter().map(|d| d.join("sce_module").join(name)).find(|p| p.exists());
         match p {
             Some(p) => match loader::load(&p, false) {
                 Ok(m) => libs.push(m),
-                Err(e) => {
-                    error!("loading {name} failed: {e}");
-                    fatal_exit(1, "load failure");
-                }
+                Err(e) => startup_failure("Game files unusable", &format!("Loading {} failed: {e}\n\nCheck the game files with the launcher's Verify.", p.display()), 1),
             },
             None => warn!("{name} not found in sce_module"),
         }
@@ -611,7 +696,7 @@ fn main() {
             .collect();
         lines.sort();
         lines.dedup();
-        let _ = std::fs::write(cfg.run_dir.join("unresolved.txt"), lines.join("\n") + "\n");
+        let _ = std::fs::write(run_dir.join("unresolved.txt"), lines.join("\n") + "\n");
     }
 
     // Guest main thread.

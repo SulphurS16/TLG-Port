@@ -1,5 +1,7 @@
 //! libSceSaveData: save directories and save-data memory backed by host
-//! directories under local-data/saves/<user>/<title>/.
+//! directories under <user folder>/saves/<user>/<title>/. Before save-data
+//! memory is replaced, the previous file is copied into the backups folder
+//! (tlg_config::saves; at most one copy per `BACKUP_EVERY`).
 
 use crate::hle::{Registry, cstr};
 use crate::{fixed, reg, sysv};
@@ -19,10 +21,21 @@ const MOUNT_CREATE: u32 = 4;
 const MOUNT_CREATE2: u32 = 32;
 
 static ROOT: OnceLock<PathBuf> = OnceLock::new();
+static BACKUPS: OnceLock<PathBuf> = OnceLock::new();
 static MOUNTS: Mutex<[Option<PathBuf>; 16]> = Mutex::new([const { None }; 16]);
 
-pub fn init(root: PathBuf) {
+/// The shortest time between two save backups.
+const BACKUP_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
+
+pub fn init(root: PathBuf, backups: PathBuf) {
+    crate::info!("saves in {}, backups in {}", root.display(), backups.display());
     ROOT.set(root).ok();
+    BACKUPS.set(backups).ok();
+}
+
+/// Waits (up to `limit`) for a save-data memory write in progress.
+pub fn wait_writes(limit: std::time::Duration) {
+    drop(SDMEM.try_lock_for(limit));
 }
 
 /// Where locally recorded trophy unlocks of the running title live.
@@ -150,9 +163,25 @@ fn sdmem_store(user: i32, data: &[u8]) -> std::io::Result<()> {
         h.sync_all()?;
     }
     if f.exists() {
+        backup_before_write(f.parent().unwrap());
         std::fs::copy(&f, f.with_extension("dat.bak"))?;
     }
     std::fs::rename(&tmp, &f)
+}
+
+/// Copies the save about to be replaced into the backups folder, unless the
+/// newest backup is recent.
+fn backup_before_write(mem: &std::path::Path) {
+    let Some(dir) = BACKUPS.get() else { return };
+    let now = std::time::SystemTime::now();
+    let recent = tlg_config::saves::newest_backup_time(dir).and_then(|t| now.duration_since(t).ok()).is_some_and(|age| age < BACKUP_EVERY);
+    if recent {
+        return;
+    }
+    match tlg_config::saves::backup(mem, dir, &tlg_config::saves::utc_stamp(now)) {
+        Ok(d) => crate::info!("save-data memory: previous save backed up to {}", d.display()),
+        Err(e) => crate::warn!("save-data memory: backup into {} failed: {e}", dir.display()),
+    }
 }
 
 /// SceSaveDataMemoryData {buf*, bufSize, offset, reserved[40]}.

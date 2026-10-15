@@ -1,0 +1,10 @@
+[package]
+name = "tlg-config"
+version.workspace = true
+description = "Paths, settings and keyboard/mouse bindings shared by the tlg runtime and its launcher"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lib]
+path = "src/lib.rs"

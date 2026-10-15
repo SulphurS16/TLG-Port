@@ -2,9 +2,10 @@
 resolver = "3"
 members = ["crates/*"]
 # spvval compiles SPIRV-Tools (C++): built on request (-p spvval).
-default-members = ["crates/prep", "crates/runtime", "crates/gcn", "crates/sce-elf", "crates/tlgdis", "crates/tlgdbg"]
+default-members = ["crates/config", "crates/prep", "crates/runtime", "crates/gcn", "crates/sce-elf", "crates/tlgdis", "crates/tlgdbg"]
 
 [workspace.package]
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"

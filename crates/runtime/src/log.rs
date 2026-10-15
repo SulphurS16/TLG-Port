@@ -68,6 +68,57 @@ pub fn elapsed_ms() -> f64 {
     START.get_or_init(Instant::now).elapsed().as_secs_f64() * 1000.0
 }
 
+/// Personal data kept out of logs and crash reports: the user profile path,
+/// the user and computer names (whole words). (pattern, replacement, whole
+/// words only).
+fn redactions() -> &'static [(String, &'static str, bool)] {
+    static R: OnceLock<Vec<(String, &'static str, bool)>> = OnceLock::new();
+    R.get_or_init(|| {
+        let var = |n: &str| std::env::var(n).ok().map(|v| v.trim().to_string()).filter(|v| v.len() >= 2);
+        let mut v = Vec::new();
+        if let Some(p) = var("USERPROFILE").filter(|p| p.len() >= 4) {
+            let p = p.replace('/', "\\");
+            // (Also as Debug formatting prints paths: backslashes doubled.)
+            v.push((p.replace('\\', "\\\\"), "%USERPROFILE%", false));
+            v.push((p.replace('\\', "/"), "%USERPROFILE%", false));
+            v.push((p, "%USERPROFILE%", false));
+        }
+        if let Some(u) = var("USERNAME") {
+            v.push((u, "<user>", true));
+        }
+        if let Some(c) = var("COMPUTERNAME") {
+            v.push((c, "<computer>", true));
+        }
+        v
+    })
+}
+
+/// `s` with personal data replaced (ASCII case-insensitive).
+pub fn redact(s: &str) -> std::borrow::Cow<'_, str> {
+    let mut out = std::borrow::Cow::Borrowed(s);
+    for (pat, rep, words) in redactions() {
+        let hay = out.to_ascii_lowercase();
+        let pl = pat.to_ascii_lowercase();
+        if !hay.contains(&pl) {
+            continue;
+        }
+        let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+        let mut res = String::with_capacity(out.len());
+        let (mut i, src) = (0usize, out.as_ref());
+        while let Some(off) = hay[i..].find(&pl) {
+            let at = i + off;
+            let end = at + pl.len();
+            let bounded = !*words || (!word(src[..at].chars().next_back()) && !word(src[end..].chars().next()));
+            res.push_str(&src[i..at]);
+            res.push_str(if bounded { rep } else { &src[at..end] });
+            i = end;
+        }
+        res.push_str(&src[i..]);
+        out = std::borrow::Cow::Owned(res);
+    }
+    out
+}
+
 pub fn write(level: Level, args: fmt::Arguments) {
     let tag = match level {
         Level::Error => "E",
@@ -77,6 +128,7 @@ pub fn write(level: Level, args: fmt::Arguments) {
         Level::Trace => "T",
     };
     let line = format!("[{:>10.3}][{}] {}: {}\n", elapsed_ms(), thread_name(), tag, args);
+    let line = redact(&line);
     if level <= Level::Warn {
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
@@ -103,6 +155,24 @@ pub fn try_flush() {
         if let Some(w) = g.as_mut() {
             let _ = w.flush();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn redaction() {
+        let user = std::env::var("USERNAME").unwrap_or_default();
+        let profile = std::env::var("USERPROFILE").unwrap_or_default();
+        if user.len() < 2 || profile.len() < 4 {
+            return;
+        }
+        let s = format!("save {}\\AppData\\Roaming\\TLG and {} (by {user}) {user}x", profile.to_ascii_uppercase(), profile.replace('\\', "/"));
+        let r = super::redact(&s);
+        assert_eq!(r, format!("save %USERPROFILE%\\AppData\\Roaming\\TLG and %USERPROFILE% (by <user>) {user}x"));
+        let dbg = format!("{:?}", vec![std::path::PathBuf::from(format!("{profile}\\AppData"))]);
+        assert_eq!(super::redact(&dbg), "[\"%USERPROFILE%\\\\AppData\"]");
+        assert!(matches!(super::redact("nothing personal"), std::borrow::Cow::Borrowed(_)));
     }
 }
 

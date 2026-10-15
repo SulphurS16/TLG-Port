@@ -411,7 +411,7 @@ dependencies = [
 
 [[package]]
 name = "tlg"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ash",
  "cc",
@@ -422,13 +422,29 @@ dependencies = [
  "rspirv",
  "sce-elf",
  "smallvec",
+ "tlg-config",
+ "windows",
+ "windows-sys",
+]
+
+[[package]]
+name = "tlg-config"
+version = "0.2.0"
+
+[[package]]
+name = "tlg-launcher"
+version = "0.2.0"
+dependencies = [
+ "ash",
+ "tlg-config",
+ "tlg-prep",
  "windows",
  "windows-sys",
 ]
 
 [[package]]
 name = "tlg-prep"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "aes",
  "hmac",
