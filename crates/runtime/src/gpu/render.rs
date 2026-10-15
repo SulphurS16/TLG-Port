@@ -1445,6 +1445,10 @@ pub(super) struct BatchCtx {
     /// Batches begun (the open one's number).
     batch: u64,
     rendering: Option<Rendering>,
+    /// The open rendering scope's attachments are marked GPU-written
+    /// (`tune attach_once`): later draws in it skip that. Reset when the
+    /// scope ends and by paths changing image state without ending it.
+    attach_marked: bool,
     barrier_needed: bool,
     /// `BARRIERS` count when GPU work other than dispatches' tracked buffer
     /// accesses was last left unordered (`unordered!`; u64::MAX: never).
@@ -2028,6 +2032,7 @@ pub fn init() -> Result<(), String> {
                 ring,
                 batch: 0,
                 rendering: None,
+                attach_marked: false,
                 barrier_needed: false,
                 unordered_gen: u64::MAX,
                 hz: smallvec::SmallVec::new(),
@@ -2594,6 +2599,7 @@ impl Renderer {
     }
 
     fn end_rendering(&mut self) {
+        self.cx.attach_marked = false;
         if self.cx.rendering.take().is_some() {
             unsafe { REC.cmd_end_rendering(self.cx.cmd) };
             unordered!(self);
@@ -5816,6 +5822,7 @@ impl Renderer {
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         if self.stale_aged != frame {
             self.stale_aged = frame;
+            self.cx.attach_marked = false;
             let mut stale = std::mem::take(&mut self.stale);
             for ks in stale.values_mut() {
                 ks.retain(|k| match self.images.get_mut(k) {
@@ -5860,6 +5867,9 @@ impl Renderer {
                     keys.push(k);
                 }
             }
+        }
+        if !keys.is_empty() {
+            self.cx.attach_marked = false;
         }
         for key in keys {
             let Some((bpp, mode, ph, total)) = Self::image_guest_layout(&key, &self.images[&key]) else { continue };
@@ -6998,26 +7008,34 @@ impl Renderer {
             }
             self.begin_rendering(&colors, depth, extent)?;
         }
-        let tick = self.draws + self.dispatches + 1;
-        for a in colors.iter().flatten() {
-            self.mark_stale(a.key);
-            if let Some(img) = self.images.get_mut(&a.key) {
-                set_gpu_written!(self, img, a.key.base);
-                img.guest_stale = true;
-                img.last_write = tick;
-                img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        // (Once per rendering scope with `tune attach_once`: the scope's
+        // first draw marks its attachments; the marks hold for the rest of
+        // it - its other commands' ordering among images at one address,
+        // generations compared after the scope - unless state-only paths
+        // reset the flag.)
+        if !(self.cx.attach_marked && crate::tune::get(crate::tune::ATTACH_ONCE) != 0) {
+            let tick = self.draws + self.dispatches + 1;
+            for a in colors.iter().flatten() {
+                self.mark_stale(a.key);
+                if let Some(img) = self.images.get_mut(&a.key) {
+                    set_gpu_written!(self, img, a.key.base);
+                    img.guest_stale = true;
+                    img.last_write = tick;
+                    img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+                }
+                *self.write_gen.entry(a.key).or_default() += 1;
             }
-            *self.write_gen.entry(a.key).or_default() += 1;
-        }
-        if let Some(d) = depth {
-            self.mark_stale(d.key);
-            if let Some(img) = self.images.get_mut(&d.key) {
-                set_gpu_written!(self, img, d.key.base);
-                img.guest_stale = true;
-                img.last_write = tick;
-                img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+            if let Some(d) = depth {
+                self.mark_stale(d.key);
+                if let Some(img) = self.images.get_mut(&d.key) {
+                    set_gpu_written!(self, img, d.key.base);
+                    img.guest_stale = true;
+                    img.last_write = tick;
+                    img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+                }
+                *self.write_gen.entry(d.key).or_default() += 1;
             }
-            *self.write_gen.entry(d.key).or_default() += 1;
+            self.cx.attach_marked = self.cx.rendering.is_some();
         }
         phase!(6);
         let cmd = self.cx.cmd;
@@ -8107,6 +8125,7 @@ impl Renderer {
                 }
                 img.guest_newer = true;
                 img.guest_stale = false;
+                self.cx.attach_marked = false;
             }
         }
     }

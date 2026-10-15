@@ -528,7 +528,13 @@ pub const HZ_DEDUPE: usize = 89;
 /// the game's own rate).
 pub const FRAME_CAP: usize = 90;
 
-const TABLE: [(&str, &str, i64); 91] = [
+/// A draw's attachments are marked GPU-written (stale index, generations,
+/// last write) once per rendering scope instead of at every draw
+/// (`TLG_ATTACH_ONCE`, 1): within one scope nothing else changes them
+/// (commands that would end the scope; the state-only paths reset it).
+pub const ATTACH_ONCE: usize = 91;
+
+const TABLE: [(&str, &str, i64); 92] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -620,6 +626,7 @@ const TABLE: [(&str, &str, i64); 91] = [
     ("vbind_recheck", "TLG_VBIND_RECHECK", 1),
     ("hz_dedupe", "TLG_HZ_DEDUPE", 1),
     ("frame_cap", "TLG_FRAME_CAP", -1),
+    ("attach_once", "TLG_ATTACH_ONCE", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
