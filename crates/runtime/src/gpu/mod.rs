@@ -1018,7 +1018,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let miss: Vec<String> = (0..2)
                 .map(|c| {
                     let m: Vec<String> = render::VBIND_MISS_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {}", render::VBIND_MISS[c][i].swap(0, Ordering::Relaxed))).collect();
-                    format!("{}: {}", ["graphics", "compute"][c], m.join(", "))
+                    let s: Vec<String> = render::VBIND_MISS_SRC_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {}", render::VBIND_MISS_SRC[c][i].swap(0, Ordering::Relaxed))).collect();
+                    format!("{}: {} (invalidated by {})", ["graphics", "compute"][c], m.join(", "), s.join(", "))
                 })
                 .collect();
             crate::info!("mirror binding cache misses/s by queue and reason: {}", miss.join("; "));

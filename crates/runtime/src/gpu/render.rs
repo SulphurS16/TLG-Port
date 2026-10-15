@@ -354,11 +354,23 @@ impl VWindow {
     }
 
     /// Guest [a, b) of the window stopped being current: generation `g`.
-    fn bump(&mut self, a: u64, b: u64, g: u64) {
+    fn bump(&mut self, a: u64, b: u64, g: u64, src: u8) {
         let (i, j) = (((a.max(self.lo) - self.lo) >> VGEN_SHIFT) as usize, ((b.max(a + 1) - 1).min(self.hi - 1).saturating_sub(self.lo) >> VGEN_SHIFT) as usize);
         for c in self.cgen.iter_mut().take(j + 1).skip(i) {
             *c = g;
         }
+        if perf_on() {
+            for c in self.csrc.iter_mut().take(j + 1).skip(i) {
+                *c = src;
+            }
+        }
+    }
+
+    /// What last invalidated the parts of [base, base+size) newer than
+    /// generation `g` (`VBIND_MISS_SRC_NAMES`).
+    fn bump_src(&self, base: u64, size: u64, g: u64) -> usize {
+        let (a, b) = (((base.max(self.lo) - self.lo) >> VGEN_SHIFT) as usize, ((base + size.max(1) - 1).min(self.hi - 1).saturating_sub(self.lo) >> VGEN_SHIFT) as usize);
+        (a..=b.min(self.cgen.len().saturating_sub(1))).filter(|&c| self.cgen[c] > g).max_by_key(|&c| self.cgen[c]).map_or(5, |c| self.csrc[c] as usize)
     }
 }
 
@@ -383,6 +395,8 @@ struct VWindow {
     /// The same per 4 MiB of the window (`VGEN_SHIFT`): bindings in one part
     /// stay served while other parts change (`vbind`).
     cgen: Vec<u64>,
+    /// Per part: the source of its last invalidation (TLG_PERF miss reasons).
+    csrc: Vec<u8>,
     /// Sparse windows (`Ctx::sparse`): `mem` is null, memory is bound block
     /// by block on first use, so a window costs what has been bound of it.
     sparse: Option<SparseMem>,
@@ -2266,6 +2280,9 @@ pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::
 /// reason (`VBIND_MISS_NAMES`).
 pub static VBIND_MISS: [[std::sync::atomic::AtomicU64; 5]; 2] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 5] }; 2];
 pub const VBIND_MISS_NAMES: [&str; 5] = ["written whole", "not bound before", "window replaced", "part of the window invalidated", "not checked this round"];
+/// Misses of invalidated parts by what invalidated them, per queue class.
+pub static VBIND_MISS_SRC: [[std::sync::atomic::AtomicU64; 6]; 2] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 6] }; 2];
+pub const VBIND_MISS_SRC_NAMES: [&str; 6] = ["GPU writes", "CPU writes found", "CP writes", "remapped memory", "GPU writes in an overlapping window", "none found"];
 
 /// TLG_PERF: TSC cycles and counts of buffer-binding steps (`BPART_NAMES`).
 pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 25] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 25];
@@ -4518,6 +4535,7 @@ impl Renderer {
                     Some(&(k, wgen, _, buf, _)) => match self.vcache.as_ref().and_then(|vc| vc.windows.get(&k)) {
                         Some(w) if w.buf == buf => {
                             if w.part_gen(base, size) != wgen {
+                                VBIND_MISS_SRC[BPART_CS.get() as usize][w.bump_src(base, size, wgen)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 3
                             } else {
                                 4
@@ -4637,7 +4655,7 @@ impl Renderer {
             let blocks = ((hi - lo + 0xFFFF) >> 16) as usize;
             let cost = if sparse.is_some() { 0 } else { hi - lo };
             self.vgen += 1;
-            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, wgen: self.vgen, cgen: vec![self.vgen; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], sparse };
+            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, wgen: self.vgen, cgen: vec![self.vgen; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], csrc: vec![5; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], sparse };
             let vc = self.vcache.get_or_insert_with(|| VCache { windows: FastMap::default(), bytes: 0, copied: 0, hits: 0 });
             vc.bytes += cost;
             vc.windows.insert(lo, w);
@@ -4723,7 +4741,7 @@ impl Renderer {
                 self.vgen += 1;
                 for (a, b) in runs {
                     bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, false);
-                    w.bump(a, b, self.vgen);
+                    w.bump(a, b, self.vgen, 1);
                 }
                 w.wgen = self.vgen;
             }
@@ -4980,6 +4998,12 @@ impl Renderer {
     }
 
     fn vcache_invalidate(&mut self, lo: u64, len: u64) {
+        self.vcache_invalidate_src(lo, len, 0);
+    }
+
+    /// `vcache_invalidate` naming why (0 GPU writes, 2 CP writes, 3 remapped
+    /// memory: `VBIND_MISS_SRC_NAMES`).
+    fn vcache_invalidate_src(&mut self, lo: u64, len: u64, src: u8) {
         let Some(vc) = self.vcache.as_mut() else { return };
         let hi = lo.saturating_add(len.max(1));
         for w in vc.windows.values_mut() {
@@ -4990,7 +5014,9 @@ impl Renderer {
                 if w.buf != self.cx.vgen_keep {
                     self.vgen += 1;
                     w.wgen = self.vgen;
-                    w.bump(a, b, self.vgen);
+                    // (A mirror write landing in another window.)
+                    let src = if self.cx.vgen_keep != vk::Buffer::null() { 4 } else { src };
+                    w.bump(a, b, self.vgen, src);
                 }
             }
         }
@@ -5344,7 +5370,7 @@ impl Renderer {
             std::mem::take(&mut v.cp_writes)
         };
         for (a, n) in writes {
-            self.vcache_invalidate(a, n);
+            self.vcache_invalidate_src(a, n, 2);
             self.forget_uploads(a, n);
         }
     }
@@ -5434,7 +5460,7 @@ impl Renderer {
         self.zc_gen = g;
         // VRAM mirror pages of remapped ranges are stale.
         for (lo, hi) in crate::mem::take_map_changes() {
-            self.vcache_invalidate(lo, hi.saturating_sub(lo));
+            self.vcache_invalidate_src(lo, hi.saturating_sub(lo), 3);
         }
         if self.zc_spans.is_empty() {
             return;
@@ -10357,7 +10383,7 @@ impl Hooks for VkHooks {
             v.reads.overlaps(addr, end)
         } else {
             if let Some(r) = RENDERER.lock().as_mut() {
-                r.vcache_invalidate(addr, len);
+                r.vcache_invalidate_src(addr, len, 2);
                 r.forget_uploads(addr, len);
             }
             true
