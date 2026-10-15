@@ -9991,7 +9991,7 @@ impl TimedRenderer {
         // goes first while it waits.)
         if q == 0 {
             GFX_LOCK_WAITING.store(true, std::sync::atomic::Ordering::Relaxed);
-        } else if crate::tune::get(crate::tune::LOCK_FAIR) == 3 {
+        } else if crate::tune::get(crate::tune::LOCK_FAIR) == 3 || (crate::tune::get(crate::tune::YIELD_QUEUES) as u64 >> (q & 63)) & 1 != 0 {
             while GFX_LOCK_WAITING.load(std::sync::atomic::Ordering::Relaxed) {
                 std::thread::yield_now();
             }

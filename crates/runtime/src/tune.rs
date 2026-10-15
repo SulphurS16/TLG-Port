@@ -435,7 +435,13 @@ pub const REC_SPIN_US: usize = 73;
 /// (part-invalidated misses -58% on the graphics queue).
 pub const VBIND_PART_KIB: usize = 74;
 
-const TABLE: [(&str, &str, i64); 75] = [
+/// Compute queues (bit n: queue n) that let a graphics CP waiting for the
+/// renderer lock go first (`TLG_YIELD_QUEUES`, 0): for queues whose work is
+/// not what the graphics CP waits for (`lock_fair 3` makes every compute
+/// queue yield).
+pub const YIELD_QUEUES: usize = 75;
+
+const TABLE: [(&str, &str, i64); 76] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -511,6 +517,7 @@ const TABLE: [(&str, &str, i64); 75] = [
     ("dma_reg_last", "TLG_DMA_REG_LAST", 1),
     ("rec_spin_us", "TLG_REC_SPIN_US", 1000),
     ("vbind_part_kib", "TLG_VBIND_PART_KIB", 64),
+    ("yield_queues", "TLG_YIELD_QUEUES", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
