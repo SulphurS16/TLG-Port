@@ -479,7 +479,18 @@ pub const GFX_CORE: usize = 81;
 /// avoid it (`TLG_GFX_CORE_SOFT`, 0).
 pub const GFX_CORE_SOFT: usize = 82;
 
-const TABLE: [(&str, &str, i64); 83] = [
+/// Experiment (`TLG_CS_CORE`, -1): with a dedicated graphics core, the
+/// compute CPs (`GPU-acb*`) and the completion thread share another
+/// physical core of their own (N: core N; -2: the core after the graphics
+/// CP's), the rest avoid both.
+pub const CS_CORE: usize = 83;
+
+/// A smaller T# over a padded color render target that the shader only reads
+/// with integer texel coordinates samples the target itself instead of a
+/// shadow copy (`TLG_SHADOW_LOAD_VIEW`, 0): the same texels.
+pub const SHADOW_LOAD_VIEW: usize = 84;
+
+const TABLE: [(&str, &str, i64); 85] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -563,6 +574,8 @@ const TABLE: [(&str, &str, i64); 83] = [
     ("hrt_spin", "TLG_HRT_SPIN", 0),
     ("gfx_core", "TLG_GFX_CORE", -2),
     ("gfx_core_soft", "TLG_GFX_CORE_SOFT", 0),
+    ("cs_core", "TLG_CS_CORE", -1),
+    ("shadow_load_view", "TLG_SHADOW_LOAD_VIEW", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

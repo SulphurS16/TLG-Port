@@ -422,12 +422,12 @@ fn gfx_thread() {
     let started = std::time::Instant::now();
     let mut frame_end: Option<u64> = None;
     // (Experiment `tune gfx_core`: applied when it changes.)
-    let mut core = (-1i64, 0i64);
+    let mut core = (-1i64, 0i64, -1i64);
     loop {
-        let want = (crate::tune::get(crate::tune::GFX_CORE), crate::tune::get(crate::tune::GFX_CORE_SOFT));
+        let want = (crate::tune::get(crate::tune::GFX_CORE), crate::tune::get(crate::tune::GFX_CORE_SOFT), crate::tune::get(crate::tune::CS_CORE));
         if want != core {
             core = want;
-            crate::info!("gfx_core: {}", crate::thread::dedicate_core(core.0, core.1 != 0));
+            crate::info!("gfx_core: {}", crate::thread::dedicate_core(core.0, core.1 != 0, core.2));
         }
         set_phase(phase::IDLE, 0);
         let mut s = {
@@ -555,7 +555,7 @@ fn gfx_thread() {
         if n <= 3 || n % 600 == 0 || REPORT_REQUEST.swap(false, Ordering::Relaxed) {
             crate::info!("gfx: submission {} done; busy {:.1}s of {:.1}s; queued {}; stats {:?}", n, busy.as_secs_f64(), started.elapsed().as_secs_f64(), q.pending.lock().len(), cp.stats);
             if let Some(r) = render::RENDERER.lock().as_mut() {
-                crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}", r.draws, r.dispatches, r.skipped, r.image_count(), r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed));
+                crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}; color shadows: copies {}, texel-load lookups {} ({} served by the target)", r.draws, r.dispatches, r.skipped, r.image_count(), r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed));
                 let ub = r.upload_bytes;
                 crate::info!("buffer copies: written {} MiB, misaligned {} MiB, pending writes {} MiB, indices {} MiB; read-only copies reused {} times ({} MiB); read-only copies into the BAR ring {} ({} MiB; {} to the host ring for want of room); index data from the mirror {} draws ({} MiB)", ub[0] >> 20, ub[1] >> 20, ub[2] >> 20, ub[3] >> 20, r.upload_reused.0, r.upload_reused.1 >> 20, r.bar_uploads.0, r.bar_uploads.1 >> 20, r.bar_uploads.2, r.index_mirrored.0, r.index_mirrored.1 >> 20);
                 crate::info!("render targets (de)tiled on the GPU: reloads {}, write-backs {}; textures detiled on the GPU {}; ring-full retries {}", r.gpu_remaps[0], r.gpu_remaps[1], r.gpu_tex_uploads, r.ring_retries);

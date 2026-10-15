@@ -4179,7 +4179,7 @@ impl Renderer {
                 if trace_frame() {
                     crate::info!("FRAME texture {:#x} {}x{} {:?}: shadow of {}x{} {:?} (last write {})", t.base, t.width, t.height, vfmt, src.width, src.height, src.format, self.images[&src].last_write);
                 }
-                return self.shadow_view(src, t, vfmt, store_fmt, view_type);
+                return self.shadow_view(src, t, vfmt, store_fmt, view_type, load_only);
             }
             if trace_frame() {
                 let others: Vec<String> = self.by_base.get(&t.base).map(|ks| ks.iter().map(|k| format!("{}x{} {:?} gw {}", k.width, k.height, k.format, self.images[k].gpu_written)).collect()).unwrap_or_default();
@@ -5071,7 +5071,18 @@ impl Renderer {
         Ok(true)
     }
 
-    fn shadow_view(&mut self, src: ImageKey, t: &Tsharp, vfmt: vk::Format, store_fmt: vk::Format, view_type: vk::ImageViewType) -> Result<vk::ImageView, String> {
+    fn shadow_view(&mut self, src: ImageKey, t: &Tsharp, vfmt: vk::Format, store_fmt: vk::Format, view_type: vk::ImageViewType, load_only: bool) -> Result<vk::ImageView, String> {
+        // Read only by integer texel coordinates (a padded target's smaller
+        // T#): the target holds the same texels (`tune shadow_load_view`).
+        let one = t.total_layers() <= 1 && src.layers == 1 && view_type == vk::ImageViewType::TYPE_2D;
+        if one && load_only {
+            SHADOW_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if crate::tune::get(crate::tune::SHADOW_LOAD_VIEW) != 0 {
+                SHADOW_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let img = self.images.get_mut(&src).unwrap();
+                return img.view(vfmt, t.dst_sel, view_type, false, 0, 1);
+            }
+        }
         // Array/cube textures may span several render targets laid out back
         // to back in guest memory (e.g. six cube shadow maps sampled as one
         // cube array): collect the consecutive ones that cover the layers.
@@ -5120,6 +5131,7 @@ impl Renderer {
                 }
             }
             unordered!(self);
+            SHADOW_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.mark(|| "shadow copy for sampling".into());
             self.shadows.insert(skey, (dst_key, wgen));
             let d = self.images.get_mut(&dst_key).unwrap();
@@ -10275,6 +10287,9 @@ pub static SKIP_CS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Depth targets sampled through a smaller T#: cropped copies made, direct
 /// views for texel loads (`depth_shadow_view`).
 pub static DEPTH_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// Color targets sampled through a smaller T# (`shadow_view`): shadow copies
+/// made, lookups read only by texel loads, of them served by the target.
+pub static SHADOW_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// Debug: image dumps also write the raw texels (control `dumpraw 1`).
 pub static DUMP_RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 

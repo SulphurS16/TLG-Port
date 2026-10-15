@@ -214,14 +214,15 @@ pub fn spin_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) ->
 /// third of the fastest cores (highest efficiency class: performance cores
 /// on hybrid CPUs; core 0 takes most interrupts), and only when at least 8
 /// logical processors remain for the rest. Returns what it did.
-pub fn dedicate_core(core: i64, soft: bool) -> String {
+pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, THREADENTRY32, TH32CS_SNAPTHREAD, Thread32First, Thread32Next};
     use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, OpenThread, SetProcessDefaultCpuSets, SetThreadSelectedCpuSets, THREAD_SET_LIMITED_INFORMATION};
     // The process's other threads, as they are now (later ones take the
-    // process default).
-    let others = |sets: &[u32]| -> u32 {
+    // process default); the compute CPs and the completion thread get
+    // `cs` instead when it is not empty.
+    let others = |sets: &[u32], cs: &[u32]| -> u32 {
         let mut n = 0;
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -234,9 +235,22 @@ pub fn dedicate_core(core: i64, soft: bool) -> String {
             let mut ok = Thread32First(snap, &mut e) != 0;
             while ok {
                 if e.th32OwnerProcessID == pid && e.th32ThreadID != me {
-                    let h = OpenThread(THREAD_SET_LIMITED_INFORMATION, 0, e.th32ThreadID);
+                    use windows_sys::Win32::System::Threading::{GetThreadDescription, THREAD_QUERY_LIMITED_INFORMATION};
+                    let h = OpenThread(THREAD_SET_LIMITED_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, 0, e.th32ThreadID);
                     if !h.is_null() {
-                        n += (SetThreadSelectedCpuSets(h, if sets.is_empty() { std::ptr::null() } else { sets.as_ptr() }, sets.len() as u32) != 0) as u32;
+                        let mut use_set = sets;
+                        if !cs.is_empty() {
+                            let mut w: *mut u16 = std::ptr::null_mut();
+                            if GetThreadDescription(h, &mut w) >= 0 && !w.is_null() {
+                                let len = (0..).take_while(|&i| *w.add(i) != 0).count();
+                                let name = String::from_utf16_lossy(std::slice::from_raw_parts(w, len));
+                                windows_sys::Win32::Foundation::LocalFree(w as _);
+                                if name.starts_with("GPU-acb") || name == "GPU-complete" {
+                                    use_set = cs;
+                                }
+                            }
+                        }
+                        n += (SetThreadSelectedCpuSets(h, if use_set.is_empty() { std::ptr::null() } else { use_set.as_ptr() }, use_set.len() as u32) != 0) as u32;
                         CloseHandle(h);
                     }
                 }
@@ -250,7 +264,7 @@ pub fn dedicate_core(core: i64, soft: bool) -> String {
         if core < 0 && core != -2 {
             SetThreadSelectedCpuSets(GetCurrentThread(), std::ptr::null(), 0);
             SetProcessDefaultCpuSets(GetCurrentProcess(), std::ptr::null(), 0);
-            let n = others(&[]);
+            let n = others(&[], &[]);
             return format!("every core shared again ({n} threads)");
         }
         let mut len = 0u32;
@@ -291,7 +305,14 @@ pub fn dedicate_core(core: i64, soft: bool) -> String {
             c
         };
         let mine: Vec<u32> = sets.iter().filter(|s| s.2 == c).map(|s| s.0).collect();
-        let rest: Vec<u32> = sets.iter().filter(|s| s.2 != c).map(|s| s.0).collect();
+        // (The compute group's core: given, or the one after the graphics CP's.)
+        let cc = match cs_core {
+            -2 => cores.iter().copied().find(|&x| x > c).or(cores.iter().copied().find(|&x| x != c)),
+            n if n >= 0 => cores.get(n as usize).copied().filter(|&x| x != c),
+            _ => None,
+        };
+        let cs: Vec<u32> = cc.map(|cc| sets.iter().filter(|s| s.2 == cc).map(|s| s.0).collect()).unwrap_or_default();
+        let rest: Vec<u32> = sets.iter().filter(|s| s.2 != c && Some(s.2) != cc).map(|s| s.0).collect();
         if mine.is_empty() || rest.is_empty() {
             return format!("core {core}: nothing to split");
         }
@@ -309,9 +330,10 @@ pub fn dedicate_core(core: i64, soft: bool) -> String {
             SetThreadSelectedCpuSets(GetCurrentThread(), mine.as_ptr(), 1) != 0
         };
         let ok2 = SetProcessDefaultCpuSets(GetCurrentProcess(), rest.as_ptr(), rest.len() as u32) != 0;
-        let n = others(&rest);
+        let n = others(&rest, &cs);
         let lps: Vec<u8> = sets.iter().filter(|s| s.2 == c).map(|s| s.1).collect();
-        format!("the core of logical processors {lps:?} dedicated{}: thread {ok1}, process default {ok2}, {n} other threads on the other {} sets", if soft { " (preferred only)" } else { "" }, rest.len())
+        let cs_lps: Vec<u8> = sets.iter().filter(|s| Some(s.2) == cc).map(|s| s.1).collect();
+        format!("the core of logical processors {lps:?} dedicated{}{}: thread {ok1}, process default {ok2}, {n} other threads on the other {} sets", if soft { " (preferred only)" } else { "" }, if cs.is_empty() { String::new() } else { format!(", compute CPs and completion on {cs_lps:?}") }, rest.len())
     }
 }
 
