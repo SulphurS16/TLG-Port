@@ -8,10 +8,13 @@
 //! nodes: straight-line blocks, `If` regions merging at their immediate
 //! post-dominator (computed per loop region, inner loops collapsed, with
 //! continue/break/return as virtual sinks), loops, break, continue, return.
-//! Every block is placed exactly once; anything else (a block reached from
-//! two regions, multi-exit loops, multi-level breaks, irreducible flow) makes
-//! `plan` fail and the caller keeps the loop + switch dispatcher, which runs
-//! any CFG. `emit` writes the tree as SPIR-V structured control flow; each
+//! A block reached from a second region (typically a shared exit sequence
+//! after an early-out branch) is placed again there - its code duplicated -
+//! while the duplicated instructions stay within half the program (plus 256):
+//! the dispatcher's loop + switch made the largest pixel shaders take 30-47 s
+//! to compile. Anything else (multi-exit loops, multi-level breaks,
+//! irreducible flow, a duplication over budget) makes `plan` fail and the
+//! caller keeps the dispatcher, which runs any CFG. `emit` writes the tree as SPIR-V structured control flow; each
 //! construct gets fresh merge/continue blocks, so no two constructs share one.
 
 use super::{R, T, e, translate_inst};
@@ -76,6 +79,11 @@ struct Planner<'a> {
     innermost: Vec<Option<usize>>,
     placed: Vec<bool>,
     ifs: usize,
+    /// Instructions per block; instructions placed a second time so far,
+    /// and the most allowed.
+    size: Vec<usize>,
+    dup: usize,
+    dup_max: usize,
 }
 
 fn succs(t: Term) -> Vec<usize> {
@@ -294,7 +302,9 @@ pub(crate) fn plan(code: &[Inst], starts: &BTreeSet<u32>, ranges: &[std::ops::Ra
         innermost[b] = best.map(|(j, _)| j);
     }
     let _ = reachable;
-    let mut p = Planner { term: &term, loops, loop_of_header, innermost, placed: vec![false; n], ifs: 0 };
+    let size: Vec<usize> = ranges.iter().map(|r| r.len()).collect();
+    let dup_max = 256 + size.iter().sum::<usize>() / 2;
+    let mut p = Planner { term: &term, loops, loop_of_header, innermost, placed: vec![false; n], ifs: 0, size, dup: 0, dup_max };
     let mut nodes = Vec::new();
     p.block(0, None, None, &mut nodes)?;
     let blocks = p.placed.iter().filter(|&&x| x).count();
@@ -441,7 +451,11 @@ impl Planner<'_> {
 
     fn block_in(&mut self, b: usize, stop: Option<usize>, ctx: Option<usize>, out: &mut Vec<Node>) -> Result<(), String> {
         if self.placed[b] {
-            return Err(format!("block {b} is reached from two regions"));
+            // Reached from a second region: its code again here.
+            self.dup += self.size[b];
+            if self.dup > self.dup_max {
+                return Err(format!("block {b} is reached from two regions (duplicating more than {} instructions)", self.dup_max));
+            }
         }
         self.placed[b] = true;
         out.push(Node::Block(b));
@@ -712,9 +726,18 @@ mod tests {
     }
 
     #[test]
-    fn block_reached_from_two_regions_is_refused() {
+    fn block_reached_from_two_regions_is_duplicated() {
         // 0: scc1 -> 3 (T); 1 (F): vccz -> 4 (M), else 2 (X); 2: branch -> 4; 3: branch -> 2
-        assert!(plan_of(&[(5, 3), (6, 4), (2, 4), (2, 2), END]).is_err());
+        let p = plan_of(&[(5, 3), (6, 4), (2, 4), (2, 2), END]).unwrap();
+        assert_eq!(show(&p.nodes), "B0 If5[B3 B2|B1 If6[|B2]] B4 ret");
+    }
+
+    #[test]
+    fn shared_exit_after_an_early_return_is_duplicated() {
+        // 0: scc1 -> 3; 1: vccz -> 6 (early end); 2: branch -> 4 (shared exit);
+        // 3: falls into 4; 4, 5: exit sequence, end; 6: end
+        let p = plan_of(&[(5, 3), (6, 6), (2, 4), NOP, NOP, END, END]).unwrap();
+        assert_eq!(show(&p.nodes), "B0 If5[B3 B4 ret|B1 If6[B5 ret|B2 B4 ret]!]!");
     }
 
     #[test]
