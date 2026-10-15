@@ -19,6 +19,10 @@ pub struct Ctx {
     pub pdev: vk::PhysicalDevice,
     pub device: ash::Device,
     pub queue: Mutex<vk::Queue>,
+    /// A second queue of the family for presentation (`present::present`):
+    /// its waits for the window's images never hold up the game's work
+    /// (None with a single queue, or TLG_PRESENT_QUEUE=0).
+    pub present_queue: Option<Mutex<vk::Queue>>,
     pub queue_family: u32,
     pub mem_props: vk::PhysicalDeviceMemoryProperties,
     pub limits: vk::PhysicalDeviceLimits,
@@ -286,8 +290,9 @@ pub fn init() -> Result<(), String> {
         if !missing.is_empty() {
             return Err(format!("{device_name} lacks Vulkan features tlg needs: {} (a newer driver may add them)", missing.join(", ")));
         }
-        let prio = [1.0f32];
-        let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio)];
+        let two_queues = instance.get_physical_device_queue_family_properties(pdev)[qf as usize].queue_count >= 2 && std::env::var("TLG_PRESENT_QUEUE").map_or(true, |v| v != "0");
+        let prio = [1.0f32, 1.0];
+        let qci = [vk::DeviceQueueCreateInfo::default().queue_family_index(qf).queue_priorities(&prio[..if two_queues { 2 } else { 1 }])];
         let host_import = instance
             .enumerate_device_extension_properties(pdev)
             .unwrap_or_default()
@@ -443,6 +448,7 @@ pub fn init() -> Result<(), String> {
             r2_supported.null_descriptor != 0
         );
         let queue = device.get_device_queue(qf, 0);
+        let present_queue = two_queues.then(|| Mutex::new(device.get_device_queue(qf, 1)));
         let mem_props = instance.get_physical_device_memory_properties(pdev);
         let ctx = Ctx {
             surface_i: ash::khr::surface::Instance::new(&entry, &instance),
@@ -469,13 +475,14 @@ pub fn init() -> Result<(), String> {
             pdev,
             device,
             queue: Mutex::new(queue),
+            present_queue,
             queue_family: qf,
             mem_props,
             limits: props.limits,
             device_name,
             validation,
         };
-        crate::info!("Vulkan device: {} (queue family {qf}, validation {}, sparse buffers {})", ctx.device_name, validation, ctx.sparse);
+        crate::info!("Vulkan device: {} (queue family {qf}, validation {}, sparse buffers {}, present queue {})", ctx.device_name, validation, ctx.sparse, ctx.present_queue.is_some());
         for i in 0..mem_props.memory_heap_count as usize {
             let h = mem_props.memory_heaps[i];
             let types: Vec<String> = (0..mem_props.memory_type_count as usize).filter(|&t| mem_props.memory_types[t].heap_index as usize == i).map(|t| format!("{:?}", mem_props.memory_types[t].property_flags)).collect();
@@ -672,10 +679,15 @@ impl Ctx {
 
     /// `submit` of several command buffers, executed in order.
     pub fn submit_cmds(&self, cmds: &[vk::CommandBuffer], wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
+        self.submit_to(&self.queue, cmds, wait, signal, fence)
+    }
+
+    /// `submit_cmds` to a given queue (`queue` or `present_queue`).
+    pub fn submit_to(&self, queue: &Mutex<vk::Queue>, cmds: &[vk::CommandBuffer], wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
         let ws: Vec<vk::Semaphore> = wait.iter().map(|w| w.0).collect();
         let wst: Vec<vk::PipelineStageFlags> = wait.iter().map(|w| w.1).collect();
         let si = vk::SubmitInfo::default().command_buffers(cmds).wait_semaphores(&ws).wait_dst_stage_mask(&wst).signal_semaphores(signal);
-        let q = self.queue.lock();
+        let q = queue.lock();
         unsafe { self.device.queue_submit(*q, &[si], fence) }.map_err(|e| format!("vkQueueSubmit: {e}"))
     }
 }

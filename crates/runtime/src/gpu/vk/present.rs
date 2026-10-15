@@ -1,10 +1,34 @@
-//! Swapchain presentation: blits a rendered image (or uploaded pixels) to the window.
+//! Swapchain presentation: copies a rendered image (or uploaded pixels) on
+//! the game's queue and scales it into a swapchain image on the present
+//! queue (`Ctx::present_queue`), so the game's GPU work never waits for the
+//! window to hand out an image (a minimized or hidden window, a throttled
+//! compositor). A frame whose slot is still being presented is not shown.
 
 use super::{ctx, window};
 use ash::vk;
 use parking_lot::Mutex;
 
-const FRAMES: usize = 2;
+const FRAMES: usize = 3;
+
+/// How long a present may wait for a swapchain image before the frame is
+/// left out (ns).
+const ACQUIRE_TIMEOUT_NS: u64 = 2_000_000;
+
+/// One present: the frame copied into `image` on the game's queue, then
+/// scaled into a swapchain image on the present queue.
+struct Slot {
+    copy: vk::CommandBuffer,
+    blit: vk::CommandBuffer,
+    /// Copy done (game queue) -> blit (present queue); unused with one queue.
+    copied: vk::Semaphore,
+    acquire: vk::Semaphore,
+    /// The slot's last blit done (created signalled).
+    fence: vk::Fence,
+    /// The copy of the frame: image, memory, size, format.
+    image: Option<(vk::Image, vk::DeviceMemory, u32, u32, vk::Format)>,
+    /// Staging buffer of `Source::Pixels`.
+    staging: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
+}
 
 struct Presenter {
     surface: vk::SurfaceKHR,
@@ -13,13 +37,11 @@ struct Presenter {
     format: vk::Format,
     extent: vk::Extent2D,
     pool: vk::CommandPool,
-    cmds: Vec<vk::CommandBuffer>,
-    fences: Vec<vk::Fence>,
-    acquire: Vec<vk::Semaphore>,
+    slots: Vec<Slot>,
     done: Vec<vk::Semaphore>,
     frame: usize,
-    staging: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
-    upload: Option<(vk::Image, vk::DeviceMemory, u32, u32)>,
+    /// Frames not shown because the window was not taking images.
+    skipped: u64,
 }
 
 unsafe impl Send for Presenter {}
@@ -27,8 +49,8 @@ unsafe impl Send for Presenter {}
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
 pub enum Source {
-    /// An image in TRANSFER_SRC_OPTIMAL-compatible state; `layout` is its current layout.
-    Image { image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32 },
+    /// An image the GPU wrote; `layout` is its current layout (kept).
+    Image { image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32, format: vk::Format },
     /// Linear BGRA8 pixels.
     Pixels { data: Vec<u8>, width: u32, height: u32 },
 }
@@ -138,8 +160,21 @@ pub fn init(title: &str) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         let cmds = c
             .device
-            .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(FRAMES as u32))
+            .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(2 * FRAMES as u32))
             .map_err(|e| e.to_string())?;
+        let sem = || c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| e.to_string());
+        let mut slots = Vec::new();
+        for k in 0..FRAMES {
+            slots.push(Slot {
+                copy: cmds[2 * k],
+                blit: cmds[2 * k + 1],
+                copied: sem()?,
+                acquire: sem()?,
+                fence: c.device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None).map_err(|e| e.to_string())?,
+                image: None,
+                staging: None,
+            });
+        }
         let mut p = Presenter {
             surface,
             swapchain: vk::SwapchainKHR::null(),
@@ -147,13 +182,10 @@ pub fn init(title: &str) -> Result<(), String> {
             format: vk::Format::UNDEFINED,
             extent: vk::Extent2D::default(),
             pool,
-            cmds,
-            fences: (0..FRAMES).map(|_| c.device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None).unwrap()).collect(),
-            acquire: (0..FRAMES).map(|_| c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap()).collect(),
+            slots,
             done: Vec::new(),
             frame: 0,
-            staging: None,
-            upload: None,
+            skipped: 0,
         };
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
@@ -217,9 +249,10 @@ mod tests {
     }
 }
 
-/// Presents one frame. Returns false if presentation is not possible (minimized).
+/// Presents one frame. Returns false if it was not shown (a minimized
+/// window, or the window still holding the images of earlier frames).
 pub fn present(src: Source) -> bool {
-    // (The frame's batches are submitted ahead of the blit: queue order.)
+    // (The frame's batches are submitted ahead of the copy: queue order.)
     crate::gpu::rec::drain();
     let c = ctx();
     let mut g = PRESENTER.lock();
@@ -231,11 +264,30 @@ pub fn present(src: Source) -> bool {
                 return false;
             }
         }
-        let f = p.frame % FRAMES;
-        p.frame += 1;
-        c.device.wait_for_fences(&[p.fences[f]], true, u64::MAX).ok();
-        let (idx, _) = match c.swapchain_d.acquire_next_image(p.swapchain, u64::MAX, p.acquire[f], vk::Fence::null()) {
+        let k = p.frame % FRAMES;
+        // The slot's previous frame not yet presented: the window is not
+        // taking images (minimized, hidden, a throttled compositor). This
+        // frame is left out; nothing waits for the window.
+        if c.device.get_fence_status(p.slots[k].fence) != Ok(true) {
+            p.skipped += 1;
+            note_skipped(p.skipped);
+            return false;
+        }
+        let (sw, sh, fmt) = match &src {
+            Source::Image { width, height, format, .. } => (*width, *height, *format),
+            Source::Pixels { width, height, .. } => (*width, *height, vk::Format::B8G8R8A8_UNORM),
+        };
+        if let Err(e) = prepare_slot(&mut p.slots[k], sw, sh, fmt, &src) {
+            crate::error!("present: {e}");
+            return false;
+        }
+        let (idx, _) = match c.swapchain_d.acquire_next_image(p.swapchain, ACQUIRE_TIMEOUT_NS, p.slots[k].acquire, vk::Fence::null()) {
             Ok(r) => r,
+            Err(vk::Result::TIMEOUT | vk::Result::NOT_READY) => {
+                p.skipped += 1;
+                note_skipped(p.skipped);
+                return false;
+            }
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
                 window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
                 return false;
@@ -245,28 +297,45 @@ pub fn present(src: Source) -> bool {
                 return false;
             }
         };
-        c.device.reset_fences(&[p.fences[f]]).ok();
-        let cmd = p.cmds[f];
+        p.frame += 1;
+        let two = c.present_queue.is_some();
+        let s = &p.slots[k];
+        let (copy_img, ..) = s.image.unwrap();
+        // The copy, on the game's queue after its work.
+        let cmd = s.copy;
+        c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
+        c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
+        barrier(c, cmd, copy_img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+        let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+        match &src {
+            Source::Image { image, layout, .. } => {
+                // (Its layout kept: the game's writes before the copy, the
+                // copy before its later writes.)
+                barrier(c, cmd, *image, *layout, *layout);
+                let region = vk::ImageCopy { src_subresource: layers, src_offset: vk::Offset3D::default(), dst_subresource: layers, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: sw, height: sh, depth: 1 } };
+                c.device.cmd_copy_image(cmd, *image, *layout, copy_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+                barrier(c, cmd, *image, *layout, *layout);
+            }
+            Source::Pixels { data, .. } => {
+                let (sb, _, sp, _) = s.staging.unwrap();
+                std::ptr::copy_nonoverlapping(data.as_ptr(), sp, (sw * sh * 4) as usize);
+                let region = vk::BufferImageCopy { buffer_offset: 0, buffer_row_length: 0, buffer_image_height: 0, image_subresource: layers, image_offset: vk::Offset3D::default(), image_extent: vk::Extent3D { width: sw, height: sh, depth: 1 } };
+                c.device.cmd_copy_buffer_to_image(cmd, sb, copy_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            }
+        }
+        barrier(c, cmd, copy_img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        c.device.end_command_buffer(cmd).ok();
+        let copied: &[vk::Semaphore] = if two { std::slice::from_ref(&s.copied) } else { &[] };
+        if let Err(e) = c.submit(cmd, &[], copied, vk::Fence::null()) {
+            crate::error!("{e}");
+            return false;
+        }
+        // The blit into the swapchain image, on the present queue.
+        let cmd = s.blit;
         c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
         c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         let dst = p.images[idx as usize];
         barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-        let (src_img, src_layout, sw, sh) = match src {
-            Source::Image { image, layout, width, height } => {
-                if layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL {
-                    barrier(c, cmd, image, layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-                }
-                (image, layout, width, height)
-            }
-            Source::Pixels { data, width, height } => match upload_pixels(p, cmd, &data, width, height) {
-                Ok(img) => (img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, width, height),
-                Err(e) => {
-                    crate::error!("present upload: {e}");
-                    c.device.end_command_buffer(cmd).ok();
-                    return false;
-                }
-            },
-        };
         let (dx0, dy0, dx1, dy1) = dst_rect(sw, sh, p.extent.width, p.extent.height);
         if (dx0, dy0, dx1, dy1) != (0, 0, p.extent.width as i32, p.extent.height as i32) {
             // Black bars around the frame.
@@ -276,23 +345,26 @@ pub fn present(src: Source) -> bool {
             c.device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[b], &[], &[]);
         }
         let blit = vk::ImageBlit {
-            src_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+            src_subresource: layers,
             src_offsets: [vk::Offset3D::default(), vk::Offset3D { x: sw as i32, y: sh as i32, z: 1 }],
-            dst_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+            dst_subresource: layers,
             dst_offsets: [vk::Offset3D { x: dx0, y: dy0, z: 0 }, vk::Offset3D { x: dx1, y: dy1, z: 1 }],
         };
         let filter = match crate::config::settings().filter {
             crate::config::Filter::Smooth => vk::Filter::LINEAR,
             crate::config::Filter::Sharp => vk::Filter::NEAREST,
         };
-        c.device.cmd_blit_image(cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
-        if src_layout != vk::ImageLayout::TRANSFER_SRC_OPTIMAL && src_img != vk::Image::null() {
-            barrier(c, cmd, src_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, src_layout);
-        }
+        c.device.cmd_blit_image(cmd, copy_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
         barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);
         c.device.end_command_buffer(cmd).ok();
         let done = p.done[idx as usize];
-        if let Err(e) = c.submit(cmd, &[(p.acquire[f], vk::PipelineStageFlags::TRANSFER)], &[done], p.fences[f]) {
+        let queue = c.present_queue.as_ref().unwrap_or(&c.queue);
+        let mut waits = vec![(s.acquire, vk::PipelineStageFlags::TRANSFER)];
+        if two {
+            waits.push((s.copied, vk::PipelineStageFlags::TRANSFER));
+        }
+        c.device.reset_fences(&[s.fence]).ok();
+        if let Err(e) = c.submit_to(queue, &[cmd], &waits, &[done], s.fence) {
             crate::error!("{e}");
             return false;
         }
@@ -300,7 +372,7 @@ pub fn present(src: Source) -> bool {
         let idxs = [idx];
         let waits = [done];
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
-        let q = c.queue.lock();
+        let q = queue.lock();
         match c.swapchain_d.queue_present(*q, &pi) {
             Ok(false) => {}
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst),
@@ -310,18 +382,26 @@ pub fn present(src: Source) -> bool {
     true
 }
 
-unsafe fn upload_pixels(p: &mut Presenter, cmd: vk::CommandBuffer, data: &[u8], w: u32, h: u32) -> Result<vk::Image, String> {
+/// Logs the first frames left out and then every 300th.
+fn note_skipped(n: u64) {
+    if n <= 3 || n % 300 == 0 {
+        crate::info!("present: {n} frames not shown so far (the window was not taking images)");
+    }
+}
+
+/// The slot's copy image (and staging buffer for pixels) for a `w` x `h`
+/// frame of `fmt`; the slot is idle (its fence signalled).
+unsafe fn prepare_slot(s: &mut Slot, w: u32, h: u32, fmt: vk::Format, src: &Source) -> Result<(), String> {
     let c = ctx();
-    let size = (w * h * 4) as u64;
     unsafe {
-        if p.staging.as_ref().is_none_or(|s| s.3 < size) {
-            let (b, m, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_SRC)?;
-            p.staging = Some((b, m, ptr, size));
-        }
-        if p.upload.as_ref().is_none_or(|u| u.2 != w || u.3 != h) {
+        if s.image.is_none_or(|i| (i.2, i.3, i.4) != (w, h, fmt)) {
+            if let Some((img, mem, ..)) = s.image.take() {
+                c.device.destroy_image(img, None);
+                c.free(mem);
+            }
             let ici = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
-                .format(vk::Format::B8G8R8A8_UNORM)
+                .format(fmt)
                 .extent(vk::Extent3D { width: w, height: h, depth: 1 })
                 .mip_levels(1)
                 .array_layers(1)
@@ -331,22 +411,18 @@ unsafe fn upload_pixels(p: &mut Presenter, cmd: vk::CommandBuffer, data: &[u8], 
             let img = c.device.create_image(&ici, None).map_err(|e| e.to_string())?;
             let mem = c.alloc(c.device.get_image_memory_requirements(img), vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
             c.device.bind_image_memory(img, mem, 0).map_err(|e| e.to_string())?;
-            p.upload = Some((img, mem, w, h));
+            s.image = Some((img, mem, w, h, fmt));
         }
-        let (sb, _, sp, _) = p.staging.unwrap();
-        std::ptr::copy_nonoverlapping(data.as_ptr(), sp, size as usize);
-        let img = p.upload.unwrap().0;
-        barrier(c, cmd, img, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
-        let region = vk::BufferImageCopy {
-            buffer_offset: 0,
-            buffer_row_length: 0,
-            buffer_image_height: 0,
-            image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-            image_offset: vk::Offset3D::default(),
-            image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
-        };
-        c.device.cmd_copy_buffer_to_image(cmd, sb, img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
-        barrier(c, cmd, img, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        Ok(img)
+        if let Source::Pixels { data, .. } = src {
+            let size = (w * h * 4) as u64;
+            if data.len() < size as usize {
+                return Err(format!("{} bytes of pixels for {w}x{h}", data.len()));
+            }
+            if s.staging.as_ref().is_none_or(|st| st.3 < size) {
+                let (b, m, ptr) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_SRC)?;
+                s.staging = Some((b, m, ptr, size));
+            }
+        }
     }
+    Ok(())
 }

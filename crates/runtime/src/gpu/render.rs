@@ -9688,9 +9688,9 @@ impl Renderer {
     }
 
     /// Image to present for a display buffer (after a flush).
-    pub fn display_image(&mut self, base: u64, w: u32, h: u32) -> Option<(vk::Image, u32, u32)> {
+    pub fn display_image(&mut self, base: u64, w: u32, h: u32) -> Option<(vk::Image, u32, u32, vk::Format)> {
         let k = self.display_key(base, w, h)?;
-        Some((self.images[&k].image, w, h))
+        Some((self.images[&k].image, w, h, k.format))
     }
 
     fn display_key(&self, base: u64, w: u32, h: u32) -> Option<ImageKey> {

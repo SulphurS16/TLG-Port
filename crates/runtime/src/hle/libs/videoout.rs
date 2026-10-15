@@ -507,8 +507,8 @@ fn present_buffer(b: &DisplayBuffer) -> Option<(Duration, Duration, Option<crate
     let t1 = Instant::now();
     // (Counted for pacing whether or not it reached the screen: a minimized
     // window presents nothing while the title keeps flipping.)
-    if let Some((image, iw, ih)) = rendered {
-        if !crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width: iw, height: ih }) {
+    if let Some((image, iw, ih, format)) = rendered {
+        if !crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width: iw, height: ih, format }) {
             crate::pacing::not_displayed();
         }
         return Some((lock_wait, t1.elapsed(), prof));
