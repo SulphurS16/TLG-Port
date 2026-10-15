@@ -1066,33 +1066,59 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
         if d.input.len() < src.len() {
             d.input.resize(src.len(), [0.0; MAX_CH]);
         }
-        let frames = d.input.iter_mut().zip(src);
         match &rows {
-            Some(rows) => {
-                for (o, fr) in frames {
-                    for (oc, row) in rows.iter().enumerate().take(dch) {
-                        let mut acc = 0.0;
-                        for ic in 0..src_ch {
-                            acc += fr[ic] * row[ic];
-                        }
-                        o[oc] += acc * g;
-                    }
-                }
-            }
+            Some(rows) => mix_rows(&mut d.input, src, rows, src_ch, dch, g),
             // No matrix: channel to channel; mono feeds the front pair.
             None if src_ch == 1 && dch >= 2 => {
-                for (o, fr) in frames {
+                for (o, fr) in d.input.iter_mut().zip(src) {
                     o[0] += fr[0] * g;
                     o[1] += fr[0] * g;
                 }
             }
-            None => {
-                let n = src_ch.min(dch);
-                for (o, fr) in frames {
-                    for c in 0..n {
-                        o[c] += fr[c] * g;
-                    }
-                }
+            None => mix_direct(&mut d.input, src, src_ch.min(dch), g),
+        }
+    }
+}
+
+/// dst[oc] += g * sum over ic < src_ch of src[ic] * rows[oc][ic], for the
+/// destination channels oc < dch (the rest untouched). By source channel
+/// (the matrix transposed): each source sample scales every destination
+/// channel at once (vector operations), each destination's sum in the same
+/// order as row by row.
+fn mix_rows(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], rows: &[[f32; MAX_CH]; MAX_CH], src_ch: usize, dch: usize, g: f32) {
+    let (src_ch, dch) = (src_ch.min(MAX_CH), dch.min(MAX_CH));
+    let mut cols = [[0f32; MAX_CH]; MAX_CH];
+    for (oc, row) in rows.iter().enumerate().take(dch) {
+        for ic in 0..src_ch {
+            cols[ic][oc] = row[ic];
+        }
+    }
+    let on: [bool; MAX_CH] = std::array::from_fn(|c| c < dch);
+    for (o, fr) in dst.iter_mut().zip(src) {
+        let mut acc = [0f32; MAX_CH];
+        for ic in 0..src_ch {
+            let x = fr[ic];
+            for oc in 0..MAX_CH {
+                acc[oc] += x * cols[ic][oc];
+            }
+        }
+        for oc in 0..MAX_CH {
+            if on[oc] {
+                o[oc] += acc[oc] * g;
+            }
+        }
+    }
+}
+
+/// dst[c] += src[c] * g for the channels c < n (the rest untouched), all
+/// lanes at once (the unused ones as zeros, not stored).
+fn mix_direct(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], n: usize, g: f32) {
+    let on: [bool; MAX_CH] = std::array::from_fn(|c| c < n);
+    for (o, fr) in dst.iter_mut().zip(src) {
+        let x: [f32; MAX_CH] = std::array::from_fn(|c| if on[c] { fr[c] } else { 0.0 });
+        for c in 0..MAX_CH {
+            if on[c] {
+                o[c] += x[c] * g;
             }
         }
     }
@@ -1497,5 +1523,49 @@ mod tests {
             assert_eq!(peak_of(&frames, ch).to_bits(), want.to_bits(), "{ch} channels");
         }
         assert_eq!(peak_of(&[], 2), 0.0);
+    }
+
+    #[test]
+    fn mixing_matches_row_by_row() {
+        // The vector forms give the row-by-row sums bit for bit and leave
+        // the destination channels past dch (or n) alone.
+        let mut x = 0x9e37_79b9u32;
+        let mut rnd = || {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (x as i32) as f32 / 2e9
+        };
+        let src: Vec<[f32; MAX_CH]> = (0..37).map(|_| std::array::from_fn(|_| rnd())).collect();
+        let dst0: Vec<[f32; MAX_CH]> = (0..37).map(|_| std::array::from_fn(|_| rnd())).collect();
+        let rows: [[f32; MAX_CH]; MAX_CH] = std::array::from_fn(|_| std::array::from_fn(|_| rnd()));
+        for src_ch in 1..=MAX_CH {
+            for dch in 1..=MAX_CH {
+                let mut want = dst0.clone();
+                for (o, fr) in want.iter_mut().zip(&src) {
+                    for (oc, row) in rows.iter().enumerate().take(dch) {
+                        let mut acc = 0.0;
+                        for ic in 0..src_ch {
+                            acc += fr[ic] * row[ic];
+                        }
+                        o[oc] += acc * 0.7;
+                    }
+                }
+                let mut got = dst0.clone();
+                mix_rows(&mut got, &src, &rows, src_ch, dch, 0.7);
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "rows {src_ch}->{dch}");
+                }
+            }
+            let mut want = dst0.clone();
+            for (o, fr) in want.iter_mut().zip(&src) {
+                for c in 0..src_ch {
+                    o[c] += fr[c] * 0.7;
+                }
+            }
+            let mut got = dst0.clone();
+            mix_direct(&mut got, &src, src_ch, 0.7);
+            for (g, w) in got.iter().zip(&want) {
+                assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "direct {src_ch}");
+            }
+        }
     }
 }

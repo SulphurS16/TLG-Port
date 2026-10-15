@@ -139,9 +139,14 @@ impl Allpass {
     fn process(&mut self, x: f32) -> f32 {
         let b = self.buf[self.pos];
         self.buf[self.pos] = x + b * 0.5;
-        self.pos = (self.pos + 1) % self.buf.len();
+        self.pos = wrap_inc(self.pos, self.buf.len());
         b - x * 0.5
     }
+}
+
+/// `(i + 1) % n` without a division (`i < n`).
+fn wrap_inc(i: usize, n: usize) -> usize {
+    if i + 1 == n { 0 } else { i + 1 }
 }
 
 /// The reverb of one reverb rack voice.
@@ -218,16 +223,19 @@ impl Reverb {
         self.in_lp = x * (1.0 - self.in_coef) + self.in_lp * self.in_coef;
         let n = self.pre.len();
         self.pre[self.pre_pos] = self.in_lp;
-        let at = |d: usize| (self.pre_pos + n - d.min(n - 1)) % n;
+        let at = |d: usize| {
+            let d = d.min(n - 1);
+            if self.pre_pos >= d { self.pre_pos - d } else { self.pre_pos + n - d }
+        };
         let late_in = self.pre[at(self.late_delay)];
         let refl = self.pre[at(self.refl_delay)] * self.refl_gain;
-        self.pre_pos = (self.pre_pos + 1) % n;
+        self.pre_pos = wrap_inc(self.pre_pos, n);
         let mut sum = 0.0;
         for c in &mut self.combs {
             let y = c.buf[c.pos];
             c.lp = y * (1.0 - self.damp) + c.lp * self.damp;
             c.buf[c.pos] = late_in + c.lp * c.fb;
-            c.pos = (c.pos + 1) % c.buf.len();
+            c.pos = wrap_inc(c.pos, c.buf.len());
             sum += y;
         }
         let mut out = [0.0; 2];
@@ -427,21 +435,37 @@ impl Biquad {
     }
 
     /// Filters channels 0..ch of every frame in place (transposed direct
-    /// form II).
+    /// form II). All eight lanes run together (vector operations: one
+    /// recurrence chain per frame instead of one per channel); lanes from
+    /// `ch` on keep their samples and their state.
     pub fn process(&mut self, frames: &mut [[f32; 8]], ch: usize) {
+        let ch = ch.min(8);
+        if ch == 0 {
+            return;
+        }
         let [b0, b1, b2] = self.b;
         let [a1, a2] = self.a;
-        for c in 0..ch.min(8) {
-            let [mut z1, mut z2] = self.z[c];
-            for fr in frames.iter_mut() {
-                let x = fr[c];
-                let y = b0 * x + z1;
-                z1 = b1 * x - a1 * y + z2;
-                z2 = b2 * x - a2 * y;
-                fr[c] = y;
+        let on: [bool; 8] = std::array::from_fn(|c| c < ch);
+        let mut z1: [f32; 8] = std::array::from_fn(|c| if on[c] { self.z[c][0] } else { 0.0 });
+        let mut z2: [f32; 8] = std::array::from_fn(|c| if on[c] { self.z[c][1] } else { 0.0 });
+        for fr in frames.iter_mut() {
+            // (Unused lanes as zeros: no denormal or NaN arithmetic there.)
+            let x: [f32; 8] = std::array::from_fn(|c| if on[c] { fr[c] } else { 0.0 });
+            let mut y = [0f32; 8];
+            for c in 0..8 {
+                y[c] = b0 * x[c] + z1[c];
+                z1[c] = b1 * x[c] - a1 * y[c] + z2[c];
+                z2[c] = b2 * x[c] - a2 * y[c];
             }
+            for c in 0..8 {
+                if on[c] {
+                    fr[c] = y[c];
+                }
+            }
+        }
+        for c in 0..ch {
             // (Denormals after silence.)
-            self.z[c] = [if z1.abs() < 1e-20 { 0.0 } else { z1 }, if z2.abs() < 1e-20 { 0.0 } else { z2 }];
+            self.z[c] = [if z1[c].abs() < 1e-20 { 0.0 } else { z1[c] }, if z2[c].abs() < 1e-20 { 0.0 } else { z2[c] }];
         }
     }
 }
@@ -577,6 +601,46 @@ mod tests {
         let flat = Biquad::new(FilterKind::Peaking, 2000.0, 0.5, 1.0, 48000);
         assert!(flat.is_flat());
         assert!(!lp(24000.0).is_flat());
+    }
+
+    #[test]
+    fn biquad_lanes_match_per_channel() {
+        // The all-lanes filter gives the per-channel recurrence's samples
+        // bit for bit and leaves the lanes past `ch` alone.
+        let mut seed = 0x1234_5678u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        for ch in 1..=8 {
+            let mut f = Biquad::new(FilterKind::Peaking, 800.0, 0.9, 1.7, 48000);
+            let (b, a) = (f.b, f.a);
+            let mut z = [[0f32; 2]; 8];
+            for _block in 0..3 {
+                let input: Vec<[f32; 8]> = (0..97).map(|_| std::array::from_fn(|_| rnd())).collect();
+                let mut want = input.clone();
+                for c in 0..ch {
+                    let [mut z1, mut z2] = z[c];
+                    for fr in want.iter_mut() {
+                        let x = fr[c];
+                        let y = b[0] * x + z1;
+                        z1 = b[1] * x - a[0] * y + z2;
+                        z2 = b[2] * x - a[1] * y;
+                        fr[c] = y;
+                    }
+                    z[c] = [z1, z2];
+                }
+                let mut got = input.clone();
+                f.process(&mut got, ch);
+                for (g, w) in got.iter().zip(&want) {
+                    for c in 0..8 {
+                        assert_eq!(g[c].to_bits(), w[c].to_bits(), "ch {ch} lane {c}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
