@@ -382,6 +382,10 @@ pub trait Hooks {
 
 pub struct CommandProcessor {
     pub name: String,
+    /// When this CP last queued a label write another queue was waiting for
+    /// (TLG_PERF: the work between it and this CP's next blocking wait,
+    /// `CHAIN_GAPS`).
+    last_label_queued: Option<Instant>,
     /// Report activity to the GPU stall watchdog (graphics queue only).
     pub watch: bool,
     /// Compute virtual queue id (0 = graphics), for the stall watchdog.
@@ -493,6 +497,11 @@ fn cross_waits_for(q: usize) -> bool {
     }
 }
 
+/// TLG_PERF: the graphics CP's waits over 0.5 ms with a label write queued
+/// before them: count, us since that write in total, us waited in total, and
+/// counts of the gap under 0.1 / 0.5 / 1 / 2 ms and longer.
+pub static CHAIN_GAPS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
 pub fn queued_label_value(addr: u64, except_queue: usize) -> Option<u32> {
     let mut val = None;
     for (q, writes) in QUEUED.lock().iter() {
@@ -583,6 +592,7 @@ impl CommandProcessor {
     pub fn new(name: &str) -> CommandProcessor {
         CommandProcessor {
             name: name.to_string(),
+            last_label_queued: None,
             watch: name == "gfx",
             queue: 0,
             pending: Vec::new(),
@@ -1448,8 +1458,21 @@ impl CommandProcessor {
             self.pending.push(EopAction { addr: a, data_sel: 1, lo: v, hi: 0, interrupt: false, gfx: false, occl: None });
         }
         DEFERRED_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.note_release(addr);
         self.publish_pending();
         true
+    }
+
+    /// TLG_PERF: a label write to `addr` queued by the graphics CP that a
+    /// compute queue is waiting for releases that queue (`CHAIN_GAPS`).
+    fn note_release(&mut self, addr: u64) {
+        if self.queue != 0 || !super::render::perf_on() {
+            return;
+        }
+        let want = ((super::phase::WAIT_REG_MEM as u64) << 56) | (addr & ((1 << 56) - 1));
+        if (13..=19).any(|q| super::QPHASE[q].load(std::sync::atomic::Ordering::Relaxed) == want) {
+            self.last_label_queued = Some(Instant::now());
+        }
     }
 
     fn queue_eop(&mut self, addr: u64, data_sel: u32, lo: u32, hi: u32, interrupt: bool) {
@@ -1457,6 +1480,7 @@ impl CommandProcessor {
         let gfx = self.watch;
         self.pending.push(EopAction { addr, data_sel, lo, hi, interrupt, gfx, occl: None });
         if matches!(data_sel, 1 | 2) {
+            self.note_release(addr);
             self.publish_pending();
         }
     }
@@ -1634,10 +1658,25 @@ impl CommandProcessor {
             addr: u64,
             start: Instant,
             polled: std::cell::Cell<bool>,
+            /// Since this CP's last queued label write.
+            gap: Option<Duration>,
         }
         impl Drop for Poll {
             fn drop(&mut self) {
                 let us = self.start.elapsed().as_micros() as u64;
+                // (The graphics CP's waits over 0.5 ms: how long it had worked
+                // since queuing its last label write - what another queue
+                // released by it could have recorded alongside.)
+                if self.queue == 0 && us >= 500 && super::render::perf_on() {
+                    if let Some(g) = self.gap {
+                        let g = g.as_micros() as u64;
+                        CHAIN_GAPS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        CHAIN_GAPS[1].fetch_add(g, std::sync::atomic::Ordering::Relaxed);
+                        CHAIN_GAPS[2].fetch_add(us, std::sync::atomic::Ordering::Relaxed);
+                        let b = match g { 0..100 => 3, 100..500 => 4, 500..1000 => 5, 1000..2000 => 6, _ => 7 };
+                        CHAIN_GAPS[b].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 if self.polled.get() && us >= 500 && super::render::perf_on() {
                     let after = unsafe { rd(self.addr) };
                     let mut g = POLLS.lock();
@@ -1647,7 +1686,7 @@ impl CommandProcessor {
                 }
             }
         }
-        let poll = Poll { queue: self.queue, func, reference, before: unsafe { rd(addr) }, addr, start, polled: std::cell::Cell::new(false) };
+        let poll = Poll { queue: self.queue, func, reference, before: unsafe { rd(addr) }, addr, start, polled: std::cell::Cell::new(false), gap: self.last_label_queued.take().map(|t| start.saturating_duration_since(t)) };
         let mut seen = super::render::label_gen();
         while !test(unsafe { rd(addr) }) {
             poll.polled.set(true);

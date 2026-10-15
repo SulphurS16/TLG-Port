@@ -576,6 +576,20 @@ fn gfx_thread() {
                 polls.sort_by(|a, b| b.1.1.cmp(&a.1.1));
                 let polls: Vec<String> = polls.iter().take(12).map(|((q, f, r, b, a), (n, us))| format!("q{q} func {f} ref {r:#x} {b:#x}->{a:#x}: {n}x {} ms", us / 1000)).collect();
                 crate::info!("WAIT_REG_MEM polls over 0.5 ms since last report (queue, test, value before -> when met): {}", polls.join("; "));
+                let cg: [u64; 8] = std::array::from_fn(|i| cp::CHAIN_GAPS[i].swap(0, Ordering::Relaxed));
+                if cg[0] != 0 {
+                    crate::info!(
+                        "graphics CP waits over 0.5 ms after queuing a label write a compute queue was waiting for: {} ({:.2} ms each on average); its work between that write and the wait {:.2} ms on average (under 0.1 ms {}, 0.1-0.5 {}, 0.5-1 {}, 1-2 {}, longer {})",
+                        cg[0],
+                        cg[2] as f64 / 1e3 / cg[0] as f64,
+                        cg[1] as f64 / 1e3 / cg[0] as f64,
+                        cg[3],
+                        cg[4],
+                        cg[5],
+                        cg[6],
+                        cg[7]
+                    );
+                }
                 let mut declines: Vec<(&str, u64)> = render::META_DECLINES.lock().take().unwrap_or_default().into_iter().collect();
                 declines.sort_by(|a, b| b.1.cmp(&a.1));
                 crate::info!(

@@ -1598,6 +1598,10 @@ pub struct Renderer {
     meta_cache: (u64, Vec<(u64, u64, ImageKey)>, u64),
     /// Distinct buffers of `hz` and whether any access to each writes.
     hz_bufs: smallvec::SmallVec<[(vk::Buffer, bool); 8]>,
+    /// `hz` entries' accesses, each kept once (`tune hz_dedupe`): the
+    /// earliest has the lowest synchronization stamp, all the conflict test
+    /// needs.
+    hz_seen: FastSet<(vk::Buffer, u64, u64, bool)>,
     /// Render targets (de)tiled on the GPU: reloads, write-backs.
     pub gpu_remaps: [u64; 2],
     /// Textures read from guest memory and detiled on the GPU.
@@ -1963,6 +1967,7 @@ pub fn init() -> Result<(), String> {
             meta_gen: 1,
             meta_cache: (0, Vec::new(), 0),
             hz_bufs: smallvec::SmallVec::new(),
+            hz_seen: FastSet::default(),
             gpu_remaps: [0; 2],
             gpu_tex_uploads: 0,
             dprof: [0; 8],
@@ -7939,6 +7944,7 @@ impl Renderer {
         let bgen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
         if self.hz_gen != bgen {
             self.hz.clear();
+            self.hz_seen.clear();
             self.hz_bufs.clear();
             self.hz_unknown = false;
             self.hz_gen = bgen;
@@ -7989,6 +7995,7 @@ impl Renderer {
         if need {
             global_barrier(self.cmd);
             self.hz.clear();
+            self.hz_seen.clear();
             self.hz_bufs.clear();
             self.hz_unknown = false;
             self.hz_gen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
@@ -7998,7 +8005,15 @@ impl Renderer {
         }
         if hazards {
             let acc = std::mem::take(&mut self.cur_access);
-            self.hz.extend(acc.iter().map(|&(b, o, n, w)| (b, o, n, w, synced)));
+            if crate::tune::get(crate::tune::HZ_DEDUPE) != 0 {
+                for &(b, o, n, w) in acc.iter() {
+                    if self.hz_seen.insert((b, o, n, w)) {
+                        self.hz.push((b, o, n, w, synced));
+                    }
+                }
+            } else {
+                self.hz.extend(acc.iter().map(|&(b, o, n, w)| (b, o, n, w, synced)));
+            }
             for &(b, _, _, w) in acc.iter() {
                 match self.hz_bufs.iter_mut().find(|e| e.0 == b) {
                     Some(e) => e.1 |= w,
