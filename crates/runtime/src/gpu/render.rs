@@ -2091,7 +2091,7 @@ fn page_edges(base: u64, bytes: u64) -> Option<Box<(Vec<u8>, Vec<u8>)>> {
 }
 
 /// Offset of a buffer in the tessellation factor ring.
-fn tess_ring_offset(base: u64) -> Option<u64> {
+pub(super) fn tess_ring_offset(base: u64) -> Option<u64> {
     base.checked_sub(TESS_FACTOR_RING).filter(|&o| o < TESS_FACTOR_RING_BYTES)
 }
 
@@ -2226,7 +2226,7 @@ pub static COPYIN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync:
 pub static PIPE_CREATES: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 2] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 2];
 
 /// TLG_PERF: mirror bindings served by the binding cache, and all.
-pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 /// TLG_PERF: binding-cache misses by queue class (graphics, compute) and
 /// reason (`VBIND_MISS_NAMES`).
 pub static VBIND_MISS: [[std::sync::atomic::AtomicU64; 5]; 2] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 5] }; 2];
@@ -4435,6 +4435,25 @@ impl Renderer {
         if !overwrite && crate::tune::get(crate::tune::VBIND_CACHE) != 0 {
             if let Some(&(k, wgen, checked, buf, off)) = self.vbind.get(&(base, size)) {
                 let required = self.required_epoch;
+                // (Stale only by a newer epoch: its blocks' CPU-write checks
+                // again, as the fill would make them; still current when they
+                // invalidate none of it - `tune vbind_recheck`.)
+                let same = |r: &Self| r.vcache.as_ref().and_then(|vc| vc.windows.get(&k)).is_some_and(|w| w.buf == buf && w.part_gen(base, size) == wgen);
+                let mut checked = checked;
+                if checked != u64::MAX && checked < required && crate::tune::get(crate::tune::VBIND_RECHECK) != 0 && same(self) {
+                    let epoch = self.cpu_epoch;
+                    if self.vcache_check(k, base, size, epoch, required).is_some() && same(self) {
+                        let w = &self.vcache.as_ref().unwrap().windows[&k];
+                        let (b0, b1) = (((base - w.lo) >> 16) as usize, ((base + size - 1 - w.lo) >> 16) as usize);
+                        checked = w.checked[b0..=b1].iter().copied().min().unwrap_or(u64::MAX);
+                        if let Some(e) = self.vbind.get_mut(&(base, size)) {
+                            e.2 = checked;
+                        }
+                        if perf_on() {
+                            VBIND_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
                 if let Some(vc) = self.vcache.as_mut() {
                     if let Some(w) = vc.windows.get_mut(&k).filter(|w| w.buf == buf && w.part_gen(base, size) == wgen && checked != u64::MAX && checked >= required) {
                         w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -4625,14 +4644,13 @@ impl Renderer {
 
     /// Copies the pages of [base, base+size) in window `k` that are not
     /// current into it; returns the binding.
-    fn vcache_fill(&mut self, k: u64, base: u64, size: u64, epoch: u64, required: u64, overwrite: bool) -> Option<(vk::Buffer, u64)> {
-        if !self.vcache_resident(k, base, size) {
-            return None;
-        }
+    /// CPU writes to [base, base+size) in window `k` since its blocks were
+    /// last checked: once per epoch and 64 KiB block (runs of unchecked
+    /// blocks in one write-watch query); pages found written become invalid
+    /// (their parts' generations bumped).
+    fn vcache_check(&mut self, k: u64, base: u64, size: u64, epoch: u64, required: u64) -> Option<()> {
         let vc = self.vcache.as_mut().unwrap();
         let w = vc.windows.get_mut(&k)?;
-        // CPU writes: checked once per epoch and 64 KiB block (runs of
-        // unchecked blocks in one write-watch query).
         let (b0, b1) = (((base - w.lo) >> 16) as usize, ((base + size - 1 - w.lo) >> 16) as usize);
         let mut i = b0;
         let valid = |c: u64| c != u64::MAX && c >= required;
@@ -4673,6 +4691,16 @@ impl Renderer {
             }
             i = j;
         }
+        Some(())
+    }
+
+    fn vcache_fill(&mut self, k: u64, base: u64, size: u64, epoch: u64, required: u64, overwrite: bool) -> Option<(vk::Buffer, u64)> {
+        if !self.vcache_resident(k, base, size) {
+            return None;
+        }
+        self.vcache_check(k, base, size, epoch, required)?;
+        let vc = self.vcache.as_mut().unwrap();
+        let w = vc.windows.get_mut(&k)?;
         if overwrite {
             // Whole pages the caller overwrites: current once it has.
             let (f0, f1) = (((base - w.lo + 0xFFF) >> 12) as usize, ((base + size - w.lo) >> 12) as usize);
@@ -5709,6 +5737,10 @@ impl Renderer {
 
     /// Ring bytes a draw/dispatch's buffer bindings need (host, device).
     fn binding_bytes(&self, stages: &[&Prepared]) -> (u64, u64) {
+        // (Without zero-copy no binding is in place: the prepared count.)
+        if ctx().ext_host.is_none() && crate::tune::get(crate::tune::RING_BYTES_AHEAD) != 0 {
+            return stages.iter().fold((0, 0), |(h, d), p| (h + p.ring_bytes.0, d + p.ring_bytes.1));
+        }
         let (mut host, mut dev) = (0u64, 0u64);
         for p in stages {
             for b in &p.translated.out.bindings {
@@ -7985,7 +8017,12 @@ impl Renderer {
                 self.bound_cs = pipeline;
             }
             set.bind(self.cmd, vk::PipelineBindPoint::COMPUTE, layout);
-            if let Some(slot) = args_slot {
+            // (Measurement `zero_groups`: this queue's GPU work left out.)
+            let zm = crate::tune::get(crate::tune::ZERO_GROUPS);
+            let zero = zm != 0 && args_slot.is_none() && (zm >> cp.queue.min(29)) & 1 != 0 && (zm & (1 << 30) == 0 || x.max(1) * y.max(1) * z.max(1) == 1);
+            if zero {
+                REC.cmd_dispatch(self.cmd, 0, 0, 0);
+            } else if let Some(slot) = args_slot {
                 REC.cmd_dispatch_indirect(self.cmd, self.dring.buffer, slot);
             } else if sx | sy | sz != 0 {
                 REC.cmd_dispatch_base(self.cmd, sx, sy, sz, x.saturating_sub(sx), y.saturating_sub(sy), z.saturating_sub(sz));
@@ -10122,7 +10159,8 @@ impl Hooks for VkHooks {
         r.maybe_submit();
     }
     fn dispatch(&mut self, cp: &CommandProcessor, x: u32, y: u32, z: u32) {
-        if matches!(crate::tune::get(crate::tune::SKIP_CMDS), 1 | 3) {
+        let skip = crate::tune::get(crate::tune::SKIP_CMDS);
+        if matches!(skip, 1 | 3) || (skip == 6 && (17..=19).contains(&cp.queue)) {
             return;
         }
         let ahead = (crate::tune::get(crate::tune::PREP_AHEAD) != 0 && cp.queue == 0).then(|| super::prepahead::take_dispatch(&cp.regs)).flatten();
@@ -10140,8 +10178,12 @@ impl Hooks for VkHooks {
         r.maybe_submit();
     }
     fn dispatch_indirect(&mut self, cp: &CommandProcessor, addr: u64) -> bool {
-        if crate::tune::get(crate::tune::GPU_INDIRECT) == 0 || crate::tune::get(crate::tune::SKIP_CMDS) != 0 {
+        let skip = crate::tune::get(crate::tune::SKIP_CMDS);
+        if crate::tune::get(crate::tune::GPU_INDIRECT) == 0 || matches!(skip, 1..=3) {
             return false;
+        }
+        if skip == 6 && (17..=19).contains(&cp.queue) {
+            return true;
         }
         let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return false };
@@ -10158,7 +10200,7 @@ impl Hooks for VkHooks {
         done
     }
     fn draw_indirect_gpu(&mut self, cp: &CommandProcessor, addr: u64, indexed: bool, vtx_loc: u32, inst_loc: u32) -> bool {
-        if crate::tune::get(crate::tune::SKIP_CMDS) != 0 {
+        if matches!(crate::tune::get(crate::tune::SKIP_CMDS), 1..=3) {
             return false;
         }
         let mut g = TimedRenderer::lock(cp.queue);

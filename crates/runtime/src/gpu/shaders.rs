@@ -489,6 +489,10 @@ pub struct Prepared {
     pub utility: Option<Utility>,
     /// Role in a tessellated draw (LS/HS: compute, DS: evaluation stage).
     pub tess: TessRole,
+    /// Ring bytes its buffer bindings may need (host, device), as the
+    /// renderer's `binding_bytes` counts them without zero-copy: computed
+    /// here, on the prepare thread for most commands.
+    pub ring_bytes: (u64, u64),
 }
 
 /// Engine utility kernels the renderer can perform as image operations when
@@ -1051,7 +1055,22 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         pool_give(&mut p.u32s, std::mem::take(&mut spec.buffer_strides));
         pool_give(&mut p.inputs, std::mem::take(&mut spec.ps_inputs));
     }
-    Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, load_only, mem_reads, code_hash, scatter, sparse_writes: None, utility, tess: tess.role })
+    let mut ring_bytes = (0u64, 0u64);
+    for b in &translated.out.bindings {
+        if let translate::BindingKind::Buffer(i) = b.kind {
+            if let Some(ResolvedRes::Buffer(v)) = resources.get(i) {
+                if super::render::tess_ring_offset(v.base).is_some() {
+                    continue;
+                }
+                let size = v.size().clamp(4, 64 << 20).next_multiple_of(256);
+                ring_bytes.0 += size;
+                if written_buffers.contains(&i) {
+                    ring_bytes.1 += size;
+                }
+            }
+        }
+    }
+    Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, load_only, mem_reads, code_hash, scatter, sparse_writes: None, utility, tess: tess.role, ring_bytes })
 }
 
 #[cfg(test)]

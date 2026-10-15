@@ -274,8 +274,9 @@ pub const DEVCOPY_READS: usize = 46;
 pub const CHAIN_WRITTEN: usize = 47;
 
 /// Measurement only (`TLG_SKIP_CMDS`, 0): 1 records no draws and no
-/// dispatches, 2 no draws, 3 no dispatches - what the title and the rest of
-/// the CP cost without that work (frames then show nothing valid).
+/// dispatches, 2 no draws, 3 no dispatches, 6 no dispatches of the compute
+/// queues 17-19 - what the title and the rest of the CP cost without that
+/// work (frames then show nothing valid).
 pub const SKIP_CMDS: usize = 48;
 
 /// Batches are recorded and submitted by the recorder thread
@@ -490,7 +491,31 @@ pub const CS_CORE: usize = 83;
 /// shadow copy (`TLG_SHADOW_LOAD_VIEW`, 0): the same texels.
 pub const SHADOW_LOAD_VIEW: usize = 84;
 
-const TABLE: [(&str, &str, i64); 85] = [
+/// Measurement only (`TLG_ZERO_GROUPS`, 0): dispatches of the CP queues in
+/// this bit mask (bit 0 graphics, 13, 17-19 compute) are recorded with zero
+/// workgroups - their GPU work bounded while the CP work stays the same
+/// (results then missing: frames and the title's GPU-fed state are wrong);
+/// bit 30: only single-workgroup dispatches.
+pub const ZERO_GROUPS: usize = 85;
+
+/// Consecutive unwritten write-watch queries after which a 64 KiB block is
+/// write-protected instead of queried (`TLG_ARM_AFTER`, 8; `tune cpu_watch`):
+/// lower moves the cost of noticing CPU writes from the CPs' queries to
+/// write faults on the title's threads.
+pub const ARM_AFTER: usize = 86;
+
+/// A command's ring-space estimate for its buffer bindings comes from its
+/// preparation (computed on the prepare thread) instead of a walk over the
+/// bindings per command (`TLG_RING_BYTES_AHEAD`, 1; not with zero-copy).
+pub const RING_BYTES_AHEAD: usize = 87;
+
+/// A mirror binding cached in an earlier CPU epoch whose window parts are
+/// unchanged has its blocks' CPU-write checks redone in place and is served
+/// again when they find nothing (`TLG_VBIND_RECHECK`, 1), instead of going
+/// through the whole fill path.
+pub const VBIND_RECHECK: usize = 88;
+
+const TABLE: [(&str, &str, i64); 89] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -576,6 +601,10 @@ const TABLE: [(&str, &str, i64); 85] = [
     ("gfx_core_soft", "TLG_GFX_CORE_SOFT", 0),
     ("cs_core", "TLG_CS_CORE", -1),
     ("shadow_load_view", "TLG_SHADOW_LOAD_VIEW", 0),
+    ("zero_groups", "TLG_ZERO_GROUPS", 0),
+    ("arm_after", "TLG_ARM_AFTER", 8),
+    ("ring_bytes_ahead", "TLG_RING_BYTES_AHEAD", 1),
+    ("vbind_recheck", "TLG_VBIND_RECHECK", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

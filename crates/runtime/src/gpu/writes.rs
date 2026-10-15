@@ -29,8 +29,11 @@ const CHUNK_PAGES: usize = 1 << (CHUNK_SHIFT - PAGE_SHIFT);
 const BLOCK_SHIFT: u32 = 16;
 const CHUNK_BLOCKS: usize = 1 << (CHUNK_SHIFT - BLOCK_SHIFT);
 /// Consecutive unwritten queries after which a block is armed (made
-/// read-only, cpuwatch.rs), doubled for each time it was written while armed.
-const ARM_AFTER: u32 = 8;
+/// read-only, cpuwatch.rs), doubled for each time it was written while armed
+/// (`tune arm_after`).
+fn arm_after() -> u32 {
+    crate::tune::get(crate::tune::ARM_AFTER).clamp(1, 64) as u32
+}
 
 /// Per chunk: blocks armed (one bit each), and per block its consecutive
 /// unwritten queries and how often it was written while armed.
@@ -266,7 +269,7 @@ impl WriteTracker {
                     continue;
                 }
                 w.clean[i] = w.clean[i].saturating_add(1);
-                if w.armed >> i & 1 == 0 && w.clean[i] as u32 >= ARM_AFTER << w.strikes[i] {
+                if w.armed >> i & 1 == 0 && w.clean[i] as u32 >= arm_after() << w.strikes[i] {
                     match arm.last_mut() {
                         Some(r) if r.1 == b => r.1 = b + 1,
                         _ => arm.push((b, b + 1)),
