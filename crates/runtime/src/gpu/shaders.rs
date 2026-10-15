@@ -275,9 +275,8 @@ pub fn dry_valid(log: &[(u64, u32, u64)]) -> bool {
         let mut a = addr;
         while a < end {
             let k = (((end - a) / 4) as usize).min(buf.len());
-            for (i, w) in buf[..k].iter_mut().enumerate() {
-                *w = unsafe { std::ptr::read_volatile((a + 4 * i as u64) as *const u32) };
-            }
+            // (One copy of the chunk: the words as the CP would read them now.)
+            unsafe { std::ptr::copy_nonoverlapping(a as *const u32, buf.as_mut_ptr(), k) };
             hs.add(&buf[..k]);
             a += 4 * k as u64;
         }

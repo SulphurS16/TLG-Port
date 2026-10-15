@@ -226,7 +226,9 @@ pub const LOCK_FAIR: usize = 40;
 /// worse in the cave (run 20261013-133752: -7% fps at full clock, -12% at
 /// 31%): the graphics CP's label waits shrink, but the CPs then interleave
 /// on the renderer lock (its waits 142 -> ~190 ms/s) and each command costs
-/// more.
+/// more. 2: only for waits of the graphics queue and the device compute queue
+/// 13 (their one-dispatch hand-offs at frame start), not of the per-frame
+/// compute queues 17-19.
 pub const CROSS_WAITS: usize = 41;
 
 /// Indirect draws whose arguments earlier GPU work is still writing read

@@ -480,6 +480,19 @@ static QUEUED: parking_lot::Mutex<Vec<(usize, Vec<(u64, u32, u32, u32)>)>> = par
 /// leave at `addr` (the last one covering it), if any. Their CPs recorded
 /// the work before them already: in the one batch all queues record into,
 /// work recorded after a full barrier from now on runs after it.
+/// Whether CP queue `q`'s memory waits may be met by another queue's queued
+/// writes (`tune cross_waits`: 1 every queue, 2 the graphics queue and the
+/// device compute queue 13 only - their one-dispatch hand-offs at frame start -
+/// not the per-frame compute queues, whose large chunks would interleave with
+/// the graphics CP on the renderer lock).
+fn cross_waits_for(q: usize) -> bool {
+    match crate::tune::get(crate::tune::CROSS_WAITS) {
+        0 => false,
+        2 => q == 0 || q == 13,
+        _ => true,
+    }
+}
+
 pub fn queued_label_value(addr: u64, except_queue: usize) -> Option<u32> {
     let mut val = None;
     for (q, writes) in QUEUED.lock().iter() {
@@ -1581,7 +1594,7 @@ impl CommandProcessor {
                 return;
             }
             // Another queue's queued writes: the same, without committing ours.
-            if virtual_waits && crate::tune::get(crate::tune::CROSS_WAITS) != 0 && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
+            if virtual_waits && cross_waits_for(self.queue) && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
                 self.stats.cross_waits += 1;
                 hooks.order_barrier(self);
                 return;
@@ -1653,7 +1666,7 @@ impl CommandProcessor {
                     self.stats.virtual_waits += 1;
                     return;
                 }
-                if virtual_waits && crate::tune::get(crate::tune::CROSS_WAITS) != 0 && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
+                if virtual_waits && cross_waits_for(self.queue) && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
                     self.stats.cross_waits += 1;
                     hooks.order_barrier(self);
                     return;
