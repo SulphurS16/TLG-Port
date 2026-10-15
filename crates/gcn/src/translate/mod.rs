@@ -795,6 +795,11 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     let mut b = Builder::new();
     b.set_version(1, 3);
     b.capability(Capability::Shader);
+    // TLG_SPIRV_NONCE=<text> (measurements): every module differs from the
+    // driver's cached ones, so pipelines compile afresh.
+    if let Ok(n) = std::env::var("TLG_SPIRV_NONCE") {
+        b.source_extension(format!("tlg-nonce-{n}"));
+    }
     b.capability(Capability::ImageQuery);
     b.capability(Capability::StorageImageWriteWithoutFormat);
     b.capability(Capability::StorageImageReadWithoutFormat);

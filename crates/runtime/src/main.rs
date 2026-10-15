@@ -528,7 +528,11 @@ fn main() {
         }
     }
     if let Err(e) = gpu::vk::init().and_then(|_| {
-        gpu::render::set_pipeline_cache_path(cfg.data.join("pipeline-cache.bin"));
+        // (TLG_PIPELINE_CACHE=0: none - pipelines compile afresh, e.g. to
+        // measure compile times.)
+        if std::env::var("TLG_PIPELINE_CACHE").map_or(true, |v| v != "0") {
+            gpu::render::set_pipeline_cache_path(cfg.data.join("pipeline-cache.bin"));
+        }
         gpu::render::init()
     }) {
         error!("renderer unavailable: {e}");

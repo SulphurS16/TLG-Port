@@ -682,6 +682,9 @@ fn gfx_thread() {
                 }
                 let parts: Vec<String> = render::PROF_NAMES.iter().zip(r.prof.iter()).map(|(n, d)| format!("{n} {:.2}s", d.as_secs_f64())).collect();
                 crate::info!("renderer time: {}", parts.join(", "));
+                let pc = |i: usize| (render::PIPE_CREATES[i].0.load(Ordering::Relaxed), render::PIPE_CREATES[i].1.load(Ordering::Relaxed) as f64 / 1e9);
+                let (g, c) = (pc(0), pc(1));
+                crate::info!("pipelines created so far: graphics {} ({:.2} s), compute {} ({:.2} s)", g.0, g.1, c.0, c.1);
             }
         }
     }

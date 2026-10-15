@@ -2221,6 +2221,10 @@ pub static DISPATCH_SYNC: [[(std::sync::atomic::AtomicU64, std::sync::atomic::At
 pub static BARRIER_WHY: [[[std::sync::atomic::AtomicU64; 2]; 4]; 2] = [const { [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4] }; 2];
 /// TLG_PERF: mirror copy-ins recorded in their batch and ahead of it.
 pub static COPYIN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// Pipelines created (graphics, compute): count and nanoseconds in the
+/// creation calls (reported with the renderer times).
+pub static PIPE_CREATES: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 2] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 2];
+
 /// TLG_PERF: mirror bindings served by the binding cache, and all.
 pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// TLG_PERF: binding-cache misses by queue class (graphics, compute) and
@@ -6806,6 +6810,8 @@ impl Renderer {
         if !self.gfx_pipes.contains_key(&key) {
             let t0 = std::time::Instant::now();
             let p = self.create_gfx_pipeline(&key, &vs, ps.as_ref())?;
+            PIPE_CREATES[0].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PIPE_CREATES[0].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let ms = t0.elapsed().as_millis();
             if ms >= 100 {
                 crate::info!("graphics pipeline for vs {:#x} ps {:#x} took {ms} ms to create", vs.addr, ps.as_ref().map(|p| p.addr).unwrap_or(0));
@@ -7848,6 +7854,8 @@ impl Renderer {
             let t0 = std::time::Instant::now();
             let pipeline = unsafe { c.device.create_compute_pipelines(pipeline_cache(), &[ci], None) }.map_err(|(_, e)| format!("vkCreateComputePipelines: {e}"))?[0];
             pipeline_cache_dirty();
+            PIPE_CREATES[1].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            PIPE_CREATES[1].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let ms = t0.elapsed().as_millis();
             if ms >= 100 {
                 crate::info!("compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms to create", cs.addr, cs.translated.out.spirv.len());
