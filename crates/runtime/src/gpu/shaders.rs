@@ -40,10 +40,11 @@ fn hash_words(w: &[u32]) -> u64 {
     super::resources::hash_slice(w.len() as u64, bytes)
 }
 
-/// Vectors of finished `Prepared`s and specializations, kept per thread for
-/// the next `prepare` (heap allocations and frees of them per stage and
-/// draw were ~4% of the graphics CP).
-#[derive(Default)]
+/// Vectors of finished `Prepared`s and specializations, kept for the next
+/// `prepare` (heap allocations and frees of them per stage and draw were
+/// ~4% of the graphics CP). One pool for all threads: the prepare thread
+/// makes most `Prepared`s and the CP threads drop them (a pool per thread
+/// freed ~2.7% of the graphics CP's time while the prepare thread allocated).
 struct VecPool {
     res: Vec<Vec<ResolvedRes>>,
     specs: Vec<Vec<ResSpec>>,
@@ -51,6 +52,8 @@ struct VecPool {
     u64s: Vec<Vec<u64>>,
     inputs: Vec<Vec<PsInput>>,
 }
+
+static POOL: parking_lot::Mutex<VecPool> = parking_lot::Mutex::new(VecPool { res: Vec::new(), specs: Vec::new(), u32s: Vec::new(), u64s: Vec::new(), inputs: Vec::new() });
 
 fn pool_take<T>(v: &mut Vec<Vec<T>>) -> Vec<T> {
     v.pop().unwrap_or_default()
@@ -66,18 +69,14 @@ fn pool_give<T>(v: &mut Vec<Vec<T>>, mut x: Vec<T>) {
 impl Drop for Prepared {
     fn drop(&mut self) {
         let (res, sgpr, reads) = (std::mem::take(&mut self.resources), std::mem::take(&mut self.sgpr_data), std::mem::take(&mut self.mem_reads));
-        // (Also at thread exit, when the pool may be gone already.)
-        let _ = POOL.try_with(|p| {
-            let mut p = p.borrow_mut();
-            pool_give(&mut p.res, res);
-            pool_give(&mut p.u32s, sgpr);
-            pool_give(&mut p.u64s, reads);
-        });
+        let mut p = POOL.lock();
+        pool_give(&mut p.res, res);
+        pool_give(&mut p.u32s, sgpr);
+        pool_give(&mut p.u64s, reads);
     }
 }
 
 thread_local! {
-    static POOL: std::cell::RefCell<VecPool> = std::cell::RefCell::new(VecPool::default());
     /// Guest addresses read while preparing a shader (see `Prepared::mem_reads`).
     static READS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
     /// Last mapping a read was validated against: (start, end, MAP_GEN).
@@ -804,10 +803,10 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
     }
     // Resolve descriptors.
     let mut memo = PtrMemo::new();
-    let (mut resources, mut specs, mut strides, mut ps_inputs, mut sgpr_data, mut mem_reads) = POOL.with(|p| {
-        let mut p = p.borrow_mut();
+    let (mut resources, mut specs, mut strides, mut ps_inputs, mut sgpr_data, mut mem_reads) = {
+        let mut p = POOL.lock();
         (pool_take(&mut p.res), pool_take(&mut p.specs), pool_take(&mut p.u32s), pool_take(&mut p.inputs), pool_take(&mut p.u32s), pool_take(&mut p.u64s))
-    });
+    };
     resources.reserve(plan.resources.len());
     specs.reserve(plan.resources.len());
     strides.reserve(plan.resources.len());
@@ -990,12 +989,12 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
     let utility = analyzed.utility;
     // (A pooled vector takes the reads' place in READS.)
     READS.with(|r| std::mem::swap(&mut *r.borrow_mut(), &mut mem_reads));
-    POOL.with(|p| {
-        let mut p = p.borrow_mut();
+    {
+        let mut p = POOL.lock();
         pool_give(&mut p.specs, std::mem::take(&mut spec.resources));
         pool_give(&mut p.u32s, std::mem::take(&mut spec.buffer_strides));
         pool_give(&mut p.inputs, std::mem::take(&mut spec.ps_inputs));
-    });
+    }
     Ok(Prepared { stage: sr.stage, addr, translated, resources, sgpr_data, written_buffers, read_buffers, res_pcs, load_only, mem_reads, code_hash, scatter, sparse_writes: None, utility, tess: tess.role })
 }
 

@@ -419,7 +419,12 @@ pub const TEX_CACHE: usize = 70;
 /// summaries' other sources). Without TLG_PERF they are never collected.
 pub const PERF_HOT: usize = 71;
 
-const TABLE: [(&str, &str, i64); 72] = [
+/// DMA_DATA of several words into one register (no destination increment:
+/// the title's L2 prefetches of shader code) makes only the last write
+/// (`TLG_DMA_REG_LAST`, 1; 0 writes every word).
+pub const DMA_REG_LAST: usize = 72;
+
+const TABLE: [(&str, &str, i64); 73] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -492,6 +497,7 @@ const TABLE: [(&str, &str, i64); 72] = [
     ("desc_templates", "TLG_DESC_TEMPLATES", 1),
     ("tex_cache", "TLG_TEX_CACHE", 1),
     ("perf_hot", "TLG_PERF_HOT", 1),
+    ("dma_reg_last", "TLG_DMA_REG_LAST", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

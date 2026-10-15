@@ -1747,13 +1747,21 @@ impl CommandProcessor {
                     return;
                 }
             }
+            let word = |i: u32| match src_sel {
+                2 => body[1],
+                0 if !sas && guest_ok(src, bytes) => unsafe { rd(src + if saic { 0 } else { i as u64 * 4 }) },
+                _ => 0,
+            };
+            // (All words into one register - the title's L2 prefetches
+            // stream shader code into 0xC08B this way, up to ~1,000 words
+            // per draw - leave only the last: one write. ~4.5% of the
+            // graphics CP went into the word-by-word loop.)
+            if daic && words > 1 && !reg_watching() && crate::tune::get(crate::tune::DMA_REG_LAST) != 0 {
+                self.write_reg(reg, word(words - 1));
+                return;
+            }
             for i in 0..words {
-                let v = match src_sel {
-                    2 => body[1],
-                    0 if !sas && guest_ok(src, bytes) => unsafe { rd(src + if saic { 0 } else { i as u64 * 4 }) },
-                    _ => 0,
-                };
-                self.write_reg(reg + if daic { 0 } else { i }, v);
+                self.write_reg(reg + if daic { 0 } else { i }, word(i));
             }
             return;
         }
