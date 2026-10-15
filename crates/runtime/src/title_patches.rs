@@ -87,8 +87,8 @@ pub fn apply(p: &mut Patcher, name: &str) {
 
 /// Mouse-look data next to the module: pending pitch and yaw change
 /// (radians, f32) at +0 and +4, camera update count at +8, the pitch and
-/// yaw change applied in the current integrator pass at +12 and +16 (0 =
-/// no hook).
+/// yaw change applied in the current integrator pass at +12 and +16, the
+/// camera object at +24 (0 = no hook).
 static CAM_SLOTS: AtomicU64 = AtomicU64::new(0);
 
 /// (camera update count last seen, when it changed: process ms and flip).
@@ -135,7 +135,9 @@ fn patch_mouse_camera(p: &mut Patcher) -> Result<u64, String> {
     let count = |a: &mut CodeAssembler| -> Result<(), IcedError> {
         a.mov(eax, dword_ptr(rcx + 8))?;
         a.lea(eax, ptr(rax + 1))?;
-        a.mov(dword_ptr(rcx + 8), eax)
+        a.mov(dword_ptr(rcx + 8), eax)?;
+        // (The camera object, for diagnostics: `camera_object`.)
+        a.mov(qword_ptr(rcx + 24), r15)
     };
     p.detour(CAM_PASSED.0, CAM_PASSED.1, |a, ins| {
         a.add_instruction(*ins)?;
@@ -313,6 +315,60 @@ pub fn in_menu() -> Option<bool> {
         crate::info!("input: the title screen ended (a load)");
     }
     Some(TITLE.load(Ordering::Relaxed) || still_ms > 500.0)
+}
+
+/// The camera hook is installed (update 01.03, TLG_MOUSE_CAMERA not 0).
+pub fn camera_hooked() -> bool {
+    CAM_SLOTS.load(Ordering::Relaxed) != 0
+}
+
+/// The game camera object (the hooks' r15) once it has updated; 0 before.
+pub fn camera_object() -> u64 {
+    let s = CAM_SLOTS.load(Ordering::Relaxed);
+    if s == 0 {
+        return 0;
+    }
+    // SAFETY: as in add_camera_turn.
+    unsafe { &*((s + 24) as *const AtomicU64) }.load(Ordering::Relaxed)
+}
+
+/// Flips left to log the camera for (control `camlog <flips>`).
+static CAMLOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn camlog(flips: u32) {
+    CAMLOG.store(flips, Ordering::Relaxed);
+}
+
+/// At each displayed flip while `camlog` runs: the camera's pitch and yaw
+/// (+0x2240/+0x2244, radians), eye (+0x2370) and pivot (+0x23c0), and the
+/// mouse turn applied in the last integrator pass.
+pub fn camlog_tick(flip: u64) {
+    if CAMLOG.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    CAMLOG.fetch_sub(1, Ordering::Relaxed);
+    let cam = camera_object();
+    if cam == 0 || !crate::mem::is_guest(cam + 0x2240, 0x190) {
+        crate::info!("camlog flip {flip}: no camera object");
+        return;
+    }
+    let f = |o: u64| unsafe { std::ptr::read_volatile((cam + o) as *const f32) };
+    let s = CAM_SLOTS.load(Ordering::Relaxed);
+    let applied = if s != 0 { unsafe { (std::ptr::read_volatile((s + 12) as *const f32), std::ptr::read_volatile((s + 16) as *const f32)) } } else { (0.0, 0.0) };
+    crate::info!(
+        "camlog flip {flip} t {:.1}: pitch {:.5} yaw {:.5} eye ({:.3} {:.3} {:.3}) pivot ({:.3} {:.3} {:.3}) applied ({:.5} {:.5})",
+        crate::log::elapsed_ms(),
+        f(0x2240),
+        f(0x2244),
+        f(0x2370),
+        f(0x2374),
+        f(0x2378),
+        f(0x23c0),
+        f(0x23c4),
+        f(0x23c8),
+        applied.0,
+        applied.1
+    );
 }
 
 fn patch_gaprint(p: &mut Patcher, name: &str) {

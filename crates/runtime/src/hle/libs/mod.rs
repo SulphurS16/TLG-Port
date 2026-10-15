@@ -9,6 +9,7 @@ pub mod extra;
 pub mod fiber;
 pub mod gnm;
 pub mod ngs2;
+pub mod ngs2_fx;
 pub mod ime_dialog;
 pub mod online;
 pub mod rtc;

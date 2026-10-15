@@ -194,6 +194,7 @@ fn vblank_thread() {
         }
         if let Some((b, frame, timing, flip_wait)) = show {
             let n = PORT.lock().as_ref().map(|p| p.count).unwrap_or(0);
+            crate::title_patches::camlog_tick(n);
             maybe_screenshot(&b, n, frame);
             if let Some((lock_wait, present, prof)) = present_buffer(&b) {
                 crate::pacing::presented(n, lock_wait, present, prof, crate::title_patches::guest_frame_ms(), timing, flip_wait);

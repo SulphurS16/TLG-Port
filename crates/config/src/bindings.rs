@@ -152,8 +152,8 @@ touchpad = T
 # Mouse: a click into the window captures the mouse; release_mouse (or
 # switching away from the window) frees it. Mouse look turns the game camera
 # directly by the raw motion (no acceleration, smoothing or dead zone;
-# sensitivity 1.0 is 0.04 degrees per count, separately for x and y); where
-# the game camera is not in charge it moves the right stick instead.
+# sensitivity 1.0 is 0.04 degrees per count, separately for x and y); it is
+# never turned into right-stick input.
 mouse_look = on
 mouse_sensitivity_x = 1.0
 mouse_sensitivity_y = 1.0

@@ -362,6 +362,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 thread::cpu_report();
                 Ok(())
             }
+            "camlog" => {
+                // camlog <flips>: the game camera at each displayed flip.
+                title_patches::camlog(parts.next().and_then(|v| v.parse().ok()).unwrap_or(60));
+                Ok(())
+            }
             "display" => {
                 // display windowed|borderless|fullscreen|toggle: as Alt+Enter / settings.
                 let m = match parts.next().unwrap_or("") {

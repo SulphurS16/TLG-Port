@@ -8,12 +8,15 @@
 //! along their patches with port volumes and port matrices into submixers and the
 //! mastering voice, which writes the render buffers.
 //!
-//! Not implemented yet (logged once each, audio passes through unchanged):
-//! envelopes, filters, distortion, compressors, reverb (I3DL2), custom rack
-//! modules, user effect callbacks, port delays, peak meters, limiter. Unknown
-//! parameter ids are logged with their payload.
+//! Sampler envelopes (with release on STOP), reverb racks (I3DL2, wet only:
+//! effect returns), the multi-tap delay module of custom racks (the taps
+//! only) and the mastering gains and limiter are applied (`ngs2_fx`). Not
+//! implemented yet (logged once each, audio passes through unchanged):
+//! filters, distortion, compressors, other custom rack modules, port delays,
+//! peak meters. Unknown parameter ids are logged with their payload.
 
 use super::atrac9;
+use super::ngs2_fx::{Envelope, I3dl2, Reverb, Taps};
 use crate::hle::Registry;
 use crate::{reg, sysv};
 use parking_lot::Mutex;
@@ -55,8 +58,12 @@ const SAMPLER_FILTER: u32 = 0x1000_000A;
 // Submixer / reverb / mastering setup ids.
 const SUBMIXER_SETUP: u32 = 0x2000_0000;
 const REVERB_SETUP: u32 = 0x2001_0000;
+const REVERB_I3DL2: u32 = 0x2001_0001;
 const MASTERING_SETUP: u32 = 0x3000_0000;
+const MASTERING_LIMITER: u32 = 0x3000_0003;
 const MASTERING_GAIN: u32 = 0x3000_0004;
+/// The multi-tap delay module of custom racks (module 0x1d's parameters).
+const CUSTOM_DELAY: u32 = 0x4000_1D00;
 
 // Voice events.
 const EVENT_PLAY: u32 = 0;
@@ -113,15 +120,20 @@ struct System {
 enum Kind {
     Sampler,
     Submixer,
+    /// Reverb racks (0x2001): the reverberation of their input.
+    Reverb,
+    /// Custom racks (0x4xxx): their modules' output (the multi-tap delay's
+    /// taps; other modules pass the input through).
+    Custom,
     Mastering,
 }
 
 fn kind_of(rack_id: u32) -> Kind {
-    match rack_id & 0xF000 {
-        0x1000 => Kind::Sampler,
-        0x3000 => Kind::Mastering,
-        // Submixers, reverbs (0x2001) and custom racks (0x4xxx) mix their
-        // inputs to their outputs.
+    match rack_id {
+        0x1000..=0x1FFF => Kind::Sampler,
+        0x2001 => Kind::Reverb,
+        0x3000..=0x3FFF => Kind::Mastering,
+        0x4000..=0x4FFF => Kind::Custom,
         _ => Kind::Submixer,
     }
 }
@@ -236,6 +248,19 @@ struct Voice {
     user_fx: Option<(u64, u64)>,
     fx_calls: u64,
     fx_buf: u64,
+    /// Sampler envelope (empty: full level).
+    env: Envelope,
+    /// Reverb racks: parameters and state.
+    i3dl2: I3dl2,
+    reverb: Option<Reverb>,
+    /// Custom racks: the multi-tap delay (module 0x1d) when set.
+    taps: Option<Taps>,
+    /// Output channels of reverb and custom racks.
+    out_channels: u32,
+    /// Mastering: LFE gain (channel 3; `gain` for the others) and limiter
+    /// threshold (0: off).
+    lfe_gain: f32,
+    limit: f32,
 }
 
 impl Voice {
@@ -260,6 +285,13 @@ impl Voice {
             user_fx: None,
             fx_calls: 0,
             fx_buf: 0,
+            env: Envelope::default(),
+            i3dl2: I3dl2::default(),
+            reverb: None,
+            taps: None,
+            out_channels: 2,
+            lfe_gain: 1.0,
+            limit: 0.0,
         }
     }
 }
@@ -381,11 +413,15 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
             match id {
                 PARAM_EVENT => match u32_at(8) {
                     EVENT_PLAY => {
+                        if v.flags & STATE_PLAYING == 0 {
+                            v.env.restart();
+                        }
                         v.flags = (v.flags | STATE_IN_USE | STATE_PLAYING) & !(STATE_STOPPED | STATE_PAUSED | STATE_EMPTY);
                     }
+                    // STOP on a playing sampler with release points plays on
+                    // through them (the voice ends with the envelope).
+                    EVENT_STOP if v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0 && v.env.release() => {}
                     e @ (EVENT_STOP | EVENT_STOP_IMMEDIATELY | EVENT_KILL) => {
-                        // (STOP releases through the envelope on hardware; without
-                        // envelopes every stop is immediate.)
                         v.flags = (v.flags & !(STATE_PLAYING | STATE_PAUSED)) | STATE_STOPPED;
                         if e != EVENT_STOP || v.kind == Kind::Sampler {
                             v.flags &= !STATE_IN_USE;
@@ -523,19 +559,79 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                 }
                 SAMPLER_PITCH => v.sampler.pitch = f32_at(8),
                 SAMPLER_FRAME_OFFSET => unimpl = Some("sampler waveform frame offset"),
-                SAMPLER_ENVELOPE => unimpl = Some("sampler envelopes"),
+                SAMPLER_ENVELOPE => {
+                    // {u32 numForwardPoints, numReleasePoints; const SceNgs2EnvelopePoint *aPoint}
+                    // with points {u32 curve, duration (samples); float height}.
+                    let (fwd, rel, pts) = (u32_at(8), u32_at(12), u64_at(16));
+                    let n = (fwd as u64 + rel as u64).min(32);
+                    if n > 0 && pts != 0 && crate::mem::is_guest(pts, n * 12) {
+                        let l: Vec<(u32, u32, f32)> = (0..n).map(|i| unsafe {
+                            let q = (pts + i * 12) as *const u32;
+                            (*q, *q.add(1), f32::from_bits(*q.add(2)))
+                        }).collect();
+                        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 6 {
+                            crate::info!("NGS2 envelope: {fwd} forward + {rel} release points {l:?}");
+                        }
+                        v.env = Envelope::new(l, (fwd as usize).min(n as usize));
+                    } else {
+                        v.env = Envelope::default();
+                    }
+                }
                 SAMPLER_DISTORTION => unimpl = Some("sampler distortion"),
                 SAMPLER_USER_FX => unimpl = Some("sampler user effects"),
                 SAMPLER_PEAKMETER => unimpl = Some("sampler peak meters"),
-                SAMPLER_FILTER => unimpl = Some("sampler filters"),
+                SAMPLER_FILTER => {
+                    unimpl = Some("sampler filters");
+                    trace_payload(vh, id, size, p);
+                }
                 SUBMIXER_SETUP | REVERB_SETUP | MASTERING_SETUP | 0x4002_0000 | 0x4001_0000 | 0x4003_0000 => {
                     // {u32 numChannels; ...} (reverb/custom: numInputChannels, numOutputChannels)
                     v.channels = u32_at(8).clamp(1, MAX_CH as u32);
+                    v.out_channels = if matches!(v.kind, Kind::Reverb | Kind::Custom) { u32_at(12).clamp(1, MAX_CH as u32) } else { v.channels };
                     v.flags |= STATE_IN_USE;
                 }
                 MASTERING_GAIN => {
                     // {float fbwLevel; float lfeLevel}
                     v.gain = f32_at(8);
+                    v.lfe_gain = f32_at(12);
+                }
+                MASTERING_LIMITER => {
+                    // {u32 enable; float threshold}
+                    v.limit = if u32_at(8) != 0 { f32_at(12).max(0.0) } else { 0.0 };
+                }
+                REVERB_I3DL2 if v.kind == Kind::Reverb => {
+                    let i = |off: usize| u32_at(off) as i32;
+                    v.i3dl2 = I3dl2 {
+                        wet: f32_at(8),
+                        dry: f32_at(12),
+                        room: i(16),
+                        room_hf: i(20),
+                        decay: f32_at(28),
+                        decay_hf: f32_at(32),
+                        reflections: i(36),
+                        reflections_delay: f32_at(40),
+                        reverb: i(44),
+                        reverb_delay: f32_at(48),
+                    };
+                    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                        crate::info!("NGS2 reverb {vh:#x}: {:?}", v.i3dl2);
+                    }
+                }
+                CUSTOM_DELAY if v.kind == Kind::Custom => {
+                    let words: Vec<u32> = (0..((size as usize).saturating_sub(8) / 4).min(40)).map(|k| u32_at(8 + k * 4)).collect();
+                    match (Taps::from_words(&words, 48000), v.taps.as_mut()) {
+                        (Some(t), Some(cur)) => cur.update(t),
+                        (Some(t), None) => {
+                            static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                            if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                                crate::info!("NGS2 custom rack {vh:#x}: multi-tap delay level {:.3} feedback {:.3} cutoff {:.0} Hz, taps {:?}", t.level, t.feedback, t.cutoff, t.taps);
+                            }
+                            v.taps = Some(t);
+                        }
+                        _ => {}
+                    }
                 }
                 SUBMIXER_USER_FX => {
                     // {handler; userData; ...}: run per grain (`run_user_fx`).
@@ -546,11 +642,14 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                         crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): user effect {h:#x} (data {u:#x})", v.kind, v.channels);
                     }
                 }
-                0x2000_0001..=0x2000_0003 | 0x2000_0005..=0x2000_0006 => unimpl = Some("submixer envelope/compressor/distortion/filter"),
-                0x2001_0001..=0x2001_00FF => unimpl = Some("reverb (I3DL2)"),
-                0x3000_0001..=0x3000_0003 | 0x3000_0005..=0x3000_00FF => unimpl = Some("mastering matrix/LFE/limiter/output/peak meter"),
+                0x2000_0001..=0x2000_0003 | 0x2000_0005..=0x2000_0006 => {
+                    unimpl = Some("submixer envelope/compressor/distortion/filter");
+                    trace_payload(vh, id, size, p);
+                }
+                0x2001_0002..=0x2001_00FF => unimpl = Some("reverb parameters other than I3DL2"),
+                0x3000_0001..=0x3000_0002 | 0x3000_0005..=0x3000_00FF => unimpl = Some("mastering matrix/output/peak meter"),
                 0x4000_0000..=0x4FFF_FFFF => {
-                    unimpl = Some("custom rack modules");
+                    unimpl = Some("custom rack modules other than the multi-tap delay (passed through)");
                     if trace_voices() {
                         let words: Vec<String> = (0..((size as usize).saturating_sub(8) / 4).min(34)).map(|i| format!("{:08x}", u32_at(8 + i * 4))).collect();
                         crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): custom module param {id:#x}: {}", v.kind, v.channels, words.join(" "));
@@ -571,6 +670,25 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
 }
 
 const SUBMIXER_USER_FX: u32 = 0x2000_0004;
+
+/// TLG_NGS2_TRACE: the distinct payloads of not-yet-applied parameters
+/// (filters, compressors), the first 64 of each id.
+fn trace_payload(vh: u64, id: u32, size: u16, p: *const u8) {
+    if !trace_voices() {
+        return;
+    }
+    static SEEN: parking_lot::Mutex<Option<HashMap<u32, HashSet<Vec<u32>>>>> = parking_lot::Mutex::new(None);
+    let words: Vec<u32> = (0..((size as usize).saturating_sub(8) / 4).min(16)).map(|i| unsafe { *(p.add(8 + i * 4) as *const u32) }).collect();
+    let mut g = SEEN.lock();
+    let set = g.get_or_insert_with(HashMap::new).entry(id).or_default();
+    if set.len() < 64 && set.insert(words.clone()) {
+        let shown: Vec<String> = words.iter().map(|&w| {
+            let f = f32::from_bits(w);
+            if w != 0 && f.is_finite() && f.abs() > 1e-6 && f.abs() < 1e6 && w > 0x00800000 { format!("{f}") } else { format!("{w:#x}") }
+        }).collect();
+        crate::info!("NGS2 param {id:#x} on {vh:#x}: [{}]", shown.join(", "));
+    }
+}
 
 /// TLG_NGS2_USER_FX=0: user effects not called (audio passes through).
 fn user_fx_on() -> bool {
@@ -785,6 +903,7 @@ fn decode_more(sm: &mut Sampler) -> bool {
 /// Renders `grain` frames of a sampler voice at the system rate.
 fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MAX_CH]>) {
     out.clear();
+    let v = &mut *v;
     let sm = &mut v.sampler;
     let step = (sm.rate as f64 / rate.max(1) as f64) * sm.pitch.max(0.0) as f64;
     let mut ended = false;
@@ -795,11 +914,19 @@ fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MA
         }
         let next = sm.pcm.front().copied().unwrap_or([0.0; MAX_CH]);
         let t = sm.phase as f32;
+        let h = v.env.step();
         let mut fr = [0f32; MAX_CH];
         for c in 0..MAX_CH {
-            fr[c] = sm.cur[c] + (next[c] - sm.cur[c]) * t;
+            fr[c] = (sm.cur[c] + (next[c] - sm.cur[c]) * t) * h;
         }
         out.push(fr);
+        if v.env.done() {
+            // (The release points ran out: the voice ends.)
+            ended = true;
+            sm.pcm.clear();
+            sm.blocks.clear();
+            break;
+        }
         sm.phase += step;
         while sm.phase >= 1.0 {
             sm.phase -= 1.0;
@@ -816,6 +943,8 @@ fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MA
             }
         }
     }
+    // (A grain cut short by the envelope's end: silence for the rest.)
+    out.resize(grain, [0.0; MAX_CH]);
     if ended && sm.pcm.is_empty() && sm.blocks.is_empty() {
         if trace_voices() {
             crate::info!("NGS2 voice (rack {:#x} #{}) ran out of data after {} samples ({} bytes decoded)", v.rack, v.index, sm.decoded_samples, sm.decoded_bytes);
@@ -944,7 +1073,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
     }
     // Mixing voices: deepest upstream first (a voice runs after everything that
     // patches into it; cycles are cut).
-    let mixers: Vec<u64> = all.iter().copied().filter(|vh| s.voices.get(vh).is_some_and(|v| v.kind == Kind::Submixer)).collect();
+    let mixers: Vec<u64> = all.iter().copied().filter(|vh| s.voices.get(vh).is_some_and(|v| matches!(v.kind, Kind::Submixer | Kind::Reverb | Kind::Custom))).collect();
     let mut depth: HashMap<u64, u32> = HashMap::new();
     fn depth_of(s: &State, vh: u64, memo: &mut HashMap<u64, u32>, guard: u32) -> u32 {
         if let Some(&d) = memo.get(&vh) {
@@ -963,16 +1092,30 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
     let mut order: Vec<(u32, u64)> = mixers.iter().map(|&vh| (depth_of(s, vh, &mut depth, 0), vh)).collect();
     order.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, vh) in order {
-        let (input, ch) = {
+        let (input, out, ch) = {
             let v = s.voices.get_mut(&vh).unwrap();
-            let ch = v.channels as usize;
+            let ch = (v.channels as usize).clamp(1, MAX_CH);
             let mut input = std::mem::take(&mut v.input);
-            run_user_fx(v, &mut input, rate);
-            let pk = peak_of(&input, ch.clamp(1, MAX_CH));
+            let pk = peak_of(&input, ch);
             v.peak_win = v.peak_win.max(pk);
-            (input, ch)
+            match v.kind {
+                Kind::Reverb => {
+                    let och = (v.out_channels as usize).clamp(1, MAX_CH);
+                    (input.clone(), Some(reverb_grain(v, &input, ch, och, rate)), och)
+                }
+                Kind::Custom if v.taps.is_some() => {
+                    let och = (v.out_channels as usize).clamp(1, MAX_CH);
+                    let t = v.taps.as_mut().unwrap();
+                    let out: Vec<[f32; MAX_CH]> = input.iter().map(|fr| t.process(fr, och.min(ch))).collect();
+                    (input, Some(out), och)
+                }
+                _ => {
+                    run_user_fx(v, &mut input, rate);
+                    (input, None, ch)
+                }
+            }
         };
-        route(s, vh, &input, ch.clamp(1, MAX_CH));
+        route(s, vh, out.as_deref().unwrap_or(&input), ch);
         if let Some(v) = s.voices.get_mut(&vh) {
             v.input = input;
         }
@@ -991,11 +1134,44 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
         let Some(v) = s.voices.get(vh) else { continue };
         for (i, fr) in v.input.iter().enumerate().take(grain) {
             for c in 0..MAX_CH {
-                out[i][c] += fr[c] * v.gain;
+                let mut x = fr[c] * if c == 3 { v.lfe_gain } else { v.gain };
+                if v.limit > 0.0 {
+                    x = x.clamp(-v.limit, v.limit);
+                }
+                out[i][c] += x;
             }
         }
     }
     out
+}
+
+/// One grain of a reverb rack: the reverberation of the input's mean (front
+/// pair; no centre or LFE) times wet, plus the input times dry.
+fn reverb_grain(v: &mut Voice, input: &[[f32; MAX_CH]], ich: usize, och: usize, rate: u32) -> Vec<[f32; MAX_CH]> {
+    let p = v.i3dl2;
+    if !v.reverb.as_ref().is_some_and(|r| r.matches(&p, rate)) {
+        v.reverb = Some(Reverb::new(p, rate));
+    }
+    let r = v.reverb.as_mut().unwrap();
+    let dry = p.dry;
+    input
+        .iter()
+        .map(|fr| {
+            let mono = fr[..ich].iter().sum::<f32>() / ich as f32;
+            let [l, rr] = r.process(mono);
+            let mut o = [0f32; MAX_CH];
+            o[0] = l;
+            if och > 1 {
+                o[1] = rr;
+            }
+            if dry != 0.0 {
+                for c in 0..och.min(ich) {
+                    o[c] += fr[c] * dry;
+                }
+            }
+            o
+        })
+        .collect()
 }
 
 sysv! {
@@ -1083,11 +1259,12 @@ sysv! {
     /// u64 numDecodedSamples, decodedDataSize; uintptr userData; const void *waveformData}.
     fn sceNgs2VoiceGetState(voice: u64, out: *mut u8, size: u64) -> i32 {
         if out.is_null() { return ERR_INVALID_OUT_ADDRESS; }
-        let Some((flags, samples, bytes, user, data, peak, before)) = with(|s| s.voices.get_mut(&voice).map(|v| {
+        let Some((flags, samples, bytes, user, data, peak, before, env)) = with(|s| s.voices.get_mut(&voice).map(|v| {
             let sm = &v.sampler;
             let data = sm.blocks.front().map(|b| b.addr).unwrap_or(sm.data);
             let before = std::mem::replace(&mut v.reported, v.flags);
-            (v.flags, sm.decoded_samples, sm.decoded_bytes, sm.user_data, data, v.peak, before)
+            let env = if v.env.points.is_empty() { 1.0 } else { v.env.height };
+            (v.flags, sm.decoded_samples, sm.decoded_bytes, sm.user_data, data, v.peak, before, env)
         })) else { return ERR_INVALID_HANDLE };
         std::ptr::write_bytes(out, 0, size as usize);
         if trace_voices() && flags != before {
@@ -1097,7 +1274,7 @@ sysv! {
             }
         }
         if size >= 4 { *(out as *mut u32) = flags; }
-        if size >= 8 { *(out.add(4) as *mut f32) = if flags & STATE_PLAYING != 0 { 1.0 } else { 0.0 }; }
+        if size >= 8 { *(out.add(4) as *mut f32) = if flags & STATE_PLAYING != 0 { env } else { 0.0 }; }
         if size >= 12 { *(out.add(8) as *mut f32) = peak; }
         if size >= 24 { *(out.add(16) as *mut u64) = samples; }
         if size >= 32 { *(out.add(24) as *mut u64) = bytes; }
@@ -1150,6 +1327,8 @@ sysv! {
                         Kind::Sampler => format!("type {:#x} {}ch {} Hz pitch {:.3}", v.sampler.wf_type, v.sampler.channels, v.sampler.rate, v.sampler.pitch),
                         Kind::Mastering => format!("{}ch gain {:.3}", v.channels, v.gain),
                         Kind::Submixer => format!("rack {rack:#x} {}ch{}", v.channels, if v.user_fx.is_some() { " +user effect" } else { "" }),
+                        Kind::Reverb => format!("reverb {}->{}ch wet {:.2} dry {:.2} decay {:.2}s", v.channels, v.out_channels, v.i3dl2.wet, v.i3dl2.dry, v.i3dl2.decay),
+                        Kind::Custom => format!("custom rack {rack:#x} {}->{}ch{}", v.channels, v.out_channels, if v.taps.is_some() { " +delay" } else { "" }),
                     };
                     lines.push(format!("{vh:#x} {:?} {what} peak {:.4}: [{}]", v.kind, v.peak_win, route.join("; ")));
                 }

@@ -20,8 +20,10 @@
 //! Mouse: a click into the window captures it (raw counts, no pointer
 //! acceleration); F1 or leaving the window releases it. Mouse look turns the
 //! game camera by the raw counts (`title_patches` camera hook: no dead zone,
-//! response curve or smoothing; sensitivity per axis); while that camera is
-//! not updating it drives the right stick instead.
+//! response curve or smoothing; sensitivity per axis). It is never turned
+//! into right-stick input: while that camera is not updating (menus, other
+//! camera modes) the motion is dropped (logged while playing); only without
+//! the camera hook does it drive the right stick.
 //!
 //! Scripted input (`TLG_INPUT`): `flip:buttons[:hold]` entries separated by
 //! `;`, e.g. `TLG_INPUT=700:cross;760:down:3;800:cross`. `buttons` joins names
@@ -344,15 +346,20 @@ fn mouse_sample(s: &Bindings, m: &mut MouseState, in_menu: bool) -> ((f32, f32),
         let sx = if s.invert_x { -1.0 } else { 1.0 } * s.sensitivity_x;
         let sy = if s.invert_y { -1.0 } else { 1.0 } * s.sensitivity_y;
         let rad = DEG_PER_COUNT.to_radians();
+        m.rs = (0.0, 0.0);
         if !captured || !s.mouse_look {
-            m.rs = (0.0, 0.0);
         } else if crate::title_patches::add_camera_turn(-(dx as f32) * rad * sx, -(dy as f32) * rad * sy) {
             // Straight into the game camera (right: turn right; forward: look up).
-            m.rs = (0.0, 0.0);
-        } else {
+        } else if !crate::title_patches::camera_hooked() {
+            // (No camera hook - another executable, TLG_MOUSE_CAMERA=0: the
+            // right stick is the only way.)
             let secs = (dt.min(250.0) / 1000.0) as f32;
             let k = 1.0 / FULL_RATE / secs.max(1e-3);
             m.rs = ((dx as f32 * k * sx).clamp(-1.0, 1.0), (dy as f32 * k * sy).clamp(-1.0, 1.0));
+        } else if !in_menu && (dx != 0 || dy != 0) {
+            // The game camera is not updating (another camera is in charge):
+            // the motion is dropped, never turned into stick input.
+            note_dropped_motion(dx.unsigned_abs() + dy.unsigned_abs());
         }
         if wheel != 0 {
             m.wheel_menu = in_menu && s.menu_mouse;
@@ -364,6 +371,22 @@ fn mouse_sample(s: &Bindings, m: &mut MouseState, in_menu: bool) -> ((f32, f32),
         }
     }
     (m.rs, now < m.wheel_up_until, now < m.wheel_down_until)
+}
+
+/// Mouse motion dropped while playing because the game camera was not
+/// updating (logged every 10 s while it happens: other camera modes to hook).
+fn note_dropped_motion(counts: u64) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTS: AtomicU64 = AtomicU64::new(0);
+    static LAST: parking_lot::Mutex<f64> = parking_lot::Mutex::new(0.0);
+    COUNTS.fetch_add(counts, Ordering::Relaxed);
+    let now = crate::log::elapsed_ms();
+    let mut last = LAST.lock();
+    if now - *last >= 10_000.0 {
+        *last = now;
+        let n = COUNTS.swap(0, Ordering::Relaxed);
+        crate::info!("mouse: {n} counts of motion dropped (flip {}): the game camera is not updating", crate::gpu::FRAMES.load(Ordering::Relaxed));
+    }
 }
 
 fn keyboard_mouse(st: &mut PadState) {

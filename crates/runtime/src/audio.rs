@@ -25,6 +25,8 @@ const MAX_QUEUED: usize = 2048;
 
 struct Port {
     fifo: VecDeque<[f32; 2]>,
+    /// Has had audio (underruns count only after that).
+    started: bool,
     /// Per-channel gain (sceAudioOutSetVolume, 32768 = 0 dB).
     volume: [f32; 8],
     dump: Option<std::fs::File>,
@@ -55,7 +57,7 @@ pub fn open_port(idx: usize) {
     if m.ports.len() <= idx {
         m.ports.resize_with(idx + 1, || None);
     }
-    m.ports[idx] = Some(Port { fifo: VecDeque::new(), volume: [1.0; 8], dump });
+    m.ports[idx] = Some(Port { fifo: VecDeque::new(), started: false, volume: [1.0; 8], dump });
     if !m.started && enabled() {
         m.started = true;
         std::thread::Builder::new().name("audio-out".into()).spawn(device_thread).ok();
@@ -145,19 +147,52 @@ pub unsafe fn output(idx: usize, data: *const u8, frames: usize, channels: usize
 fn mix(out: &mut [f32]) {
     out.fill(0.0);
     let mut m = MIXER.lock();
+    let mut short = 0usize;
     for p in m.ports.iter_mut().flatten() {
+        let want = out.len() / 2;
+        // (A port that has started and then runs dry: an underrun, heard as a gap.)
+        if p.fifo.len() < want && p.started {
+            short += want - p.fifo.len();
+        }
+        if !p.fifo.is_empty() {
+            p.started = true;
+        }
         for frame in out.chunks_exact_mut(2) {
             let Some(s) = p.fifo.pop_front() else { break };
             frame[0] += s[0];
             frame[1] += s[1];
         }
     }
+    note_underrun(short);
     let gain = master_gain();
     for v in out.iter_mut() {
         *v = (*v * gain).clamp(-1.0, 1.0);
     }
     drop(m);
     CV.notify_all();
+}
+
+/// Underrun statistics: frames the device asked for that a playing port did
+/// not have, logged every 10 s while there are any.
+fn note_underrun(frames: usize) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static FRAMES: AtomicU64 = AtomicU64::new(0);
+    static EVENTS: AtomicU64 = AtomicU64::new(0);
+    static LAST: parking_lot::Mutex<Option<std::time::Instant>> = parking_lot::Mutex::new(None);
+    if frames > 0 {
+        FRAMES.fetch_add(frames as u64, Ordering::Relaxed);
+        EVENTS.fetch_add(1, Ordering::Relaxed);
+    }
+    let mut last = LAST.lock();
+    let now = std::time::Instant::now();
+    let due = last.is_none_or(|t| now.duration_since(t).as_secs() >= 10);
+    if due {
+        *last = Some(now);
+        let (f, e) = (FRAMES.swap(0, Ordering::Relaxed), EVENTS.swap(0, Ordering::Relaxed));
+        if e > 0 {
+            crate::info!("audio: {e} underruns in the last 10 s ({f} frames = {:.1} ms of gaps)", f as f64 / RATE as f64 * 1000.0);
+        }
+    }
 }
 
 fn master_gain() -> f32 {
