@@ -186,7 +186,14 @@ fn dst_rect(sw: u32, sh: u32, dw: u32, dh: u32) -> (i32, i32, i32, i32) {
     fit_rect(sw, sh, dw, dh)
 }
 
+/// A frame up to 1% smaller than the target in each direction is shown
+/// pixel for pixel, centred (e.g. 1360x764 rendered for a 1366x768
+/// screen); otherwise it is scaled to fit.
 fn fit_rect(sw: u32, sh: u32, dw: u32, dh: u32) -> (i32, i32, i32, i32) {
+    if sw <= dw && sh <= dh && (dw - sw) * 100 <= dw && (dh - sh) * 100 <= dh {
+        let (x, y) = ((dw - sw) / 2, (dh - sh) / 2);
+        return (x as i32, y as i32, (x + sw) as i32, (y + sh) as i32);
+    }
     let (sw, sh, dw, dh) = (sw as u64, sh as u64, dw as u64, dh as u64);
     // Width-limited if the target is relatively narrower than the frame.
     let (w, h) = if dw * sh <= dh * sw { (dw, (dw * sh + sw / 2) / sw) } else { ((dh * sw + sh / 2) / sh, dh) };
@@ -204,6 +211,9 @@ mod tests {
         assert_eq!(super::fit_rect(1920, 1080, 1920, 1200), (0, 60, 1920, 1140));
         assert_eq!(super::fit_rect(1920, 1080, 3440, 1440), (440, 0, 3000, 1440));
         assert_eq!(super::fit_rect(1920, 1080, 1280, 1024), (0, 152, 1280, 872));
+        // Nearly the target's size: pixel for pixel.
+        assert_eq!(super::fit_rect(1360, 764, 1366, 768), (3, 2, 1363, 766));
+        assert_eq!(super::fit_rect(1280, 720, 1366, 768), (0, 0, 1365, 768));
     }
 }
 

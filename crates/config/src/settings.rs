@@ -49,6 +49,36 @@ pub enum FrameCap {
 /// Frame caps tested at their game speed (offered by the launcher).
 pub const TESTED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game];
 
+/// Render resolutions accepted (the tested range).
+pub const RENDER_MIN: (u32, u32) = (640, 360);
+pub const RENDER_MAX: (u32, u32) = (3840, 2160);
+
+pub fn render_size_ok((w, h): (u32, u32)) -> bool {
+    (RENDER_MIN.0..=RENDER_MAX.0).contains(&w) && (RENDER_MIN.1..=RENDER_MAX.1).contains(&h)
+}
+
+/// The render size for a display area (`render_resolution = display`): the
+/// largest 16:9 size inside it in the accepted range, its width a multiple
+/// of 16 and its height even (as in all the game's own display modes).
+pub fn render_size_for(w: u32, h: u32) -> (u32, u32) {
+    let w = (w as u64).min(h as u64 * 16 / 9) as u32;
+    let w = (w & !15).clamp(RENDER_MIN.0, RENDER_MAX.0);
+    (w, (w * 9 / 16) & !1)
+}
+
+/// The windowed client size on a monitor with work area `work`: the
+/// configured size (within the work area), else the largest 16:9 size
+/// within 3/4 of the work area (exactly 16:9, width a multiple of 32: the
+/// display render size is then the window's).
+pub fn window_size(s: &Settings, work: (u32, u32)) -> (u32, u32) {
+    let (ww, wh) = work;
+    if s.window_width >= 320 && s.window_height >= 180 {
+        return (s.window_width.min(ww), s.window_height.min(wh));
+    }
+    let w = ((ww as u64 * 3 / 4).min(wh as u64 * 3 / 4 * 16 / 9) as u32).max(320) & !31;
+    (w, w * 9 / 16)
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Settings {
     pub display_mode: DisplayMode,
@@ -61,6 +91,9 @@ pub struct Settings {
     pub resolution: Option<(u32, u32)>,
     /// Exclusive fullscreen refresh rate in Hz; 0 = the current one.
     pub refresh_rate: u32,
+    /// The size the game renders at; None = the display's (16:9 inside the
+    /// fullscreen mode, the monitor, or the window's client area).
+    pub render_resolution: Option<(u32, u32)>,
     pub vsync: VSync,
     pub scaling: Scaling,
     pub filter: Filter,
@@ -84,6 +117,7 @@ impl Default for Settings {
             window_height: 0,
             resolution: None,
             refresh_rate: 0,
+            render_resolution: None,
             vsync: VSync::On,
             scaling: Scaling::Fit,
             filter: Filter::Smooth,
@@ -115,11 +149,17 @@ window_height = 0
 # Exclusive fullscreen: WIDTHxHEIGHT and Hz, or desktop (the current mode).
 resolution = desktop
 refresh_rate = desktop
+# The resolution the game renders at (set when it starts): display = the
+# screen's (the fullscreen resolution, the monitor's for borderless, the
+# window's size for windowed; 16:9 within it), or WIDTHxHEIGHT, e.g.
+# 1280x720 (faster) or 3840x2160 (sharper, slower).
+render_resolution = display
 # on (no tearing), off (lowest latency, may tear) or fast (no tearing, no
 # waiting; where the driver offers it).
 vsync = on
-# The game draws 1920x1080: fit keeps its 16:9 shape (black bars where the
-# window's shape differs), stretch fills the window.
+# Where the window's size differs from the rendered frame's: fit keeps the
+# frame's 16:9 shape (black bars where the window's shape differs), stretch
+# fills the window.
 scaling = fit
 # smooth (bilinear) or sharp (nearest pixel) scaling.
 filter = smooth
@@ -201,6 +241,19 @@ impl Settings {
                         }
                     }
                 }
+                "render_resolution" => {
+                    if lv == "display" || lv == "auto" || lv.is_empty() {
+                        s.render_resolution = None;
+                    } else {
+                        match lv.split_once('x').and_then(|(w, h)| Some((num(w.trim())?, num(h.trim())?))).filter(|&r| render_size_ok(r)) {
+                            Some(r) => s.render_resolution = Some(r),
+                            None => errs.push(bad(&format!(
+                                "WIDTHxHEIGHT ({}x{} to {}x{}) or display",
+                                RENDER_MIN.0, RENDER_MIN.1, RENDER_MAX.0, RENDER_MAX.1
+                            ))),
+                        }
+                    }
+                }
                 "vsync" => match lv.as_str() {
                     "on" | "fifo" => s.vsync = VSync::On,
                     "off" | "immediate" => s.vsync = VSync::Off,
@@ -260,6 +313,7 @@ impl Settings {
         f.set("window_height", &self.window_height.to_string());
         f.set("resolution", &self.resolution.map_or("desktop".to_string(), |(w, h)| format!("{w}x{h}")));
         f.set("refresh_rate", &if self.refresh_rate == 0 { "desktop".to_string() } else { self.refresh_rate.to_string() });
+        f.set("render_resolution", &self.render_resolution.map_or("display".to_string(), |(w, h)| format!("{w}x{h}")));
         f.set("vsync", match self.vsync {
             VSync::On => "on",
             VSync::Off => "off",
@@ -324,11 +378,36 @@ mod tests {
     }
 
     #[test]
+    fn render_resolution() {
+        let (s, errs) = Settings::parse("render_resolution = 2560x1440\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(s.render_resolution, Some((2560, 1440)));
+        let (s, errs) = Settings::parse("render_resolution = 8000x5000\n");
+        assert_eq!((s.render_resolution, errs.len()), (None, 1));
+        assert_eq!(render_size_for(1920, 1080), (1920, 1080));
+        assert_eq!(render_size_for(1440, 810), (1440, 810));
+        assert_eq!(render_size_for(1920, 1200), (1920, 1080));
+        assert_eq!(render_size_for(3440, 1440), (2560, 1440));
+        assert_eq!(render_size_for(1366, 768), (1360, 764));
+        assert_eq!(render_size_for(5120, 2880), (3840, 2160));
+        assert_eq!(render_size_for(300, 200), (640, 360));
+        // Automatic windows render 1:1 (work areas of 2560x1440, 1920x1080
+        // and 1366x768 screens).
+        let s = Settings::default();
+        for work in [(2560, 1392), (1920, 1032), (1366, 728), (3840, 2112)] {
+            let (w, h) = window_size(&s, work);
+            assert_eq!(render_size_for(w, h), (w, h), "{work:?}");
+        }
+        assert_eq!(window_size(&s, (2560, 1392)), (1856, 1044));
+    }
+
+    #[test]
     fn store_round_trips() {
         let s = Settings {
             display_mode: DisplayMode::Fullscreen,
             monitor: r"\\.\DISPLAY2".into(),
             resolution: Some((1920, 1080)),
+            render_resolution: Some((1280, 720)),
             refresh_rate: 60,
             vsync: VSync::Off,
             filter: Filter::Sharp,

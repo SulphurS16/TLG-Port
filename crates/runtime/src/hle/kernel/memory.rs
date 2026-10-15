@@ -137,7 +137,7 @@ struct VirtualQueryInfo {
 }
 
 sysv! {
-    fn sceKernelGetDirectMemorySize() -> u64 { mem::DMEM_SIZE }
+    fn sceKernelGetDirectMemorySize() -> u64 { mem::dmem_size() }
     fn sceKernelAllocateDirectMemory(start: i64, end: i64, len: u64, align: u64, mtype: i32, out: *mut i64) -> i32 {
         if out.is_null() || len == 0 || len % PAGE != 0 || (align != 0 && !align.is_power_of_two()) { return sce(EINVAL); }
         match MEM.lock().dmem_allocate(start.max(0) as u64, end.max(0) as u64, len, align, mtype) {
@@ -153,7 +153,7 @@ sysv! {
         }
     }
     fn sceKernelAllocateMainDirectMemory(len: u64, align: u64, mtype: i32, out: *mut i64) -> i32 {
-        sceKernelAllocateDirectMemory(0, mem::DMEM_SIZE as i64, len, align, mtype, out)
+        sceKernelAllocateDirectMemory(0, mem::dmem_size() as i64, len, align, mtype, out)
     }
     fn sceKernelReleaseDirectMemory(start: i64, len: u64) -> i32 {
         MEM.lock().dmem_release(start as u64, len);

@@ -1,5 +1,6 @@
 //! NGS2 voice processing beyond mixing: sampler envelopes, the I3DL2 reverb
-//! rack and the multi-tap delay module of custom racks.
+//! rack, the multi-tap delay module of custom racks and the submixers'
+//! equalizer bands (`Biquad`).
 //!
 //! The envelope follows the SOTC native port's ngs2.rs (MIT): forward points
 //! ramp linearly to their heights over their durations (in samples), the
@@ -326,9 +327,257 @@ impl Taps {
     }
 }
 
+/// Filter shapes of the sampler and submixer filter parameters (their type
+/// word), as TLG's settings read: every submixer carries a four-band
+/// equalizer (band 0 type 6 at 80-150 Hz, bands 1-2 type 8 at 280-2000 Hz
+/// with gains 0.72-1.19, band 3 type 7 at 1-24 kHz or type 1 at 4.5-7 kHz;
+/// gains mostly 1); samplers also use type 2 at 50-100 Hz (gain 1: a rumble
+/// high-pass).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FilterKind {
+    LowPass,
+    HighPass,
+    LowShelf,
+    HighShelf,
+    Peaking,
+}
+
+impl FilterKind {
+    pub fn from_type(t: u32) -> Option<FilterKind> {
+        match t {
+            1 => Some(FilterKind::LowPass),
+            2 => Some(FilterKind::HighPass),
+            6 => Some(FilterKind::LowShelf),
+            7 => Some(FilterKind::HighShelf),
+            8 => Some(FilterKind::Peaking),
+            _ => None,
+        }
+    }
+}
+
+/// One equalizer band: a biquad (RBJ cookbook) with its state per channel.
+/// `level` is a linear gain (the shelf's or peak's gain, the pass-band gain
+/// of the low- and high-pass).
+#[derive(Clone, Debug)]
+pub struct Biquad {
+    pub kind: FilterKind,
+    pub fc: f32,
+    pub q: f32,
+    pub level: f32,
+    b: [f32; 3],
+    a: [f32; 2],
+    z: [[f32; 2]; 8],
+}
+
+impl Biquad {
+    pub fn new(kind: FilterKind, fc: f32, q: f32, level: f32, rate: u32) -> Biquad {
+        let mut f = Biquad { kind, fc, q, level, b: [1.0, 0.0, 0.0], a: [0.0, 0.0], z: [[0.0; 2]; 8] };
+        f.design(rate);
+        f
+    }
+
+    /// New parameters, keeping the state (no click when they glide).
+    pub fn set(&mut self, kind: FilterKind, fc: f32, q: f32, level: f32, rate: u32) {
+        (self.kind, self.fc, self.q, self.level) = (kind, fc, q, level);
+        self.design(rate);
+    }
+
+    /// No effect at these parameters (a shelf or peak at unity gain).
+    pub fn is_flat(&self) -> bool {
+        !matches!(self.kind, FilterKind::LowPass | FilterKind::HighPass) && (self.level - 1.0).abs() < 1e-3
+    }
+
+    fn design(&mut self, rate: u32) {
+        let fs = rate.max(1) as f32;
+        let fc = self.fc.clamp(10.0, fs * 0.49);
+        let q = self.q.clamp(0.1, 20.0);
+        let w0 = std::f32::consts::TAU * fc / fs;
+        let (sn, cs) = w0.sin_cos();
+        let alpha = sn / (2.0 * q);
+        let lvl = self.level.clamp(1e-4, 100.0);
+        let a = lvl.sqrt(); // RBJ A = 10^(dB/40)
+        let (b, aa) = match self.kind {
+            FilterKind::LowPass => {
+                let k = (1.0 - cs) / 2.0 * lvl;
+                ([k, 2.0 * k, k], [1.0 + alpha, -2.0 * cs, 1.0 - alpha])
+            }
+            FilterKind::HighPass => {
+                let k = (1.0 + cs) / 2.0 * lvl;
+                ([k, -2.0 * k, k], [1.0 + alpha, -2.0 * cs, 1.0 - alpha])
+            }
+            FilterKind::Peaking => ([1.0 + alpha * a, -2.0 * cs, 1.0 - alpha * a], [1.0 + alpha / a, -2.0 * cs, 1.0 - alpha / a]),
+            FilterKind::LowShelf => {
+                let r = 2.0 * a.sqrt() * alpha;
+                (
+                    [a * ((a + 1.0) - (a - 1.0) * cs + r), 2.0 * a * ((a - 1.0) - (a + 1.0) * cs), a * ((a + 1.0) - (a - 1.0) * cs - r)],
+                    [(a + 1.0) + (a - 1.0) * cs + r, -2.0 * ((a - 1.0) + (a + 1.0) * cs), (a + 1.0) + (a - 1.0) * cs - r],
+                )
+            }
+            FilterKind::HighShelf => {
+                let r = 2.0 * a.sqrt() * alpha;
+                (
+                    [a * ((a + 1.0) + (a - 1.0) * cs + r), -2.0 * a * ((a - 1.0) + (a + 1.0) * cs), a * ((a + 1.0) + (a - 1.0) * cs - r)],
+                    [(a + 1.0) - (a - 1.0) * cs + r, 2.0 * ((a - 1.0) - (a + 1.0) * cs), (a + 1.0) - (a - 1.0) * cs - r],
+                )
+            }
+        };
+        let a0 = aa[0];
+        self.b = [b[0] / a0, b[1] / a0, b[2] / a0];
+        self.a = [aa[1] / a0, aa[2] / a0];
+    }
+
+    /// Filters channels 0..ch of every frame in place (transposed direct
+    /// form II).
+    pub fn process(&mut self, frames: &mut [[f32; 8]], ch: usize) {
+        let [b0, b1, b2] = self.b;
+        let [a1, a2] = self.a;
+        for c in 0..ch.min(8) {
+            let [mut z1, mut z2] = self.z[c];
+            for fr in frames.iter_mut() {
+                let x = fr[c];
+                let y = b0 * x + z1;
+                z1 = b1 * x - a1 * y + z2;
+                z2 = b2 * x - a2 * y;
+                fr[c] = y;
+            }
+            // (Denormals after silence.)
+            self.z[c] = [if z1.abs() < 1e-20 { 0.0 } else { z1 }, if z2.abs() < 1e-20 { 0.0 } else { z2 }];
+        }
+    }
+}
+
+/// A submixer compressor (parameter 0x20000002, words {index, threshold,
+/// slope, -, attack s, release s, gain, detector window ms}) as TLG's values
+/// read: above the threshold (linear) the level rises by `slope` dB per dB
+/// (0.5 = 2:1, 1 = none); the gain then applies (it matches the reduction
+/// at the bus's typical level: e.g. threshold -21 dB, slope 0.87, gain +2 dB).
+/// The detector follows the loudest channel (RMS over the window, peak when
+/// it is 0) with the attack and release times.
+#[derive(Clone, Debug)]
+pub struct Compressor {
+    thr: f32,
+    slope: f32,
+    gain: f32,
+    att: f32,
+    rel: f32,
+    ms_coef: f32,
+    ms: f32,
+    env: f32,
+}
+
+impl Compressor {
+    pub fn new(words: &[u32], rate: u32) -> Compressor {
+        let mut c = Compressor { thr: 1.0, slope: 1.0, gain: 1.0, att: 0.0, rel: 0.0, ms_coef: 0.0, ms: 0.0, env: 0.0 };
+        c.set(words, rate);
+        c
+    }
+
+    /// New parameters, keeping the detector state.
+    pub fn set(&mut self, w: &[u32], rate: u32) {
+        let f = |i: usize| w.get(i).map_or(0.0, |&x| f32::from_bits(x));
+        let fs = rate.max(1) as f32;
+        let coef = |secs: f32| if secs > 0.0 { (-1.0 / (secs * fs)).exp() } else { 0.0 };
+        self.thr = f(1).clamp(1e-6, 1.0);
+        self.slope = f(2).clamp(0.0, 1.0);
+        self.att = coef(f(4).clamp(0.0, 5.0));
+        self.rel = coef(f(5).clamp(0.0, 10.0));
+        self.gain = f(6).clamp(0.0, 16.0);
+        let window_ms = w.get(7).copied().unwrap_or(0).min(10_000);
+        self.ms_coef = coef(window_ms as f32 / 1000.0);
+    }
+
+    /// No effect at these parameters.
+    pub fn is_flat(&self) -> bool {
+        (self.slope >= 1.0 || self.thr >= 1.0) && (self.gain - 1.0).abs() < 1e-3
+    }
+
+    /// Compresses channels 0..ch of every frame in place.
+    pub fn process(&mut self, frames: &mut [[f32; 8]], ch: usize) {
+        let ch = ch.min(8);
+        for fr in frames.iter_mut() {
+            let mut sq = 0f32;
+            for &x in &fr[..ch] {
+                sq = sq.max(x * x);
+            }
+            let level = if self.ms_coef > 0.0 {
+                self.ms = self.ms_coef * self.ms + (1.0 - self.ms_coef) * sq;
+                self.ms.sqrt()
+            } else {
+                sq.sqrt()
+            };
+            let k = if level > self.env { self.att } else { self.rel };
+            self.env = k * self.env + (1.0 - k) * level;
+            if self.env < 1e-20 {
+                self.env = 0.0;
+            }
+            let g = if self.env > self.thr { (self.thr / self.env).powf(1.0 - self.slope) } else { 1.0 } * self.gain;
+            for x in &mut fr[..ch] {
+                *x *= g;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compressor_slope_and_gain() {
+        // Threshold 0.1 (-20 dB), 2:1, fast peak detector, gain 1: a steady
+        // 1.0 (+20 dB over) comes out 10 dB over the threshold (0.316).
+        let w = [0, 0.1f32.to_bits(), 0.5f32.to_bits(), 0, 0.001f32.to_bits(), 0.001f32.to_bits(), 1.0f32.to_bits(), 0];
+        let mut c = Compressor::new(&w, 48000);
+        let mut fr = vec![[1.0f32, -1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; 4800];
+        c.process(&mut fr, 2);
+        assert!((fr[4799][0] - 0.316).abs() < 0.005, "{}", fr[4799][0]);
+        assert!((fr[4799][1] + 0.316).abs() < 0.005);
+        // Below the threshold only the gain applies.
+        let w = [0, 0.5f32.to_bits(), 0.5f32.to_bits(), 0, 0.001f32.to_bits(), 0.001f32.to_bits(), 2.0f32.to_bits(), 36];
+        let mut c = Compressor::new(&w, 48000);
+        let mut fr = vec![[0.1f32; 8]; 4800];
+        c.process(&mut fr, 1);
+        assert!((fr[4799][0] - 0.2).abs() < 1e-4);
+        let off = [0, 1.0f32.to_bits(), 1.0f32.to_bits(), 0, 0.12f32.to_bits(), 0.3f32.to_bits(), 1.0f32.to_bits(), 0];
+        assert!(Compressor::new(&off, 48000).is_flat());
+    }
+
+    /// Steady-state amplitude of a unit sine at `hz` through the filter
+    /// (from the RMS of the second half second: whole periods at these
+    /// frequencies).
+    fn gain_at(f: &mut Biquad, hz: f32) -> f32 {
+        let n = 48000;
+        let mut fr: Vec<[f32; 8]> = (0..n).map(|i| {
+            let mut x = [0f32; 8];
+            x[0] = (std::f64::consts::TAU * hz as f64 * i as f64 / 48000.0).sin() as f32;
+            x
+        }).collect();
+        f.process(&mut fr, 1);
+        let ms = fr[n / 2..].iter().map(|x| (x[0] as f64).powi(2)).sum::<f64>() / (n / 2) as f64;
+        (2.0 * ms).sqrt() as f32
+    }
+
+    #[test]
+    fn equalizer_bands() {
+        let lp = |fc| Biquad::new(FilterKind::LowPass, fc, 0.707, 1.0, 48000);
+        assert!((gain_at(&mut lp(1000.0), 100.0) - 1.0).abs() < 0.02);
+        assert!(gain_at(&mut lp(1000.0), 10000.0) < 0.02);
+        let mut hp = Biquad::new(FilterKind::HighPass, 100.0, 0.5, 1.0, 48000);
+        assert!(gain_at(&mut hp, 20.0) < 0.1);
+        assert!((gain_at(&mut hp, 4000.0) - 1.0).abs() < 0.02);
+        let mut hs = Biquad::new(FilterKind::HighShelf, 1000.0, 0.707, 0.25, 48000);
+        assert!((gain_at(&mut hs, 100.0) - 1.0).abs() < 0.03);
+        assert!((gain_at(&mut hs, 12000.0) - 0.25).abs() < 0.02);
+        let mut ls = Biquad::new(FilterKind::LowShelf, 200.0, 0.707, 2.0, 48000);
+        assert!((gain_at(&mut ls, 30.0) - 2.0).abs() < 0.05);
+        assert!((gain_at(&mut ls, 8000.0) - 1.0).abs() < 0.02);
+        let mut pk = Biquad::new(FilterKind::Peaking, 1000.0, 1.0, 0.5, 48000);
+        assert!((gain_at(&mut pk, 1000.0) - 0.5).abs() < 0.02);
+        assert!((gain_at(&mut pk, 50.0) - 1.0).abs() < 0.02);
+        let flat = Biquad::new(FilterKind::Peaking, 2000.0, 0.5, 1.0, 48000);
+        assert!(flat.is_flat());
+        assert!(!lp(24000.0).is_flat());
+    }
 
     #[test]
     fn envelope_attack_hold_release() {

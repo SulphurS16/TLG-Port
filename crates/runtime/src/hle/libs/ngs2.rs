@@ -8,15 +8,17 @@
 //! along their patches with port volumes and port matrices into submixers and the
 //! mastering voice, which writes the render buffers.
 //!
-//! Sampler envelopes (with release on STOP), reverb racks (I3DL2, wet only:
-//! effect returns), the multi-tap delay module of custom racks (the taps
-//! only) and the mastering gains and limiter are applied (`ngs2_fx`). Not
-//! implemented yet (logged once each, audio passes through unchanged):
-//! filters, distortion, compressors, other custom rack modules, port delays,
-//! peak meters. Unknown parameter ids are logged with their payload.
+//! Sampler envelopes (with release on STOP), sampler and submixer filters
+//! (equalizer bands: types 1, 2, 6, 7, 8 as low-pass, high-pass, low shelf,
+//! high shelf, peaking), submixer compressors, reverb racks (I3DL2, wet only: effect
+//! returns), the multi-tap delay module of custom racks (the taps only) and
+//! the mastering gains and limiter are applied (`ngs2_fx`). Not implemented
+//! yet (logged once each, audio passes through unchanged): other filter
+//! types, submixer envelopes and distortion, other custom rack modules, port
+//! delays, peak meters. Unknown parameter ids are logged with their payload.
 
 use super::atrac9;
-use super::ngs2_fx::{Envelope, I3dl2, Reverb, Taps};
+use super::ngs2_fx::{Biquad, Compressor, Envelope, FilterKind, I3dl2, Reverb, Taps};
 use crate::hle::Registry;
 use crate::{reg, sysv};
 use parking_lot::Mutex;
@@ -255,6 +257,16 @@ struct Voice {
     reverb: Option<Reverb>,
     /// Custom racks: the multi-tap delay (module 0x1d) when set.
     taps: Option<Taps>,
+    /// Submixer filter slots 0-7 (parameter 0x20000006): shape, cutoff, Q,
+    /// gain; their filters designed at the system rate (`eq_rate`; 0 = to
+    /// be designed).
+    eq_params: [Option<(FilterKind, f32, f32, f32)>; 8],
+    eq: [Option<Biquad>; 8],
+    eq_rate: u32,
+    /// Submixer compressor (parameter 0x20000002): its words, and the
+    /// compressor (made at the system rate with the filters).
+    comp_words: Option<[u32; 8]>,
+    comp: Option<Compressor>,
     /// Output channels of reverb and custom racks.
     out_channels: u32,
     /// Mastering: LFE gain (channel 3; `gain` for the others) and limiter
@@ -289,6 +301,11 @@ impl Voice {
             i3dl2: I3dl2::default(),
             reverb: None,
             taps: None,
+            eq_params: [None; 8],
+            eq: [const { None }; 8],
+            eq_rate: 0,
+            comp_words: None,
+            comp: None,
             out_channels: 2,
             lfe_gain: 1.0,
             limit: 0.0,
@@ -581,9 +598,34 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                 SAMPLER_DISTORTION => unimpl = Some("sampler distortion"),
                 SAMPLER_USER_FX => unimpl = Some("sampler user effects"),
                 SAMPLER_PEAKMETER => unimpl = Some("sampler peak meters"),
-                SAMPLER_FILTER => {
-                    unimpl = Some("sampler filters");
+                SAMPLER_FILTER | SUBMIXER_FILTER => {
+                    // {index, ?, type, ?, fc, Q, level} (docs/LOG.md: Audio level).
                     trace_payload(vh, id, size, p);
+                    let slot = u32_at(8) as usize;
+                    let t = u32_at(16);
+                    if slot < 8 && size >= 36 {
+                        match FilterKind::from_type(t) {
+                            Some(k) => v.eq_params[slot] = Some((k, f32_at(24), f32_at(28), f32_at(32))),
+                            None => {
+                                v.eq_params[slot] = None;
+                                if t != 0 {
+                                    unimpl = Some("filter types other than 1, 2, 6, 7, 8");
+                                }
+                            }
+                        }
+                        v.eq_rate = 0;
+                    }
+                }
+                SUBMIXER_COMPRESSOR => {
+                    trace_payload(vh, id, size, p);
+                    if size >= 40 {
+                        let mut w = [0u32; 8];
+                        for (i, x) in w.iter_mut().enumerate() {
+                            *x = u32_at(8 + i * 4);
+                        }
+                        v.comp_words = Some(w);
+                        v.eq_rate = 0;
+                    }
                 }
                 SUBMIXER_SETUP | REVERB_SETUP | MASTERING_SETUP | 0x4002_0000 | 0x4001_0000 | 0x4003_0000 => {
                     // {u32 numChannels; ...} (reverb/custom: numInputChannels, numOutputChannels)
@@ -642,8 +684,8 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                         crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): user effect {h:#x} (data {u:#x})", v.kind, v.channels);
                     }
                 }
-                0x2000_0001..=0x2000_0003 | 0x2000_0005..=0x2000_0006 => {
-                    unimpl = Some("submixer envelope/compressor/distortion/filter");
+                0x2000_0001 | 0x2000_0003 | 0x2000_0005 => {
+                    unimpl = Some("submixer envelope/distortion");
                     trace_payload(vh, id, size, p);
                 }
                 0x2001_0002..=0x2001_00FF => unimpl = Some("reverb parameters other than I3DL2"),
@@ -670,6 +712,42 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
 }
 
 const SUBMIXER_USER_FX: u32 = 0x2000_0004;
+const SUBMIXER_FILTER: u32 = 0x2000_0006;
+const SUBMIXER_COMPRESSOR: u32 = 0x2000_0002;
+
+/// Runs a voice's filters (equalizer bands) and then its compressor over
+/// `frames` (making them at the system rate first after a parameter change).
+fn run_eq(v: &mut Voice, frames: &mut [[f32; MAX_CH]], ch: usize, rate: u32) {
+    if v.eq_rate != rate {
+        for i in 0..8 {
+            v.eq[i] = match (v.eq_params[i], v.eq[i].take()) {
+                (None, _) => None,
+                (Some((k, fc, q, l)), Some(mut f)) => {
+                    f.set(k, fc, q, l, rate);
+                    Some(f)
+                }
+                (Some((k, fc, q, l)), None) => Some(Biquad::new(k, fc, q, l, rate)),
+            };
+        }
+        v.comp = match (v.comp_words, v.comp.take()) {
+            (None, _) => None,
+            (Some(w), Some(mut c)) => {
+                c.set(&w, rate);
+                Some(c)
+            }
+            (Some(w), None) => Some(Compressor::new(&w, rate)),
+        };
+        v.eq_rate = rate;
+    }
+    for f in v.eq.iter_mut().flatten() {
+        if !f.is_flat() {
+            f.process(frames, ch);
+        }
+    }
+    if let Some(c) = v.comp.as_mut().filter(|c| !c.is_flat()) {
+        c.process(frames, ch);
+    }
+}
 
 /// TLG_NGS2_TRACE: the distinct payloads of not-yet-applied parameters
 /// (filters, compressors), the first 64 of each id.
@@ -1065,6 +1143,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             let v = s.voices.get_mut(vh).unwrap();
             render_sampler(v, grain, rate, &mut buf);
             let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
+            run_eq(v, &mut buf, ch, rate);
             v.peak = peak_of(&buf, ch);
             v.peak_win = v.peak_win.max(v.peak);
             ch
@@ -1110,6 +1189,9 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
                     (input, Some(out), och)
                 }
                 _ => {
+                    if v.kind == Kind::Submixer {
+                        run_eq(v, &mut input, ch, rate);
+                    }
                     run_user_fx(v, &mut input, rate);
                     (input, None, ch)
                 }

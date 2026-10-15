@@ -25,6 +25,17 @@
 //! yaw change, stick up a positive pitch change (looks up). Applied only
 //! when all seven sites hold the expected bytes.
 //!
+//! Render resolution (`render_resolution`, TLG_RENDER_SIZE): the game
+//! renders at the size of its display mode, the first entry of a table the
+//! graphics init copies (render and output size, checkerboard flag, name:
+//! "1920x1080", then "1760x990" and "1600x900"; the PS4 Pro table for 4K
+//! displays has "1680x1890(cb)" first and "3840x2160(native)" among them).
+//! That entry is set to the chosen size for both; its render targets, the
+//! viewports and constants derived from it and the display buffers follow
+//! (checked at 1280x720 and 3840x2160: picture and interface whole). Above
+//! 1080p the graphics heap takes the PS4 Pro's size (+512 MB, the direct
+//! memory with it). Applied only when the bytes are the expected ones.
+//!
 //! Script prints: every `log(fmt, ...)` and `GaPrint(...)` in the Lua (Havok
 //! Script) game scripts ends in the C function `GaPrint`, which the retail
 //! build compiled out (`xor eax, eax; ret` at eboot 0xd51780). The patch
@@ -70,6 +81,14 @@ static BASE: AtomicU64 = AtomicU64::new(0);
 
 pub fn apply(p: &mut Patcher, name: &str) {
     patch_gaprint(p, name);
+    let (w, h) = crate::gpu::vk::window::render_size();
+    match patch_render_size(p, w, h) {
+        Ok(heap) => {
+            let more = if heap { "; graphics heap +512 MB (the PS4 Pro's)" } else { "" };
+            crate::info!("render resolution: {w}x{h} (the game's display mode, {name}+{MODE_TABLE:#x}){more}");
+        }
+        Err(e) => crate::warn!("render resolution: {name}: {e}; the game renders 1920x1080"),
+    }
     match patch_kick_wait(p) {
         Ok(()) => crate::info!("render-kick wait: busy loop at {name}+{KICK_SITE:#x} detoured to a polling wait"),
         Err(e) => crate::warn!("render-kick wait: {name}: {e}; not patched"),
@@ -83,6 +102,52 @@ pub fn apply(p: &mut Patcher, name: &str) {
             Err(e) => crate::warn!("mouse camera: {name}: {e}; mouse look drives the right stick instead"),
         }
     }
+}
+
+/// The game's display-mode table for 1080p displays (the graphics init at
+/// eboot 0xc4fa30 copies it to 0x59b1820): 24-byte entries of render size
+/// and output size (each width | height << 16), a checkerboard flag and a
+/// name pointer; the first entry ("1920x1080") is the mode the game runs
+/// in, its output size the display buffers' size.
+const MODE_TABLE: usize = 0x16ec3a0;
+const MODE_1080P: [u8; 12] = [0x80, 0x07, 0x38, 0x04, 0x80, 0x07, 0x38, 0x04, 0, 0, 0, 0];
+/// The graphics heap's size choices (eboot 0xdd3a46..): 0xb0000000, or
+/// 0xd0000000 when sceKernelIsNeoMode (PS4 Pro) - allocated, mapped and
+/// recorded by these `cmove reg, r15` (the base size where not Neo; two on
+/// the error paths).
+const HEAP_SITES: [(usize, [u8; 4]); 5] = [
+    (0xdd3aad, [0x49, 0x0F, 0x44, 0xD7]), // cmove rdx, r15 (allocation)
+    (0xdd3b21, [0x49, 0x0F, 0x44, 0xF7]), // cmove rsi, r15 (mapping)
+    (0xdd3b47, [0x4D, 0x0F, 0x44, 0xEF]), // cmove r13, r15 (recorded size)
+    (0xdd3bf7, [0x4D, 0x0F, 0x44, 0xEF]),
+    (0xdd3c22, [0x49, 0x0F, 0x44, 0xCF]),
+];
+const HEAP_EXTRA: u64 = 0x2000_0000;
+
+/// Sets the game's display mode to render and show `w` x `h`; above 1080p
+/// also gives it the PS4 Pro's graphics heap (its higher-resolution modes'
+/// memory). Returns whether the heap grew.
+fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<bool, String> {
+    if !(64..=8192).contains(&w) || !(64..=8192).contains(&h) {
+        return Err(format!("{w}x{h} is out of range"));
+    }
+    if p.image.get(MODE_TABLE..MODE_TABLE + 12) != Some(&MODE_1080P[..]) {
+        return Err("not the expected executable (display-mode table differs)".into());
+    }
+    let heap = w as u64 * h as u64 > 1920 * 1080;
+    if heap && HEAP_SITES.iter().any(|(off, b)| p.image.get(*off..*off + 4) != Some(&b[..])) {
+        return Err("not the expected executable (graphics heap code differs)".into());
+    }
+    let v = (w | h << 16).to_le_bytes();
+    p.image[MODE_TABLE..MODE_TABLE + 4].copy_from_slice(&v);
+    p.image[MODE_TABLE + 4..MODE_TABLE + 8].copy_from_slice(&v);
+    if heap {
+        for (off, _) in HEAP_SITES {
+            p.image[off..off + 4].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]); // nop: the Neo size stays
+        }
+        crate::mem::add_dmem(HEAP_EXTRA);
+    }
+    Ok(heap)
 }
 
 /// Mouse-look data next to the module: pending pitch and yaw change

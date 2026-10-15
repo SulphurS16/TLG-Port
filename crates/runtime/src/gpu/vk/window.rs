@@ -322,13 +322,39 @@ unsafe fn frame_for_client(hwnd: HWND, w: i32, h: i32) -> (i32, i32) {
 /// The default windowed client size on a monitor: settings, else the
 /// largest 16:9 area within 3/4 of its work area.
 fn windowed_client(m: &Monitor) -> (i32, i32) {
-    let s = crate::config::settings();
-    let (ww, wh) = (m.work.right - m.work.left, m.work.bottom - m.work.top);
-    if s.window_width >= 320 && s.window_height >= 180 {
-        return ((s.window_width as i32).min(ww), (s.window_height as i32).min(wh));
+    let work = ((m.work.right - m.work.left).max(0) as u32, (m.work.bottom - m.work.top).max(0) as u32);
+    let (w, h) = tlg_config::settings::window_size(crate::config::settings(), work);
+    (w as i32, h as i32)
+}
+
+/// The size the game renders at (fixed when its executable loads): the
+/// setting `render_resolution` (development override TLG_RENDER_SIZE), or
+/// 16:9 within the display - the exclusive mode, the monitor (borderless)
+/// or the window's client area (windowed).
+pub fn render_size() -> (u32, u32) {
+    use tlg_config::settings::{render_size_for, render_size_ok};
+    let dev = std::env::var("TLG_RENDER_SIZE").ok().and_then(|v| {
+        let (w, h) = v.split_once('x')?;
+        Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
+    });
+    if let Some(r) = dev.filter(|&r| render_size_ok(r)) {
+        return r;
     }
-    let w = ((ww * 3 / 4) as i64).min((wh * 3 / 4) as i64 * 16 / 9) as i32;
-    (w.max(320) & !7, (w.max(320) * 9 / 16) & !1)
+    let s = crate::config::settings();
+    if let Some(r) = s.render_resolution {
+        return r;
+    }
+    let Some(m) = (unsafe { find_monitor(&s.monitor) }) else { return (1920, 1080) };
+    let full = ((m.rect.right - m.rect.left).max(0) as u32, (m.rect.bottom - m.rect.top).max(0) as u32);
+    let (w, h) = match s.display_mode {
+        DisplayMode::Fullscreen => s.resolution.unwrap_or(full),
+        DisplayMode::Borderless => full,
+        DisplayMode::Windowed => {
+            let (w, h) = windowed_client(&m);
+            (w as u32, h as u32)
+        }
+    };
+    render_size_for(w, h)
 }
 
 /// Switches the monitor to the exclusive mode (only what differs from its

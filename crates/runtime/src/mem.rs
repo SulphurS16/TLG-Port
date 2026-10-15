@@ -33,7 +33,20 @@ pub fn is_guest(addr: u64, len: u64) -> bool {
     (addr >= GUEST_BASE && end <= GUEST_END) || (addr >= LOW_BASE && end <= LOW_END)
 }
 pub const PAGE: u64 = 0x4000; // PS4 page size
-pub const DMEM_SIZE: u64 = 5056 << 20; // direct memory available to the title
+/// Direct memory available to the title (a PS4's), plus what a title patch
+/// adds before the title runs (`add_dmem`).
+const DMEM_BASE: u64 = 5056 << 20;
+static DMEM_EXTRA: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn dmem_size() -> u64 {
+    DMEM_BASE + DMEM_EXTRA.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// More direct memory for the title (title patches at load: e.g. the PS4
+/// Pro's larger graphics heap).
+pub fn add_dmem(bytes: u64) {
+    DMEM_EXTRA.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+}
 
 pub const PROT_CPU_READ: u32 = 0x1;
 pub const PROT_CPU_WRITE: u32 = 0x2;
@@ -460,7 +473,7 @@ impl MemState {
 
     pub fn dmem_allocate(&mut self, search_start: u64, search_end: u64, len: u64, align: u64, mtype: i32) -> Option<u64> {
         let align = align.max(PAGE);
-        let end_limit = search_end.min(DMEM_SIZE);
+        let end_limit = search_end.min(dmem_size());
         let mut cand = align_up(search_start, align);
         for (&s, b) in self.dmem.iter() {
             if s + b.size <= cand {
@@ -512,7 +525,7 @@ impl MemState {
 
     /// Largest free direct-memory block within [start, end).
     pub fn dmem_largest_free(&self, start: u64, end: u64) -> (u64, u64) {
-        let end = end.min(DMEM_SIZE);
+        let end = end.min(dmem_size());
         let mut best = (0u64, 0u64);
         let mut cursor = start;
         for (&s, b) in self.dmem.iter() {
