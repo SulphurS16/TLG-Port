@@ -51,16 +51,19 @@ struct VecPool {
     u32s: Vec<Vec<u32>>,
     u64s: Vec<Vec<u64>>,
     inputs: Vec<Vec<PsInput>>,
+    logs: Vec<Vec<(u64, u32, u64)>>,
 }
 
-static POOL: parking_lot::Mutex<VecPool> = parking_lot::Mutex::new(VecPool { res: Vec::new(), specs: Vec::new(), u32s: Vec::new(), u64s: Vec::new(), inputs: Vec::new() });
+static POOL: parking_lot::Mutex<VecPool> = parking_lot::Mutex::new(VecPool { res: Vec::new(), specs: Vec::new(), u32s: Vec::new(), u64s: Vec::new(), inputs: Vec::new(), logs: Vec::new() });
 
 fn pool_take<T>(v: &mut Vec<Vec<T>>) -> Vec<T> {
     v.pop().unwrap_or_default()
 }
 
 fn pool_give<T>(v: &mut Vec<Vec<T>>, mut x: Vec<T>) {
-    if v.len() < 32 && x.capacity() != 0 && x.capacity() <= 4096 {
+    // (The prepare thread runs up to a submission ahead: hundreds of stages
+    // in flight, returned in bursts. A pool of 32 freed most of them.)
+    if v.len() < 2048 && x.capacity() != 0 && x.capacity() <= 4096 {
         x.clear();
         v.push(x);
     }
@@ -156,11 +159,44 @@ impl Overlay {
     }
 }
 
-fn hash_dwords(w: &[u32]) -> u64 {
-    let mut h = super::render::FxHasher::default();
-    for &x in w {
-        h.write_u32(x);
+/// Dwords hashed in four independent lanes (pairs of words), folded in at
+/// the end: one multiply chain per word was most of the graphics CP's check
+/// of a prepared result (`dry_valid`).
+#[derive(Default)]
+struct WordHash {
+    lanes: [u64; 4],
+    tail: super::render::FxHasher,
+    n: u64,
+}
+
+impl WordHash {
+    /// Words in order; every call but the last must pass a multiple of 8.
+    fn add(&mut self, w: &[u32]) {
+        let mut chunks = w.chunks_exact(8);
+        for c in &mut chunks {
+            for (l, lane) in self.lanes.iter_mut().enumerate() {
+                let v = c[2 * l] as u64 | (c[2 * l + 1] as u64) << 32;
+                *lane = (lane.rotate_left(5) ^ v).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+            }
+        }
+        for &r in chunks.remainder() {
+            self.tail.write_u32(r);
+        }
+        self.n += w.len() as u64;
     }
+
+    fn finish(mut self) -> u64 {
+        for l in self.lanes {
+            self.tail.write_u64(l);
+        }
+        self.tail.write_u64(self.n);
+        self.tail.finish()
+    }
+}
+
+fn hash_dwords(w: &[u32]) -> u64 {
+    let mut h = WordHash::default();
+    h.add(w);
     h.finish()
 }
 
@@ -170,11 +206,32 @@ pub fn dry_begin() {
     DRY_ON.set(true);
 }
 
+/// A dry preparation's reads (`dry_end`), checked by `dry_valid`; the
+/// vector goes back to the pool when dropped (on the CP thread that took the
+/// result).
+pub struct DryLog(Vec<(u64, u32, u64)>);
+
+impl std::ops::Deref for DryLog {
+    type Target = [(u64, u32, u64)];
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for DryLog {
+    fn drop(&mut self) {
+        let v = std::mem::take(&mut self.0);
+        pool_give(&mut POOL.lock().logs, v);
+    }
+}
+
 /// Ends the log started by `dry_begin` and returns it.
-pub fn dry_end() -> Vec<(u64, u32, u64)> {
+pub fn dry_end() -> DryLog {
     DRY_ON.set(false);
-    // (A copy of exactly its size: the log keeps its capacity.)
-    DRY_LOG.with(|l| l.borrow().to_vec())
+    // (Copied into a pooled vector: the thread's log keeps its capacity.)
+    let mut v = pool_take(&mut POOL.lock().logs);
+    DRY_LOG.with(|l| v.extend_from_slice(&l.borrow()));
+    DryLog(v)
 }
 
 /// The dry-run CP wrote guest [addr, addr+4*len): later reads see it.
@@ -213,16 +270,15 @@ pub fn dry_valid(log: &[(u64, u32, u64)]) -> bool {
         if !mapped(addr, end) {
             return false;
         }
-        let mut hs = super::render::FxHasher::default();
+        // (Chunks of 64 words: a multiple of 8, as `WordHash::add` needs.)
+        let mut hs = WordHash::default();
         let mut a = addr;
         while a < end {
             let k = (((end - a) / 4) as usize).min(buf.len());
             for (i, w) in buf[..k].iter_mut().enumerate() {
                 *w = unsafe { std::ptr::read_volatile((a + 4 * i as u64) as *const u32) };
             }
-            for &x in &buf[..k] {
-                hs.write_u32(x);
-            }
+            hs.add(&buf[..k]);
             a += 4 * k as u64;
         }
         if hs.finish() != h {

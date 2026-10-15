@@ -332,8 +332,9 @@ struct VCache {
     hits: u64,
 }
 
-/// `VWindow::cgen` granularity: 4 MiB.
-const VGEN_SHIFT: u32 = 22;
+/// `VWindow::cgen` granularity: 64 KiB (bindings check the parts of
+/// `tune vbind_part_kib` they touch).
+const VGEN_SHIFT: u32 = 16;
 
 impl VWindow {
     /// The newest generation of the parts of the window [base, base+size)
@@ -343,6 +344,9 @@ impl VWindow {
             return self.wgen;
         }
         let (a, b) = (((base.max(self.lo) - self.lo) >> VGEN_SHIFT) as usize, ((base + size.max(1) - 1).min(self.hi - 1).saturating_sub(self.lo) >> VGEN_SHIFT) as usize);
+        // (Widened to whole parts: entries per part, a power of two.)
+        let per = ((crate::tune::get(crate::tune::VBIND_PART_KIB).max(64) as u64) >> (VGEN_SHIFT - 10)).next_power_of_two() as usize;
+        let (a, b) = (a / per * per, (b / per + 1) * per - 1);
         self.cgen.get(a..=b.min(self.cgen.len().saturating_sub(1))).and_then(|g| g.iter().copied().max()).unwrap_or(self.wgen)
     }
 
@@ -2219,6 +2223,10 @@ pub static BARRIER_WHY: [[[std::sync::atomic::AtomicU64; 2]; 4]; 2] = [const { [
 pub static COPYIN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// TLG_PERF: mirror bindings served by the binding cache, and all.
 pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// TLG_PERF: binding-cache misses by queue class (graphics, compute) and
+/// reason (`VBIND_MISS_NAMES`).
+pub static VBIND_MISS: [[std::sync::atomic::AtomicU64; 5]; 2] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 5] }; 2];
+pub const VBIND_MISS_NAMES: [&str; 5] = ["written whole", "not bound before", "window replaced", "part of the window invalidated", "not checked this round"];
 
 /// TLG_PERF: TSC cycles and counts of buffer-binding steps (`BPART_NAMES`).
 pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 25] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 25];
@@ -4435,6 +4443,26 @@ impl Renderer {
                     }
                 }
             }
+        }
+        if perf_on() {
+            let why = if overwrite {
+                0
+            } else {
+                match self.vbind.get(&(base, size)) {
+                    None => 1,
+                    Some(&(k, wgen, _, buf, _)) => match self.vcache.as_ref().and_then(|vc| vc.windows.get(&k)) {
+                        Some(w) if w.buf == buf => {
+                            if w.part_gen(base, size) != wgen {
+                                3
+                            } else {
+                                4
+                            }
+                        }
+                        _ => 2,
+                    },
+                }
+            };
+            VBIND_MISS[BPART_CS.get() as usize][why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         // Windows are keyed by their start: a 256 MiB slot can hold windows
         // of separate mappings, and a window is replaced when its mapping

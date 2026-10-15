@@ -399,12 +399,14 @@ pub fn init() -> Result<(), String> {
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
             ctx.instance.get_physical_device_properties2(pdev, &mut p2);
             crate::info!(
-                "Vulkan limits: maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}",
+                "Vulkan limits: maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}, graphics_pipeline_library {}, shader_object {}",
                 ctx.limits.max_storage_buffer_range,
                 ctx.limits.min_storage_buffer_offset_alignment,
                 has(ash::ext::external_memory_host::NAME),
                 host.min_imported_host_pointer_alignment,
-                has(ash::khr::buffer_device_address::NAME)
+                has(ash::khr::buffer_device_address::NAME),
+                has(ash::ext::graphics_pipeline_library::NAME),
+                has(ash::ext::shader_object::NAME)
             );
         }
         CTX.set(ctx).ok();

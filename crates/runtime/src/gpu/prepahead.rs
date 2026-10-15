@@ -42,7 +42,7 @@ struct Entry {
     epoch: u64,
     key: u64,
     prep: Prep,
-    log: Vec<(u64, u32, u64)>,
+    log: shaders::DryLog,
 }
 
 struct Job {

@@ -424,7 +424,18 @@ pub const PERF_HOT: usize = 71;
 /// (`TLG_DMA_REG_LAST`, 1; 0 writes every word).
 pub const DMA_REG_LAST: usize = 72;
 
-const TABLE: [(&str, &str, i64); 73] = [
+/// The recorder thread polls this many microseconds for more operations
+/// before it sleeps (`TLG_REC_SPIN_US`, 1000): a CP publishes every few
+/// commands, and waking the sleeping recorder costs the CP a system call.
+pub const REC_SPIN_US: usize = 73;
+
+/// Mirror bindings stay valid in the binding cache while no part of this
+/// many KiB they touch was invalidated (`TLG_VBIND_PART_KIB`, 64; parts of
+/// 64 KiB and up, powers of two). Cave, 31% clock: frame -1.6% against 4096
+/// (part-invalidated misses -58% on the graphics queue).
+pub const VBIND_PART_KIB: usize = 74;
+
+const TABLE: [(&str, &str, i64); 75] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -498,6 +509,8 @@ const TABLE: [(&str, &str, i64); 73] = [
     ("tex_cache", "TLG_TEX_CACHE", 1),
     ("perf_hot", "TLG_PERF_HOT", 1),
     ("dma_reg_last", "TLG_DMA_REG_LAST", 1),
+    ("rec_spin_us", "TLG_REC_SPIN_US", 1000),
+    ("vbind_part_kib", "TLG_VBIND_PART_KIB", 64),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

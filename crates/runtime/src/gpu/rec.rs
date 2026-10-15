@@ -256,9 +256,11 @@ fn run() {
             let mut q = QUEUE.lock();
             if q.ops.is_empty() {
                 drop(q);
-                // Briefly busy: CPs recording queue more within microseconds.
+                // Briefly busy: CPs recording queue more within microseconds
+                // (`tune rec_spin_us`).
                 let t0 = std::time::Instant::now();
-                while PUSHED.load(Ordering::Acquire) == DONE.load(Ordering::Acquire) && t0.elapsed() < std::time::Duration::from_micros(50) {
+                let spin = std::time::Duration::from_micros(crate::tune::get(crate::tune::REC_SPIN_US).max(0) as u64);
+                while PUSHED.load(Ordering::Acquire) == DONE.load(Ordering::Acquire) && t0.elapsed() < spin {
                     std::hint::spin_loop();
                 }
                 q = QUEUE.lock();

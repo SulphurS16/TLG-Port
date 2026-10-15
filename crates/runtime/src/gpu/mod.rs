@@ -990,6 +990,13 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let h: [u64; 5] = std::array::from_fn(|i| writes::HV_STATS[i].swap(0, Ordering::Relaxed));
             let b: [u64; 4] = std::array::from_fn(|i| writes::BULK_STATS[i].swap(0, Ordering::Relaxed));
             crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served (TLG_PERF=2): {} same CPU epoch, {} same required epoch; mirror binding cache {} of {}; validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none); bulk rounds {} ({} runs, {} pages, {} written pages found)", parts.join("; "), x[0], x[1], v[0], v[1], h[0], h[1], h[2], h[3], h[4], b[0], b[1], b[2], b[3]);
+            let miss: Vec<String> = (0..2)
+                .map(|c| {
+                    let m: Vec<String> = render::VBIND_MISS_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {}", render::VBIND_MISS[c][i].swap(0, Ordering::Relaxed))).collect();
+                    format!("{}: {}", ["graphics", "compute"][c], m.join(", "))
+                })
+                .collect();
+            crate::info!("mirror binding cache misses/s by queue and reason: {}", miss.join("; "));
         }
         // (The compute queues' share of them.)
         static LAST_CS: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);
