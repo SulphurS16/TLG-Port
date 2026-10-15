@@ -210,6 +210,9 @@ struct TargetCache {
     blends: smallvec::SmallVec<[u32; 8]>,
     masks: smallvec::SmallVec<[u32; 8]>,
     depth: Option<Attachment>,
+    /// `Renderer::newer_gen` when its images all existed and none was newer
+    /// in guest memory (0: check them).
+    newer: u64,
 }
 
 /// Dynamic graphics state last recorded in the current command buffer
@@ -1681,6 +1684,9 @@ pub struct Renderer {
     /// of images changes): GPU buffer writes look them up instead of
     /// visiting every image with metadata.
     meta_gen: u64,
+    /// Bumped when an image becomes newer in guest memory, is created or is
+    /// removed: a target cache entry with this value needs no per-image check.
+    newer_gen: u64,
     meta_cache: (u64, Vec<(u64, u64, ImageKey)>, u64),
     /// Render targets (de)tiled on the GPU: reloads, write-backs.
     pub gpu_remaps: [u64; 2],
@@ -1953,6 +1959,7 @@ pub fn init() -> Result<(), String> {
             desc_template_uses: (0, 0),
             target_hits: (0, 0),
             meta_gen: 1,
+            newer_gen: 1,
             meta_cache: (0, Vec::new(), 0),
             gpu_remaps: [0; 2],
             gpu_tex_uploads: 0,
@@ -2972,6 +2979,7 @@ impl Renderer {
         self.img_max_bytes = self.img_max_bytes.max(bytes);
         self.image_bytes += img.bytes;
         self.images.insert(k, img);
+        self.newer_gen += 1;
         self.meta_gen += 1;
         *self.base_gen.entry(k.base).or_default() += 1;
     }
@@ -3079,7 +3087,9 @@ impl Renderer {
                 tregs.extend_from_slice(&[regs.ctx(0xA010), regs.ctx(0xA011), regs.ctx(0xA014), regs.ctx(0xA016), regs.ctx(0xA005)]);
             }
             let hit = self.cx.target_cache.as_ref().filter(|c| {
-                c.seq + 1 == self.cx.work_seq && c.regs == tregs && c.colors.iter().flatten().map(|a| a.key).chain(c.depth.map(|d| d.key)).all(|k| self.images.get(&k).is_some_and(|i| !i.guest_newer))
+                c.seq + 1 == self.cx.work_seq
+                    && c.regs == tregs
+                    && (c.newer == self.newer_gen || c.colors.iter().flatten().map(|a| a.key).chain(c.depth.map(|d| d.key)).all(|k| self.images.get(&k).is_some_and(|i| !i.guest_newer)))
             });
             if perf_on() {
                 self.target_hits.0 += hit.is_some() as u64;
@@ -3117,7 +3127,9 @@ impl Renderer {
         // targets: buffer or storage-image stores may change its images.)
         let only_targets = [Some(vs), ps].into_iter().flatten().all(|p| p.written_buffers.is_empty() && !p.translated.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_))));
         if caching && only_targets {
-            self.cx.target_cache = Some(TargetCache { regs: tregs, seq: self.cx.work_seq, colors: colors.clone(), blends: blends.clone(), masks: masks.clone(), depth });
+            let current = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).all(|k| self.images.get(&k).is_some_and(|i| !i.guest_newer));
+            let newer = if current { self.newer_gen } else { 0 };
+            self.cx.target_cache = Some(TargetCache { regs: tregs, seq: self.cx.work_seq, colors: colors.clone(), blends: blends.clone(), masks: masks.clone(), depth, newer });
         }
         Ok((colors, blends, masks, depth))
     }
@@ -3252,6 +3264,7 @@ impl Renderer {
         self.mark(|| "level grow copy".into());
         // The new image takes over the old one's state and index entries.
         let o = self.images.remove(&old).unwrap();
+        self.newer_gen += 1;
         *self.base_gen.entry(old.base).or_default() += 1;
         *self.base_gen.entry(new.base).or_default() += 1;
         let n = self.images.get_mut(&new).unwrap();
@@ -5891,6 +5904,7 @@ impl Renderer {
                     if let Some(i) = self.images.get_mut(&key) {
                         i.guest_stale = false;
                         i.guest_newer = true;
+                        self.newer_gen += 1;
                     }
                     continue;
                 }
@@ -8125,6 +8139,7 @@ impl Renderer {
                 }
                 img.guest_newer = true;
                 img.guest_stale = false;
+                self.newer_gen += 1;
                 self.cx.attach_marked = false;
             }
         }
@@ -9572,6 +9587,7 @@ impl Renderer {
         let mut freed = 0;
         for k in &victims {
             let Some(img) = self.images.remove(k) else { continue };
+            self.newer_gen += 1;
             if img.meta_listed {
                 self.meta_images.retain(|x| x != k);
                 self.meta_gen += 1;
