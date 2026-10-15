@@ -410,10 +410,16 @@ pub const DESC_TEMPLATES: usize = 69;
 
 /// A sampled texture whose descriptor took the guest-memory path before
 /// skips the search for render targets and shadows at its address while no
-/// image there became GPU-written since (`TLG_TEX_CACHE`, 0: not measured yet).
+/// image there became GPU-written since (`TLG_TEX_CACHE`, 1). Cave, 31%
+/// clock: ~85% of lookups, frame -2.5% (3 rounds).
 pub const TEX_CACHE: usize = 70;
 
-const TABLE: [(&str, &str, i64); 71] = [
+/// With TLG_PERF: the per-command statistics (lock, phase and binding
+/// timers) are collected (`TLG_PERF_HOT`, 1; 0 leaves only the per-second
+/// summaries' other sources). Without TLG_PERF they are never collected.
+pub const PERF_HOT: usize = 71;
+
+const TABLE: [(&str, &str, i64); 72] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -484,7 +490,8 @@ const TABLE: [(&str, &str, i64); 71] = [
     ("target_cache", "TLG_TARGET_CACHE", 1),
     ("dma_reg_bulk", "TLG_DMA_REG_BULK", 1),
     ("desc_templates", "TLG_DESC_TEMPLATES", 1),
-    ("tex_cache", "TLG_TEX_CACHE", 0),
+    ("tex_cache", "TLG_TEX_CACHE", 1),
+    ("perf_hot", "TLG_PERF_HOT", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -2250,12 +2250,30 @@ pub const BPART_NAMES: [&str; 25] = [
     "draw targets",
 ];
 
-/// Adds the cycles since `t0` to buffer-binding step `i` (TLG_PERF);
-/// returns the current TSC.
+/// The time-stamp counter for `bpart` and other per-command timers; 0 while
+/// their statistics are off (`perf_on`).
+#[inline]
+fn tsc() -> u64 {
+    if perf_on() { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 }
+}
+
+/// `Instant::now()` for per-command timers of `Renderer::prof`; None while
+/// their statistics are off (`perf_on`).
+#[inline]
+fn perf_now() -> Option<std::time::Instant> {
+    perf_on().then(std::time::Instant::now)
+}
+
+/// Adds the cycles since `t0` to buffer-binding step `i` (TLG_PERF; none
+/// for a `t0` of 0, taken while off); returns the current TSC (0 while off).
 #[inline]
 fn bpart(i: usize, t0: u64) -> u64 {
+    if !perf_on() {
+        return 0;
+    }
     let t = unsafe { core::arch::x86_64::_rdtsc() };
-    if perf_on() {
+    // (A chain started while the statistics were off: from now on.)
+    if t0 != 0 {
         BPARTS[i].0.fetch_add(t.wrapping_sub(t0), std::sync::atomic::Ordering::Relaxed);
         BPARTS[i].1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if BPART_CS.get() {
@@ -2287,7 +2305,7 @@ pub static BPARTS_CS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU
 
 pub fn perf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some())
+    *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some()) && crate::tune::get(crate::tune::PERF_HOT) != 0
 }
 
 /// Per-binding site statistics (`TLG_PERF=2`): upload, forward and content
@@ -4601,7 +4619,7 @@ impl Renderer {
             // (The GPU's own writes to the window keep it current; GPU writes
             // elsewhere invalidate it explicitly: `note_pending_gpu_write`.)
             let with_gpu = crate::tune::get(crate::tune::MIRROR_GPU_STAMPS) != 0;
-            let th = unsafe { core::arch::x86_64::_rdtsc() };
+            let th = tsc();
             let (written, stamp) = self.writes.cpu_changed_since(rlo, rhi - rlo, since, with_gpu);
             bpart(14, th);
             if written {
@@ -5372,7 +5390,7 @@ impl Renderer {
         // their slot is reused, which the queue orders after this batch)
         // rather than waited for.
         let mut inflight: Vec<(u64, vk::Buffer, u64, u64)> = Vec::new();
-        let tf = unsafe { core::arch::x86_64::_rdtsc() };
+        let tf = tsc();
         let in_flight = writeback_in_flight(base, size);
         bpart(11, tf);
         if in_flight {
@@ -5419,11 +5437,13 @@ impl Renderer {
         let Some(off) = self.ring.alloc(size) else {
             return Err(format!("ring full: {size:#x}-byte copy of {base:#x} (segment {:#x})", self.ring.segment_size()));
         };
-        let t0 = std::time::Instant::now();
-        let tc = unsafe { core::arch::x86_64::_rdtsc() };
+        let t0 = perf_now();
+        let tc = tsc();
         self.ring_copy(off, base, size);
         let tc = bpart(12, tc);
-        self.prof[2] += t0.elapsed();
+        if let Some(t0) = t0 {
+            self.prof[2] += t0.elapsed();
+        }
         let regions: Vec<(vk::Buffer, vk::BufferCopy)> = inflight
             .iter()
             .copied()
@@ -5477,10 +5497,12 @@ impl Renderer {
             let r = self.bar.as_mut().unwrap();
             match r.alloc(size) {
                 Some(off) => {
-                    let t0 = std::time::Instant::now();
+                    let t0 = perf_now();
                     r.write_guest(off, base, size);
                     let buf = r.buffer;
-                    self.prof[2] += t0.elapsed();
+                    if let Some(t0) = t0 {
+                        self.prof[2] += t0.elapsed();
+                    }
                     self.upload_forwarded = false;
                     self.upload_devcopy = false;
                     self.bar_uploads.0 += 1;
@@ -5874,7 +5896,7 @@ impl Renderer {
         self.zc_revalidate();
         // Buffers first: their render target write-backs may write guest
         // memory that CPU-sourced textures read.
-        let mut tp = unsafe { core::arch::x86_64::_rdtsc() };
+        let mut tp = tsc();
         for pass in 0..2 {
             if pass == 1 {
                 tp = bpart(22, tp);
@@ -6000,7 +6022,8 @@ impl Renderer {
         let mut infos: smallvec::SmallVec<[(u32, vk::DescriptorType, Info); 36]> = smallvec::SmallVec::new();
         // (TLG_PERF timing: each binding's time is added to its kind when the
         // next one starts.)
-        let mut tb = unsafe { core::arch::x86_64::_rdtsc() };
+        let perf = perf_on();
+        let mut tb = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         let mut part = 4usize;
         let mut bpath = 0usize;
         for p in prepared {
@@ -6016,13 +6039,15 @@ impl Renderer {
                 }
             }
             for b in &p.translated.out.bindings {
-                let t = unsafe { core::arch::x86_64::_rdtsc() };
-                self.dsub[part] += t.wrapping_sub(tb);
-                if part == 2 {
-                    self.bsub[bpath] += t.wrapping_sub(tb);
-                    self.bcnt[bpath] += 1;
+                if perf {
+                    let t = unsafe { core::arch::x86_64::_rdtsc() };
+                    self.dsub[part] += t.wrapping_sub(tb);
+                    if part == 2 {
+                        self.bsub[bpath] += t.wrapping_sub(tb);
+                        self.bcnt[bpath] += 1;
+                    }
+                    tb = t;
                 }
-                tb = t;
                 part = match b.kind {
                     BindingKind::SgprData => 1,
                     BindingKind::Buffer(_) => 2,
@@ -6121,7 +6146,7 @@ impl Renderer {
                             let room = (base >> VWIN_SHIFT << VWIN_SHIFT) + VWIN_SIZE - base;
                             let n = extent.min(room);
                             self.vc_why = "read binding";
-                            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+                            let t0 = tsc();
                             if let Some((vb, voff)) = self.vcache_bind_ex(base, n, false, n < VCACHE_MIN) {
                                 bpart(8, t0);
                                 bpath = 3;
@@ -6136,7 +6161,7 @@ impl Renderer {
                             // commands; guest memory gets the range when the
                             // batch completes (copied out at its end).
                             self.vc_why = "written binding";
-                            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+                            let t0 = tsc();
                             if let Some((vb, voff)) = self.vcache_bind_ex(base, extent, false, extent < VCACHE_MIN) {
                                 let t1 = bpart(0, t0);
                                 bpath = 4;
@@ -6168,7 +6193,7 @@ impl Renderer {
                             }
                         }
                         let size = extent.clamp(4, 64 << 20);
-                        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+                        let t0 = tsc();
                         if !written && crate::tune::get(crate::tune::UPLOAD_REUSE) != 0 {
                             if let Some((buf, off)) = self.reused_upload(base, size) {
                                 bpath = 5;
@@ -6233,7 +6258,7 @@ impl Renderer {
                                 }
                                 self.upload_seen.insert((base, size), now);
                             }
-                            let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+                            let t0 = tsc();
                             let (buf, off) = self.upload_guest_ro(base, size)?;
                             let t1 = bpart(6, t0);
                             if self.upload_devcopy {
@@ -6265,7 +6290,7 @@ impl Renderer {
                         // the ring copy: host writes are visible at
                         // submission, the device range is fresh.)
                         bpath = 8;
-                        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+                        let t0 = tsc();
                         let off = self.upload_guest(base, size)?;
                         let t0 = bpart(9, t0);
                         let forwarded = self.upload_forwarded;
@@ -6332,13 +6357,15 @@ impl Renderer {
                 }
             }
         }
-        let t = unsafe { core::arch::x86_64::_rdtsc() };
-        self.dsub[part] += t.wrapping_sub(tb);
-        if part == 2 {
-            self.bsub[bpath] += t.wrapping_sub(tb);
-            self.bcnt[bpath] += 1;
+        if perf {
+            let t = unsafe { core::arch::x86_64::_rdtsc() };
+            self.dsub[part] += t.wrapping_sub(tb);
+            if part == 2 {
+                self.bsub[bpath] += t.wrapping_sub(tb);
+                self.bcnt[bpath] += 1;
+            }
+            tb = t;
         }
-        tb = t;
         if prepared.iter().any(|p| p.tess == TessRole::Ds) {
             let (_, tf) = self.tess_buffers()?;
             infos.push((TESS_TF_BINDING, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: tf, offset: 0, range: TESS_FACTOR_RING_BYTES })));
@@ -6375,7 +6402,9 @@ impl Renderer {
                     (*binding, *ty, d)
                 })
                 .collect();
-            self.dsub[4] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tb);
+            if perf {
+                self.dsub[4] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tb);
+            }
             return Ok(Some(w));
         }
         if crate::tune::get(crate::tune::DESC_TEMPLATES) != 0 {
@@ -6388,10 +6417,12 @@ impl Renderer {
                         Info::Img(i) => DescData { img: *i },
                     })
                     .collect();
-                let t = unsafe { core::arch::x86_64::_rdtsc() };
+                let t = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
                 self.dsub[4] += t.wrapping_sub(tb);
                 unsafe { c.device.update_descriptor_set_with_template(set, tpl, data.as_ptr() as *const core::ffi::c_void) };
-                self.dsub[5] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t);
+                if perf {
+                    self.dsub[5] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t);
+                }
                 return Ok(None);
             }
         }
@@ -6405,10 +6436,12 @@ impl Renderer {
                 }
             })
             .collect();
-        let t = unsafe { core::arch::x86_64::_rdtsc() };
+        let t = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         self.dsub[4] += t.wrapping_sub(tb);
         unsafe { c.device.update_descriptor_sets(&writes, &[]) };
-        self.dsub[5] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t);
+        if perf {
+            self.dsub[5] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t);
+        }
         Ok(None)
     }
 
@@ -6451,9 +6484,11 @@ impl Renderer {
     /// instead) and the pending-write count before it was written.
     fn descriptors_with_retry(&mut self, set_layout: vk::DescriptorSetLayout, stages: &[&Prepared]) -> Result<(Descriptors, usize), String> {
         let push = self.push_layouts.contains(&set_layout);
-        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t0 = tsc();
         let set = if push { vk::DescriptorSet::null() } else { self.alloc_set(set_layout)? };
-        self.dsub[0] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+        if t0 != 0 {
+            self.dsub[0] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+        }
         let wb_before = self.writebacks.len() + self.zc_writes.len();
         match self.write_descriptors(set, set_layout, stages) {
             Ok(w) => Ok((Descriptors::new(set, w), wb_before)),
@@ -6514,12 +6549,16 @@ impl Renderer {
         self.draw_targets.clear();
         self.cmd_queue = cp.queue;
         self.drain_cp_writes();
-        let mut tl = unsafe { core::arch::x86_64::_rdtsc() };
+        // (Phase timers only with TLG_PERF.)
+        let perf = perf_on();
+        let mut tl = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         macro_rules! phase {
             ($i:expr) => {{
-                let t = unsafe { core::arch::x86_64::_rdtsc() };
-                self.dprof[$i] += t.wrapping_sub(tl);
-                tl = t;
+                if perf {
+                    let t = unsafe { core::arch::x86_64::_rdtsc() };
+                    self.dprof[$i] += t.wrapping_sub(tl);
+                    tl = t;
+                }
             }};
         }
         super::set_phase(super::phase::DRAW, ((cp.regs.sh(0x2C48) as u64) | ((cp.regs.sh(0x2C49) as u64) << 32)) << 8);
@@ -6598,7 +6637,7 @@ impl Renderer {
         }
         self.set_required_epoch(false);
         phase!(0);
-        let tp = std::time::Instant::now();
+        let tp = perf_now();
         let ps_addr = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64) << 32)) << 8;
         if ps_addr != 0 && SKIP_PS.lock().contains(&ps_addr) {
             self.skipped += 1;
@@ -6624,7 +6663,9 @@ impl Renderer {
             vs = shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, ds)?;
             ps = if ps_addr != 0 { Some(shaders::prepare(&StageRegs { stage: Stage::Fragment, regs })?) } else { None };
         }
-        self.prof[5] += tp.elapsed();
+        if let Some(tp) = tp {
+            self.prof[5] += tp.elapsed();
+        }
         phase!(1);
         self.cur_shader = ps.as_ref().map(|p| p.addr).unwrap_or(vs.addr);
         let rect = prim == 0x11;
@@ -6636,7 +6677,7 @@ impl Renderer {
             self.report(format!("user clip planes {:#x} not implemented", regs.ctx(0xA204) & 0x3F));
         }
         // Attachments.
-        let tt = unsafe { core::arch::x86_64::_rdtsc() };
+        let tt = tsc();
         let (colors, blends, masks, depth) = self.draw_attachments(regs, &vs, ps.as_ref())?;
         self.draw_targets = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).collect();
         self.apply_meta_clears(regs, &colors, depth);
@@ -6754,7 +6795,7 @@ impl Renderer {
         if let Some(p) = &ps {
             stages.push(p);
         }
-        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        let t0 = tsc();
         let (host, dev) = self.binding_bytes(&stages);
         let t0 = bpart(19, t0);
         let tex = self.texture_upload_estimate(&stages);
@@ -6932,7 +6973,9 @@ impl Renderer {
             }
         }
         phase!(7);
-        self.dprof_draws += 1;
+        if perf {
+            self.dprof_draws += 1;
+        }
         if trace_frame() {
             // TLG_TRACE_ATTR=<vs addr>:<resource>:<byte>: histogram of that byte
             // of every record of the vertex shader's buffer resource, and of
@@ -7663,12 +7706,15 @@ impl Renderer {
         let class = (cp.queue != 0) as usize;
         BPART_CS.set(class == 1);
         spin_ns(crate::tune::get(if class == 1 { crate::tune::DELAY_CS_NS } else { crate::tune::DELAY_GFX_NS }));
-        let mut tl = unsafe { core::arch::x86_64::_rdtsc() };
+        let perf = perf_on();
+        let mut tl = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         macro_rules! phase {
             ($i:expr) => {{
-                let t = unsafe { core::arch::x86_64::_rdtsc() };
-                self.cprof[class][$i] += t.wrapping_sub(tl);
-                tl = t;
+                if perf {
+                    let t = unsafe { core::arch::x86_64::_rdtsc() };
+                    self.cprof[class][$i] += t.wrapping_sub(tl);
+                    tl = t;
+                }
             }};
         }
         self.drain_cp_writes();
@@ -7688,7 +7734,7 @@ impl Renderer {
         self.begin();
         self.gpu_wb.clear();
         self.set_required_epoch(cp.queue != 0);
-        let tp = std::time::Instant::now();
+        let tp = perf_now();
         let mut cs = match pre {
             Some(p) => p?,
             None => shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs })?,
@@ -7721,7 +7767,9 @@ impl Renderer {
             cs.sparse_writes = self.scatter_ranges(&cs, records, dst, x as u64 * y as u64 * z as u64);
             self.scatters += cs.sparse_writes.is_some() as u64;
         }
-        self.prof[5] += tp.elapsed();
+        if let Some(tp) = tp {
+            self.prof[5] += tp.elapsed();
+        }
         // Engine copy/fill kernels over whole render-target surfaces run as
         // image operations (`tune elide_utility 0` runs them as shaders).
         // (Kernels dispatched from a start group (COMPUTE_START_X/Y/Z) cover
@@ -7907,8 +7955,10 @@ impl Renderer {
         if self.writebacks.len() + self.zc_writes.len() > wb_before {
             self.epoch += 1;
         }
-        self.cprof[class][6] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tl);
-        self.cprof_n[class] += 1;
+        if perf {
+            self.cprof[class][6] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tl);
+            self.cprof_n[class] += 1;
+        }
         if trace_frame() {
             self.trace_timing("dispatch");
         }
@@ -9894,12 +9944,13 @@ static GFX_LOCK_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 struct TimedRenderer {
     g: std::mem::ManuallyDrop<parking_lot::MutexGuard<'static, Option<Renderer>>>,
     q: usize,
-    since: std::time::Instant,
+    /// When the lock was taken (TLG_PERF).
+    since: Option<std::time::Instant>,
 }
 
 impl TimedRenderer {
     fn lock(q: usize) -> TimedRenderer {
-        let t0 = std::time::Instant::now();
+        let t0 = perf_on().then(std::time::Instant::now);
         // (`tune lock_fair 3`: the graphics CP, the frame's critical path,
         // goes first while it waits.)
         if q == 0 {
@@ -9913,15 +9964,20 @@ impl TimedRenderer {
         if q == 0 {
             GFX_LOCK_WAITING.store(false, std::sync::atomic::Ordering::Relaxed);
         }
-        let since = std::time::Instant::now();
-        QUEUE_LOCK_WAIT_NS[q & 63].fetch_add((since - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        let since = t0.map(|t0| {
+            let now = std::time::Instant::now();
+            QUEUE_LOCK_WAIT_NS[q & 63].fetch_add((now - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            now
+        });
         TimedRenderer { g: std::mem::ManuallyDrop::new(g), q, since }
     }
 }
 
 impl Drop for TimedRenderer {
     fn drop(&mut self) {
-        QUEUE_LOCK_HOLD_NS[self.q & 63].fetch_add(self.since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        if let Some(since) = self.since {
+            QUEUE_LOCK_HOLD_NS[self.q & 63].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
         // SAFETY: `g` is not used after this.
         let g = unsafe { std::mem::ManuallyDrop::take(&mut self.g) };
         // (`tune lock_fair`: 1, the graphics CP lets a waiting compute CP in;
@@ -9979,7 +10035,7 @@ impl Hooks for VkHooks {
         // Shader preparation reads registers and guest memory only: before
         // the lock (its reads are checked under it). Not for patches.
         let prim = cp.regs.uconfig[(0xC242 - 0xC000) as usize];
-        let tp = unsafe { core::arch::x86_64::_rdtsc() };
+        let tp = tsc();
         let ahead = (crate::tune::get(crate::tune::PREP_AHEAD) != 0 && cp.queue == 0 && prim != 9).then(|| super::prepahead::take_draw(&cp.regs)).flatten();
         let tp = if crate::tune::get(crate::tune::PREP_AHEAD) != 0 { bpart(17, tp) } else { tp };
         let own = ahead.is_none();
@@ -10309,6 +10365,7 @@ pub const DESC_PARTS: [&str; 6] = ["alloc", "sgpr data", "buffers", "images", "s
 /// Buffer binding paths timed in `Renderer::bsub` (`write_descriptors`).
 pub const BUFFER_PATHS: [&str; 11] = ["other", "in place read", "in place written", "mirror read", "mirror written", "reused copy", "read-only copy", "written round trip", "written copy", "device copy", "written copy chained"];
 
+/// (Buffer upload and shader prep: timed with TLG_PERF only, `perf_on`.)
 pub const PROF_NAMES: [&str; 7] = ["submit+wait", "writeback", "buffer upload", "texture hash", "texture read", "shader prep", "slot wait"];
 
 pub const FLUSH_REASONS: [&str; 6] = ["eop/dma", "writeback sync", "ring full", "descriptors", "flip", "fwd copies"];
