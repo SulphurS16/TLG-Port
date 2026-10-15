@@ -25,6 +25,19 @@ impl Regs {
     pub fn sh(&self, reg: u32) -> u32 {
         self.sh[(reg - pm4::SH_REG_BASE) as usize]
     }
+    /// Registers [reg, reg+n) when they lie in one register file (the
+    /// ranges `CommandProcessor::write_reg` stores).
+    fn run_mut(&mut self, reg: u32, n: u32) -> Option<&mut [u32]> {
+        let (r, end) = (reg as usize, reg as usize + n as usize);
+        let (file, base) = match r {
+            0xA000..0xA400 => (&mut self.ctx, 0xA000),
+            0x2C00..0x3000 => (&mut self.sh, 0x2C00),
+            0xC000..0xC400 => (&mut self.uconfig, 0xC000),
+            0x2000..0x2C00 => (&mut self.config, 0x2000),
+            _ => return None,
+        };
+        (end - base <= file.len()).then(|| &mut file[r - base..end - base])
+    }
 }
 
 #[derive(Default, Clone, Debug)]
@@ -1726,6 +1739,14 @@ impl CommandProcessor {
             // Destination is register space (byte offset).
             let reg = (dst as u32) >> 2;
             let words = (bytes / 4) as u32;
+            // (A run of memory words into one register file: copied at once;
+            // ~5% of the graphics CP went into loading them word by word.)
+            if src_sel == 0 && !sas && !saic && !daic && words != 0 && guest_ok(src, bytes) && !reg_watching() && crate::tune::get(crate::tune::DMA_REG_BULK) != 0 {
+                if let Some(run) = self.regs.run_mut(reg, words) {
+                    unsafe { std::ptr::copy_nonoverlapping(src as *const u8, run.as_mut_ptr() as *mut u8, words as usize * 4) };
+                    return;
+                }
+            }
             for i in 0..words {
                 let v = match src_sel {
                     2 => body[1],

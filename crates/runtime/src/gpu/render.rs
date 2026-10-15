@@ -17,6 +17,17 @@ use std::collections::HashMap;
 /// before later commands: the next consumer starts with a full barrier.
 /// (`barrier_needed` alone is also set after dispatches, whose own buffer
 /// accesses are tracked instead: see `tune dispatch_hazards`.)
+/// Marks image `$img` (at guest base `$base`) GPU-written; when the flag
+/// changes, texture paths cached for that base are stale (`tex_paths`).
+macro_rules! set_gpu_written {
+    ($s:expr, $img:expr, $base:expr) => {{
+        if !$img.gpu_written {
+            $img.gpu_written = true;
+            *$s.base_gen.entry($base).or_default() += 1;
+        }
+    }};
+}
+
 macro_rules! unordered {
     ($s:expr) => {{
         $s.barrier_needed = true;
@@ -50,6 +61,8 @@ struct GfxKey {
     /// Emulated tessellation: VGT_TF_PARAM and the factor clamp
     /// (VGT_HOS_MIN/MAX_TESS_LEVEL bits) of the generated control stage.
     tess: Option<(u32, u32, u32)>,
+    /// Created with `tune push_desc` on (its set layout pushed).
+    push: bool,
 }
 
 /// A tessellated draw whose LS and HS stages have been dispatched (see
@@ -1552,6 +1565,21 @@ pub struct Renderer {
     meta_images: Vec<ImageKey>,
     /// Set layouts created for push descriptors (`tune push_desc`).
     push_layouts: FastSet<vk::DescriptorSetLayout>,
+    /// Texture bases `texture_upload_estimate` found needing no upload, with
+    /// the CPU epoch then.
+    ready_bases: FastMap<u64, u64>,
+    /// Sampled textures that took the guest-memory path (`tune tex_cache`),
+    /// with their base's `base_gen` then; per guest base, a count bumped when
+    /// an image there becomes GPU-written (or is replaced); hits / lookups.
+    tex_paths: FastMap<(Tsharp, bool), u64>,
+    base_gen: FastMap<u64, u64>,
+    pub tex_path_hits: (u64, u64),
+    /// Update templates by set layout (`tune desc_templates`), made from the
+    /// (binding, type) order of the layout's first write; writes in another
+    /// order (none expected) use write structures. Uses and fallbacks
+    /// (TLG_PERF).
+    desc_templates: FastMap<vk::DescriptorSetLayout, (smallvec::SmallVec<[(u32, vk::DescriptorType); 36]>, vk::DescriptorUpdateTemplate)>,
+    pub desc_template_uses: (u64, u64),
     /// Draws and dispatches begun (`TargetCache::seq`), the previous draw's
     /// targets, and cache hits / lookups (TLG_PERF).
     work_seq: u64,
@@ -1919,6 +1947,12 @@ pub fn init() -> Result<(), String> {
             tile_maps: FastMap::default(),
             meta_images: Vec::new(),
             push_layouts: FastSet::default(),
+            ready_bases: FastMap::default(),
+            tex_paths: FastMap::default(),
+            base_gen: FastMap::default(),
+            tex_path_hits: (0, 0),
+            desc_templates: FastMap::default(),
+            desc_template_uses: (0, 0),
             work_seq: 0,
             target_cache: None,
             target_hits: (0, 0),
@@ -2129,15 +2163,30 @@ pub static BATCH_SITES: parking_lot::Mutex<Option<HashMap<(&'static str, u32), (
 /// write since, by the same CP queue: in the same CPU epoch, and in the same
 /// required epoch (graphics or compute) though another CPU epoch began.
 pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// One descriptor of a template update's data (`tune desc_templates`): the
+/// two kinds have the same size, so the array has a fixed stride.
+#[repr(C)]
+#[derive(Clone, Copy)]
+union DescData {
+    buf: vk::DescriptorBufferInfo,
+    img: vk::DescriptorImageInfo,
+}
+
+/// Compute pipeline keys of `tune push_desc` mode (pipelines are kept per
+/// mode: their set layouts differ).
+fn push_mode_key() -> u64 {
+    if crate::tune::get(crate::tune::PUSH_DESC) != 0 { 0x9E37_79B9_7F4A_7C15 } else { 0 }
+}
+
 /// A command's descriptors: an allocated set, or the descriptors to push
 /// (`tune push_desc`).
 enum Descriptors {
     Set(vk::DescriptorSet),
-    Push(Box<super::rec::PushWrites>),
+    Push(super::rec::PushWrites),
 }
 
 impl Descriptors {
-    fn new(set: vk::DescriptorSet, push: Option<Box<super::rec::PushWrites>>) -> Descriptors {
+    fn new(set: vk::DescriptorSet, push: Option<super::rec::PushWrites>) -> Descriptors {
         match push {
             Some(w) => Descriptors::Push(w),
             None => Descriptors::Set(set),
@@ -2148,7 +2197,7 @@ impl Descriptors {
     unsafe fn bind(self, cmd: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout) {
         match self {
             Descriptors::Set(set) => unsafe { REC.cmd_bind_descriptor_sets(cmd, bp, layout, 0, &[set], &[]) },
-            Descriptors::Push(w) => unsafe { REC.cmd_push_descriptor_set(cmd, bp, layout, 0, w) },
+            Descriptors::Push(w) => unsafe { REC.cmd_push_descriptor_set(cmd, bp, layout, 0, &w) },
         }
     }
 }
@@ -2865,6 +2914,7 @@ impl Renderer {
         self.image_bytes += img.bytes;
         self.images.insert(k, img);
         self.meta_gen += 1;
+        *self.base_gen.entry(k.base).or_default() += 1;
     }
 
     fn init_image(&mut self, key: ImageKey) -> Result<(), String> {
@@ -3143,6 +3193,8 @@ impl Renderer {
         self.mark(|| "level grow copy".into());
         // The new image takes over the old one's state and index entries.
         let o = self.images.remove(&old).unwrap();
+        *self.base_gen.entry(old.base).or_default() += 1;
+        *self.base_gen.entry(new.base).or_default() += 1;
         let n = self.images.get_mut(&new).unwrap();
         n.gpu_written = o.gpu_written;
         n.uploaded_hash = o.uploaded_hash;
@@ -3228,7 +3280,7 @@ impl Renderer {
         let last = self.images[&src].last_write;
         let d = self.images.get_mut(&dst).unwrap();
         d.last_write = last;
-        d.gpu_written = true;
+        set_gpu_written!(self, d, dst.base);
         *self.write_gen.entry(dst).or_default() += 1;
         if trace_frame() {
             crate::info!("FRAME alias {:#x}: {}x{} {:?} updated from newer {}x{} {:?}", dst.base, dst.width, dst.height, dst.format, src.width, src.height, src.format);
@@ -3430,7 +3482,7 @@ impl Renderer {
         let tick = self.draws + self.dispatches + 1;
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         if let Some(img) = self.images.get_mut(&key) {
-            img.gpu_written = true;
+            set_gpu_written!(self, img, key.base);
             img.guest_stale = true;
             img.guest_newer = false;
             img.last_write = tick;
@@ -3946,7 +3998,7 @@ impl Renderer {
     fn note_storage_write(&mut self, key: ImageKey) {
         let tick = self.draws + self.dispatches + 1;
         if let Some(img) = self.images.get_mut(&key) {
-            img.gpu_written = true;
+            set_gpu_written!(self, img, key.base);
             img.last_write = tick;
         }
         *self.write_gen.entry(key).or_default() += 1;
@@ -3984,7 +4036,7 @@ impl Renderer {
         };
         self.init_image(key)?;
         let img = self.images.get_mut(&key).unwrap();
-        img.gpu_written = true; // never sourced from guest memory
+        set_gpu_written!(self, img, key.base); // never sourced from guest memory
         const IDENTITY_SEL: u16 = 4 | (5 << 3) | (6 << 6) | (7 << 9);
         img.view(format, IDENTITY_SEL, view_type, storage, 0, layers)
     }
@@ -4028,68 +4080,88 @@ impl Renderer {
         };
         let store_fmt = canonical(vfmt);
         let depth_layers = if ty3d { t.depth } else { total_layers };
-        // Render targets here whose memory the title reused (see
-        // `reused_target`), and those whose guest memory was since written by
-        // buffer stores: reloaded before sampling (directly or via shadows).
-        // (One walk over the images at the base for both.)
-        let (mut old, mut newer) = (smallvec::SmallVec::<[ImageKey; 4]>::new(), smallvec::SmallVec::<[ImageKey; 4]>::new());
-        if let Some(ks) = self.by_base.get(&t.base) {
-            for k in ks {
-                let img = &self.images[k];
-                if img.gpu_written && !storage {
-                    old.push(*k);
-                }
-                if img.guest_newer {
-                    newer.push(*k);
-                }
-            }
-        }
-        for k in old {
-            // (A reused target stops being GPU-written: not refreshed below.)
-            if self.reused_target(k) {
-                newer.retain(|n| *n != k);
-            }
-        }
-        for k in newer {
-            self.refresh_from_guest(k, false)?;
-        }
         let key = ImageKey { base: t.base, width: t.width, height: t.height, layers: depth_layers, levels, format: store_fmt, depth: false, ty3d };
-        // GPU-written image with the same size at this address?
-        if let Some(k) = self.find_compatible(key) {
-            if self.images[&k].gpu_written || storage {
-                let k = self.grow_levels(k, view_level, levels)?;
-                self.sync_alias(k)?;
-                if storage {
-                    self.note_storage_write(k);
+        // (`tune tex_cache`: this descriptor took the guest-memory path
+        // before and no image at its base became GPU-written since.)
+        let caching = !storage && crate::tune::get(crate::tune::TEX_CACHE) != 0 && !trace_frame();
+        let hit = caching && {
+            let g = self.base_gen.get(&t.base).copied().unwrap_or(0);
+            self.tex_paths.get(&(*t, load_only)) == Some(&g)
+        };
+        if perf_on() && caching {
+            self.tex_path_hits.0 += hit as u64;
+            self.tex_path_hits.1 += 1;
+        }
+        if !hit {
+            // Render targets here whose memory the title reused (see
+            // `reused_target`), and those whose guest memory was since written by
+            // buffer stores: reloaded before sampling (directly or via shadows).
+            // (One walk over the images at the base for both.)
+            let (mut old, mut newer) = (smallvec::SmallVec::<[ImageKey; 4]>::new(), smallvec::SmallVec::<[ImageKey; 4]>::new());
+            if let Some(ks) = self.by_base.get(&t.base) {
+                for k in ks {
+                    let img = &self.images[k];
+                    if img.gpu_written && !storage {
+                        old.push(*k);
+                    }
+                    if img.guest_newer {
+                        newer.push(*k);
+                    }
                 }
-                let img = self.images.get_mut(&k).unwrap();
-                let v = img.view_levels(if storage { canonical(vfmt) } else { vfmt }, t.dst_sel, view_type, storage, view_base, layers, view_level, view_levels)?;
-                return Ok(v);
             }
-        }
-        // A depth render target at this address (sampled after a decompress):
-        // copy its depth values into a color image of the sampled format.
-        if matches!(vfmt, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !storage {
-            if let Some(src) = self.by_base.get(&t.base).and_then(|ks| ks.iter().copied().find(|k| k.depth && self.images[k].gpu_written && (k.format == vk::Format::D16_UNORM) == (vfmt == vk::Format::R16_UNORM))) {
-                return self.depth_shadow_view(src, t, vfmt, view_type, load_only);
+            for k in old {
+                // (A reused target stops being GPU-written: not refreshed below.)
+                if self.reused_target(k) {
+                    newer.retain(|n| *n != k);
+                }
             }
-        }
-        // A render target at this address with padded dimensions: copy into a
-        // shadow image (from the most recently rendered one if several exist).
-        if let Some(src) = self.by_base.get(&t.base).and_then(|ks| {
-            ks.iter()
-                .copied()
-                .filter(|k| self.images[k].gpu_written && k.width >= t.width && k.height >= t.height && same_surface(k.width, k.height, t.width, t.height) && format_class(k.format) == format_class(store_fmt) && !k.depth)
-                .max_by_key(|k| self.images[k].last_write)
-        }) {
+            for k in newer {
+                self.refresh_from_guest(k, false)?;
+            }
+            // GPU-written image with the same size at this address?
+            if let Some(k) = self.find_compatible(key) {
+                if self.images[&k].gpu_written || storage {
+                    let k = self.grow_levels(k, view_level, levels)?;
+                    self.sync_alias(k)?;
+                    if storage {
+                        self.note_storage_write(k);
+                    }
+                    let img = self.images.get_mut(&k).unwrap();
+                    let v = img.view_levels(if storage { canonical(vfmt) } else { vfmt }, t.dst_sel, view_type, storage, view_base, layers, view_level, view_levels)?;
+                    return Ok(v);
+                }
+            }
+            // A depth render target at this address (sampled after a decompress):
+            // copy its depth values into a color image of the sampled format.
+            if matches!(vfmt, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !storage {
+                if let Some(src) = self.by_base.get(&t.base).and_then(|ks| ks.iter().copied().find(|k| k.depth && self.images[k].gpu_written && (k.format == vk::Format::D16_UNORM) == (vfmt == vk::Format::R16_UNORM))) {
+                    return self.depth_shadow_view(src, t, vfmt, view_type, load_only);
+                }
+            }
+            // A render target at this address with padded dimensions: copy into a
+            // shadow image (from the most recently rendered one if several exist).
+            if let Some(src) = self.by_base.get(&t.base).and_then(|ks| {
+                ks.iter()
+                    .copied()
+                    .filter(|k| self.images[k].gpu_written && k.width >= t.width && k.height >= t.height && same_surface(k.width, k.height, t.width, t.height) && format_class(k.format) == format_class(store_fmt) && !k.depth)
+                    .max_by_key(|k| self.images[k].last_write)
+            }) {
+                if trace_frame() {
+                    crate::info!("FRAME texture {:#x} {}x{} {:?}: shadow of {}x{} {:?} (last write {})", t.base, t.width, t.height, vfmt, src.width, src.height, src.format, self.images[&src].last_write);
+                }
+                return self.shadow_view(src, t, vfmt, store_fmt, view_type);
+            }
             if trace_frame() {
-                crate::info!("FRAME texture {:#x} {}x{} {:?}: shadow of {}x{} {:?} (last write {})", t.base, t.width, t.height, vfmt, src.width, src.height, src.format, self.images[&src].last_write);
+                let others: Vec<String> = self.by_base.get(&t.base).map(|ks| ks.iter().map(|k| format!("{}x{} {:?} gw {}", k.width, k.height, k.format, self.images[k].gpu_written)).collect()).unwrap_or_default();
+                crate::info!("FRAME texture {:#x} {}x{} {:?}: guest memory (images here: [{}])", t.base, t.width, t.height, vfmt, others.join(", "));
             }
-            return self.shadow_view(src, t, vfmt, store_fmt, view_type);
-        }
-        if trace_frame() {
-            let others: Vec<String> = self.by_base.get(&t.base).map(|ks| ks.iter().map(|k| format!("{}x{} {:?} gw {}", k.width, k.height, k.format, self.images[k].gpu_written)).collect()).unwrap_or_default();
-            crate::info!("FRAME texture {:#x} {}x{} {:?}: guest memory (images here: [{}])", t.base, t.width, t.height, vfmt, others.join(", "));
+            if caching {
+                if self.tex_paths.len() > 1 << 16 {
+                    self.tex_paths.clear();
+                }
+                let g = self.base_gen.get(&t.base).copied().unwrap_or(0);
+                self.tex_paths.insert((*t, load_only), g);
+            }
         }
         self.init_image(key)?;
         let batch = self.epoch;
@@ -4190,6 +4262,7 @@ impl Renderer {
             );
         }
         img.gpu_written = false;
+        *self.base_gen.entry(k.base).or_default() += 1;
         img.guest_stale = false;
         img.guest_newer = false;
         img.validated = None;
@@ -4853,7 +4926,8 @@ impl Renderer {
                 DEPTH_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 DEPTH_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 self.shadows.insert(skey, (dst_key, wgen));
-                self.images.get_mut(&dst_key).unwrap().gpu_written = true;
+                let d = self.images.get_mut(&dst_key).unwrap();
+                set_gpu_written!(self, d, dst_key.base);
                 let img = self.images.get_mut(&dst_key).unwrap();
                 return img.view(vfmt, t.dst_sel, view_type, false, 0, 1);
             }
@@ -4881,7 +4955,8 @@ impl Renderer {
             self.mark(|| "depth copy for sampling".into());
             DEPTH_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.shadows.insert(skey, (dst_key, wgen));
-            self.images.get_mut(&dst_key).unwrap().gpu_written = true;
+            let d = self.images.get_mut(&dst_key).unwrap();
+            set_gpu_written!(self, d, dst_key.base);
         }
         let img = self.images.get_mut(&dst_key).unwrap();
         img.view(vfmt, t.dst_sel, view_type, false, 0, 1)
@@ -4997,7 +5072,8 @@ impl Renderer {
             unordered!(self);
             self.mark(|| "shadow copy for sampling".into());
             self.shadows.insert(skey, (dst_key, wgen));
-            self.images.get_mut(&dst_key).unwrap().gpu_written = true;
+            let d = self.images.get_mut(&dst_key).unwrap();
+            set_gpu_written!(self, d, dst_key.base);
         }
         let img = self.images.get_mut(&dst_key).unwrap();
         img.view(vfmt, t.dst_sel, view_type, false, t.view_base_layer(), t.layers().max(1))
@@ -5526,25 +5602,35 @@ impl Renderer {
 
     /// Upper bound of ring bytes texture uploads of a draw/dispatch may need
     /// (images not produced by the GPU; reloads of stale render targets).
-    fn texture_upload_estimate(&self, stages: &[&Prepared]) -> u64 {
+    fn texture_upload_estimate(&mut self, stages: &[&Prepared]) -> u64 {
         // (Not skippable when the ring has room: a large estimate submits
         // the batch first, which also leaves the next batch's device ring
         // free for the texture's GPU detiling -- without that, a 64 MiB
         // shadow map sampled from guest memory every frame fell back to the
         // CPU detiler, ~150 ms per frame.)
+        if self.ready_bases.len() > 1 << 14 {
+            self.ready_bases.clear();
+        }
         let mut n = 0u64;
         for p in stages {
             for b in &p.translated.out.bindings {
                 if let BindingKind::Image(i) | BindingKind::StorageImage(i) = b.kind {
                     if let ResolvedRes::Image(t) = &p.resources[i] {
                         // Images that are GPU-produced or already validated this epoch need no upload.
+                        // (A base found ready counts as ready for the rest of
+                        // the CPU epoch: an estimate, a short one is retried.)
+                        if self.ready_bases.get(&t.base) == Some(&self.cpu_epoch) {
+                            continue;
+                        }
                         let ready = self.by_base.get(&t.base).is_some_and(|ks| {
                             ks.iter().any(|k| {
                                 let img = &self.images[k];
                                 (img.gpu_written && !img.guest_newer) || (!img.gpu_written && img.upload_batch == self.epoch)
                             })
                         });
-                        if !ready {
+                        if ready {
+                            self.ready_bases.insert(t.base, self.cpu_epoch);
+                        } else {
                             let layers = if t.ty == desc::T_3D { t.depth } else { t.total_layers() }.max(1);
                             n += resources::texture_bytes(t, layers).min(64 << 20);
                         }
@@ -5903,13 +5989,15 @@ impl Renderer {
 
     /// Writes the descriptors of `prepared` into `set`, or returns them for
     /// a push (`set` null: a push-descriptor layout).
-    fn write_descriptors(&mut self, set: vk::DescriptorSet, prepared: &[&Prepared]) -> Result<Option<Box<super::rec::PushWrites>>, String> {
+    fn write_descriptors(&mut self, set: vk::DescriptorSet, layout: vk::DescriptorSetLayout, prepared: &[&Prepared]) -> Result<Option<super::rec::PushWrites>, String> {
         let c = ctx();
         enum Info {
             Buf(vk::DescriptorBufferInfo),
             Img(vk::DescriptorImageInfo),
         }
-        let mut infos: smallvec::SmallVec<[(u32, vk::DescriptorType, Info); 24]> = smallvec::SmallVec::new();
+        // (Room for the bindings of most draws: past it the vector moves to
+        // the heap.)
+        let mut infos: smallvec::SmallVec<[(u32, vk::DescriptorType, Info); 36]> = smallvec::SmallVec::new();
         // (TLG_PERF timing: each binding's time is added to its kind when the
         // next one starts.)
         let mut tb = unsafe { core::arch::x86_64::_rdtsc() };
@@ -6128,7 +6216,8 @@ impl Renderer {
                         }
                         if !written {
                             bpath = 6;
-                            if perf_on() {
+                            // (TLG_PERF=2: a map entry per copy.)
+                            if perf_detail() {
                                 let now = (self.cpu_epoch, self.required_epoch, self.writes.stamp(), self.cmd_queue, self.batch);
                                 if let Some(&(ce, re, st, q, b)) = self.upload_seen.get(&(base, size)) {
                                     if q == now.3 && b != now.4 && !self.writes.gpu_written_since(base, size, st) {
@@ -6287,9 +6376,26 @@ impl Renderer {
                 })
                 .collect();
             self.dsub[4] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tb);
-            return Ok(Some(Box::new(w)));
+            return Ok(Some(w));
         }
-        let writes: smallvec::SmallVec<[vk::WriteDescriptorSet; 24]> = infos
+        if crate::tune::get(crate::tune::DESC_TEMPLATES) != 0 {
+            let sig: smallvec::SmallVec<[(u32, vk::DescriptorType); 36]> = infos.iter().map(|&(b, t, _)| (b, t)).collect();
+            if let Some(tpl) = self.desc_template(layout, sig) {
+                let data: smallvec::SmallVec<[DescData; 36]> = infos
+                    .iter()
+                    .map(|(_, _, info)| match info {
+                        Info::Buf(b) => DescData { buf: *b },
+                        Info::Img(i) => DescData { img: *i },
+                    })
+                    .collect();
+                let t = unsafe { core::arch::x86_64::_rdtsc() };
+                self.dsub[4] += t.wrapping_sub(tb);
+                unsafe { c.device.update_descriptor_set_with_template(set, tpl, data.as_ptr() as *const core::ffi::c_void) };
+                self.dsub[5] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t);
+                return Ok(None);
+            }
+        }
+        let writes: smallvec::SmallVec<[vk::WriteDescriptorSet; 36]> = infos
             .iter()
             .map(|(binding, ty, info)| {
                 let w = vk::WriteDescriptorSet::default().dst_set(set).dst_binding(*binding).descriptor_type(*ty);
@@ -6306,6 +6412,36 @@ impl Renderer {
         Ok(None)
     }
 
+    /// The update template of set layout `layout` for descriptors in the
+    /// (binding, type) order `sig`: made from the first write's order; None
+    /// when a later write's order differs (written with write structures).
+    fn desc_template(&mut self, layout: vk::DescriptorSetLayout, sig: smallvec::SmallVec<[(u32, vk::DescriptorType); 36]>) -> Option<vk::DescriptorUpdateTemplate> {
+        if let Some((s, t)) = self.desc_templates.get(&layout) {
+            let same = *s == sig;
+            if perf_on() {
+                if same {
+                    self.desc_template_uses.0 += 1;
+                } else {
+                    self.desc_template_uses.1 += 1;
+                }
+            }
+            return same.then_some(*t);
+        }
+        let stride = std::mem::size_of::<DescData>();
+        let entries: Vec<vk::DescriptorUpdateTemplateEntry> = sig
+            .iter()
+            .enumerate()
+            .map(|(i, &(binding, ty))| vk::DescriptorUpdateTemplateEntry { dst_binding: binding, dst_array_element: 0, descriptor_count: 1, descriptor_type: ty, offset: i * stride, stride })
+            .collect();
+        let ci = vk::DescriptorUpdateTemplateCreateInfo::default()
+            .descriptor_update_entries(&entries)
+            .template_type(vk::DescriptorUpdateTemplateType::DESCRIPTOR_SET)
+            .descriptor_set_layout(layout);
+        let t = unsafe { ctx().device.create_descriptor_update_template(&ci, None) }.ok()?;
+        self.desc_templates.insert(layout, (sig, t));
+        Some(t)
+    }
+
     /// Allocates and writes a draw/dispatch's descriptor set. The ring
     /// reservation is an estimate made before guest-read preparation (which
     /// can reload render targets or turn in-place bindings into copies); when
@@ -6319,7 +6455,7 @@ impl Renderer {
         let set = if push { vk::DescriptorSet::null() } else { self.alloc_set(set_layout)? };
         self.dsub[0] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
         let wb_before = self.writebacks.len() + self.zc_writes.len();
-        match self.write_descriptors(set, stages) {
+        match self.write_descriptors(set, set_layout, stages) {
             Ok(w) => Ok((Descriptors::new(set, w), wb_before)),
             Err(e) if e.contains("ring full") => {
                 self.flushes[2] += 1;
@@ -6332,7 +6468,7 @@ impl Renderer {
                 let set = if push { vk::DescriptorSet::null() } else { self.alloc_set(set_layout)? };
                 let wb_before = self.writebacks.len() + self.zc_writes.len();
                 self.desc_retry = true;
-                let r = self.write_descriptors(set, stages);
+                let r = self.write_descriptors(set, set_layout, stages);
                 self.desc_retry = false;
                 let w = r.map_err(|e2| format!("{e2} (retried in a new batch after: {e}; ring {:#x} of {:#x} left)", self.ring.remaining(), self.ring.segment_size()))?;
                 Ok((Descriptors::new(set, w), wb_before))
@@ -6595,6 +6731,7 @@ impl Renderer {
             polygon: ((regs.ctx(0xA205) >> 3) & 3) as u8,
             depth_clamp: regs.ctx(0xA204) & (3 << 26) != 0,
             tess: tess.as_ref().map(|t| (t.tf_param, t.min.to_bits(), t.max.to_bits())),
+            push: crate::tune::get(crate::tune::PUSH_DESC) != 0,
         };
         phase!(2);
         if !self.gfx_pipes.contains_key(&key) {
@@ -6723,7 +6860,7 @@ impl Renderer {
         for a in colors.iter().flatten() {
             self.mark_stale(a.key);
             if let Some(img) = self.images.get_mut(&a.key) {
-                img.gpu_written = true;
+                set_gpu_written!(self, img, a.key.base);
                 img.guest_stale = true;
                 img.last_write = tick;
                 img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -6733,7 +6870,7 @@ impl Renderer {
         if let Some(d) = depth {
             self.mark_stale(d.key);
             if let Some(img) = self.images.get_mut(&d.key) {
-                img.gpu_written = true;
+                set_gpu_written!(self, img, d.key.base);
                 img.guest_stale = true;
                 img.last_write = tick;
                 img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
@@ -7474,7 +7611,7 @@ impl Renderer {
     /// workgroups, ordered after all earlier work (the LDS and factor
     /// buffers are reused by every draw).
     fn tess_dispatch(&mut self, p: &Prepared, groups: u32) -> Result<(), String> {
-        let key = p.translated.key_hash ^ p.addr;
+        let key = p.translated.key_hash ^ p.addr ^ push_mode_key();
         if !self.cs_pipes.contains_key(&key) {
             let c = ctx();
             let m = self.module(key, &p.translated.out.spirv)?;
@@ -7623,7 +7760,7 @@ impl Renderer {
             crate::info!("FRAME {} dispatch {groups} cs {:#x} res [{}] written {:?} sgpr data after user [{:x?}]", cp.name, cs.addr, res.join(", "), cs.written_buffers, &loads[..loads.len().min(48)]);
         }
         phase!(0);
-        let key = cs.translated.key_hash ^ cs.addr;
+        let key = cs.translated.key_hash ^ cs.addr ^ push_mode_key();
         if !self.cs_pipes.contains_key(&key) {
             let c = ctx();
             let m = self.module(key, &cs.translated.out.spirv)?;
@@ -8847,7 +8984,7 @@ impl Renderer {
             }
             self.mark_stale(key);
             if let Some(i) = self.images.get_mut(&key) {
-                i.gpu_written = true;
+                set_gpu_written!(self, i, key.base);
                 i.guest_stale = true;
             }
             // The hardware marks tiles expanded as it renders them (and an
@@ -9032,7 +9169,7 @@ impl Renderer {
         // (As the CPU path's clear does; the draw that follows renders to it.)
         self.mark_stale(key);
         if let Some(i) = self.images.get_mut(&key) {
-            i.gpu_written = true;
+            set_gpu_written!(self, i, key.base);
             i.guest_stale = true;
         }
         self.meta_gpu += 1;

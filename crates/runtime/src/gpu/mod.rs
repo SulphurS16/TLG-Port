@@ -887,6 +887,8 @@ struct PerfSnap {
     cprof: [[u64; 7]; 2],
     cprof_n: [u64; 2],
     target_hits: (u64, u64),
+    desc_template_uses: (u64, u64),
+    tex_path_hits: (u64, u64),
     dsub: [u64; 6],
     bsub: [u64; 11],
     bcnt: [u64; 11],
@@ -929,6 +931,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         cprof: r.cprof,
         cprof_n: r.cprof_n,
         target_hits: r.target_hits,
+        desc_template_uses: r.desc_template_uses,
+        tex_path_hits: r.tex_path_hits,
         dsub: r.dsub,
         bsub: r.bsub,
         bcnt: r.bcnt,
@@ -985,7 +989,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let v = [render::VBIND_STATS[0].swap(0, Ordering::Relaxed), render::VBIND_STATS[1].swap(0, Ordering::Relaxed)];
             let h: [u64; 5] = std::array::from_fn(|i| writes::HV_STATS[i].swap(0, Ordering::Relaxed));
             let b: [u64; 4] = std::array::from_fn(|i| writes::BULK_STATS[i].swap(0, Ordering::Relaxed));
-            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served: {} same CPU epoch, {} same required epoch; mirror binding cache {} of {}; validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none); bulk rounds {} ({} runs, {} pages, {} written pages found)", parts.join("; "), x[0], x[1], v[0], v[1], h[0], h[1], h[2], h[3], h[4], b[0], b[1], b[2], b[3]);
+            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served (TLG_PERF=2): {} same CPU epoch, {} same required epoch; mirror binding cache {} of {}; validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none); bulk rounds {} ({} runs, {} pages, {} written pages found)", parts.join("; "), x[0], x[1], v[0], v[1], h[0], h[1], h[2], h[3], h[4], b[0], b[1], b[2], b[3]);
         }
         // (The compute queues' share of them.)
         static LAST_CS: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);
@@ -998,7 +1002,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         if !parts.is_empty() {
             crate::info!("buffer binding steps/s of compute queues: {}", parts.join("; "));
         }
-        crate::info!("render targets/s: {} lookups, {} reused from the previous draw", now.target_hits.1.saturating_sub(p.target_hits.1), now.target_hits.0.saturating_sub(p.target_hits.0));
+        crate::info!("render targets/s: {} lookups, {} reused from the previous draw; descriptor sets written by template: {}, with write structures for another binding order: {}; sampled textures: {} lookups, {} by the cached guest-memory path", now.target_hits.1.saturating_sub(p.target_hits.1), now.target_hits.0.saturating_sub(p.target_hits.0), now.desc_template_uses.0.saturating_sub(p.desc_template_uses.0), now.desc_template_uses.1.saturating_sub(p.desc_template_uses.1), now.tex_path_hits.1.saturating_sub(p.tex_path_hits.1), now.tex_path_hits.0.saturating_sub(p.tex_path_hits.0));
         let wi = [render::WB_IMAGES[0].swap(0, Ordering::Relaxed), render::WB_IMAGES[1].swap(0, Ordering::Relaxed)];
         if wi[0] != 0 {
             crate::info!("render-target write-back checks/s: {} (stale intervals {:.1} each)", wi[0], wi[1] as f64 / wi[0] as f64);

@@ -353,11 +353,12 @@ pub const TITLE_SYNC: usize = 60;
 /// Descriptor sets of translated shaders are pushed into the command buffer
 /// (VK_KHR_push_descriptor) by the recorder thread instead of allocated from
 /// the batch's pool and written on the CP threads, for layouts within the
-/// device's push limit. Read when a layout is created: set it at boot
-/// (`TLG_PUSH_DESC`, 0). Cave: the CPs' descriptor allocation and writes
-/// 1.5 -> 0.2 us per command, the recorder +50 ms/s, frame rate unchanged
-/// (26.0 vs 25.9 fps at 102-108% clock); every pipeline is created again
-/// for the new layouts (first boot).
+/// device's push limit (`TLG_PUSH_DESC`, 1). Pipelines are kept per mode: a
+/// change applies to pipelines looked up after it (the first use of a mode
+/// creates its pipelines; the pipeline cache keeps both). The descriptors go
+/// in a buffer published with the recorder's operations. Cave, 31% clock,
+/// one boot: -4.6% per frame against template-written sets (rounds after the
+/// switch; -1.4% before the buffer, with a heap allocation per push).
 pub const PUSH_DESC: usize = 61;
 
 /// Measurement only: busy-waits this many ns per draw / per dispatch of the
@@ -397,7 +398,22 @@ pub const COPY_SPIN_US: usize = 66;
 /// of a pass skip the target lookups (~1.2 us per draw at full clock).
 pub const TARGET_CACHE: usize = 67;
 
-const TABLE: [(&str, &str, i64); 68] = [
+/// DMA_DATA from memory into a run of registers of one register file is
+/// copied at once instead of word by word (`TLG_DMA_REG_BULK`, 1). Cave:
+/// within noise (the reads miss the cache either way).
+pub const DMA_REG_BULK: usize = 68;
+
+/// Descriptor sets are written with an update template per set layout (one
+/// array of descriptors in the layout's binding order) instead of a write
+/// structure per binding (`TLG_DESC_TEMPLATES`, 1).
+pub const DESC_TEMPLATES: usize = 69;
+
+/// A sampled texture whose descriptor took the guest-memory path before
+/// skips the search for render targets and shadows at its address while no
+/// image there became GPU-written since (`TLG_TEX_CACHE`, 0: not measured yet).
+pub const TEX_CACHE: usize = 70;
+
+const TABLE: [(&str, &str, i64); 71] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -459,13 +475,16 @@ const TABLE: [(&str, &str, i64); 68] = [
     ("hoist_copyins", "TLG_HOIST_COPYINS", 1),
     ("copy_inline", "TLG_COPY_INLINE", 0),
     ("title_sync", "TLG_TITLE_SYNC", 1),
-    ("push_desc", "TLG_PUSH_DESC", 0),
+    ("push_desc", "TLG_PUSH_DESC", 1),
     ("delay_gfx_ns", "TLG_DELAY_GFX_NS", 0),
     ("delay_cs_ns", "TLG_DELAY_CS_NS", 0),
     ("ww_log", "TLG_WW_LOG", 0),
     ("ww_bulk", "TLG_WW_BULK", 16),
     ("copy_spin_us", "TLG_COPY_SPIN_US", 1000),
     ("target_cache", "TLG_TARGET_CACHE", 1),
+    ("dma_reg_bulk", "TLG_DMA_REG_BULK", 1),
+    ("desc_templates", "TLG_DESC_TEMPLATES", 1),
+    ("tex_cache", "TLG_TEX_CACHE", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

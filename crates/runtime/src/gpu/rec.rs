@@ -35,10 +35,11 @@ pub enum DescInfo {
 }
 
 /// A pushed set's descriptors: (binding, type, descriptor).
-pub type PushWrites = SmallVec<[(u32, vk::DescriptorType, DescInfo); 24]>;
+pub type PushWrites = SmallVec<[(u32, vk::DescriptorType, DescInfo); 36]>;
+type PushEntry = (u32, vk::DescriptorType, DescInfo);
 
-fn push_set_now(cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, w: &PushWrites) {
-    let writes: SmallVec<[vk::WriteDescriptorSet; 24]> = w
+fn push_set_now(cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, w: &[PushEntry]) {
+    let writes: SmallVec<[vk::WriteDescriptorSet; 36]> = w
         .iter()
         .map(|(binding, ty, info)| {
             let wd = vk::WriteDescriptorSet::default().dst_binding(*binding).descriptor_type(*ty);
@@ -56,7 +57,8 @@ enum Op {
     Barrier(vk::CommandBuffer, vk::PipelineStageFlags, vk::PipelineStageFlags, vk::MemoryBarrier<'static>),
     BindPipeline(vk::CommandBuffer, vk::PipelineBindPoint, vk::Pipeline),
     BindSet(vk::CommandBuffer, vk::PipelineBindPoint, vk::PipelineLayout, u32, vk::DescriptorSet),
-    PushSet(vk::CommandBuffer, vk::PipelineBindPoint, vk::PipelineLayout, u32, Box<PushWrites>),
+    /// Descriptors [start, start+len) of the published operations' push data.
+    PushSet(vk::CommandBuffer, vk::PipelineBindPoint, vk::PipelineLayout, u32, u32, u32),
     PushConstants(vk::CommandBuffer, vk::PipelineLayout, vk::ShaderStageFlags, u32, SmallVec<[u8; 32]>),
     Dispatch(vk::CommandBuffer, u32, u32, u32),
     Draw(vk::CommandBuffer, u32, u32, u32, u32),
@@ -101,21 +103,24 @@ enum DynOp {
     BlendConstants([f32; 4]),
 }
 
+/// Operations and the descriptors their `PushSet`s push (no allocation per
+/// push: published together).
 struct Queue {
     ops: Vec<Op>,
+    data: Vec<PushEntry>,
 }
 
 /// Operations queued but not yet published to the recorder. Only renderer
 /// methods queue operations, with the renderer lock held: that lock
 /// serializes all access.
-struct Local(std::cell::UnsafeCell<Vec<Op>>);
+struct Local(std::cell::UnsafeCell<Queue>);
 
 // SAFETY: accessed only under the renderer lock (see `push`).
 unsafe impl Sync for Local {}
 
-static LOCAL: Local = Local(std::cell::UnsafeCell::new(Vec::new()));
+static LOCAL: Local = Local(std::cell::UnsafeCell::new(Queue { ops: Vec::new(), data: Vec::new() }));
 
-static QUEUE: Mutex<Queue> = Mutex::new(Queue { ops: Vec::new() });
+static QUEUE: Mutex<Queue> = Mutex::new(Queue { ops: Vec::new(), data: Vec::new() });
 static CV: Condvar = Condvar::new();
 static SLEEPING: AtomicBool = AtomicBool::new(false);
 /// Operations queued and performed so far.
@@ -172,20 +177,30 @@ fn push(op: Op, now: bool) {
     // SAFETY: only renderer methods queue operations, under the renderer
     // lock, which serializes every access to `LOCAL`.
     let l = unsafe { &mut *LOCAL.0.get() };
-    l.push(op);
-    if now || l.len() >= crate::tune::get(crate::tune::REC_BATCH).max(1) as usize {
+    l.ops.push(op);
+    if now || l.ops.len() >= crate::tune::get(crate::tune::REC_BATCH).max(1) as usize {
         publish(l, now);
     }
 }
 
-fn publish(l: &mut Vec<Op>, wake: bool) {
-    if l.is_empty() {
+fn publish(l: &mut Queue, wake: bool) {
+    if l.ops.is_empty() {
         return;
     }
-    let n = l.len() as u64;
+    let n = l.ops.len() as u64;
     let queued = {
         let mut q = QUEUE.lock();
-        q.ops.append(l);
+        // (Push data offsets: from the start of the queue's data.)
+        let base = q.data.len() as u32;
+        if base != 0 && !l.data.is_empty() {
+            for op in l.ops.iter_mut() {
+                if let Op::PushSet(_, _, _, _, start, _) = op {
+                    *start += base;
+                }
+            }
+        }
+        q.ops.append(&mut l.ops);
+        q.data.append(&mut l.data);
         PUSHED.fetch_add(n, Ordering::Release);
         q.ops.len()
     };
@@ -232,11 +247,12 @@ fn run() {
     crate::log::set_thread_name("GPU-record");
     crate::thread::raise_priority();
     let mut spare: Vec<Op> = Vec::with_capacity(1024);
+    let mut spare_data: Vec<PushEntry> = Vec::with_capacity(1024);
     // (A failed sparse bind never signals its semaphore: the submit waiting
     // for it must not.)
     let mut unsignaled: Option<vk::Semaphore> = None;
     loop {
-        let mut ops = {
+        let taken = {
             let mut q = QUEUE.lock();
             if q.ops.is_empty() {
                 drop(q);
@@ -253,14 +269,18 @@ fn run() {
                     WAKES.fetch_add(1, Ordering::Relaxed);
                 }
             }
-            std::mem::replace(&mut q.ops, std::mem::take(&mut spare))
+            let data = std::mem::replace(&mut q.data, std::mem::take(&mut spare_data));
+            (std::mem::replace(&mut q.ops, std::mem::take(&mut spare)), data)
         };
+        let (mut ops, mut data) = taken;
         let n = ops.len() as u64;
         let t0 = std::time::Instant::now();
         let d = &ctx().device;
         for op in ops.drain(..) {
-            unsafe { perform(d, op, &mut unsignaled) };
+            unsafe { perform(d, op, &data, &mut unsignaled) };
         }
+        data.clear();
+        spare_data = data;
         BUSY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
         OPS.fetch_add(n, Ordering::Relaxed);
         spare = ops;
@@ -272,13 +292,13 @@ fn run() {
     }
 }
 
-unsafe fn perform(d: &ash::Device, op: Op, unsignaled: &mut Option<vk::Semaphore>) {
+unsafe fn perform(d: &ash::Device, op: Op, data: &[PushEntry], unsignaled: &mut Option<vk::Semaphore>) {
     unsafe {
         match op {
             Op::Barrier(cb, src, dst, mb) => d.cmd_pipeline_barrier(cb, src, dst, vk::DependencyFlags::empty(), &[mb], &[], &[]),
             Op::BindPipeline(cb, bp, p) => d.cmd_bind_pipeline(cb, bp, p),
             Op::BindSet(cb, bp, layout, first, set) => d.cmd_bind_descriptor_sets(cb, bp, layout, first, &[set], &[]),
-            Op::PushSet(cb, bp, layout, set, w) => push_set_now(cb, bp, layout, set, &w),
+            Op::PushSet(cb, bp, layout, set, start, len) => push_set_now(cb, bp, layout, set, &data[start as usize..(start + len) as usize]),
             Op::PushConstants(cb, layout, stages, off, data) => d.cmd_push_constants(cb, layout, stages, off, &data),
             Op::Dispatch(cb, x, y, z) => d.cmd_dispatch(cb, x, y, z),
             Op::Draw(cb, a, b, c, e) => d.cmd_draw(cb, a, b, c, e),
@@ -512,11 +532,16 @@ impl Rec {
     }
 
     /// vkCmdPushDescriptorSetKHR with the descriptors `w`.
-    pub unsafe fn cmd_push_descriptor_set(&self, cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, w: Box<PushWrites>) {
+    pub unsafe fn cmd_push_descriptor_set(&self, cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, w: &[PushEntry]) {
         if deferred() {
-            return push(Op::PushSet(cb, bp, layout, set, w), false);
+            // SAFETY: renderer lock held (see `push`); the data is published
+            // with the operation that refers to it.
+            let l = unsafe { &mut *LOCAL.0.get() };
+            let start = l.data.len() as u32;
+            l.data.extend_from_slice(w);
+            return push(Op::PushSet(cb, bp, layout, set, start, w.len() as u32), false);
         }
-        push_set_now(cb, bp, layout, set, &w);
+        push_set_now(cb, bp, layout, set, w);
     }
 
     pub unsafe fn cmd_push_constants(&self, cb: vk::CommandBuffer, layout: vk::PipelineLayout, stages: vk::ShaderStageFlags, offset: u32, data: &[u8]) {
