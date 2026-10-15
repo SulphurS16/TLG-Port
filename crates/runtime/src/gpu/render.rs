@@ -1086,6 +1086,58 @@ pub fn wait_labels(seen: u64, timeout: std::time::Duration) {
     });
 }
 
+/// The submitted batch whose graphics-interrupt actions may be performed
+/// early (`tune early_eop`; 0: none), and how often they were.
+static EARLY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EARLY_DONE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// TLG_PERF, at each early performance: batches in flight, their eager
+/// write-backs (count, bytes), in-place writes and reads, other end-of-pipe
+/// writes, and times nothing of that was in flight.
+pub static EARLY_INFLIGHT: [std::sync::atomic::AtomicU64; 6] = [const { std::sync::atomic::AtomicU64::new(0) }; 6];
+
+/// `tune early_eop`: performs the pending batch's end-of-pipe actions now if
+/// every compute queue is idle (they have consumed what the frame gave them:
+/// the title re-arms their labels once the frame is done) and it has not
+/// completed yet.
+pub fn try_early_eop() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let seq = EARLY_SEQ.load(SeqCst);
+    if seq == 0 || !super::compute_queues_idle() || EARLY_SEQ.compare_exchange(seq, 0, SeqCst, SeqCst).is_err() {
+        return;
+    }
+    let Some(c) = COMPLETIONS.lock().iter().find(|c| c.seq == seq).cloned() else { return };
+    if perf_on() {
+        // What the batches still in flight will do to guest memory at
+        // completion besides these actions (TLG_PERF, `EARLY_INFLIGHT`).
+        let q = COMPLETIONS.lock();
+        let s = &EARLY_INFLIGHT;
+        use std::sync::atomic::Ordering::Relaxed;
+        s[0].fetch_add(q.len() as u64, Relaxed);
+        s[1].fetch_add(q.iter().map(|c| c.writebacks.len() as u64).sum(), Relaxed);
+        s[2].fetch_add(q.iter().map(|c| c.writebacks.iter().map(|w| w.2).sum::<u64>()).sum(), Relaxed);
+        s[3].fetch_add(q.iter().map(|c| c.zc_writes.len() as u64 + (!c.zc_reads.is_empty()) as u64).sum(), Relaxed);
+        s[4].fetch_add(q.iter().filter(|x| x.seq != seq).map(|c| c.actions.len() as u64).sum(), Relaxed);
+        s[5].fetch_add(q.iter().all(|x| x.writebacks.is_empty() && x.zc_writes.is_empty() && x.zc_reads.is_empty() && (x.seq == seq || x.actions.is_empty())) as u64, Relaxed);
+    }
+    {
+        // (The completion thread may be performing them already.)
+        let mut st = EARLY_STATE.lock();
+        if st.1 >= seq {
+            return;
+        }
+        st.0 = seq;
+    }
+    for a in &c.actions {
+        a.perform();
+    }
+    labels_changed();
+    EARLY_DONE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// (Batch whose actions `try_early_eop` performed, batch whose actions the
+/// completion thread performs or performed): each batch's are performed once.
+static EARLY_STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
 /// Waits for submitted batches, then performs their buffer write-backs and
 /// end-of-pipe actions in order.
 fn completion_thread() {
@@ -1247,8 +1299,16 @@ fn completion_thread() {
         WB_NS_SUM.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         LAST_WB_BYTES.store(wb_bytes, std::sync::atomic::Ordering::Relaxed);
         WB_BYTES_SUM.fetch_add(wb_bytes, std::sync::atomic::Ordering::Relaxed);
-        for a in &c.actions {
-            a.perform();
+        // (Unless `try_early_eop` performed them.)
+        let early = {
+            let mut st = EARLY_STATE.lock();
+            st.1 = c.seq;
+            st.0 == c.seq
+        };
+        if !early {
+            for a in &c.actions {
+                a.perform();
+            }
         }
         labels_changed();
         COMPLETIONS.lock().pop_front();
@@ -2823,6 +2883,7 @@ impl Renderer {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             unsafe { REC.cmd_pipeline_barrier(self.cx.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
         }
+        let early = crate::tune::get(crate::tune::EARLY_EOP) != 0 && actions.iter().any(|a| a.interrupt && a.gfx);
         if !self.cx.recording {
             if actions.is_empty() && writebacks.is_empty() {
                 return self.last_seq;
@@ -2832,6 +2893,10 @@ impl Renderer {
             push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: self.cx.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads: Ranges::default(), wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
             // (In COMPLETIONS now: the view may forget them.)
             CP_VIEW.lock().pending = Ranges::new();
+            if early {
+                EARLY_SEQ.store(self.last_seq, std::sync::atomic::Ordering::SeqCst);
+                try_early_eop();
+            }
             return self.last_seq;
         }
         self.end_rendering();
@@ -2887,6 +2952,10 @@ impl Renderer {
             let mut v = CP_VIEW.lock();
             v.pending = Ranges::new();
             v.reads = Ranges::new();
+        }
+        if early {
+            EARLY_SEQ.store(self.last_seq, std::sync::atomic::Ordering::SeqCst);
+            try_early_eop();
         }
         self.cx.recording = false;
         self.cx.batch += 1;

@@ -752,6 +752,16 @@ pub fn ding_dong(vq: u32, next_dw: u32) {
     }
 }
 
+/// Whether every mapped compute queue is idle: its ring executed and no
+/// newer work rung (`render::try_early_eop`).
+pub fn compute_queues_idle() -> bool {
+    let c = COMPUTE.lock();
+    c.iter().enumerate().all(|(vq, q)| match q {
+        None => true,
+        Some(q) => (QPHASE[vq & 63].load(Ordering::Relaxed) >> 56) as u8 == phase::IDLE && q.ring.lock().pending_to.is_none(),
+    })
+}
+
 fn compute_thread(cq: &'static ComputeQueue, name: String, vq: usize) {
     crate::log::set_thread_name(&name);
     crate::thread::raise_priority();
@@ -761,6 +771,9 @@ fn compute_thread(cq: &'static ComputeQueue, name: String, vq: usize) {
     loop {
         let (base, size, from, to, rptr) = {
             set_qphase(vq, phase::IDLE, 0);
+            if crate::tune::get(crate::tune::EARLY_EOP) != 0 && cq.ring.lock().pending_to.is_none() {
+                render::try_early_eop();
+            }
             let mut r = cq.ring.lock();
             while r.pending_to.is_none() {
                 cq.cv.wait(&mut r);
@@ -1122,7 +1135,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             if ts[0] != 0 {
                 let ms = |v: u64| v as f64 / ts[0] as f64 / 1e6;
                 let cs: [u64; 3] = std::array::from_fn(|i| CAPTURE_STATS[i].swap(0, Ordering::Relaxed));
-                crate::info!("frame tail (ms per frame, after the graphics CP finished the frame): its last batch done on the GPU {:.2}, its end-of-pipe actions {:.2}, the title's next submission {:.2}, taken up {:.2} ({} frames); PM4 captures {} ({:.2} ms, {} KiB)", ms(ts[1]), ms(ts[2]), ms(ts[3]), ms(ts[4]), ts[0], cs[0], cs[1] as f64 / 1e6, cs[2] * 4 >> 10);
+                crate::info!("frame tail (ms per frame, after the graphics CP finished the frame): its last batch done on the GPU {:.2}, its end-of-pipe actions {:.2}, the title's next submission {:.2}, taken up {:.2} ({} frames); PM4 captures {} ({:.2} ms, {} KiB); end-of-pipe actions performed early {} (in flight then: batches {}, eager write-backs {} of {} KiB, in-place accesses {}, other end-of-pipe writes {}; nothing of those {} times)", ms(ts[1]), ms(ts[2]), ms(ts[3]), ms(ts[4]), ts[0], cs[0], cs[1] as f64 / 1e6, cs[2] * 4 >> 10, render::EARLY_DONE.swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[0].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[1].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[2].swap(0, Ordering::Relaxed) >> 10, render::EARLY_INFLIGHT[3].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[4].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[5].swap(0, Ordering::Relaxed));
             }
         }
         let mut fills: Vec<((u64, u64, &'static str), (u64, u64))> = render::VCACHE_FILL_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();

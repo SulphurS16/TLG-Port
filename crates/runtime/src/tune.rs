@@ -535,7 +535,14 @@ pub const FRAME_CAP: usize = 90;
 /// (commands that would end the scope; the state-only paths reset it).
 pub const ATTACH_ONCE: usize = 91;
 
-const TABLE: [(&str, &str, i64); 92] = [
+/// Measurement only (`TLG_EARLY_EOP`, 0): a batch's end-of-pipe actions
+/// with a graphics interrupt (the frame-done event the title waits for
+/// before its next submission) are performed once it is submitted and every
+/// compute queue is idle, instead of when it completes on the GPU. GPU
+/// results still in flight are not protected from the title meanwhile.
+pub const EARLY_EOP: usize = 92;
+
+const TABLE: [(&str, &str, i64); 93] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -628,6 +635,7 @@ const TABLE: [(&str, &str, i64); 92] = [
     ("hz_dedupe", "TLG_HZ_DEDUPE", 1),
     ("frame_cap", "TLG_FRAME_CAP", -1),
     ("attach_once", "TLG_ATTACH_ONCE", 1),
+    ("early_eop", "TLG_EARLY_EOP", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
