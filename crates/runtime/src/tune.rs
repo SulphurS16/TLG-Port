@@ -525,7 +525,8 @@ pub const HZ_DEDUPE: usize = 89;
 
 /// Flips no closer than the title's flip rate allows (`TLG_FRAME_CAP`; -1 =
 /// settings.txt `frame_cap`, 1 on, 0 off: development measurements above
-/// the game's own rate).
+/// the game's own rate; 60: the 60 fps limit, the game's time step snapped
+/// to 1/60 s - `videoout::frame_cap`).
 pub const FRAME_CAP: usize = 90;
 
 /// A draw's attachments are marked GPU-written (stale index, generations,

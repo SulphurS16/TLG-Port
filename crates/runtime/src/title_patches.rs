@@ -93,6 +93,19 @@ pub fn apply(p: &mut Patcher, name: &str) {
         Ok(()) => crate::info!("render-kick wait: busy loop at {name}+{KICK_SITE:#x} detoured to a polling wait"),
         Err(e) => crate::warn!("render-kick wait: {name}: {e}; not patched"),
     }
+    let sixty = crate::hle::libs::videoout::frame_cap() == crate::config::FrameCap::Fps60;
+    match find_step(p) {
+        Ok(a) => {
+            STEP_ADDR.store(a, Ordering::Relaxed);
+            if sixty {
+                p.image[STEP_CONSTS..STEP_CONSTS + 12].copy_from_slice(&step_bytes(true));
+                STEP_60.store(true, Ordering::Relaxed);
+                crate::info!("frame rate: up to 60 fps; the game's time step snaps to 1/60 s near it instead of 1/30 s ({name}+{STEP_CONSTS:#x})");
+            }
+        }
+        Err(e) if sixty => crate::warn!("time step: {name}: {e}; 60 fps unavailable (the game's own limit applies)"),
+        Err(e) => crate::info!("time step: {name}: {e} (60 fps would be unavailable)"),
+    }
     if !std::env::var("TLG_MOUSE_CAMERA").is_ok_and(|v| v == "0") {
         match patch_mouse_camera(p) {
             Ok(slots) => {
@@ -148,6 +161,71 @@ fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<bool, String> {
         crate::mem::add_dmem(HEAP_EXTRA);
     }
     Ok(heap)
+}
+
+/// The title's frame time step (eboot 0xd16480, called by the frame update
+/// at 0xdd48f7): the measured real time, smoothed (0.8-1.25x through an
+/// error accumulator), clamped to the minimum frame rate (1/20 s) and scaled
+/// by the game speed; while the Havok world exists a step between 0.031667
+/// and 0.035 s is snapped to exactly 1/30 s, then filtered and rounded down
+/// to 1/360 s (floor(t * 360 + 0.1) / 360). The snap keeps the step exact at
+/// the game's 30 fps limit; at the 60 fps limit it moves to 1/60 s (0.015833
+/// to 0.0175 s) - without it a 1/60 s step a little short rounds down to
+/// 1/72 s. Between the two rates the step is real time either way. These
+/// are the snap's three constants (upper bound, step, lower bound) at
+/// 0x14f17f8, read only by the instructions in `STEP_SITES`.
+const STEP_CONSTS: usize = 0x14f17f8;
+const SNAP_30: [u32; 3] = [0x3d0f5c29, 0x3d088889, 0x3d01b4e8]; // 0.035, 1/30, 0.031666666
+const SNAP_60: [u32; 3] = [0x3c8f5c29, 0x3c888889, 0x3c81b4e8]; // 0.0175, 1/60, 0.015833333
+const STEP_SITES: [(usize, &[u8]); 3] = [
+    (0xd165e2, &[0xC5, 0xFA, 0xC2, 0x15, 0x0D, 0xB2, 0x7D, 0x00, 0x01]), // vcmpltss xmm2,xmm0,[14F17F8h]
+    (0xd165eb, &[0xC5, 0xFA, 0x10, 0x1D, 0x09, 0xB2, 0x7D, 0x00]),       // vmovss xmm3,[14F17FCh]
+    (0xd165ff, &[0xC5, 0xFA, 0x10, 0x1D, 0xF9, 0xB1, 0x7D, 0x00]),       // vmovss xmm3,[14F1800h]
+];
+
+/// The loaded snap constants (0: the executable's step code is not the
+/// expected one), and whether they snap to 1/60 s.
+static STEP_ADDR: AtomicU64 = AtomicU64::new(0);
+static STEP_60: AtomicBool = AtomicBool::new(false);
+
+fn step_bytes(sixty: bool) -> [u8; 12] {
+    let mut b = [0u8; 12];
+    for (i, v) in (if sixty { SNAP_60 } else { SNAP_30 }).iter().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&v.to_le_bytes());
+    }
+    b
+}
+
+/// The snap constants' address when the step code and its constants are
+/// the expected ones.
+fn find_step(p: &Patcher) -> Result<u64, String> {
+    if let Some((off, _)) = STEP_SITES.iter().find(|(off, b)| p.image.get(*off..*off + b.len()) != Some(*b)) {
+        return Err(format!("unexpected code at +{off:#x} (not update 01.03?)"));
+    }
+    if p.image.get(STEP_CONSTS..STEP_CONSTS + 12) != Some(&step_bytes(false)[..]) {
+        return Err("unexpected time-step constants".into());
+    }
+    Ok(p.base + STEP_CONSTS as u64)
+}
+
+/// Snaps the game's time step to 1/60 s (`sixty`) or 1/30 s near that rate
+/// from the next frame on; false where that is not possible (the
+/// executable's step code is not the expected one: it stays at 1/30 s).
+pub fn set_step_60(sixty: bool) -> bool {
+    if STEP_60.load(Ordering::Relaxed) == sixty {
+        return true;
+    }
+    let a = STEP_ADDR.load(Ordering::Relaxed);
+    if a == 0 {
+        return false;
+    }
+    if let Err(e) = crate::debug_mem::write_guest(a, &step_bytes(sixty)) {
+        crate::warn!("time step: {e}");
+        return false;
+    }
+    STEP_60.store(sixty, Ordering::Relaxed);
+    crate::info!("time step: snapped to 1/{} s near that frame rate from now on", if sixty { 60 } else { 30 });
+    true
 }
 
 /// Mouse-look data next to the module: pending pitch and yaw change

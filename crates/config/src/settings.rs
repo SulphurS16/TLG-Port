@@ -42,12 +42,16 @@ pub enum Filter {
 pub enum FrameCap {
     /// The game's own limit (its flip rate: 30 fps in update 01.03).
     Game,
+    /// Up to 60 fps: flips at up to 60 Hz and the game's time step snapped
+    /// to 1/60 s near that rate instead of 1/30 s, so game speed stays real
+    /// time (experimental: not yet played at 60 fps on a machine reaching it).
+    Fps60,
     /// No limit (development measurements only: untested game timing).
     Off,
 }
 
-/// Frame caps tested at their game speed (offered by the launcher).
-pub const TESTED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game];
+/// Frame caps the launcher offers, in its order.
+pub const OFFERED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game, FrameCap::Fps60];
 
 /// Render resolutions accepted (the tested range).
 pub const RENDER_MIN: (u32, u32) = (640, 360);
@@ -163,8 +167,9 @@ vsync = on
 scaling = fit
 # smooth (bilinear) or sharp (nearest pixel) scaling.
 filter = smooth
-# game = the game's own frame-rate limit (30 fps with update 01.03), the only
-# tested setting.
+# game = the game's own frame-rate limit (30 fps with update 01.03); 60 = up
+# to 60 fps (experimental, needs a fast PC: the game's time step follows the
+# frame rate, so its speed stays the same; not yet played at 60 fps).
 frame_cap = game
 # auto (a discrete GPU first) or part of the graphics card's name.
 gpu = auto
@@ -272,8 +277,9 @@ impl Settings {
                 },
                 "frame_cap" => match lv.as_str() {
                     "game" | "30" => s.frame_cap = FrameCap::Game,
+                    "60" => s.frame_cap = FrameCap::Fps60,
                     "off" | "uncapped" | "0" => s.frame_cap = FrameCap::Off,
-                    _ => errs.push(bad("game (other limits are not tested yet)")),
+                    _ => errs.push(bad("game or 60 (other limits are not tested yet)")),
                 },
                 "gpu" => s.gpu = if v.is_empty() { "auto".into() } else { v.to_string() },
                 "volume" => match num(v).filter(|&n| n <= 100) {
@@ -329,6 +335,7 @@ impl Settings {
         });
         f.set("frame_cap", match self.frame_cap {
             FrameCap::Game => "game",
+            FrameCap::Fps60 => "60",
             FrameCap::Off => "off",
         });
         f.set("gpu", &self.gpu);
@@ -365,7 +372,7 @@ mod tests {
     #[test]
     fn values_and_errors() {
         let (s, errs) = Settings::parse(
-            "display_mode = Borderless\nresolution = 2560x1440\nrefresh_rate = 144hz\nvsync = fast # tear-free\nvolume = 70\ngame_dir = D:\\Games #1\\TLG\nframe_cap = 60\nbogus = 1\nwindow_width = wide\n",
+            "display_mode = Borderless\nresolution = 2560x1440\nrefresh_rate = 144hz\nvsync = fast # tear-free\nvolume = 70\ngame_dir = D:\\Games #1\\TLG\nframe_cap = 45\nbogus = 1\nwindow_width = wide\n",
         );
         assert_eq!(s.display_mode, DisplayMode::Borderless);
         assert_eq!(s.resolution, Some((2560, 1440)));
@@ -375,6 +382,9 @@ mod tests {
         assert_eq!(s.game_dir, Some(PathBuf::from("D:\\Games #1\\TLG")));
         assert_eq!(s.frame_cap, FrameCap::Game);
         assert_eq!(errs.len(), 3, "{errs:?}");
+        let (s, errs) = Settings::parse("frame_cap = 60 # experimental\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(s.frame_cap, FrameCap::Fps60);
     }
 
     #[test]
@@ -411,6 +421,7 @@ mod tests {
             refresh_rate: 60,
             vsync: VSync::Off,
             filter: Filter::Sharp,
+            frame_cap: FrameCap::Fps60,
             game_dir: Some(PathBuf::from(r"E:\TLG\CUSA03627")),
             close_launcher: true,
             ..Settings::default()

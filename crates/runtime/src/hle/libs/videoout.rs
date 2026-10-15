@@ -94,18 +94,39 @@ fn immediate_flips() -> bool {
     })
 }
 
-/// The frame-rate limit of immediate flips: flips no closer than the
-/// title's flip rate allows (rate n: every n+1 vblanks at 60 Hz, 30 fps for
-/// update 01.03's rate 1), as the console's vblank-timed flips. On a fixed
+/// The frame-rate limit in force: `tune frame_cap` (`TLG_FRAME_CAP`: 0 none,
+/// 1 the game's, 60), else settings.txt `frame_cap`.
+pub fn frame_cap() -> crate::config::FrameCap {
+    use crate::config::FrameCap;
+    match crate::tune::get(crate::tune::FRAME_CAP) {
+        -1 => crate::config::settings().frame_cap,
+        0 => FrameCap::Off,
+        60 => FrameCap::Fps60,
+        _ => FrameCap::Game,
+    }
+}
+
+/// The flip rate in force (rate n: a flip every n+1 vblanks at 60 Hz): the
+/// title's (update 01.03 sets 1, 30 fps), or 0 at the 60 fps limit, the
+/// title's time step then snapped to 1/60 s instead of 1/30 s
+/// (`title_patches::set_step_60`; where that is not possible the title's
+/// rate stays). None: no limit (`frame_cap = off`, `tune frame_cap 0`).
+fn flip_rate_in_force(rate: u32) -> Option<u32> {
+    use crate::config::FrameCap;
+    let cap = frame_cap();
+    let sixty = cap == FrameCap::Fps60 && crate::title_patches::set_step_60(true);
+    if !sixty {
+        crate::title_patches::set_step_60(false);
+    }
+    (cap != FrameCap::Off).then_some(if sixty { 0 } else { rate })
+}
+
+/// The frame-rate limit of immediate flips: flips no closer than the flip
+/// rate in force allows, as the console's vblank-timed flips. On a fixed
 /// schedule, so their average interval is exact (the title's time step
-/// snaps to 1/30 s near it); a late frame restarts the schedule. None:
-/// no limit (`frame_cap = off`, `tune frame_cap 0`).
+/// snaps to it); a late frame restarts the schedule. None: no limit.
 fn flip_interval(rate: u32) -> Option<Duration> {
-    let on = match crate::tune::get(crate::tune::FRAME_CAP) {
-        -1 => crate::config::settings().frame_cap == crate::config::FrameCap::Game,
-        v => v != 0,
-    };
-    on.then(|| Duration::from_nanos(16_666_667 * (rate as u64 + 1)))
+    flip_rate_in_force(rate).map(|r| Duration::from_nanos(16_666_667 * (r as u64 + 1)))
 }
 
 /// How late a flip may be and still keep the schedule (the next one then
@@ -159,7 +180,7 @@ fn vblank_thread() {
                 p.vblanks += 1;
                 VBLANK_CV.notify_all();
             }
-            let interval = p.flip_rate as u64 + 1;
+            let interval = if immediate { 1 } else { flip_rate_in_force(p.flip_rate).unwrap_or(p.flip_rate) as u64 + 1 };
             let now = Instant::now();
             let due = flip_at.is_none_or(|t| now >= t);
             if !p.pending.is_empty() && ((immediate && due) || (!immediate && p.vblanks - p.last_flip_vblank >= interval)) {
