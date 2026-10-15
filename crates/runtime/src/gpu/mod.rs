@@ -563,7 +563,7 @@ fn gfx_thread() {
                 crate::info!("rings since last report: host peak {} of {} MiB per segment, device peak {} of {} MiB", hp >> 20, hs >> 20, dp >> 20, ds >> 20);
                 let mips: Vec<String> = render::GPU_MIP_STAT_NAMES.iter().zip(render::GPU_MIP_STATS.iter()).map(|(n, v)| format!("{n} {}", v.load(Ordering::Relaxed))).collect();
                 crate::info!("GPU mip-chain/BC texture path: {}", mips.join(", "));
-                crate::info!("texture validations: {} unwritten, {} hashed ({} MiB hashed in total)", r.writes.clean, r.writes.dirty, r.hashed_bytes >> 20);
+                crate::info!("texture validations: {} unwritten, {} hashed ({} MiB hashed in total)", r.mem.writes.clean, r.mem.writes.dirty, r.hashed_bytes >> 20);
                 if let Some((mib, n, copied, hits)) = r.vcache_stats() {
                     crate::info!("VRAM mirrors: {mib} MiB in {n} windows; {copied} MiB copied in; {hits} bindings served");
                 }
@@ -960,7 +960,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         harvests: crate::mem::HARVESTS.load(Ordering::Relaxed),
         harvest_pages: crate::mem::HARVEST_PAGES.load(Ordering::Relaxed),
         harvest_ns: crate::mem::HARVEST_NS.load(Ordering::Relaxed),
-        ww_cached: r.writes.cached,
+        ww_cached: r.mem.writes.cached,
         cpu_epochs: CPU_EPOCH.load(Ordering::Relaxed),
         gfx_cpu: GFX_CPU_100NS.load(Ordering::Relaxed),
         batches: r.last_seq,
