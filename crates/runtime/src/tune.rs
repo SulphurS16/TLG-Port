@@ -668,8 +668,14 @@ pub const NGS2_FTZ: usize = 110;
 /// (`__fe_dfl_env` in libc.prx), where Windows starts threads with 0x1F80
 /// (denormals kept, and ~100 times slower) and 0x027F (`TLG_PS4_FPU`, 1).
 pub const PS4_FPU: usize = 111;
+/// The NGS2 mixer skips what silence passes through unchanged
+/// (`TLG_NGS2_IDLE`, 1): the mixing of silent voice outputs, a submixer's
+/// filters on silent input while they have no state left (silence out, bit
+/// for bit), and reverbs and delays on silent input once their state has
+/// died away under -180 dB (it is then cleared).
+pub const NGS2_IDLE: usize = 112;
 
-const TABLE: [(&str, &str, i64); 112] = [
+const TABLE: [(&str, &str, i64); 113] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -782,6 +788,7 @@ const TABLE: [(&str, &str, i64); 112] = [
     ("pipe_ahead", "TLG_PIPE_AHEAD", 1),
     ("ngs2_ftz", "TLG_NGS2_FTZ", 1),
     ("ps4_fpu", "TLG_PS4_FPU", 1),
+    ("ngs2_idle", "TLG_NGS2_IDLE", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -284,6 +284,10 @@ struct Voice {
     lfe_gain: f32,
     limit: f32,
     limiter: Option<Limiter>,
+    /// Mixing voices: consecutive grains with silent input, and whether the
+    /// reverb's or delay's state has died away and was cleared (`render`).
+    quiet: u32,
+    fx_idle: bool,
 }
 
 impl Voice {
@@ -321,6 +325,8 @@ impl Voice {
             lfe_gain: 1.0,
             limit: 0.0,
             limiter: None,
+            quiet: 0,
+            fx_idle: false,
         }
     }
 }
@@ -339,6 +345,9 @@ struct State {
     /// Measurement (a `tune::REV_AB` variant): ports 4-7 take the volume
     /// and matrix of port & 3, as before ports past 3 had their own.
     port_fold: bool,
+    /// Grains skipped as idle and run since the last statistics line
+    /// (`IDLE_FX_SKIPPED` ...).
+    idle: [u64; 6],
 }
 
 static NGS2: Mutex<Option<State>> = Mutex::new(None);
@@ -1264,9 +1273,34 @@ impl Drop for FtzGuard {
     }
 }
 
+/// A reverb's or delay's state under this (-180 dB) has died away (`tune
+/// ngs2_idle`): it is cleared, and the effect skipped while its input stays
+/// silent.
+const IDLE_EPS: f32 = 1e-9;
+/// Silent grains between checks of an effect's state (a scan of its delay
+/// lines).
+const IDLE_SCAN: u32 = 8;
+/// `State::idle` counters: reverb and delay grains skipped / run, submixer
+/// filter grains skipped / run, voice outputs not mixed (silent) / mixed.
+const IDLE_FX_SKIPPED: usize = 0;
+const IDLE_FX_RUN: usize = 1;
+const IDLE_EQ_SKIPPED: usize = 2;
+const IDLE_EQ_RUN: usize = 3;
+const IDLE_UNMIXED: usize = 4;
+const IDLE_MIXED: usize = 5;
+
+/// A voice's filters and compressor have no state left: on silent input
+/// they give silence, bit for bit (flat ones are not run at all).
+fn eq_at_rest(v: &Voice) -> bool {
+    v.eq.iter().flatten().all(|f| f.is_flat() || f.at_rest()) && v.comp.as_ref().is_none_or(|c| c.is_flat() || c.at_rest())
+}
+
 /// One grain of the system: samplers, then mixing voices in patch order, then
-/// the mastering voice into the render buffers.
-fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_CH]> {
+/// the mastering voice into the render buffers. With `idle` (`tune
+/// ngs2_idle`), what silence passes through unchanged is skipped: the mixing
+/// of silent outputs, a submixer's filters on silent input while they are at
+/// rest, reverbs and delays on silent input once they have died away.
+fn render(s: &mut State, system: u64, grain: usize, rate: u32, idle: bool) -> Vec<[f32; MAX_CH]> {
     let _ftz = FtzGuard::new();
     let at = s.systems.get(&system).map_or(0, |y| y.renders.saturating_sub(1)) * grain as u64;
     let rev_gain = reverb_ab_gain(s, at, rate);
@@ -1292,7 +1326,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             }
             continue;
         }
-        let ch = {
+        let (ch, silent) = {
             let v = s.voices.get_mut(vh).unwrap();
             render_sampler(v, grain, rate, &mut buf);
             let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
@@ -1302,8 +1336,13 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             run_eq(v, &mut buf, ch, rate);
             v.peak = peak_of(&buf, ch);
             v.peak_win = v.peak_win.max(v.peak);
-            ch
+            (ch, idle && v.peak == 0.0)
         };
+        if silent {
+            s.idle[IDLE_UNMIXED] += 1;
+            continue;
+        }
+        s.idle[IDLE_MIXED] += 1;
         route(s, *vh, &buf, ch);
     }
     // Mixing voices: deepest upstream first (a voice runs after everything that
@@ -1327,33 +1366,58 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
     let mut order: Vec<(u32, u64)> = mixers.iter().map(|&vh| (depth_of(s, vh, &mut depth, 0), vh)).collect();
     order.sort_by(|a, b| b.0.cmp(&a.0));
     for (_, vh) in order {
-        let (input, out, ch) = {
+        let (input, out, ch, silent) = {
             let v = s.voices.get_mut(&vh).unwrap();
             let ch = (v.channels as usize).clamp(1, MAX_CH);
             let mut input = std::mem::take(&mut v.input);
             let pk = peak_of(&input, ch);
             v.peak_win = v.peak_win.max(pk);
+            // (Silent input: the voice's own state alone makes its output. A
+            // reverb's or delay's is checked every IDLE_SCAN silent grains.)
+            let quiet = idle && pk == 0.0;
+            v.quiet = if quiet { v.quiet.saturating_add(1) } else { 0 };
+            let scan = quiet && v.quiet % IDLE_SCAN == 0;
             match v.kind {
+                Kind::Reverb | Kind::Custom if quiet && v.fx_idle => {
+                    s.idle[IDLE_FX_SKIPPED] += 1;
+                    (input, None, ch, true)
+                }
                 Kind::Reverb => {
                     let och = (v.out_channels as usize).clamp(1, MAX_CH);
-                    (input.clone(), Some(reverb_grain(v, &input, ch, och, rate, rev_gain)), och)
+                    let out = reverb_grain(v, &input, ch, och, rate, rev_gain);
+                    v.fx_idle = scan && v.reverb.as_mut().is_some_and(|r| r.settle(IDLE_EPS));
+                    s.idle[IDLE_FX_RUN] += 1;
+                    (input.clone(), Some(out), och, false)
                 }
                 Kind::Custom if v.taps.is_some() => {
                     let och = (v.out_channels as usize).clamp(1, MAX_CH);
                     let t = v.taps.as_mut().unwrap();
                     let out: Vec<[f32; MAX_CH]> = input.iter().map(|fr| t.process(fr, och.min(ch))).collect();
-                    (input, Some(out), och)
+                    v.fx_idle = scan && t.settle(IDLE_EPS);
+                    s.idle[IDLE_FX_RUN] += 1;
+                    (input, Some(out), och, false)
                 }
                 _ => {
+                    let rest = quiet && eq_at_rest(v);
                     if v.kind == Kind::Submixer {
-                        run_eq(v, &mut input, ch, rate);
+                        if rest {
+                            s.idle[IDLE_EQ_SKIPPED] += 1;
+                        } else {
+                            s.idle[IDLE_EQ_RUN] += 1;
+                            run_eq(v, &mut input, ch, rate);
+                        }
                     }
                     run_user_fx(v, &mut input, rate);
-                    (input, None, ch)
+                    (input, None, ch, rest && v.user_fx.is_none())
                 }
             }
         };
-        route(s, vh, out.as_deref().unwrap_or(&input), ch);
+        if silent {
+            s.idle[IDLE_UNMIXED] += 1;
+        } else {
+            s.idle[IDLE_MIXED] += 1;
+            route(s, vh, out.as_deref().unwrap_or(&input), ch);
+        }
         if let Some(v) = s.voices.get_mut(&vh) {
             v.input = input;
         }
@@ -1567,7 +1631,7 @@ sysv! {
         let mut g = NGS2.lock();
         let s = g.get_or_insert_with(State::default);
         let Some((grain, rate)) = s.systems.get_mut(&system).map(|y| { y.renders += 1; (y.grain as usize, y.sample_rate) }) else { return ERR_INVALID_HANDLE };
-        let mix = render(s, system, grain, rate);
+        let mix = render(s, system, grain, rate, crate::tune::get(crate::tune::NGS2_IDLE) != 0);
         // Every ~10 s: what the mixer is doing.
         let renders = s.systems[&system].renders;
         let peak = mix.iter().flat_map(|f| f.iter()).fold(0f32, |m, &x| m.max(x.abs()));
@@ -1583,7 +1647,19 @@ sysv! {
                     }
                 }
             }
-            crate::info!("NGS2: {} sampler voices playing (by waveform type {:x?}), {starved} without data; output peak {:.4} over the last 10 s", by_type.values().sum::<u32>(), by_type, s.peak);
+            let st = std::mem::take(&mut s.idle);
+            crate::info!(
+                "NGS2: {} sampler voices playing (by waveform type {:x?}), {starved} without data; output peak {:.4} over the last 10 s; grains skipped as idle: reverbs and delays {} of {}, submixer filters {} of {}, voice outputs {} of {} (silent, not mixed)",
+                by_type.values().sum::<u32>(),
+                by_type,
+                s.peak,
+                st[IDLE_FX_SKIPPED],
+                st[IDLE_FX_SKIPPED] + st[IDLE_FX_RUN],
+                st[IDLE_EQ_SKIPPED],
+                st[IDLE_EQ_SKIPPED] + st[IDLE_EQ_RUN],
+                st[IDLE_UNMIXED],
+                st[IDLE_UNMIXED] + st[IDLE_MIXED]
+            );
             s.peak = 0.0;
             if trace_voices() {
                 // The mix path's levels: each voice that carried sound, with
@@ -1783,5 +1859,63 @@ mod tests {
                 assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "direct {src_ch}");
             }
         }
+    }
+
+    #[test]
+    fn idle_skips_change_nothing_audible() {
+        // A burst through a filtered bus into a reverb, a delay and the
+        // mastering voice, then silence, with and without the idle skips:
+        // the same output bit for bit until the effects have died away (their
+        // tails are cut under -180 dB), and the skips happen.
+        fn build() -> State {
+            let mut s = State::default();
+            let (sam, bus, rev, dly, mst) = (0x10u64, 0x20u64, 0x30u64, 0x40u64, 0x50u64);
+            for (rack, vh, kind) in [(0x100u64, sam, Kind::Sampler), (0x200, bus, Kind::Submixer), (0x300, rev, Kind::Reverb), (0x400, dly, Kind::Custom), (0x500, mst, Kind::Mastering)] {
+                s.racks.insert(rack, Rack { system: 1, rack_id: 0, buf: BufferInfo::default(), voices: vec![vh] });
+                s.voices.insert(vh, Voice::new(rack, kind, 0));
+            }
+            let patch = |port: u32, dest: u64| Patch { port, dest, dest_input: 0 };
+            let v = s.voices.get_mut(&sam).unwrap();
+            v.flags = STATE_IN_USE | STATE_PLAYING;
+            let mut x = 0x1357_9bdfu32;
+            v.sampler.pcm = (0..4800)
+                .map(|_| {
+                    x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    let mut fr = [0f32; MAX_CH];
+                    fr[0] = (x as i32) as f32 / 4e9;
+                    fr
+                })
+                .collect();
+            v.patches = vec![patch(0, bus)];
+            let v = s.voices.get_mut(&bus).unwrap();
+            v.eq_params[0] = Some((FilterKind::Peaking, 1000.0, 1.0, 2.0));
+            v.patches = vec![patch(0, mst), patch(1, rev), patch(2, dly)];
+            s.voices.get_mut(&rev).unwrap().patches = vec![patch(0, mst)];
+            let words = [0, 0, 0.5f32.to_bits(), 0.3f32.to_bits(), 8000f32.to_bits(), 2, 0.6f32.to_bits(), 120f32.to_bits(), 0.4f32.to_bits(), 250f32.to_bits()];
+            let v = s.voices.get_mut(&dly).unwrap();
+            v.taps = Taps::from_words(&words, 48000);
+            v.patches = vec![patch(0, mst)];
+            s
+        }
+        let (mut on, mut off) = (build(), build());
+        let (mut first_diff, mut worst, mut peak) = (None, 0f32, 0f32);
+        for g in 0..1600 {
+            let a = render(&mut on, 1, 256, 48000, true);
+            let b = render(&mut off, 1, 256, 48000, false);
+            for (x, y) in a.iter().zip(&b) {
+                for c in 0..MAX_CH {
+                    peak = peak.max(y[c].abs());
+                    if x[c].to_bits() != y[c].to_bits() {
+                        first_diff.get_or_insert(g);
+                        worst = worst.max((x[c] - y[c]).abs());
+                    }
+                }
+            }
+        }
+        assert!(peak > 0.01, "the burst is heard ({peak})");
+        assert!(worst < 1e-7, "{worst}");
+        assert!(first_diff.is_none_or(|g| g >= 200), "{first_diff:?}");
+        assert!(on.idle[IDLE_FX_SKIPPED] > 0 && on.idle[IDLE_EQ_SKIPPED] > 0 && on.idle[IDLE_UNMIXED] > 0, "{:?}", on.idle);
+        assert_eq!(off.idle[IDLE_FX_SKIPPED] + off.idle[IDLE_EQ_SKIPPED] + off.idle[IDLE_UNMIXED], 0);
     }
 }

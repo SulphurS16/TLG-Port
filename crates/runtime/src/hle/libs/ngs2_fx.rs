@@ -149,6 +149,43 @@ fn wrap_inc(i: usize, n: usize) -> usize {
     if i + 1 == n { 0 } else { i + 1 }
 }
 
+/// The largest |x| of `v` (NaNs passed over), eight lanes at a time.
+fn max_abs(v: &[f32]) -> f32 {
+    let mut lanes = [0f32; 8];
+    let chunks = v.chunks_exact(8);
+    let rest = chunks.remainder();
+    for c in chunks {
+        for k in 0..8 {
+            let a = c[k].abs();
+            if a > lanes[k] {
+                lanes[k] = a;
+            }
+        }
+    }
+    let mut m = 0f32;
+    for &x in rest.iter().chain(&lanes) {
+        let a = x.abs();
+        if a > m {
+            m = a;
+        }
+    }
+    m
+}
+
+/// `max_abs` over frames of eight channels.
+fn max_abs_frames(v: &[[f32; 8]]) -> f32 {
+    let mut lanes = [0f32; 8];
+    for f in v {
+        for k in 0..8 {
+            let a = f[k].abs();
+            if a > lanes[k] {
+                lanes[k] = a;
+            }
+        }
+    }
+    max_abs(&lanes)
+}
+
 /// The reverb of one reverb rack voice.
 pub struct Reverb {
     p: I3dl2,
@@ -224,6 +261,32 @@ impl Reverb {
     /// Whether the parameters or rate changed enough to rebuild.
     pub fn matches(&self, p: &I3dl2, rate: u32) -> bool {
         self.p == *p && self.rate == rate.max(8000)
+    }
+
+    /// Whether the reverb has died away: every value of its state under
+    /// `eps`. The state is then cleared, so that silence in gives silence
+    /// out bit for bit (the mixer skips it while its input stays silent).
+    pub fn settle(&mut self, eps: f32) -> bool {
+        let mut m = max_abs(&[self.in_lp, self.hp_x, self.hp_y]).max(max_abs(&self.pre));
+        for c in &self.combs {
+            m = m.max(c.lp.abs()).max(max_abs(&c.buf));
+        }
+        for a in self.ap.iter().flatten() {
+            m = m.max(max_abs(&a.buf));
+        }
+        if !(m < eps) {
+            return false;
+        }
+        (self.in_lp, self.hp_x, self.hp_y) = (0.0, 0.0, 0.0);
+        self.pre.fill(0.0);
+        for c in &mut self.combs {
+            c.lp = 0.0;
+            c.buf.fill(0.0);
+        }
+        for a in self.ap.iter_mut().flatten() {
+            a.buf.fill(0.0);
+        }
+        true
     }
 
     /// One frame: mono input (the channels' mean), a stereo pair out.
@@ -396,6 +459,17 @@ impl Taps {
         self.fb = new.fb;
     }
 
+    /// Whether the delay has died away (every value of its line and filter
+    /// under `eps`; then cleared, as `Reverb::settle`).
+    pub fn settle(&mut self, eps: f32) -> bool {
+        if !(max_abs(&self.lp).max(max_abs_frames(&self.buf)) < eps) {
+            return false;
+        }
+        self.lp = [0.0; 8];
+        self.buf.fill([0.0; 8]);
+        true
+    }
+
     /// One frame of `ch` channels.
     pub fn process(&mut self, x: &[f32; 8], ch: usize) -> [f32; 8] {
         let n = self.buf.len();
@@ -486,6 +560,11 @@ impl Biquad {
     /// No effect at these parameters (a shelf or peak at unity gain).
     pub fn is_flat(&self) -> bool {
         !matches!(self.kind, FilterKind::LowPass | FilterKind::HighPass) && (self.level - 1.0).abs() < 1e-3
+    }
+
+    /// No state left: silence in gives silence out.
+    pub fn at_rest(&self) -> bool {
+        self.z.iter().all(|z| z[0] == 0.0 && z[1] == 0.0)
     }
 
     fn design(&mut self, rate: u32) {
@@ -605,6 +684,12 @@ impl Compressor {
     /// No effect at these parameters.
     pub fn is_flat(&self) -> bool {
         (self.slope >= 1.0 || self.thr >= 1.0) && (self.gain - 1.0).abs() < 1e-3
+    }
+
+    /// No detector state left (on silence its output is silence anyway; the
+    /// state decides how it meets the next sound).
+    pub fn at_rest(&self) -> bool {
+        self.ms == 0.0 && self.env == 0.0
     }
 
     /// Compresses channels 0..ch of every frame in place.
@@ -890,6 +975,48 @@ mod tests {
             pos = (pos + 1) % n;
             let got = t.process(&fr, 3);
             assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
+    }
+
+    #[test]
+    fn effects_settle_after_silence() {
+        // A reverb and a delay after an impulse: not settled while their
+        // tails ring, settled within seconds of silence and then cleared:
+        // silence in, silence out.
+        let mut r = Reverb::new(I3dl2::default(), 48000);
+        r.process(1.0);
+        for _ in 0..4800 {
+            r.process(0.0);
+        }
+        assert!(!r.settle(1e-9));
+        let mut n = 4800;
+        while !r.settle(1e-9) {
+            for _ in 0..4800 {
+                r.process(0.0);
+            }
+            n += 4800;
+            assert!(n < 48000 * 30, "the reverb never settled");
+        }
+        for _ in 0..48000 {
+            assert_eq!(r.process(0.0), [0.0, 0.0]);
+        }
+        let words = [0, 0, 0.5f32.to_bits(), 0.3f32.to_bits(), 8000f32.to_bits(), 2, 0.6f32.to_bits(), 120f32.to_bits(), 0.4f32.to_bits(), 250f32.to_bits()];
+        let mut t = Taps::from_words(&words, 48000).unwrap();
+        t.process(&[1.0; 8], 2);
+        for _ in 0..4800 {
+            t.process(&[0.0; 8], 2);
+        }
+        assert!(!t.settle(1e-9));
+        let mut n = 4800;
+        while !t.settle(1e-9) {
+            for _ in 0..4800 {
+                t.process(&[0.0; 8], 2);
+            }
+            n += 4800;
+            assert!(n < 48000 * 30, "the delay never settled");
+        }
+        for _ in 0..48000 {
+            assert_eq!(t.process(&[0.0; 8], 2), [0.0; 8]);
         }
     }
 }
