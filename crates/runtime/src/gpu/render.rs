@@ -1923,9 +1923,10 @@ pub struct Renderer {
     reused_targets: u64,
     /// Texture validations settled by comparing shared edge pages.
     edge_skips: u64,
-    /// The memory model: VRAM mirror windows, their binding cache, the
-    /// write tracker, pending GPU writes, zero-copy spans (`MemModel`).
-    pub mem: MemModel,
+    /// The shared memory model's guard while this renderer uses it (`mem!`):
+    /// VRAM mirror windows, their binding cache, the write tracker, pending
+    /// GPU writes, zero-copy spans (`MemModel`).
+    mem_g: Option<parking_lot::MutexGuard<'static, MemModel>>,
     /// The recording context in use (`BatchCtx`): the graphics queue's, or
     /// while a compute CP records, the compute queues' (`select_ctx`).
     cx: Box<BatchCtx>,
@@ -1956,7 +1957,73 @@ struct PendingWrite {
     bits: Option<(u64, u64, u32)>,
 }
 
-pub static RENDERER: Mutex<Option<Renderer>> = Mutex::new(None);
+static RENDERER_CELL: Mutex<Option<Renderer>> = Mutex::new(None);
+
+/// The renderer lock. Its guard (`RGuard`) releases the shared-state guards
+/// the renderer took while it was held (`Renderer::release_shared`), so none
+/// outlives it and blocks another renderer.
+pub struct RendererLock;
+pub static RENDERER: RendererLock = RendererLock;
+
+impl RendererLock {
+    pub fn lock(&self) -> RGuard {
+        RGuard(Some(RENDERER_CELL.lock()))
+    }
+    pub fn try_lock_for(&self, d: std::time::Duration) -> Option<RGuard> {
+        RENDERER_CELL.try_lock_for(d).map(|g| RGuard(Some(g)))
+    }
+}
+
+pub struct RGuard(Option<parking_lot::MutexGuard<'static, Option<Renderer>>>);
+
+impl RGuard {
+    /// Releases the lock to a waiting thread (parking_lot's fair unlock).
+    fn unlock_fair(mut self) {
+        let mut g = self.0.take().unwrap();
+        if let Some(r) = g.as_mut() {
+            r.release_shared();
+        }
+        parking_lot::MutexGuard::unlock_fair(g);
+    }
+}
+
+impl Drop for RGuard {
+    fn drop(&mut self) {
+        if let Some(mut g) = self.0.take() {
+            if let Some(r) = g.as_mut() {
+                r.release_shared();
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for RGuard {
+    type Target = Option<Renderer>;
+    fn deref(&self) -> &Option<Renderer> {
+        self.0.as_ref().unwrap()
+    }
+}
+
+impl std::ops::DerefMut for RGuard {
+    fn deref_mut(&mut self) -> &mut Option<Renderer> {
+        self.0.as_mut().unwrap()
+    }
+}
+
+/// The memory model, shared by the renderers (`Renderer::mem_g`).
+static MEM_CELL: std::sync::OnceLock<parking_lot::Mutex<MemModel>> = std::sync::OnceLock::new();
+
+fn lock_mem() -> parking_lot::MutexGuard<'static, MemModel> {
+    MEM_CELL.get().expect("renderer not initialized").lock()
+}
+
+/// The memory model for this renderer: its guard, taken on first use and
+/// held until the renderer lock is released (or `release_shared`).
+macro_rules! mem {
+    ($s:expr) => {
+        (&mut **$s.mem_g.get_or_insert_with(lock_mem))
+    };
+}
 
 /// A recording context: its command pool, the batch slots (command buffers,
 /// fences, descriptor pools, queries) and rings of the given sizes.
@@ -2108,6 +2175,33 @@ pub fn init() -> Result<(), String> {
             .map_err(|e| format!("occlusion query pool: {e}"))?;
         OCCL_POOL.set(occl_pool).ok();
         crate::thread::spawn_host("GPU-complete", 1 << 20, Box::new(completion_thread)).map_err(|e| e.to_string())?;
+        MEM_CELL.set(parking_lot::Mutex::new(MemModel {
+            zc_spans: Vec::new(),
+            zc_gen: 0,
+            cpu_epoch: 0,
+            pending_log: Vec::new(),
+            writes: super::writes::WriteTracker::new(),
+            gpu_pending_pages: PageSeqs::default(),
+            gpu_pending_all: 0,
+            vcache: None,
+            sparse_pool: None,
+            vbind: FastMap::default(),
+            vgen: 0,
+            epoch: 0,
+            meta_images: Vec::new(),
+            meta_gen: 1,
+            meta_cache: (0, Vec::new(), 0),
+            img_bases: std::collections::BTreeMap::new(),
+            img_max_bytes: 0,
+            img_bases_large: std::collections::BTreeMap::new(),
+            stale: std::collections::BTreeMap::new(),
+            stale_max: 0,
+            stale_aged: 0,
+            stale_ivals: Vec::new(),
+            stale_sorted: false,
+            stale_span_max: 0,
+            stale_unbounded_lo: u64::MAX,
+        })).ok();
         *RENDERER.lock() = Some(Renderer {
             last_seq: 0,
             images: FastMap::default(),
@@ -2197,33 +2291,7 @@ pub fn init() -> Result<(), String> {
             reused_skips: 0,
             reused_targets: 0,
             edge_skips: 0,
-            mem: MemModel {
-                zc_spans: Vec::new(),
-                zc_gen: 0,
-                cpu_epoch: 0,
-                pending_log: Vec::new(),
-                writes: super::writes::WriteTracker::new(),
-                gpu_pending_pages: PageSeqs::default(),
-                gpu_pending_all: 0,
-                vcache: None,
-                sparse_pool: None,
-                vbind: FastMap::default(),
-                vgen: 0,
-                epoch: 0,
-                meta_images: Vec::new(),
-                meta_gen: 1,
-                meta_cache: (0, Vec::new(), 0),
-                img_bases: std::collections::BTreeMap::new(),
-                img_max_bytes: 0,
-                img_bases_large: std::collections::BTreeMap::new(),
-                stale: std::collections::BTreeMap::new(),
-                stale_max: 0,
-                stale_aged: 0,
-                stale_ivals: Vec::new(),
-                stale_sorted: false,
-                stale_span_max: 0,
-                stale_unbounded_lo: u64::MAX,
-            },
+            mem_g: None,
             cx: Box::new(cx),
             cx_park: Box::new(cx_park),
             cx_cs: false,
@@ -2819,15 +2887,15 @@ impl Renderer {
     /// which are tracked as ranges.)
     pub fn new_epoch(&mut self, kind: EpochKind) {
         use std::sync::atomic::Ordering::Relaxed;
-        self.mem.epoch += 1;
-        self.mem.cpu_epoch += 1;
-        self.mem.writes.epoch = self.mem.cpu_epoch;
-        super::CPU_EPOCH.store(self.mem.cpu_epoch, Relaxed);
+        mem!(self).epoch += 1;
+        mem!(self).cpu_epoch += 1;
+        mem!(self).writes.epoch = mem!(self).cpu_epoch;
+        super::CPU_EPOCH.store(mem!(self).cpu_epoch, Relaxed);
         if kind != EpochKind::Compute {
-            super::GFX_EPOCH.store(self.mem.cpu_epoch, Relaxed);
+            super::GFX_EPOCH.store(mem!(self).cpu_epoch, Relaxed);
         }
         if kind != EpochKind::Graphics {
-            super::CS_EPOCH.store(self.mem.cpu_epoch, Relaxed);
+            super::CS_EPOCH.store(mem!(self).cpu_epoch, Relaxed);
         }
     }
 
@@ -2836,8 +2904,8 @@ impl Renderer {
     fn set_required_epoch(&mut self, compute_queue: bool) {
         let e = if compute_queue { &super::CS_EPOCH } else { &super::GFX_EPOCH };
         self.cx.required_epoch = e.load(std::sync::atomic::Ordering::Relaxed);
-        self.mem.writes.required = self.cx.required_epoch;
-        self.mem.writes.class = compute_queue as usize;
+        mem!(self).writes.required = self.cx.required_epoch;
+        mem!(self).writes.class = compute_queue as usize;
         super::REQUIRED_EPOCH.with(|r| r.set(self.cx.required_epoch));
     }
 
@@ -2849,7 +2917,7 @@ impl Renderer {
             return;
         }
         if !self.cx.writebacks.is_empty() {
-            self.mem.epoch += 1;
+            mem!(self).epoch += 1;
         }
         super::set_phase(super::phase::SUBMIT_WAIT, self.cx.batch);
         let seq = self.submit_batch(Vec::new());
@@ -2862,6 +2930,16 @@ impl Renderer {
     /// performed after it and everything before it has completed. Returns the
     /// batch's sequence number.
     #[track_caller]
+    /// Drops the shared-state guards this renderer holds.
+    fn release_shared(&mut self) {
+        self.mem_g = None;
+    }
+
+    /// The shared memory model (its guard taken if not held).
+    pub fn mem(&mut self) -> &mut MemModel {
+        mem!(self)
+    }
+
     /// Makes the compute queues' context (`compute`) or the graphics queue's
     /// the one in use.
     fn select_ctx(&mut self, compute: bool) {
@@ -3221,15 +3299,15 @@ impl Renderer {
             None => k.width as u64 * k.height as u64 * match format_class(k.format) { c @ 1..=16 => c.max(4), _ => 16 } as u64,
         };
         let bytes = (linear * k.layers.max(1) as u64 * 2).max(256 << 10);
-        self.mem.img_bases.entry(k.base).or_default().push((k, bytes));
+        mem!(self).img_bases.entry(k.base).or_default().push((k, bytes));
         if bytes > IMG_NEAR_BYTES {
-            self.mem.img_bases_large.entry(k.base).or_default().push((k, bytes));
+            mem!(self).img_bases_large.entry(k.base).or_default().push((k, bytes));
         }
-        self.mem.img_max_bytes = self.mem.img_max_bytes.max(bytes);
+        mem!(self).img_max_bytes = mem!(self).img_max_bytes.max(bytes);
         self.image_bytes += img.bytes;
         self.images.insert(k, img);
         self.newer_gen += 1;
-        self.mem.meta_gen += 1;
+        mem!(self).meta_gen += 1;
         *self.base_gen.entry(k.base).or_default() += 1;
     }
 
@@ -3423,11 +3501,11 @@ impl Renderer {
         let meta = (info & (1 << 13) != 0 && cmask != 0).then(|| (cmask, (pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64).div_ceil(2)));
         if img.meta != meta {
             img.meta = meta;
-            self.mem.meta_gen += 1;
+            mem!(self).meta_gen += 1;
         }
         if img.meta.is_some() && !img.meta_listed {
             img.meta_listed = true;
-            self.mem.meta_images.push(key);
+            mem!(self).meta_images.push(key);
         }
         Ok(Some(Attachment { key, view_format: format, layer: slice_start.min(key.layers.max(1) - 1) }))
     }
@@ -3462,11 +3540,11 @@ impl Renderer {
         let meta = (zinfo & (1 << 29) != 0 && htile != 0).then(|| (htile, pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64 * 4));
         if img.meta != meta {
             img.meta = meta;
-            self.mem.meta_gen += 1;
+            mem!(self).meta_gen += 1;
         }
         if img.meta.is_some() && !img.meta_listed {
             img.meta_listed = true;
-            self.mem.meta_images.push(key);
+            mem!(self).meta_images.push(key);
         }
         Ok(Some(Attachment { key, view_format: format, layer: 0 }))
     }
@@ -3537,21 +3615,22 @@ impl Renderer {
         n.meta_listed = o.meta_listed;
         n.guest_newer = o.guest_newer;
         n.last_used = o.last_used;
-        for k in self.mem.meta_images.iter_mut().chain(self.mem.stale.values_mut().flatten()) {
+        let m = mem!(self);
+        for k in m.meta_images.iter_mut().chain(m.stale.values_mut().flatten()) {
             if *k == old {
                 *k = new;
             }
         }
-        self.mem.meta_gen += 1;
+        mem!(self).meta_gen += 1;
         // (`stale_ivals` rebuilt with the next aging.)
-        self.mem.stale_aged = u64::MAX;
+        mem!(self).stale_aged = u64::MAX;
         if let Some(v) = self.by_base.get_mut(&old.base) {
             v.retain(|x| *x != old);
         }
-        if let Some(v) = self.mem.img_bases.get_mut(&old.base) {
+        if let Some(v) = mem!(self).img_bases.get_mut(&old.base) {
             v.retain(|x| x.0 != old);
         }
-        if let Some(v) = self.mem.img_bases_large.get_mut(&old.base) {
+        if let Some(v) = mem!(self).img_bases_large.get_mut(&old.base) {
             v.retain(|x| x.0 != old);
         }
         if let Some(g) = self.write_gen.remove(&old) {
@@ -3619,20 +3698,20 @@ impl Renderer {
         // Becoming stale: CPU writes to the image's memory from now on mean
         // the title has reused it (see `writeback_images`).
         if let Some(total) = self.images.get(&key).filter(|i| !i.guest_stale).and_then(|i| Self::image_guest_layout(&key, i)).map(|g| g.3) {
-            let (_, stamp) = self.mem.writes.cpu_written_since(key.base, total, u64::MAX);
+            let (_, stamp) = mem!(self).writes.cpu_written_since(key.base, total, u64::MAX);
             if let Some(i) = self.images.get_mut(&key) {
                 i.stale_stamp = stamp;
             }
         }
-        let ks = self.mem.stale.entry(key.base).or_default();
+        let ks = mem!(self).stale.entry(key.base).or_default();
         if !ks.contains(&key) {
             ks.push(key);
             let total = self.images.get(&key).and_then(|i| Self::image_guest_layout(&key, i)).map(|g| g.3);
             if let Some(t) = total {
-                self.mem.stale_max = self.mem.stale_max.max(t);
+                mem!(self).stale_max = mem!(self).stale_max.max(t);
             }
-            self.mem.stale_ivals.push(Self::stale_ival(&key, total));
-            self.mem.stale_sorted = false;
+            mem!(self).stale_ivals.push(Self::stale_ival(&key, total));
+            mem!(self).stale_sorted = false;
         }
     }
 
@@ -3642,13 +3721,13 @@ impl Renderer {
         self.vcache_invalidate(base, len);
         let seq = self.last_seq + 1;
         if perf_on() {
-            if self.mem.pending_log.len() >= 4096 {
-                self.mem.pending_log.drain(..2048);
+            if mem!(self).pending_log.len() >= 4096 {
+                mem!(self).pending_log.drain(..2048);
             }
-            self.mem.pending_log.push((base, len, self.cx.cur_shader, seq));
+            mem!(self).pending_log.push((base, len, self.cx.cur_shader, seq));
         }
         if len > SURFACE_WRITE_MAX {
-            self.mem.gpu_pending_all = seq;
+            mem!(self).gpu_pending_all = seq;
             return;
         }
         // (Entries of this batch stay until it completes: a range noted for
@@ -3660,7 +3739,7 @@ impl Renderer {
         if !self.cx.pending_noted.1.insert((base, len)) {
             return;
         }
-        self.mem.gpu_pending_pages.insert(base >> 12, ((base + len.max(1) - 1) >> 12) + 1, seq);
+        mem!(self).gpu_pending_pages.insert(base >> 12, ((base + len.max(1) - 1) >> 12) + 1, seq);
     }
 
     /// GPU work of this batch writes guest [base, base+len) in the mirror
@@ -3683,16 +3762,16 @@ impl Renderer {
             return false;
         }
         let done = *DONE.lock();
-        let mut need = if self.mem.gpu_pending_all > done { self.mem.gpu_pending_all } else { 0 };
+        let mut need = if mem!(self).gpu_pending_all > done { mem!(self).gpu_pending_all } else { 0 };
         for &a in reads {
-            if let Some(s) = self.mem.gpu_pending_pages.get(a >> 12) {
+            if let Some(s) = mem!(self).gpu_pending_pages.get(a >> 12) {
                 if s > done {
                     need = need.max(s);
                 }
             }
         }
-        if self.mem.gpu_pending_pages.len() > 1 << 12 {
-            self.mem.gpu_pending_pages.retain_after(done);
+        if mem!(self).gpu_pending_pages.len() > 1 << 12 {
+            mem!(self).gpu_pending_pages.retain_after(done);
         }
         if need == 0 {
             return false;
@@ -3704,12 +3783,12 @@ impl Renderer {
             let mut g = GUARD_SITES.lock();
             let m = g.get_or_insert_with(HashMap::new);
             for &a in reads {
-                if !self.mem.gpu_pending_pages.get(a >> 12).is_some_and(|s| s > done) && self.mem.gpu_pending_all <= done {
+                if !mem!(self).gpu_pending_pages.get(a >> 12).is_some_and(|s| s > done) && mem!(self).gpu_pending_all <= done {
                     continue;
                 }
                 let w = self.cx.writebacks.iter().rev().find(|w| w.base <= a && a < w.base + w.size).map(|w| (w.base, w.size, w.mirror, "this batch"));
                 let w = w.or_else(|| COMPLETIONS.lock().iter().rev().find_map(|c| c.dev_writes.iter().find(|d| d.0 <= a && a < d.0 + d.3).map(|d| (d.0, d.3, true, "in flight"))));
-                let who = self.mem.pending_log.iter().rev().find(|e| e.0 <= a && a < e.0 + e.1.max(1)).map(|e| format!("; registered by {:#x} as {:#x}+{:#x}", e.2, e.0, e.1)).unwrap_or_default();
+                let who = mem!(self).pending_log.iter().rev().find(|e| e.0 <= a && a < e.0 + e.1.max(1)).map(|e| format!("; registered by {:#x} as {:#x}+{:#x}", e.2, e.0, e.1)).unwrap_or_default();
                 let k = match w {
                     Some((b, n, mirror, when)) => format!("{:#x}/{:#x} reads {:#x} (+{:#x} into {b:#x}+{n:#x}, {}{when}{who})", self.cx.prep_vs, self.cx.prep_shader, a, a - b, if mirror { "mirror, " } else { "" }),
                     None => format!("{:#x}/{:#x} reads {:#x} (no covering write-back{who})", self.cx.prep_vs, self.cx.prep_shader, a),
@@ -3935,13 +4014,13 @@ impl Renderer {
         let Some((vb, voff)) = self.vcache_bind_ex(base, bytes, true, true) else { return Ok(None) };
         // (Every byte of the range is written.)
         self.mirror_write_back_full(base, bytes, vb, voff)?;
-        self.mem.writes.note_gpu_write(base, bytes);
+        mem!(self).writes.note_gpu_write(base, bytes);
         self.note_mirror_write(vb, base, bytes);
         if bytes <= SURFACE_WRITE_MAX {
             self.note_meta_write(base, bytes);
             self.note_buffer_write(base, bytes);
         }
-        self.mem.epoch += 1;
+        mem!(self).epoch += 1;
         Ok(Some((vb, voff)))
     }
 
@@ -4245,13 +4324,13 @@ impl Renderer {
         global_barrier(self.cx.cmd);
         unsafe { REC.cmd_copy_buffer(self.cx.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]) };
         unordered!(self);
-        self.mem.writes.note_gpu_write(dst, bytes);
+        mem!(self).writes.note_gpu_write(dst, bytes);
         self.note_mirror_write(dbuf, dst, bytes);
         if bytes <= SURFACE_WRITE_MAX {
             self.note_meta_write(dst, bytes);
             self.note_buffer_write(dst, bytes);
         }
-        self.mem.epoch += 1;
+        mem!(self).epoch += 1;
         self.dma_mirror += 1;
         self.mark(|| "DMA_DATA copy (GPU, mirror)".into());
         true
@@ -4306,13 +4385,13 @@ impl Renderer {
     /// metadata it overwrites.
     fn note_inplace_gpu_write(&mut self, base: u64, len: u64) {
         self.push_zc_write(base, len);
-        self.mem.writes.note_gpu_write(base, len);
+        mem!(self).writes.note_gpu_write(base, len);
         self.note_pending_gpu_write(base, len);
         if len <= SURFACE_WRITE_MAX {
             self.note_meta_write(base, len);
             self.note_buffer_write(base, len);
         }
-        self.mem.epoch += 1;
+        mem!(self).epoch += 1;
     }
 
     /// Records a shader write to a storage image (for `sync_alias`).
@@ -4485,7 +4564,7 @@ impl Renderer {
             }
         }
         self.init_image(key)?;
-        let batch = self.mem.epoch;
+        let batch = mem!(self).epoch;
         let mut needs_upload = {
             let img = &self.images[&key];
             !img.gpu_written && img.upload_batch != batch
@@ -4495,7 +4574,7 @@ impl Renderer {
         if needs_upload {
             let bytes = resources::texture_bytes(t, depth_layers.max(1));
             let img = &self.images[&key];
-            if img.cpu_checked != u64::MAX && img.cpu_checked >= self.cx.required_epoch && img.validated.is_some_and(|v| !self.mem.writes.gpu_written_since(t.base, bytes, v)) {
+            if img.cpu_checked != u64::MAX && img.cpu_checked >= self.cx.required_epoch && img.validated.is_some_and(|v| !mem!(self).writes.gpu_written_since(t.base, bytes, v)) {
                 self.images.get_mut(&key).unwrap().upload_batch = batch;
                 needs_upload = false;
             }
@@ -4508,7 +4587,7 @@ impl Renderer {
             // Hash only when the OS saw pages of the texture written (or the
             // GPU wrote there) since the last validation.
             let since = self.images[&key].validated;
-            let (written, stamp) = self.mem.writes.changed_since(t.base, bytes, since.unwrap_or(0));
+            let (written, stamp) = mem!(self).writes.changed_since(t.base, bytes, since.unwrap_or(0));
             let mut changed = false;
             let mut h = 0;
             // TLG_WRITE_WATCH_VERIFY=1: hash anyway and report changes the
@@ -4539,7 +4618,7 @@ impl Renderer {
             }
             let img = self.images.get_mut(&key).unwrap();
             img.validated = Some(stamp);
-            img.cpu_checked = self.mem.cpu_epoch;
+            img.cpu_checked = mem!(self).cpu_epoch;
         }
         if storage {
             self.sync_alias(key)?;
@@ -4567,7 +4646,7 @@ impl Renderer {
         let since = img.stale_stamp;
         self.images.get_mut(&k).unwrap().reuse_checked = frame;
         let (lo, hi) = ((k.base + 0xFFF) & !0xFFF, (k.base + total) & !0xFFF);
-        if lo >= hi || !self.mem.writes.cpu_written_since(lo, hi - lo, since).0 {
+        if lo >= hi || !mem!(self).writes.cpu_written_since(lo, hi - lo, since).0 {
             return false;
         }
         let img = self.images.get_mut(&k).unwrap();
@@ -4596,13 +4675,13 @@ impl Renderer {
     /// Whether the only pages of [base, base+bytes) written after stamp `since`
     /// are the range's partially covered first/last page and the range's
     /// bytes there equal those saved at the last hash (`page_edges`).
-    fn edges_unchanged(&self, key: ImageKey, base: u64, bytes: u64, since: u64) -> bool {
+    fn edges_unchanged(&mut self, key: ImageKey, base: u64, bytes: u64, since: u64) -> bool {
         let Some(saved) = self.images.get(&key).and_then(|i| i.edges.as_deref()) else { return false };
         let end = base + bytes;
         let (head_page, tail_page) = (base & !0xFFF, (end - 1) & !0xFFF);
         let head_partial = base & 0xFFF != 0;
         let tail_partial = end & 0xFFF != 0;
-        for (a, b) in self.mem.writes.dirty_runs(base, end, since) {
+        for (a, b) in mem!(self).writes.dirty_runs(base, end, since) {
             // (A run may span many pages: all of it must lie in one edge page.)
             let (first, last) = (a & !0xFFF, (b - 1) & !0xFFF);
             let ok = first == last && ((head_partial && first == head_page) || (tail_partial && first == tail_page));
@@ -4640,9 +4719,9 @@ impl Renderer {
             return Ok(false);
         }
         let since = self.images[&key].validated;
-        let (written, stamp) = self.mem.writes.changed_since(t.base, bytes, since.unwrap_or(0));
+        let (written, stamp) = mem!(self).writes.changed_since(t.base, bytes, since.unwrap_or(0));
         if !written && since.is_some() {
-            let cpu_epoch = self.mem.cpu_epoch;
+            let cpu_epoch = mem!(self).cpu_epoch;
             let img = self.images.get_mut(&key).unwrap();
             img.upload_batch = batch;
             img.validated = Some(stamp);
@@ -4690,7 +4769,7 @@ impl Renderer {
         self.uploads += 1;
         self.gpu_tex_uploads += 1;
         self.mark(|| "texture detiling (GPU)".into());
-        let cpu_epoch = self.mem.cpu_epoch;
+        let cpu_epoch = mem!(self).cpu_epoch;
         let img = self.images.get_mut(&key).unwrap();
         img.upload_batch = batch;
         img.validated = Some(stamp);
@@ -4724,20 +4803,20 @@ impl Renderer {
             VBIND_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if !overwrite && crate::tune::get(crate::tune::VBIND_CACHE) != 0 {
-            if let Some(&(k, wgen, checked, buf, off)) = self.mem.vbind.get(&(base, size)) {
+            if let Some(&(k, wgen, checked, buf, off)) = mem!(self).vbind.get(&(base, size)) {
                 let required = self.cx.required_epoch;
                 // (Stale only by a newer epoch: its blocks' CPU-write checks
                 // again, as the fill would make them; still current when they
                 // invalidate none of it - `tune vbind_recheck`.)
-                let same = |r: &Self| r.mem.vcache.as_ref().and_then(|vc| vc.windows.get(&k)).is_some_and(|w| w.buf == buf && w.part_gen(base, size) == wgen);
+                let same = |m: &MemModel| m.vcache.as_ref().and_then(|vc| vc.windows.get(&k)).is_some_and(|w| w.buf == buf && w.part_gen(base, size) == wgen);
                 let mut checked = checked;
-                if checked != u64::MAX && checked < required && crate::tune::get(crate::tune::VBIND_RECHECK) != 0 && same(self) {
-                    let epoch = self.mem.cpu_epoch;
-                    if self.vcache_check(k, base, size, epoch, required).is_some() && same(self) {
-                        let w = &self.mem.vcache.as_ref().unwrap().windows[&k];
+                if checked != u64::MAX && checked < required && crate::tune::get(crate::tune::VBIND_RECHECK) != 0 && same(&*mem!(self)) {
+                    let epoch = mem!(self).cpu_epoch;
+                    if self.vcache_check(k, base, size, epoch, required).is_some() && same(&*mem!(self)) {
+                        let w = &mem!(self).vcache.as_ref().unwrap().windows[&k];
                         let (b0, b1) = (((base - w.lo) >> 16) as usize, ((base + size - 1 - w.lo) >> 16) as usize);
                         checked = w.checked[b0..=b1].iter().copied().min().unwrap_or(u64::MAX);
-                        if let Some(e) = self.mem.vbind.get_mut(&(base, size)) {
+                        if let Some(e) = mem!(self).vbind.get_mut(&(base, size)) {
                             e.2 = checked;
                         }
                         if perf_on() {
@@ -4745,7 +4824,7 @@ impl Renderer {
                         }
                     }
                 }
-                if let Some(vc) = self.mem.vcache.as_mut() {
+                if let Some(vc) = mem!(self).vcache.as_mut() {
                     if let Some(w) = vc.windows.get_mut(&k).filter(|w| w.buf == buf && w.part_gen(base, size) == wgen && checked != u64::MAX && checked >= required) {
                         w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
                         vc.hits += 1;
@@ -4762,9 +4841,9 @@ impl Renderer {
             let why = if overwrite {
                 0
             } else {
-                match self.mem.vbind.get(&(base, size)) {
+                match mem!(self).vbind.get(&(base, size)) {
                     None => 1,
-                    Some(&(k, wgen, _, buf, _)) => match self.mem.vcache.as_ref().and_then(|vc| vc.windows.get(&k)) {
+                    Some(&(k, wgen, _, buf, _)) => match mem!(self).vcache.as_ref().and_then(|vc| vc.windows.get(&k)) {
                         Some(w) if w.buf == buf => {
                             if w.part_gen(base, size) != wgen {
                                 VBIND_MISS_SRC[BPART_CS.get() as usize][w.bump_src(base, size, wgen)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -4784,7 +4863,7 @@ impl Renderer {
         // has grown past it.
         // (The window of the base's own slot first: writers and later readers
         // of a range then meet in the same window.)
-        let found = self.mem.vcache.as_ref().and_then(|vc| {
+        let found = mem!(self).vcache.as_ref().and_then(|vc| {
             let fits = |w: &&VWindow| w.lo <= base && base + size <= w.hi;
             vc.windows.values().filter(fits).find(|w| w.lo >> VWIN_SHIFT == base >> VWIN_SHIFT).or_else(|| vc.windows.values().find(fits)).map(|w| w.lo)
         });
@@ -4809,7 +4888,7 @@ impl Renderer {
                 // released once the batches using them have completed.
                 let seq = self.last_seq + 1;
                 let mut gone = Vec::new();
-                if let Some(vc) = self.mem.vcache.as_mut() {
+                if let Some(vc) = mem!(self).vcache.as_mut() {
                     // (Same slot only: windows of neighbouring slots overlap
                     // by design, see `VWIN_SIZE`.)
                     let stale: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.lo >> VWIN_SHIFT == slot >> VWIN_SHIFT && w.lo < hi && lo < w.hi).map(|(k, _)| *k).collect();
@@ -4826,15 +4905,15 @@ impl Renderer {
                     self.retire_dirty_set(b, seq);
                 }
                 let cost = if sparse_mirrors() { 0 } else { hi - lo };
-                if self.mem.vcache.as_ref().map_or(0, |vc| vc.bytes) + cost > VCACHE_BUDGET {
+                if mem!(self).vcache.as_ref().map_or(0, |vc| vc.bytes) + cost > VCACHE_BUDGET {
                     return None;
                 }
                 self.vcache_new_window(lo, hi)?;
                 lo
             }
         };
-        let (epoch, required) = (self.mem.cpu_epoch, self.cx.required_epoch);
-        let vc = self.mem.vcache.as_mut().unwrap();
+        let (epoch, required) = (mem!(self).cpu_epoch, self.cx.required_epoch);
+        let vc = mem!(self).vcache.as_mut().unwrap();
         let w = vc.windows.get_mut(&k)?;
         if base < w.lo || base + size > w.hi {
             return None;
@@ -4858,7 +4937,7 @@ impl Renderer {
                     let ty = ctx().memory_type(req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL);
                     match (ty, req.alignment) {
                         (Some(ty), block) if block.is_power_of_two() && block <= SPARSE_CHUNK && (1 << 20) % block == 0 => {
-                            let pool = self.mem.sparse_pool.get_or_insert_with(|| BlockPool { block, ty, chunks: FastMap::default(), free: Vec::new() });
+                            let pool = mem!(self).sparse_pool.get_or_insert_with(|| BlockPool { block, ty, chunks: FastMap::default(), free: Vec::new() });
                             if pool.block != block || pool.ty != ty {
                                 unsafe { ctx().device.destroy_buffer(buf, None) };
                                 return Err(format!("sparse block {block:#x} / memory type {ty} differ from the pool's"));
@@ -4886,9 +4965,9 @@ impl Renderer {
             let pages = ((hi - lo) >> 12) as usize;
             let blocks = ((hi - lo + 0xFFFF) >> 16) as usize;
             let cost = if sparse.is_some() { 0 } else { hi - lo };
-            self.mem.vgen += 1;
-            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, wgen: self.mem.vgen, cgen: vec![self.mem.vgen; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], csrc: vec![5; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], sparse };
-            let vc = self.mem.vcache.get_or_insert_with(|| VCache { windows: FastMap::default(), bytes: 0, copied: 0, hits: 0 });
+            mem!(self).vgen += 1;
+            let w = VWindow { lo, hi, buf, mem, valid: vec![0; pages.div_ceil(64)], touched: vec![0; pages.div_ceil(64)], checked: vec![u64::MAX; blocks], stamp: vec![0; blocks], last_used: 0, wgen: mem!(self).vgen, cgen: vec![mem!(self).vgen; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], csrc: vec![5; (((hi - lo) >> VGEN_SHIFT) + 1) as usize], sparse };
+            let vc = mem!(self).vcache.get_or_insert_with(|| VCache { windows: FastMap::default(), bytes: 0, copied: 0, hits: 0 });
             vc.bytes += cost;
             vc.windows.insert(lo, w);
         }
@@ -4899,7 +4978,9 @@ impl Renderer {
     /// covers and that lack it; the binds go out before the batch is
     /// submitted (`submit_batch`). False when block memory is unavailable.
     fn vcache_resident(&mut self, k: u64, base: u64, size: u64) -> bool {
-        let Some(vc) = self.mem.vcache.as_mut() else { return false };
+        let m = mem!(self);
+        let pool = &mut m.sparse_pool;
+        let Some(vc) = m.vcache.as_mut() else { return false };
         let VCache { windows, bytes, .. } = vc;
         let Some(w) = windows.get_mut(&k) else { return false };
         let Some(sp) = w.sparse.as_mut() else { return true };
@@ -4911,7 +4992,7 @@ impl Renderer {
             if sp.resident[word] >> bit & 1 != 0 {
                 continue;
             }
-            let block = (*bytes + sp.block <= VCACHE_BUDGET).then(|| self.mem.sparse_pool.as_mut().and_then(BlockPool::take)).flatten();
+            let block = (*bytes + sp.block <= VCACHE_BUDGET).then(|| pool.as_mut().and_then(BlockPool::take)).flatten();
             let Some((memory, memory_offset)) = block else {
                 ok = false;
                 break;
@@ -4941,7 +5022,8 @@ impl Renderer {
     /// blocks in one write-watch query); pages found written become invalid
     /// (their parts' generations bumped).
     fn vcache_check(&mut self, k: u64, base: u64, size: u64, epoch: u64, required: u64) -> Option<()> {
-        let vc = self.mem.vcache.as_mut().unwrap();
+        let m = mem!(self);
+        let vc = m.vcache.as_mut().unwrap();
         let w = vc.windows.get_mut(&k)?;
         let (b0, b1) = (((base - w.lo) >> 16) as usize, ((base + size - 1 - w.lo) >> 16) as usize);
         let mut i = b0;
@@ -4962,20 +5044,20 @@ impl Renderer {
             // elsewhere invalidate it explicitly: `note_pending_gpu_write`.)
             let with_gpu = crate::tune::get(crate::tune::MIRROR_GPU_STAMPS) != 0;
             let th = tsc();
-            let (written, stamp) = self.mem.writes.cpu_changed_since(rlo, rhi - rlo, since, with_gpu);
+            let (written, stamp) = m.writes.cpu_changed_since(rlo, rhi - rlo, since, with_gpu);
             bpart(14, th);
             if written {
-                let mut runs = if with_gpu { self.mem.writes.dirty_runs(rlo, rhi, since) } else { self.mem.writes.cpu_dirty_runs(rlo, rhi, since) };
+                let mut runs = if with_gpu { m.writes.dirty_runs(rlo, rhi, since) } else { m.writes.cpu_dirty_runs(rlo, rhi, since) };
                 if runs.is_empty() {
                     // (Written but no page stamps: no write watching.)
                     runs.push((rlo, rhi));
                 }
-                self.mem.vgen += 1;
+                m.vgen += 1;
                 for (a, b) in runs {
                     bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, false);
-                    w.bump(a, b, self.mem.vgen, 1);
+                    w.bump(a, b, m.vgen, 1);
                 }
-                w.wgen = self.mem.vgen;
+                w.wgen = m.vgen;
             }
             for x in i..j {
                 w.checked[x] = epoch;
@@ -4991,7 +5073,7 @@ impl Renderer {
             return None;
         }
         self.vcache_check(k, base, size, epoch, required)?;
-        let vc = self.mem.vcache.as_mut().unwrap();
+        let vc = mem!(self).vcache.as_mut().unwrap();
         let w = vc.windows.get_mut(&k)?;
         if overwrite {
             // Whole pages the caller overwrites: current once it has.
@@ -5121,7 +5203,7 @@ impl Renderer {
                 }
                 unordered!(self);
             }
-            let vc = self.mem.vcache.as_mut().unwrap();
+            let vc = mem!(self).vcache.as_mut().unwrap();
             let w = vc.windows.get_mut(&k).unwrap();
             for &(a, b) in &runs {
                 bits_set(&mut w.valid, a, b, true);
@@ -5145,16 +5227,17 @@ impl Renderer {
                 self.mark(|| "vertex/index data to VRAM".into());
             }
         }
-        let vc = self.mem.vcache.as_mut().unwrap();
+        let m = mem!(self);
+        let vc = m.vcache.as_mut().unwrap();
         vc.hits += 1;
         if !overwrite {
             if let Some(w) = vc.windows.get(&k) {
                 let (b0, b1) = (((base - w.lo) >> 16) as usize, ((base + size - 1 - w.lo) >> 16) as usize);
                 let checked = w.checked[b0..=b1].iter().copied().min().unwrap_or(u64::MAX);
-                if self.mem.vbind.len() >= 1 << 16 {
-                    self.mem.vbind.clear();
+                if m.vbind.len() >= 1 << 16 {
+                    m.vbind.clear();
                 }
-                self.mem.vbind.insert((base, size), (k, w.part_gen(base, size), checked, vbuf, base - wlo));
+                m.vbind.insert((base, size), (k, w.part_gen(base, size), checked, vbuf, base - wlo));
             }
         }
         Some((vbuf, base - wlo))
@@ -5167,7 +5250,7 @@ impl Renderer {
     /// forwarded -- from the buffer `exclude`, from a released mirror window,
     /// from a batch whose slot may be reused, in-place or CPU-performed
     /// writes (end-of-pipe actions) -- or with the import: the caller waits.
-    fn mirror_forwards(&self, spans: &[(u64, u64)], exclude: vk::Buffer) -> Option<Vec<(u64, vk::Buffer, u64, u64)>> {
+    fn mirror_forwards(&mut self, spans: &[(u64, u64)], exclude: vk::Buffer) -> Option<Vec<(u64, vk::Buffer, u64, u64)>> {
         self.mirror_forwards_keep(spans, exclude).filter(|(_, keep)| keep.is_empty()).map(|(out, _)| out)
     }
 
@@ -5175,7 +5258,7 @@ impl Renderer {
     /// writes the window already holds (its own mirror-resident writes) are
     /// returned as guest ranges to leave out of the copy-in instead of
     /// failing, unless a forward overlaps one (their order is not known).
-    fn mirror_forwards_keep(&self, spans: &[(u64, u64)], exclude: vk::Buffer) -> Option<(Vec<(u64, vk::Buffer, u64, u64)>, Vec<(u64, u64)>)> {
+    fn mirror_forwards_keep(&mut self, spans: &[(u64, u64)], exclude: vk::Buffer) -> Option<(Vec<(u64, vk::Buffer, u64, u64)>, Vec<(u64, u64)>)> {
         if ctx().ext_host.is_some() || spans.is_empty() {
             return None;
         }
@@ -5195,7 +5278,8 @@ impl Renderer {
             }
         }
         out.extend(self.cx.writebacks.iter().filter(|p| overlaps(p.base, p.size)).map(|p| (p.base, p.dev_buf, p.dev_off, p.size)));
-        let live = |b: vk::Buffer| b == self.cx.dring.buffer || self.mem.vcache.as_ref().is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
+        let (dring, vc) = (self.cx.dring.buffer, mem!(self).vcache.as_ref());
+        let live = |b: vk::Buffer| b == dring || vc.is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
         let (keep, out): (Vec<_>, Vec<_>) = out.into_iter().partition(|e| exclude != vk::Buffer::null() && e.1 == exclude);
         if out.iter().any(|e| !live(e.1)) {
             return None;
@@ -5209,8 +5293,8 @@ impl Renderer {
 
     /// VRAM buffer cache statistics: (MiB allocated, windows, MiB copied in,
     /// bindings served).
-    pub fn vcache_stats(&self) -> Option<(u64, usize, u64, u64)> {
-        self.mem.vcache.as_ref().map(|v| (v.bytes >> 20, v.windows.len(), v.copied >> 20, v.hits))
+    pub fn vcache_stats(&mut self) -> Option<(u64, usize, u64, u64)> {
+        mem!(self).vcache.as_ref().map(|v| (v.bytes >> 20, v.windows.len(), v.copied >> 20, v.hits))
     }
 
     /// GPU or CP writes to guest [lo, lo+len): mirrored pages there must be
@@ -5219,7 +5303,7 @@ impl Renderer {
     /// data (the GPU wrote them there); other windows overlapping the range
     /// (neighbouring slots) were invalidated with the write.
     fn vcache_validate(&mut self, buf: vk::Buffer, lo: u64, len: u64) {
-        let Some(vc) = self.mem.vcache.as_mut() else { return };
+        let Some(vc) = mem!(self).vcache.as_mut() else { return };
         let hi = lo.saturating_add(len.max(1));
         for w in vc.windows.values_mut().filter(|w| w.buf == buf) {
             let (a, b) = (lo.max(w.lo), hi.min(w.hi));
@@ -5236,7 +5320,8 @@ impl Renderer {
     /// `vcache_invalidate` naming why (0 GPU writes, 2 CP writes, 3 remapped
     /// memory: `VBIND_MISS_SRC_NAMES`).
     fn vcache_invalidate_src(&mut self, lo: u64, len: u64, src: u8) {
-        let Some(vc) = self.mem.vcache.as_mut() else { return };
+        let m = mem!(self);
+        let Some(vc) = m.vcache.as_mut() else { return };
         let hi = lo.saturating_add(len.max(1));
         for w in vc.windows.values_mut() {
             let (a, b) = (lo.max(w.lo), hi.min(w.hi));
@@ -5244,11 +5329,11 @@ impl Renderer {
                 bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, false);
                 // (Not the window a GPU write lands in: `note_mirror_write`.)
                 if w.buf != self.cx.vgen_keep {
-                    self.mem.vgen += 1;
-                    w.wgen = self.mem.vgen;
+                    m.vgen += 1;
+                    w.wgen = m.vgen;
                     // (A mirror write landing in another window.)
                     let src = if self.cx.vgen_keep != vk::Buffer::null() { 4 } else { src };
-                    w.bump(a, b, self.mem.vgen, src);
+                    w.bump(a, b, m.vgen, src);
                 }
             }
         }
@@ -5668,7 +5753,7 @@ impl Renderer {
             return None; // zero-copy disabled (TLG_ZERO_COPY)
         }
         let max_range = (ctx().limits.max_storage_buffer_range as u64) & !3;
-        let span = match self.mem.zc_spans.iter().find(|s| s.0 <= base && base < s.1) {
+        let span = match mem!(self).zc_spans.iter().find(|s| s.0 <= base && base < s.1) {
             Some(s) => (s.0, s.1, s.2),
             None => {
                 let (start, end) = crate::mem::MEM.lock().committed_span(base)?;
@@ -5676,7 +5761,7 @@ impl Renderer {
                 match ctx().import_host(start, end - start, usage) {
                     Ok((buf, mem)) => {
                         crate::info!("zero-copy: imported guest memory {start:#x}-{end:#x} ({} MiB)", (end - start) >> 20);
-                        self.mem.zc_spans.push((start, end, buf, mem));
+                        mem!(self).zc_spans.push((start, end, buf, mem));
                         (start, end, buf)
                     }
                     Err(e) => {
@@ -5693,19 +5778,19 @@ impl Renderer {
     /// Drops imported spans when guest mappings changed (GPU idle first).
     fn zc_revalidate(&mut self) {
         let g = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::SeqCst);
-        if g == self.mem.zc_gen {
+        if g == mem!(self).zc_gen {
             return;
         }
-        self.mem.zc_gen = g;
+        mem!(self).zc_gen = g;
         // VRAM mirror pages of remapped ranges are stale.
         for (lo, hi) in crate::mem::take_map_changes() {
             self.vcache_invalidate_src(lo, hi.saturating_sub(lo), 3);
         }
-        if self.mem.zc_spans.is_empty() {
+        if mem!(self).zc_spans.is_empty() {
             return;
         }
         self.flush();
-        if let Some(vc) = self.mem.vcache.take() {
+        if let Some(vc) = mem!(self).vcache.take() {
             for (_, w) in vc.windows {
                 // (The GPU is idle: released now.)
                 super::lazywb::release_buffer(w.buf);
@@ -5715,13 +5800,13 @@ impl Renderer {
                 if w.mem != vk::DeviceMemory::null() {
                     ctx().free(w.mem);
                 }
-                if let (Some(p), Some(s)) = (self.mem.sparse_pool.as_mut(), w.sparse) {
+                if let (Some(p), Some(s)) = (mem!(self).sparse_pool.as_mut(), w.sparse) {
                     p.give(s.bound);
                 }
             }
         }
         let c = ctx();
-        for (start, end, buf, mem) in self.mem.zc_spans.drain(..) {
+        for (start, end, buf, mem) in mem!(self).zc_spans.drain(..) {
             unsafe {
                 c.device.destroy_buffer(buf, None);
                 c.free(mem);
@@ -5785,7 +5870,8 @@ impl Renderer {
             }
             // (Mirror windows hold data until they are released: only live
             // ones can be forwarded from.)
-            let live = |b: vk::Buffer| b == self.cx.dring.buffer || self.mem.vcache.as_ref().is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
+            let (dring, vc) = (self.cx.dring.buffer, mem!(self).vcache.as_ref());
+            let live = |b: vk::Buffer| b == dring || vc.is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
             if !inflight.iter().all(|e| live(e.1)) {
                 forward = false;
             }
@@ -5896,7 +5982,7 @@ impl Renderer {
             // (TLG_PERF=2: copies whose guest bytes equal the previous copy's.)
             super::copier::wait(self.cx.batch_copies);
             let h = resources::hash_slice(size, unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(r.1 as usize), size as usize) });
-            let stamp = self.mem.writes.stamp();
+            let stamp = mem!(self).writes.stamp();
             let prev = {
                 let mut g = UPLOAD_HASHES.lock();
                 let m = g.get_or_insert_with(HashMap::new);
@@ -5911,7 +5997,7 @@ impl Renderer {
             // (Neither GPU nor CPU writes found since the previous copy: a
             // copy kept from then would still be current.)
             if let Some((_, s)) = prev {
-                if !self.mem.writes.gpu_written_since(base, size, s) && !self.mem.writes.cpu_changed_since(base, size, s, false).0 {
+                if !mem!(self).writes.gpu_written_since(base, size, s) && !mem!(self).writes.cpu_changed_since(base, size, s, false).0 {
                     UPLOADS_REUSABLE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             }
@@ -5929,16 +6015,16 @@ impl Renderer {
     /// needed forwards are not kept (their GPU copies belong to one command).
     fn reused_upload(&mut self, base: u64, size: u64) -> Option<(vk::Buffer, u64)> {
         self.drain_cp_writes();
-        if self.cx.upload_reuse_epoch != self.mem.cpu_epoch {
+        if self.cx.upload_reuse_epoch != mem!(self).cpu_epoch {
             self.cx.upload_reuse.clear();
-            self.cx.upload_reuse_epoch = self.mem.cpu_epoch;
+            self.cx.upload_reuse_epoch = mem!(self).cpu_epoch;
             return None;
         }
         let &(bytes, buf, off, stamp, queue) = self.cx.upload_reuse.get(&base)?;
         if queue != self.cx.cmd_queue {
             return None;
         }
-        if bytes < size || self.mem.writes.gpu_written_since(base, bytes, stamp) {
+        if bytes < size || mem!(self).writes.gpu_written_since(base, bytes, stamp) {
             self.cx.upload_reuse.remove(&base);
             return None;
         }
@@ -5952,11 +6038,11 @@ impl Renderer {
         if self.cx.upload_forwarded || crate::tune::get(crate::tune::UPLOAD_REUSE) == 0 {
             return;
         }
-        if self.cx.upload_reuse_epoch != self.mem.cpu_epoch {
+        if self.cx.upload_reuse_epoch != mem!(self).cpu_epoch {
             self.cx.upload_reuse.clear();
-            self.cx.upload_reuse_epoch = self.mem.cpu_epoch;
+            self.cx.upload_reuse_epoch = mem!(self).cpu_epoch;
         }
-        self.cx.upload_reuse.insert(base, (size, buf, off, self.mem.writes.stamp(), self.cx.cmd_queue));
+        self.cx.upload_reuse.insert(base, (size, buf, off, mem!(self).writes.stamp(), self.cx.cmd_queue));
     }
 
     /// The CP wrote guest [addr, addr+len) directly: copies of it are stale.
@@ -6020,17 +6106,17 @@ impl Renderer {
                         // Images that are GPU-produced or already validated this epoch need no upload.
                         // (A base found ready counts as ready for the rest of
                         // the CPU epoch: an estimate, a short one is retried.)
-                        if self.ready_bases.get(&t.base) == Some(&self.mem.cpu_epoch) {
+                        if self.ready_bases.get(&t.base) == Some(&mem!(self).cpu_epoch) {
                             continue;
                         }
                         let ready = self.by_base.get(&t.base).is_some_and(|ks| {
                             ks.iter().any(|k| {
                                 let img = &self.images[k];
-                                (img.gpu_written && !img.guest_newer) || (!img.gpu_written && img.upload_batch == self.mem.epoch)
+                                (img.gpu_written && !img.guest_newer) || (!img.gpu_written && img.upload_batch == mem!(self).epoch)
                             })
                         });
                         if ready {
-                            self.ready_bases.insert(t.base, self.mem.cpu_epoch);
+                            self.ready_bases.insert(t.base, mem!(self).cpu_epoch);
                         } else {
                             let layers = if t.ty == desc::T_3D { t.depth } else { t.total_layers() }.max(1);
                             n += resources::texture_bytes(t, layers).min(64 << 20);
@@ -6098,10 +6184,10 @@ impl Renderer {
         // contents back would corrupt it).
         // Only images in the stale index can be newer than guest memory.
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-        if self.mem.stale_aged != frame {
-            self.mem.stale_aged = frame;
+        if mem!(self).stale_aged != frame {
+            mem!(self).stale_aged = frame;
             self.cx.attach_marked = false;
-            let mut stale = std::mem::take(&mut self.mem.stale);
+            let mut stale = std::mem::take(&mut mem!(self).stale);
             for ks in stale.values_mut() {
                 ks.retain(|k| match self.images.get_mut(k) {
                     Some(i) => {
@@ -6114,31 +6200,32 @@ impl Renderer {
                 });
             }
             stale.retain(|_, ks| !ks.is_empty());
-            self.mem.stale_ivals = stale.values().flatten().map(|k| Self::stale_ival(k, self.images.get(k).and_then(|i| Self::image_guest_layout(k, i)).map(|g| g.3))).collect();
-            self.mem.stale_sorted = false;
-            self.mem.stale = stale;
+            mem!(self).stale_ivals = stale.values().flatten().map(|k| Self::stale_ival(k, self.images.get(k).and_then(|i| Self::image_guest_layout(k, i)).map(|g| g.3))).collect();
+            mem!(self).stale_sorted = false;
+            mem!(self).stale = stale;
         }
         // (No stale image near this memory: nothing to write back.)
         let end = base.saturating_add(size);
-        if !self.mem.stale_sorted {
-            self.mem.stale_ivals.sort_unstable();
-            self.mem.stale_span_max = self.mem.stale_ivals.iter().filter(|e| e.1 != u64::MAX).map(|e| e.1 - e.0).max().unwrap_or(0);
-            self.mem.stale_unbounded_lo = self.mem.stale_ivals.iter().filter(|e| e.1 == u64::MAX).map(|e| e.0).min().unwrap_or(u64::MAX);
-            self.mem.stale_sorted = true;
+        if !mem!(self).stale_sorted {
+            mem!(self).stale_ivals.sort_unstable();
+            mem!(self).stale_span_max = mem!(self).stale_ivals.iter().filter(|e| e.1 != u64::MAX).map(|e| e.1 - e.0).max().unwrap_or(0);
+            mem!(self).stale_unbounded_lo = mem!(self).stale_ivals.iter().filter(|e| e.1 == u64::MAX).map(|e| e.0).min().unwrap_or(u64::MAX);
+            mem!(self).stale_sorted = true;
         }
+        let m = mem!(self);
         let near = || {
-            let i0 = self.mem.stale_ivals.partition_point(|e| e.0 < base.saturating_sub(self.mem.stale_span_max));
-            self.mem.stale_ivals[i0..].iter().take_while(|e| e.0 < end).any(|e| base < e.1)
+            let i0 = m.stale_ivals.partition_point(|e| e.0 < base.saturating_sub(m.stale_span_max));
+            m.stale_ivals[i0..].iter().take_while(|e| e.0 < end).any(|e| base < e.1)
         };
         if perf_on() {
             WB_IMAGES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            WB_IMAGES[1].fetch_add(self.mem.stale_ivals.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            WB_IMAGES[1].fetch_add(m.stale_ivals.len() as u64, std::sync::atomic::Ordering::Relaxed);
         }
-        if self.mem.stale_unbounded_lo >= end && !near() {
+        if m.stale_unbounded_lo >= end && !near() {
             return;
         }
         let mut keys: Vec<ImageKey> = Vec::new();
-        for ks in self.mem.stale.range(base.saturating_sub(self.mem.stale_max)..base + size).map(|(_, ks)| ks) {
+        for ks in m.stale.range(base.saturating_sub(m.stale_max)..base + size).map(|(_, ks)| ks) {
             for &k in ks {
                 let Some(i) = self.images.get(&k) else { continue };
                 if i.guest_stale && !i.guest_newer && !k.ty3d && Self::image_guest_layout(&k, i).is_some_and(|g| base < k.base + g.3) {
@@ -6158,7 +6245,7 @@ impl Renderer {
             // harvest then consumes them.)
             {
                 let since = self.images[&key].stale_stamp;
-                if self.mem.writes.cpu_written_since(key.base, total, since).0 {
+                if mem!(self).writes.cpu_written_since(key.base, total, since).0 {
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
                         crate::info!("write-back of {:#x} {}x{} {:?} skipped: the CPU wrote its memory since it was rendered (reused)", key.base, key.width, key.height, key.format);
@@ -6213,11 +6300,11 @@ impl Renderer {
                         // (Mirror tiling registered its write-back itself.)
                         if !mirrored {
                             self.push_zc_write(key.base, total);
-                            self.mem.writes.note_gpu_write(key.base, total);
+                            mem!(self).writes.note_gpu_write(key.base, total);
                             self.note_pending_gpu_write(key.base, total);
                         }
                         self.images.get_mut(&key).unwrap().guest_stale = false;
-                        self.mem.epoch += 1;
+                        mem!(self).epoch += 1;
                         self.gpu_remaps[1] += 1;
                         continue;
                     }
@@ -6261,15 +6348,15 @@ impl Renderer {
                 tiling::tile_slice(src, dst, key.width, key.height, key.width, ph, bpp, mode);
             }
             resources::copy_to_guest(&tiled, key.base);
-            self.mem.writes.note_gpu_write(key.base, total);
+            mem!(self).writes.note_gpu_write(key.base, total);
             // (A new baseline: these CPU writes are ours, not the title's.)
-            let (_, stamp) = self.mem.writes.cpu_written_since(key.base, total, u64::MAX);
+            let (_, stamp) = mem!(self).writes.cpu_written_since(key.base, total, u64::MAX);
             if let Some(i) = self.images.get_mut(&key) {
                 i.stale_stamp = stamp;
             }
             self.prof[1] += t0.elapsed();
             self.images.get_mut(&key).unwrap().guest_stale = false;
-            self.mem.epoch += 1;
+            mem!(self).epoch += 1;
             if crate::log::enabled(crate::log::Level::Debug) {
                 crate::debug!("render target {:#x} {}x{} {:?} written back to guest memory", key.base, key.width, key.height, key.format);
             }
@@ -6497,7 +6584,7 @@ impl Renderer {
                                     };
                                     for (b, n) in ranges {
                                         self.push_zc_write(b, n);
-                                        self.mem.writes.note_gpu_write(b, n);
+                                        mem!(self).writes.note_gpu_write(b, n);
                                         self.note_pending_gpu_write(b, n);
                                         // Other huge bindings are sparse writers
                                         // too: not a surface write.
@@ -6563,7 +6650,7 @@ impl Renderer {
                                     self.note_buffer_write(base, extent);
                                 }
                                 let t3 = bpart(2, t2);
-                                self.mem.writes.note_gpu_write(base, extent);
+                                mem!(self).writes.note_gpu_write(base, extent);
                                 let tn = bpart(15, t3);
                                 self.note_mirror_write(vb, base, extent);
                                 bpart(16, tn);
@@ -6620,7 +6707,7 @@ impl Renderer {
                                 unordered!(self);
                                 self.cx.gpu_wb.push((dev_off, zbuf, zoff, size));
                                 self.push_zc_write(base, size);
-                                self.mem.writes.note_gpu_write(base, size);
+                                mem!(self).writes.note_gpu_write(base, size);
                                 self.note_pending_gpu_write(base, size);
                                 self.mark(|| "written buffer setup copy".into());
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.cx.dring.buffer, offset: dev_off, range: size.next_multiple_of(4) })));
@@ -6631,9 +6718,9 @@ impl Renderer {
                             bpath = 6;
                             // (TLG_PERF=2: a map entry per copy.)
                             if perf_detail() {
-                                let now = (self.mem.cpu_epoch, self.cx.required_epoch, self.mem.writes.stamp(), self.cx.cmd_queue, self.cx.batch);
+                                let now = (mem!(self).cpu_epoch, self.cx.required_epoch, mem!(self).writes.stamp(), self.cx.cmd_queue, self.cx.batch);
                                 if let Some(&(ce, re, st, q, b)) = self.cx.upload_seen.get(&(base, size)) {
-                                    if q == now.3 && b != now.4 && !self.mem.writes.gpu_written_since(base, size, st) {
+                                    if q == now.3 && b != now.4 && !mem!(self).writes.gpu_written_since(base, size, st) {
                                         if ce == now.0 {
                                             XBATCH[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                         } else if re == now.1 {
@@ -6666,7 +6753,7 @@ impl Renderer {
                             let prev = self.cx.writebacks.iter().rev().find(|w| over(w)).filter(|w| !w.mirror && w.bits.is_none() && w.dev_buf == self.cx.dring.buffer && w.base == base && w.size == size).map(|w| w.dev_off);
                             if let Some(dev_off) = prev {
                                 bpath = 10;
-                                self.mem.writes.note_gpu_write(base, size);
+                                mem!(self).writes.note_gpu_write(base, size);
                                 self.note_pending_gpu_write(base, size);
                                 infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.cx.dring.buffer, offset: dev_off, range: size.next_multiple_of(4) })));
                                 continue;
@@ -6700,7 +6787,7 @@ impl Renderer {
                         }
                         self.push_writeback(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.cx.dring.buffer, mirror: false, bits: None });
                         bpart(10, t0);
-                        self.mem.writes.note_gpu_write(base, size);
+                        mem!(self).writes.note_gpu_write(base, size);
                         self.note_pending_gpu_write(base, size);
                         self.mark(|| "written buffer setup copy".into());
                         infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.cx.dring.buffer, offset: dev_off, range: size.next_multiple_of(4) })));
@@ -7434,7 +7521,7 @@ impl Renderer {
             // Buffer writes: order later consumers; CPU-sourced textures may
             // alias the written memory.
             unordered!(self);
-            self.mem.epoch += 1;
+            mem!(self).epoch += 1;
         }
         if trace_frame() {
             if vs.translated.out.bindings.iter().any(|b| b.kind == BindingKind::DebugOut) {
@@ -8368,7 +8455,7 @@ impl Renderer {
         self.dispatches += 1;
         self.cx.batch_cmds += 1;
         if self.cx.writebacks.len() + self.cx.zc_writes.len() > wb_before {
-            self.mem.epoch += 1;
+            mem!(self).epoch += 1;
         }
         if perf {
             self.cprof[class][6] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tl);
@@ -8386,8 +8473,9 @@ impl Renderer {
     fn note_buffer_write(&mut self, base: u64, size: u64) {
         // (Images starting up to IMG_NEAR_BYTES below the write, and the
         // large ones further below; one found twice is marked twice.)
-        let near = self.mem.img_bases.range(base.saturating_sub(self.mem.img_max_bytes.min(IMG_NEAR_BYTES))..base + size);
-        let far = self.mem.img_bases_large.range(base.saturating_sub(self.mem.img_max_bytes)..base + size);
+        let m = mem!(self);
+        let near = m.img_bases.range(base.saturating_sub(m.img_max_bytes.min(IMG_NEAR_BYTES))..base + size);
+        let far = m.img_bases_large.range(base.saturating_sub(m.img_max_bytes)..base + size);
         for (k, _) in near.chain(far).flat_map(|(_, ks)| ks.iter()).filter(|(k, bound)| k.base + bound > base) {
             let Some(img) = self.images.get_mut(k) else { continue };
             if !img.gpu_written || k.ty3d {
@@ -8437,9 +8525,9 @@ impl Renderer {
         let layers = key.layers.max(1);
         let bytes = resources::texture_bytes(t, layers);
         let since = self.images[&key].validated;
-        let (written, stamp) = self.mem.writes.changed_since(t.base, bytes, since.unwrap_or(0));
+        let (written, stamp) = mem!(self).writes.changed_since(t.base, bytes, since.unwrap_or(0));
         if !written && since.is_some() {
-            let cpu_epoch = self.mem.cpu_epoch;
+            let cpu_epoch = mem!(self).cpu_epoch;
             let img = self.images.get_mut(&key).unwrap();
             img.upload_batch = batch;
             img.validated = Some(stamp);
@@ -8549,7 +8637,7 @@ impl Renderer {
         self.gpu_tex_uploads += 1;
         self.mark(|| "texture detiling, mip chain (GPU)".into());
         mip_stat(0);
-        let cpu_epoch = self.mem.cpu_epoch;
+        let cpu_epoch = mem!(self).cpu_epoch;
         let img = self.images.get_mut(&key).unwrap();
         img.upload_batch = batch;
         img.validated = Some(stamp);
@@ -8725,7 +8813,7 @@ impl Renderer {
     fn dirty_set(&mut self, src: vk::Buffer) -> Result<vk::DescriptorSet, String> {
         // (Kept only for live mirror windows: a retired window's handle can
         // be reused by a new buffer once it is destroyed.)
-        let live = self.mem.vcache.as_ref().is_some_and(|vc| vc.windows.values().any(|w| w.buf == src));
+        let live = mem!(self).vcache.as_ref().is_some_and(|vc| vc.windows.values().any(|w| w.buf == src));
         if let Some(&s) = self.dirty_sets.get(&src).filter(|_| live) {
             return Ok(s);
         }
@@ -9011,14 +9099,15 @@ impl Renderer {
     /// their slot is reused, mirror windows while they live) that covers it
     /// entirely. None when no such write is pending (or one covers it only
     /// partly).
-    fn device_copy_of(&self, addr: u64, len: u64) -> Option<(vk::Buffer, u64)> {
+    fn device_copy_of(&mut self, addr: u64, len: u64) -> Option<(vk::Buffer, u64)> {
         let overlaps = |b: u64, n: u64| b < addr + len && addr < b + n;
         let covers = |b: u64, n: u64| b <= addr && addr + len <= b + n;
         if let Some(p) = self.cx.writebacks.iter().rev().find(|p| overlaps(p.base, p.size)) {
             return covers(p.base, p.size).then(|| (p.dev_buf, p.dev_off + (addr - p.base)));
         }
         let oldest = (self.last_seq + 2).saturating_sub(SLOTS as u64);
-        let live = |b: vk::Buffer| b == self.cx.dring.buffer || self.mem.vcache.as_ref().is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
+        let (dring, vc) = (self.cx.dring.buffer, mem!(self).vcache.as_ref());
+        let live = |b: vk::Buffer| b == dring || vc.is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
         for c in COMPLETIONS.lock().iter().rev() {
             // (CPU-performed end-of-pipe writes of it in flight: no device copy.)
             if c.actions.iter().any(|a| a.overlaps(addr, len)) {
@@ -9183,7 +9272,7 @@ impl Renderer {
             // (Images over the range are not marked older than guest memory:
             // the one written back stays the current copy.)
             self.mirror_write_back_full(key.base, total, zbuf, zoff)?;
-            self.mem.writes.note_gpu_write(key.base, total);
+            mem!(self).writes.note_gpu_write(key.base, total);
             self.note_mirror_write(zbuf, key.base, total);
         }
         unordered!(self);
@@ -9317,13 +9406,13 @@ impl Renderer {
     /// The images whose metadata surfaces overlap [base, base+size)
     /// (`inside`: lie entirely inside it), from `meta_cache`.
     fn meta_overlapping(&mut self, base: u64, size: u64, inside: bool) -> smallvec::SmallVec<[ImageKey; 4]> {
-        if self.mem.meta_cache.0 != self.mem.meta_gen {
-            let mut v: Vec<(u64, u64, ImageKey)> = self.mem.meta_images.iter().filter_map(|k| self.images.get(k).and_then(|i| i.meta).map(|(m, n)| (m, m + n, *k))).collect();
+        if mem!(self).meta_cache.0 != mem!(self).meta_gen {
+            let mut v: Vec<(u64, u64, ImageKey)> = mem!(self).meta_images.iter().filter_map(|k| self.images.get(k).and_then(|i| i.meta).map(|(m, n)| (m, m + n, *k))).collect();
             v.sort_unstable_by_key(|e| e.0);
             let max = v.iter().map(|e| e.1 - e.0).max().unwrap_or(0);
-            self.mem.meta_cache = (self.mem.meta_gen, v, max);
+            mem!(self).meta_cache = (mem!(self).meta_gen, v, max);
         }
-        let (_, v, max) = &self.mem.meta_cache;
+        let (_, v, max) = &mem!(self).meta_cache;
         let end = base.saturating_add(size);
         let i0 = v.partition_point(|e| e.0 < base.saturating_sub(*max));
         v[i0..].iter().take_while(|e| e.0 < end).filter(|e| if inside { base <= e.0 && e.1 <= end } else { base < e.1 }).map(|e| e.2).collect()
@@ -9461,7 +9550,7 @@ impl Renderer {
             if crate::mem::is_guest(mbase, msize) {
                 let expanded = vec![0xFFu8; msize as usize];
                 resources::copy_to_guest(&expanded, mbase);
-                self.mem.writes.note_gpu_write(mbase, msize);
+                mem!(self).writes.note_gpu_write(mbase, msize);
             }
         }
     }
@@ -9623,14 +9712,14 @@ impl Renderer {
             // written back to guest memory at the end of the batch (every
             // page), current for later readers of the mirror.
             self.mirror_write_back_full(base, span, zbuf, zoff)?;
-            self.mem.writes.note_gpu_write(base, span);
+            mem!(self).writes.note_gpu_write(base, span);
             self.note_mirror_write(zbuf, base, span);
         } else {
             // The expanded state lands in place (when a clear applied); the
             // probe read the metadata in place.
             self.push_zc_write(mbase, msize);
             self.zc_read(mbase, mbase + msize);
-            self.mem.writes.note_gpu_write(mbase, msize);
+            mem!(self).writes.note_gpu_write(mbase, msize);
             self.note_pending_gpu_write(mbase, msize);
         }
         // (As the CPU path's clear does; the draw that follows renders to it.)
@@ -9704,10 +9793,10 @@ impl Renderer {
                 let region = vk::BufferCopy { src_offset: o, dst_offset: dev_off, size: n };
                 unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.gds, self.cx.dring.buffer, &[region]) };
                 self.push_writeback(PendingWrite { base: dst, size: n, host_off, dev_off, dev_buf: self.cx.dring.buffer, mirror: false, bits: None });
-                self.mem.writes.note_gpu_write(dst, n);
+                mem!(self).writes.note_gpu_write(dst, n);
                 self.note_pending_gpu_write(dst, n);
                 self.note_buffer_write(dst, n);
-                self.mem.epoch += 1;
+                mem!(self).epoch += 1;
             }
         }
         unordered!(self);
@@ -9776,7 +9865,7 @@ impl Renderer {
                 }
                 false
             });
-            if let Some(p) = self.mem.sparse_pool.as_mut() {
+            if let Some(p) = mem!(self).sparse_pool.as_mut() {
                 p.give(blocks);
             }
             for (k, p) in pooled {
@@ -9854,8 +9943,8 @@ impl Renderer {
             let Some(img) = self.images.remove(k) else { continue };
             self.newer_gen += 1;
             if img.meta_listed {
-                self.mem.meta_images.retain(|x| x != k);
-                self.mem.meta_gen += 1;
+                mem!(self).meta_images.retain(|x| x != k);
+                mem!(self).meta_gen += 1;
             }
             if let Some(v) = self.by_base.get_mut(&k.base) {
                 v.retain(|x| x != k);
@@ -9863,16 +9952,16 @@ impl Renderer {
                     self.by_base.remove(&k.base);
                 }
             }
-            if let Some(v) = self.mem.img_bases.get_mut(&k.base) {
+            if let Some(v) = mem!(self).img_bases.get_mut(&k.base) {
                 v.retain(|x| x.0 != *k);
                 if v.is_empty() {
-                    self.mem.img_bases.remove(&k.base);
+                    mem!(self).img_bases.remove(&k.base);
                 }
             }
-            if let Some(v) = self.mem.img_bases_large.get_mut(&k.base) {
+            if let Some(v) = mem!(self).img_bases_large.get_mut(&k.base) {
                 v.retain(|x| x.0 != *k);
                 if v.is_empty() {
-                    self.mem.img_bases_large.remove(&k.base);
+                    mem!(self).img_bases_large.remove(&k.base);
                 }
             }
             self.write_gen.remove(k);
@@ -9900,7 +9989,7 @@ impl Renderer {
         let mut released = 0;
         if self.pressure >= 2 && release_windows {
             let mut gone = Vec::new();
-            if let Some(vc) = self.mem.vcache.as_mut() {
+            if let Some(vc) = mem!(self).vcache.as_mut() {
                 let idle: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.last_used + age <= frame).map(|(k, _)| *k).collect();
                 for k in idle {
                     let w = vc.windows.remove(&k).unwrap();
@@ -9915,7 +10004,7 @@ impl Renderer {
                 self.retire_dirty_set(b, seq);
             }
             // (Blocks of windows released earlier are back by now.)
-            if let Some(p) = self.mem.sparse_pool.as_mut() {
+            if let Some(p) = mem!(self).sparse_pool.as_mut() {
                 let freed = p.trim();
                 if freed > 0 {
                     crate::info!("VRAM: freed {} MiB of unused mirror block memory (pressure {})", freed >> 20, self.pressure);
@@ -9930,7 +10019,7 @@ impl Renderer {
                 usage >> 20,
                 budget >> 20,
                 self.image_bytes >> 20,
-                self.mem.vcache.as_ref().map_or(0, |v| v.bytes) >> 20,
+                mem!(self).vcache.as_ref().map_or(0, |v| v.bytes) >> 20,
                 if released > 0 { format!(", released {} MiB of mirrors", released >> 20) } else { String::new() }
             );
         }
@@ -9947,7 +10036,7 @@ impl Renderer {
         format!("images by guest base: {} bases, {} images, at most {} at one base, {} bases with 4 or more (most: {})", counts.len(), self.images.len(), counts.first().map_or(0, |c| c.0), many, top.join(", "))
     }
 
-    pub fn vram_report(&self) -> String {
+    pub fn vram_report(&mut self) -> String {
         let (mut tex, mut gpu, mut shadow) = (0u64, 0u64, 0u64);
         for (k, i) in &self.images {
             if is_shadow(k) {
@@ -9962,7 +10051,7 @@ impl Renderer {
         let sites: Vec<String> = sites.iter().take(8).map(|(at, b, n)| format!("{at} {} MiB in {n}", b >> 20)).collect();
         let budget = ctx().vram().map(|(u, b)| format!("; device-local usage {} MiB of a {} MiB budget; allocated by us {} MiB ({})", u >> 20, b >> 20, tracked >> 20, sites.join(", "))).unwrap_or_default();
         // Per mirror window: MiB ever bound / currently valid / allocated.
-        let mut wins: Vec<(u64, u64, u64, u64)> = self.mem.vcache.as_ref().map_or(Vec::new(), |vc| {
+        let mut wins: Vec<(u64, u64, u64, u64)> = mem!(self).vcache.as_ref().map_or(Vec::new(), |vc| {
             let ones = |v: &[u64]| v.iter().map(|x| x.count_ones() as u64).sum::<u64>() << 12;
             vc.windows.values().map(|w| (w.lo, ones(&w.touched), ones(&w.valid), w.bytes())).collect()
         });
@@ -9976,7 +10065,7 @@ impl Renderer {
             tex >> 20,
             gpu >> 20,
             shadow >> 20,
-            self.mem.vcache.as_ref().map_or(0, |v| v.bytes) >> 20,
+            mem!(self).vcache.as_ref().map_or(0, |v| v.bytes) >> 20,
             touched >> 20,
             wins.join(", "),
             self.tile_map_bytes >> 20,
@@ -10397,7 +10486,7 @@ pub static QUEUE_WAIT_REG_NS: [std::sync::atomic::AtomicU64; 64] = [const { std:
 static GFX_LOCK_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct TimedRenderer {
-    g: std::mem::ManuallyDrop<parking_lot::MutexGuard<'static, Option<Renderer>>>,
+    g: std::mem::ManuallyDrop<RGuard>,
     q: usize,
     /// When the lock was taken (TLG_PERF).
     since: Option<std::time::Instant>,
@@ -10446,7 +10535,7 @@ impl Drop for TimedRenderer {
         // 2-3, the compute CPs let a waiting graphics CP in.)
         let fair = crate::tune::get(crate::tune::LOCK_FAIR);
         if (self.q == 0 && fair == 1) || (self.q != 0 && fair >= 2) {
-            parking_lot::MutexGuard::unlock_fair(g);
+            g.unlock_fair();
         } else {
             drop(g);
         }
