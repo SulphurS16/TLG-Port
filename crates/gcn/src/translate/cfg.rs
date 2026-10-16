@@ -507,7 +507,14 @@ pub(crate) fn branch_cond(tr: &mut T, op: u16) -> R<Word> {
             let hi = tr.sreg(src as u32 + 1)?;
             let o = e(tr.b.bitwise_or(tr.t.u32, None, lo, hi))?;
             let z = tr.u(0);
-            let zero = e(tr.b.i_equal(tr.t.bool_, None, o, z))?;
+            let zero = if tr.wave_sync {
+                // The wave's mask is zero when no invocation's bit is set.
+                let set = e(tr.b.i_not_equal(tr.t.bool_, None, o, z))?;
+                let any = tr.wave_any(set)?;
+                e(tr.b.logical_not(tr.t.bool_, None, any))?
+            } else {
+                e(tr.b.i_equal(tr.t.bool_, None, o, z))?
+            };
             if op == 6 || op == 8 { zero } else { e(tr.b.logical_not(tr.t.bool_, None, zero))? }
         }
         _ => return Err(format!("unknown conditional branch op {op}")),
@@ -539,7 +546,7 @@ fn lds_construct(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>], n
         return Ok(false);
     }
     if tr.lds_phase != 0 {
-        if tr.cf_depth == 0 {
+        if tr.cf_depth == 0 || tr.wave_sync {
             tr.workgroup_barrier()?;
         } else {
             tr.lds_hazards_nested += 1;
@@ -602,6 +609,10 @@ pub(crate) fn emit(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>],
                 tr.b.branch(start).map_err(ef)?;
                 e(tr.b.begin_block(Some(start)))?;
                 tr.cf_depth += 1;
+                if lds && tr.wave_sync {
+                    // The previous iteration's accesses are pending.
+                    tr.lds_phase = 3;
+                }
                 emit(tr, code, ranges, body, Some((cont, merge)), None)?;
                 tr.cf_depth -= 1;
                 if lds {

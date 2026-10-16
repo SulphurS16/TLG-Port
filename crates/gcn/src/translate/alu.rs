@@ -667,6 +667,25 @@ fn usrc(tr: &mut T, ins: &Inst, v: &V, k: usize) -> R<Word> {
     tr.operand(ins, v.src[k])
 }
 
+/// A source of the bit moves (v_mov_b32, v_cndmask_b32) with the VOP3
+/// abs/neg modifiers applied to its sign bit, as the hardware does:
+/// compilers write fabs/fneg and their selects this way (`v_cndmask_b32 v7,
+/// v7, -v7, vcc` in TLG's occlusion tile sort: without the negation every
+/// compare-exchange sorted one way, and the per-tile occluder lists came out
+/// half sorted - square blocks of missing occlusion).
+fn bsrc(tr: &mut T, ins: &Inst, v: &V, k: usize) -> R<Word> {
+    let mut x = usrc(tr, ins, v, k)?;
+    if v.abs >> k & 1 != 0 {
+        let m = tr.u(0x7FFF_FFFF);
+        x = e(tr.b.bitwise_and(tr.t.u32, None, x, m))?;
+    }
+    if v.neg >> k & 1 != 0 {
+        let m = tr.u(0x8000_0000);
+        x = e(tr.b.bitwise_xor(tr.t.u32, None, x, m))?;
+    }
+    Ok(x)
+}
+
 /// 64-bit vector-instruction source (VGPR pair, SGPR pair or constant).
 fn vsrc64(tr: &mut T, ins: &Inst, op: u16) -> R<(Word, Word)> {
     if op >= 256 {
@@ -694,9 +713,10 @@ fn fout(tr: &mut T, v: &V, x: Word) -> R<()> {
         _ => {}
     }
     if v.clamp {
+        // (NaN clamps to 0.)
         let z = tr.f(0.0);
         let o = tr.f(1.0);
-        x = tr.glsl3(tr.t.f32, GLOp::FClamp, x, z, o)?;
+        x = tr.glsl3(tr.t.f32, GLOp::NClamp, x, z, o)?;
     }
     let u = tr.to_u(x)?;
     tr.set_vreg(v.dst as u32, u)
@@ -907,8 +927,8 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
         // ---- VOP2-derived (0x100 + op)
         0x100 => {
             // v_cndmask_b32
-            let a = usrc(tr, ins, &v, 0)?;
-            let b = usrc(tr, ins, &v, 1)?;
+            let a = bsrc(tr, ins, &v, 0)?;
+            let b = bsrc(tr, ins, &v, 1)?;
             let c = if v.vop3 { read_mask(tr, ins, v.src[2])? } else { read_mask(tr, ins, crate::OP_VCC_LO)? };
             let r = e(tr.b.select(u, None, c, b, a))?;
             uout(tr, &v, r)?;
@@ -952,8 +972,19 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 0x105 => e(tr.b.f_sub(f, None, b, a))?,
                 0x108 => e(tr.b.f_mul(f, None, a, b))?,
                 0x107 => legacy_mul(tr, a, b)?,
-                0x10F | 0x10D => tr.glsl2(f, GLOp::FMin, a, b)?,
-                _ => tr.glsl2(f, GLOp::FMax, a, b)?,
+                // v_min/v_max_f32: IEEE minNum/maxNum - a NaN operand yields
+                // the other one (GLSL FMin/FMax leave NaN results undefined).
+                0x10F => tr.glsl2(f, GLOp::NMin, a, b)?,
+                0x110 => tr.glsl2(f, GLOp::NMax, a, b)?,
+                // The legacy (DX9) forms: S0 < S1 ? S0 : S1, S0 >= S1 ? S0 : S1.
+                0x10D => {
+                    let lt = e(tr.b.f_ord_less_than(bt, None, a, b))?;
+                    e(tr.b.select(f, None, lt, a, b))?
+                }
+                _ => {
+                    let ge = e(tr.b.f_ord_greater_than_equal(bt, None, a, b))?;
+                    e(tr.b.select(f, None, ge, a, b))?
+                }
             };
             fout(tr, &v, r)?;
         }
@@ -1251,20 +1282,28 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 let a = fsrc(tr, ins, &v, 0)?;
                 let b = fsrc(tr, ins, &v, 1)?;
                 let c = fsrc(tr, ins, &v, 2)?;
+                // IEEE minNum/maxNum steps (NaN operands drop out); v_med3_f32
+                // with any NaN operand is the min3 of the rest (GCN ISA).
+                let min3 = |tr: &mut T| -> R<Word> {
+                    let m = tr.glsl2(f, GLOp::NMin, a, b)?;
+                    tr.glsl2(f, GLOp::NMin, m, c)
+                };
                 let r = match which {
-                    0 => {
-                        let m = tr.glsl2(f, GLOp::FMin, a, b)?;
-                        tr.glsl2(f, GLOp::FMin, m, c)?
-                    }
+                    0 => min3(tr)?,
                     1 => {
-                        let m = tr.glsl2(f, GLOp::FMax, a, b)?;
-                        tr.glsl2(f, GLOp::FMax, m, c)?
+                        let m = tr.glsl2(f, GLOp::NMax, a, b)?;
+                        tr.glsl2(f, GLOp::NMax, m, c)?
                     }
                     _ => {
-                        let mn = tr.glsl2(f, GLOp::FMin, a, b)?;
-                        let mx = tr.glsl2(f, GLOp::FMax, a, b)?;
-                        let m2 = tr.glsl2(f, GLOp::FMin, mx, c)?;
-                        tr.glsl2(f, GLOp::FMax, mn, m2)?
+                        let mn = tr.glsl2(f, GLOp::NMin, a, b)?;
+                        let mx = tr.glsl2(f, GLOp::NMax, a, b)?;
+                        let m2 = tr.glsl2(f, GLOp::NMin, mx, c)?;
+                        let med = tr.glsl2(f, GLOp::NMax, mn, m2)?;
+                        let (na, nb, nc) = (e(tr.b.is_nan(bt, None, a))?, e(tr.b.is_nan(bt, None, b))?, e(tr.b.is_nan(bt, None, c))?);
+                        let nab = e(tr.b.logical_or(bt, None, na, nb))?;
+                        let any = e(tr.b.logical_or(bt, None, nab, nc))?;
+                        let lo = min3(tr)?;
+                        e(tr.b.select(f, None, any, lo, med))?
                     }
                 };
                 return fout(tr, &v, r);
@@ -1362,7 +1401,7 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             let base = usrc(tr, ins, &v, 2)?;
             let z = tr.f(0.0);
             let m255 = tr.f(255.0);
-            let c = tr.glsl3(f, GLOp::FClamp, x, z, m255)?;
+            let c = tr.glsl3(f, GLOp::NClamp, x, z, m255)?;
             let rn = tr.glsl1(f, GLOp::RoundEven, c)?;
             let q = e(tr.b.convert_f_to_u(u, None, rn))?;
             let k3 = tr.u(3);
@@ -1428,7 +1467,7 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
         // ---- VOP1-derived (0x180 + op)
         0x180 => {}
         0x181 | 0x189 => {
-            let a = usrc(tr, ins, &v, 0)?;
+            let a = bsrc(tr, ins, &v, 0)?;
             uout(tr, &v, a)?;
         }
         0x182 => {
@@ -1449,18 +1488,22 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
         0x187 | 0x188 | 0x18C | 0x18D => {
             let a = fsrc(tr, ins, &v, 0)?;
             let r = match v.op {
+                // (NaN converts to 0.)
                 0x187 => {
                     let z = tr.f(0.0);
                     let mx = tr.f(4294967040.0);
-                    let c = tr.glsl3(f, GLOp::FClamp, a, z, mx)?;
+                    let c = tr.glsl3(f, GLOp::NClamp, a, z, mx)?;
                     e(tr.b.convert_f_to_u(u, None, c))?
                 }
                 0x188 => {
                     let lo = tr.f(-2147483648.0);
                     let hi = tr.f(2147483520.0);
-                    let c = tr.glsl3(f, GLOp::FClamp, a, lo, hi)?;
+                    let c = tr.glsl3(f, GLOp::NClamp, a, lo, hi)?;
                     let x = e(tr.b.convert_f_to_s(i, None, c))?;
-                    tr.to_u(x)?
+                    let nan = e(tr.b.is_nan(bt, None, a))?;
+                    let z = tr.u(0);
+                    let x = tr.to_u(x)?;
+                    e(tr.b.select(u, None, nan, z, x))?
                 }
                 0x18C => {
                     let h = tr.f(0.5);

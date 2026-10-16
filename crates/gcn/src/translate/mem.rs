@@ -1096,20 +1096,23 @@ fn pack_field(tr: &mut T, v: Word, w: u32, nfmt: u8) -> R<Word> {
     let mask = tr.u(max_u);
     let r = match nfmt {
         0 => {
-            // UNORM: clamp to [0, 1], scale, round to nearest even.
+            // UNORM: clamp to [0, 1] (NaN to 0), scale, round to nearest even.
             let x = tr.to_f(v)?;
             let (z, one) = (tr.f(0.0), tr.f(1.0));
-            let c = tr.glsl3(f, GLOp::FClamp, x, z, one)?;
+            let c = tr.glsl3(f, GLOp::NClamp, x, z, one)?;
             let scale = tr.f(max_u as f32);
             let s = e(tr.b.f_mul(f, None, c, scale))?;
             let r = tr.glsl1(f, GLOp::RoundEven, s)?;
             e(tr.b.convert_f_to_u(u, None, r))?
         }
         1 => {
-            // SNORM: clamp to [-1, 1], scale by 2^(w-1)-1, round, two's complement field.
+            // SNORM: clamp to [-1, 1] (NaN to 0), scale by 2^(w-1)-1, round,
+            // two's complement field.
             let x = tr.to_f(v)?;
-            let (lo, hi) = (tr.f(-1.0), tr.f(1.0));
-            let c = tr.glsl3(f, GLOp::FClamp, x, lo, hi)?;
+            let (lo, hi, z) = (tr.f(-1.0), tr.f(1.0), tr.f(0.0));
+            let nan = e(tr.b.is_nan(tr.t.bool_, None, x))?;
+            let x = e(tr.b.select(f, None, nan, z, x))?;
+            let c = tr.glsl3(f, GLOp::NClamp, x, lo, hi)?;
             let scale = tr.f(((1u64 << (w - 1)) - 1) as f32);
             let s = e(tr.b.f_mul(f, None, c, scale))?;
             let r = tr.glsl1(f, GLOp::RoundEven, s)?;

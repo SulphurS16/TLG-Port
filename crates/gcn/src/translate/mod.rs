@@ -12,6 +12,7 @@ pub mod gs;
 pub mod kernels;
 mod mem;
 pub mod tess;
+mod wave;
 
 use crate::analysis::{Plan, ResKind};
 use crate::{Enc, Inst};
@@ -422,11 +423,18 @@ pub(crate) struct T<'a> {
     /// GCN lanes of a wave run in lockstep, so a wave-sized workgroup may
     /// write LDS and read other lanes' entries without s_barrier; here lanes
     /// are invocations, so a barrier goes where accesses switch between
-    /// reads and writes -- only at depth 0, in uniform control flow.
+    /// reads and writes -- only at depth 0, in uniform control flow (also
+    /// inside constructs when `wave_sync` makes all control flow uniform).
     pub lds_phase: u8,
     pub cf_depth: u32,
     /// LDS hazards found inside control flow (left without a barrier).
     pub lds_hazards_nested: u32,
+    /// Wave-synchronous translation (`wave`): VCCZ/EXECZ branches vote
+    /// across the workgroup, LDS barriers also inside control flow.
+    pub wave_sync: bool,
+    /// The vote's workgroup slots (three u32) and this invocation's index of
+    /// the next slot (`wave_any`).
+    pub vote: Option<(Word, Word)>,
     pub sb_struct: Option<Word>,
     /// Function variables holding the debug capture (see Spec::debug_capture).
     pub dbg_vars: Vec<Word>,
@@ -522,7 +530,7 @@ impl<'a> T<'a> {
         }
         let hazard = (read && self.lds_phase & 2 != 0) || (write && self.lds_phase & 1 != 0);
         if hazard {
-            if self.cf_depth == 0 {
+            if self.cf_depth == 0 || self.wave_sync {
                 self.workgroup_barrier()?;
             } else {
                 self.lds_hazards_nested += 1;
@@ -530,6 +538,37 @@ impl<'a> T<'a> {
         }
         self.lds_phase |= read as u8 | ((write as u8) << 1);
         Ok(())
+    }
+    /// Workgroup vote (`wave_sync`): whether `bit` holds in any invocation,
+    /// the same answer in all of them (a VCCZ/EXECZ test of the whole wave).
+    /// Three slots rotate: vote k ORs into slot k % 3, reads it after the
+    /// barrier and clears slot (k + 2) % 3 - whose last reads (vote k - 1)
+    /// precede this barrier and whose next writes (vote k + 2) follow the
+    /// next one.
+    pub fn wave_any(&mut self, bit: Word) -> R<Word> {
+        let (slots, idx) = self.vote.ok_or("wave vote without slots")?;
+        let (u, bt) = (self.t.u32, self.t.bool_);
+        let (zero, one, two) = (self.u(0), self.u(1), self.u(2));
+        let ef = |x: rspirv::dr::Error| format!("{x:?}");
+        let k = e(self.b.load(u, None, idx, None, []))?;
+        let last = e(self.b.i_equal(bt, None, k, two))?;
+        let k1 = e(self.b.i_add(u, None, k, one))?;
+        let next = e(self.b.select(u, None, last, zero, k1))?;
+        self.b.store(idx, next, None, []).map_err(ef)?;
+        let p_wg = self.b.type_pointer(None, StorageClass::Workgroup, u);
+        let scope = self.u(spirv::Scope::Workgroup as u32);
+        let relaxed = self.u(0);
+        let p = e(self.b.access_chain(p_wg, None, slots, [k]))?;
+        let v = e(self.b.select(u, None, bit, one, zero))?;
+        e(self.b.atomic_or(u, None, p, scope, relaxed, v))?;
+        self.workgroup_barrier()?;
+        let r = e(self.b.atomic_load(u, None, p, scope, relaxed))?;
+        let first = e(self.b.i_equal(bt, None, k, zero))?;
+        let km1 = e(self.b.i_sub(u, None, k, one))?;
+        let clear = e(self.b.select(u, None, first, two, km1))?;
+        let pc = e(self.b.access_chain(p_wg, None, slots, [clear]))?;
+        self.b.atomic_store(pc, scope, relaxed, zero).map_err(ef)?;
+        e(self.b.i_not_equal(bt, None, r, zero))
     }
     pub fn get_scc(&mut self) -> R<Word> {
         e(self.b.load(self.t.bool_, None, self.scc, None, []))
@@ -808,6 +847,36 @@ pub fn may_write_exec(ins: &Inst) -> bool {
 }
 
 pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
+    let (out, nested) = translate_mode(code, plan, spec, false)?;
+    // A one-wave workgroup whose lanes share LDS inside control flow without
+    // s_barrier: again wave-synchronously (`wave`), when that is safe.
+    let [x, y, z] = spec.cs_local_size;
+    let one_wave = x.max(1) * y.max(1) * z.max(1) <= 64;
+    if nested == 0 || spec.stage != Stage::Compute || spec.tess.role != TessRole::None || !one_wave {
+        return Ok(out);
+    }
+    if !wave::scc_branches_uniform(code) {
+        let mut out = out;
+        out.warnings.push("not wave-synchronous: an SCC branch tests a per-lane value".into());
+        return Ok(out);
+    }
+    match translate_mode(code, plan, spec, true) {
+        Ok((mut w, _)) => {
+            w.warnings.push(format!("wave-synchronous: {nested} LDS read/write switch(es) inside control flow get barriers, VCCZ/EXECZ branches a workgroup vote"));
+            Ok(w)
+        }
+        Err(why) => {
+            let mut out = out;
+            out.warnings.push(format!("not wave-synchronous: {why}"));
+            Ok(out)
+        }
+    }
+}
+
+/// The translation; with `wave_sync` (`wave`) branches on VCCZ/EXECZ vote
+/// across the workgroup and LDS barriers also go inside control flow. Also
+/// returns the LDS hazards left without a barrier inside control flow.
+fn translate_mode(code: &[Inst], plan: &Plan, spec: &Spec, wave_sync: bool) -> R<(Output, u32)> {
     if code.is_empty() {
         return Err("empty program".into());
     }
@@ -930,6 +999,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         lds_phase: 0,
         cf_depth: 0,
         lds_hazards_nested: 0,
+        wave_sync,
+        vote: None,
         sb_struct: None,
         dbg_vars: Vec::new(),
     };
@@ -1014,6 +1085,14 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     tr.scc = tr.b.variable(tr.t.fn_bool, None, StorageClass::Function, None);
     tr.pc_var = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
     let lds_i = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+    if wave_sync {
+        let idx = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+        let three = tr.u(3);
+        let arr = tr.b.type_array(tr.t.u32, three);
+        let pt = tr.b.type_pointer(None, StorageClass::Workgroup, arr);
+        let slots = tr.global_var(pt, StorageClass::Workgroup);
+        tr.vote = Some((slots, idx));
+    }
     for ins in code {
         if let Some((true, vgpr, lane)) = ins.const_lane_op() {
             if !tr.lane_slots.contains_key(&(vgpr as u32, lane)) {
@@ -1060,6 +1139,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
     }
     mem::stage_inputs(&mut tr)?;
     zero_lds(&mut tr, lds_i)?;
+    init_votes(&mut tr)?;
     if spec.debug_pos_store && spec.stage == Stage::Vertex && spec.tess.role == TessRole::None {
         let v = tr.sb_var(false);
         let bnd = tr.alloc_binding(BindingKind::DebugOut);
@@ -1127,6 +1207,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         match want.then(|| cfg::plan(code, &starts, &ranges)) {
             Some(Ok(p)) => cfg::emit(&mut tr, code, &ranges, &p.nodes, None, None)?,
             other => {
+                if wave_sync {
+                    return Err("control flow not structured".into());
+                }
                 if let Some(Err(why)) = other {
                     tr.warnings.push(format!("control flow kept as a dispatcher loop: {why}"));
                 }
@@ -1136,9 +1219,9 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
             }
         }
     }
-    if tr.lds_hazards_nested > 0 {
-        let n = tr.lds_hazards_nested;
-        tr.warnings.push(format!("{n} LDS read/write switch(es) inside control flow left without a barrier (wave lockstep assumed)"));
+    let nested = tr.lds_hazards_nested;
+    if nested > 0 {
+        tr.warnings.push(format!("{nested} LDS read/write switch(es) inside control flow left without a barrier (wave lockstep assumed)"));
     }
     tr.b.end_function().map_err(|x| format!("{x:?}"))?;
 
@@ -1190,7 +1273,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         tr.b.execution_mode(func, ExecutionMode::DenormFlushToZero, [32]);
     }
     let spirv = tr.b.module().assemble();
-    Ok(Output {
+    let out = Output {
         spirv,
         bindings: tr.bindings,
         params: tr.params,
@@ -1199,7 +1282,8 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         pos_exports: tr.pos_exports,
         pos_ignored: tr.pos_ignored,
         warnings: tr.warnings,
-    })
+    };
+    Ok((out, nested))
 }
 
 const PC_EXIT: u32 = 0xFFFF_FFFF;
@@ -1245,6 +1329,24 @@ fn zero_lds(tr: &mut T, var: Word) -> R<()> {
     let sem = tr.u((spirv::MemorySemantics::ACQUIRE_RELEASE | spirv::MemorySemantics::WORKGROUP_MEMORY).bits());
     tr.b.control_barrier(wg, wg, sem).map_err(|x| format!("{x:?}"))?;
     Ok(())
+}
+
+/// The workgroup vote's slots cleared and its index at 0 (`T::wave_any`),
+/// then a barrier before any vote, in the entry block.
+fn init_votes(tr: &mut T) -> R<()> {
+    let Some((slots, idx)) = tr.vote else { return Ok(()) };
+    let u = tr.t.u32;
+    let zero = tr.u(0);
+    tr.b.store(idx, zero, None, []).map_err(|x| format!("{x:?}"))?;
+    let p_wg = tr.b.type_pointer(None, StorageClass::Workgroup, u);
+    let scope = tr.u(spirv::Scope::Workgroup as u32);
+    let relaxed = tr.u(0);
+    for k in 0..3 {
+        let kk = tr.u(k);
+        let p = e(tr.b.access_chain(p_wg, None, slots, [kk]))?;
+        tr.b.atomic_store(p, scope, relaxed, zero).map_err(|x| format!("{x:?}"))?;
+    }
+    tr.workgroup_barrier()
 }
 
 fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()> {
@@ -1508,5 +1610,28 @@ mod tests {
         let plain = ops_of(2);
         assert_eq!(count(&plain, spirv::Op::GroupNonUniformAllEqual), 0);
         assert_eq!(count(&plain, spirv::Op::AtomicOr), 3);
+    }
+
+    #[test]
+    fn bit_moves_apply_vop3_sign_modifiers() {
+        // VOP3 v_cndmask_b32 v0, v1, -v1, vcc; VOP3 v_mov_b32 v2, |v3|; s_endpgm
+        let vop3 = |op: u32, vdst: u32, abs: u32, src: [u32; 3], neg: u32| [0xD000_0000 | (op << 17) | (abs << 8) | vdst, src[0] | (src[1] << 9) | (src[2] << 18) | (neg << 29)];
+        let mut words = Vec::new();
+        words.extend(vop3(0x100, 0, 0, [257, 257, 106], 0b010));
+        words.extend(vop3(0x181, 2, 0b001, [259, 0, 0], 0));
+        words.push(0xBF81_0000);
+        let code = crate::decode_program(&words).unwrap();
+        let plan = crate::analysis::analyze(&code, 0, 0);
+        let out = translate(&code, &plan, &vertex_spec(0)).unwrap();
+        let m = rspirv::dr::load_words(&out.spirv).unwrap();
+        let consts: HashMap<Word, u32> = m.types_global_values.iter().filter_map(|i| match (i.class.opcode, i.result_id, i.operands.as_slice()) {
+            (spirv::Op::Constant, Some(id), [Operand::LiteralBit32(v)]) => Some((id, *v)),
+            _ => None,
+        }).collect();
+        let uses = |op: spirv::Op, k: u32| {
+            m.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions).any(|i| i.class.opcode == op && i.operands.iter().any(|o| matches!(o, Operand::IdRef(id) if consts.get(id) == Some(&k))))
+        };
+        assert!(uses(spirv::Op::BitwiseXor, 0x8000_0000), "the negation of v_cndmask's src1");
+        assert!(uses(spirv::Op::BitwiseAnd, 0x7FFF_FFFF), "the abs of v_mov's src0");
     }
 }
