@@ -45,6 +45,14 @@ struct Mixer {
 
 static MIXER: Mutex<Mixer> = Mutex::new(Mixer { ports: Vec::new(), playing: false, started: false, limit_env: 0.0 });
 static CV: Condvar = Condvar::new();
+/// Frames written to each port's TLG_AUDIO_DUMP file (for placing logged
+/// events in the dump).
+static DUMPED: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+
+/// Frames written so far to port `idx`'s dump file.
+pub fn dumped_frames(idx: usize) -> u64 {
+    DUMPED.get(idx).map_or(0, |d| d.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 fn enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -125,6 +133,9 @@ pub unsafe fn output(idx: usize, data: *const u8, frames: usize, channels: usize
         if let Some(f) = &mut port.dump {
             let bytes: Vec<u8> = block.iter().flat_map(|s| s.iter().flat_map(|v| v.to_le_bytes())).collect();
             let _ = f.write_all(&bytes);
+            if let Some(d) = DUMPED.get(idx) {
+                d.fetch_add(block.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
     if !m.playing {

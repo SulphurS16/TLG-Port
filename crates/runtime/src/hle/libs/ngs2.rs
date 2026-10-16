@@ -103,6 +103,11 @@ fn vag_frame(fr: &[u8], hist: &mut [f32; 2]) -> [f32; 28] {
 
 /// Channels of every mixing bus (output buffers have at most 8).
 const MAX_CH: usize = 8;
+/// Output ports per voice with their own volume and matrix. (TLG's sampler
+/// voices patch ports 0-4: the dry path and four effect sends; with four
+/// slots port 4 shared port 0's volume and matrix, so its reverb send ran at
+/// the full dry level whatever the title set.)
+const MAX_PORTS: usize = 8;
 
 #[derive(Clone, Copy, Default)]
 struct BufferInfo {
@@ -178,6 +183,9 @@ struct Sampler {
     /// Repeat passes left for the front block (taken from it when it starts).
     repeats_left: u32,
     started_block: bool,
+    /// The front block's data, taken in whole when it starts (and again for
+    /// each repeat pass); decoding reads this copy (`take_block`).
+    copy: Vec<u8>,
     dec: Option<atrac9::Decoder>,
     /// Decoded frames not yet consumed by the resampler (interleaved by channel).
     pcm: VecDeque<[f32; MAX_CH]>,
@@ -205,6 +213,7 @@ impl Default for Sampler {
             sample_pos: 0,
             repeats_left: 0,
             started_block: false,
+            copy: Vec::new(),
             dec: None,
             pcm: VecDeque::new(),
             phase: 0.0,
@@ -227,8 +236,8 @@ struct Voice {
     flags: u32,
     /// Bus channels (submixer/mastering setup), sampler: its waveform's.
     channels: u32,
-    port_volume: [f32; 4],
-    port_matrix: [i32; 4],
+    port_volume: [f32; MAX_PORTS],
+    port_matrix: [i32; MAX_PORTS],
     matrices: FastMap<i32, Vec<f32>>,
     /// Where each matrix's levels came from (TLG_NGS2_TRACE: checked for
     /// later in-place changes).
@@ -285,8 +294,8 @@ impl Voice {
             index,
             flags: 0,
             channels: if kind == Kind::Sampler { 1 } else { 2 },
-            port_volume: [1.0; 4],
-            port_matrix: [-1; 4],
+            port_volume: [1.0; MAX_PORTS],
+            port_matrix: [-1; MAX_PORTS],
             matrices: FastMap::default(),
             matrix_src: FastMap::default(),
             patches: Vec::new(),
@@ -325,6 +334,11 @@ struct State {
     noted: HashSet<&'static str>,
     /// Output peak since the last statistics line.
     peak: f32,
+    /// The current `tune::REV_AB` window (logged at each start).
+    rev_ab_window: Option<u64>,
+    /// Measurement (a `tune::REV_AB` variant): ports 4-7 take the volume
+    /// and matrix of port & 3, as before ports past 3 had their own.
+    port_fold: bool,
 }
 
 static NGS2: Mutex<Option<State>> = Mutex::new(None);
@@ -449,6 +463,17 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                             sm.blocks.clear();
                             sm.pcm.clear();
                             sm.started_block = false;
+                            sm.copy = Vec::new();
+                        }
+                        // A killed sampler voice keeps no patches: TLG kills
+                        // each voice before reusing it and patches only the
+                        // ports the next sound uses (port 0 for a cutscene
+                        // stream, 0-3 for most effects). Kept patches sent
+                        // the narration and the boy's voice, at full level,
+                        // into the previous sound's reverb and delay sends,
+                        // which the PS4 recording does not have.
+                        if e == EVENT_KILL && v.kind == Kind::Sampler && crate::tune::get(crate::tune::NGS2_COMPAT) & 1 == 0 {
+                            v.patches.clear();
                         }
                     }
                     EVENT_PAUSE => v.flags |= STATE_PAUSED,
@@ -457,7 +482,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                 },
                 PARAM_PORT_VOLUME => {
                     let port = u32_at(8) as usize;
-                    if port < 4 {
+                    if port >= MAX_PORTS {
+                        unimpl = Some("voice ports above 7");
+                    } else {
                         if trace_voices() && v.port_volume[port] != f32_at(12) {
                             crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): port {port} volume {:.4}", v.kind, v.channels, f32_at(12));
                         }
@@ -466,7 +493,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                 }
                 PARAM_PORT_MATRIX => {
                     let port = u32_at(8) as usize;
-                    if port < 4 {
+                    if port >= MAX_PORTS {
+                        unimpl = Some("voice ports above 7");
+                    } else {
                         if trace_voices() && v.port_matrix[port] != u32_at(12) as i32 {
                             crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): port {port} matrix {}", v.kind, v.channels, u32_at(12) as i32);
                         }
@@ -821,6 +850,24 @@ fn run_user_fx(v: &mut Voice, input: &mut [[f32; MAX_CH]], rate: u32) {
     v.fx_calls += 1;
 }
 
+/// Takes in a block's data whole when it starts playing (and again for each
+/// repeat pass), counting it as decoded: the PS4 consumes a block well
+/// before it has played it. TLG streams its cutscene ambience through a ring
+/// one block long and writes the next block once the decoded byte count says
+/// the ring is free; consumed just in time, the voice ran dry first and the
+/// title gave the stream up (the opening scene had no cave ambience). The
+/// decoder reads the copy, so the title may refill or move the data meanwhile.
+fn take_block(sm: &mut Sampler, b: &Block) {
+    // (A new allocation each time: a voice's copy does not keep the
+    // capacity of the largest block it ever played.)
+    sm.copy = if b.addr != 0 && b.size > 0 && crate::mem::is_guest(b.addr, b.size as u64) {
+        unsafe { std::slice::from_raw_parts(b.addr as *const u8, b.size as usize) }.to_vec()
+    } else {
+        Vec::new()
+    };
+    sm.decoded_bytes += b.size as u64;
+}
+
 /// Decodes the next portion of the front block into `sm.pcm`; false when the
 /// voice has no more data.
 fn decode_more(sm: &mut Sampler) -> bool {
@@ -833,6 +880,7 @@ fn decode_more(sm: &mut Sampler) -> bool {
             sm.sample_pos = 0;
             sm.repeats_left = b.repeats;
             sm.user_data = b.user_data;
+            take_block(sm, &b);
         }
         let ch = sm.channels as usize;
         let mut produced = false;
@@ -848,8 +896,9 @@ fn decode_more(sm: &mut Sampler) -> bool {
                     let avail = (b.size - sm.byte_pos) as usize;
                     let take = sf.min(avail);
                     let mut buf = vec![0u8; sf + 64];
-                    if crate::mem::is_guest(b.addr + sm.byte_pos as u64, take as u64) {
-                        unsafe { std::ptr::copy_nonoverlapping((b.addr + sm.byte_pos as u64) as *const u8, buf.as_mut_ptr(), take) };
+                    let p = sm.byte_pos as usize;
+                    if let Some(src) = sm.copy.get(p..p + take) {
+                        buf[..take].copy_from_slice(src);
                     }
                     let mut pcm16 = vec![0i16; fs * dch];
                     let mut off = 0usize;
@@ -880,13 +929,12 @@ fn decode_more(sm: &mut Sampler) -> bool {
                         produced = true;
                     }
                     sm.byte_pos += take as u32;
-                    sm.decoded_bytes += take as u64;
                 }
                 WF_PCM_I16L | WF_PCM_F32L => {
                     let bps = if sm.wf_type == WF_PCM_I16L { 2 } else { 4 } * ch;
                     let frames_left = ((b.size - sm.byte_pos) as usize / bps).min(1024);
-                    let addr = b.addr + sm.byte_pos as u64;
-                    if frames_left > 0 && crate::mem::is_guest(addr, (frames_left * bps) as u64) {
+                    let p = sm.byte_pos as usize;
+                    if frames_left > 0 && sm.copy.len() >= p + frames_left * bps {
                         for f in 0..frames_left {
                             let s = sm.sample_pos;
                             sm.sample_pos += 1;
@@ -895,12 +943,11 @@ fn decode_more(sm: &mut Sampler) -> bool {
                             }
                             let mut fr = [0f32; MAX_CH];
                             for c in 0..ch.min(MAX_CH) {
-                                fr[c] = unsafe {
-                                    if sm.wf_type == WF_PCM_I16L {
-                                        *((addr + (f * bps + c * 2) as u64) as *const i16) as f32 / 32768.0
-                                    } else {
-                                        *((addr + (f * bps + c * 4) as u64) as *const f32)
-                                    }
+                                let at = &sm.copy[p + f * bps..];
+                                fr[c] = if sm.wf_type == WF_PCM_I16L {
+                                    i16::from_le_bytes([at[c * 2], at[c * 2 + 1]]) as f32 / 32768.0
+                                } else {
+                                    f32::from_le_bytes([at[c * 4], at[c * 4 + 1], at[c * 4 + 2], at[c * 4 + 3]])
                                 };
                             }
                             sm.pcm.push_back(fr);
@@ -909,7 +956,6 @@ fn decode_more(sm: &mut Sampler) -> bool {
                         produced = true;
                     }
                     sm.byte_pos += (frames_left * bps) as u32;
-                    sm.decoded_bytes += (frames_left * bps) as u64;
                     if frames_left == 0 {
                         sm.byte_pos = b.size;
                     }
@@ -919,13 +965,13 @@ fn decode_more(sm: &mut Sampler) -> bool {
                     // byte, 28 4-bit samples); channels interleave frame by frame.
                     let frame_bytes = 16 * ch;
                     let frames_left = ((b.size - sm.byte_pos) as usize / frame_bytes).min(64);
-                    let addr = b.addr + sm.byte_pos as u64;
-                    if frames_left > 0 && crate::mem::is_guest(addr, (frames_left * frame_bytes) as u64) {
+                    let p = sm.byte_pos as usize;
+                    if frames_left > 0 && sm.copy.len() >= p + frames_left * frame_bytes {
                         for f in 0..frames_left {
                             let mut out = [[0f32; MAX_CH]; 28];
                             for c in 0..ch.min(MAX_CH) {
-                                let fr = unsafe { std::slice::from_raw_parts((addr + (f * frame_bytes + c * 16) as u64) as *const u8, 16) };
-                                let decoded = vag_frame(fr, &mut sm.vag_hist[c]);
+                                let at = p + f * frame_bytes + c * 16;
+                                let decoded = vag_frame(&sm.copy[at..at + 16], &mut sm.vag_hist[c]);
                                 for (k, x) in decoded.iter().enumerate() {
                                     out[k][c] = *x;
                                 }
@@ -943,7 +989,6 @@ fn decode_more(sm: &mut Sampler) -> bool {
                         produced = true;
                     }
                     sm.byte_pos += (frames_left * frame_bytes) as u32;
-                    sm.decoded_bytes += (frames_left * frame_bytes) as u64;
                     if frames_left == 0 {
                         sm.byte_pos = b.size;
                     }
@@ -966,9 +1011,11 @@ fn decode_more(sm: &mut Sampler) -> bool {
                 }
                 sm.byte_pos = 0;
                 sm.sample_pos = 0;
+                take_block(sm, &b);
             } else {
                 sm.blocks.pop_front();
                 sm.started_block = false;
+                sm.copy = Vec::new();
             }
         }
         if produced {
@@ -980,6 +1027,8 @@ fn decode_more(sm: &mut Sampler) -> bool {
         crate::warn!("NGS2: a sampler voice's blocks produce no samples (stopped)");
     }
     sm.blocks.clear();
+    sm.started_block = false;
+    sm.copy = Vec::new();
     false
 }
 
@@ -1008,6 +1057,8 @@ fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MA
             ended = true;
             sm.pcm.clear();
             sm.blocks.clear();
+            sm.started_block = false;
+            sm.copy = Vec::new();
             break;
         }
         sm.phase += step;
@@ -1046,6 +1097,7 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
     // matrix (rows per destination channel), before the destinations are
     // borrowed for mixing.
     let mut jobs: Vec<(u64, usize, f32, Option<[[f32; MAX_CH]; MAX_CH]>)> = Vec::with_capacity(v.patches.len());
+    let fold = s.port_fold || crate::tune::get(crate::tune::NGS2_COMPAT) & 2 != 0;
     for p in &v.patches {
         // The title patches to rack handles of one-voice racks (mastering,
         // submixers): their first voice.
@@ -1055,7 +1107,10 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
             continue;
         }
         let dch = (d.channels as usize).clamp(1, MAX_CH);
-        let port = p.port as usize & 3;
+        let port = if fold { p.port as usize & 3 } else { p.port as usize };
+        if port >= MAX_PORTS {
+            continue;
+        }
         // Levels per destination channel, source channels inner (aLevel[dst * src_ch + src]).
         let rows = v.matrices.get(&v.port_matrix[port]).filter(|m| m.len() >= src_ch * dch).map(|m| {
             let mut rows = [[0f32; MAX_CH]; MAX_CH];
@@ -1156,9 +1211,33 @@ fn peak_of(frames: &[[f32; MAX_CH]], ch: usize) -> f32 {
     m
 }
 
+/// The measurement gain of the reverb racks' wet output (`tune::REV_DB`,
+/// `tune::REV_AB`) for the grain starting at rendered sample `at`; logs the
+/// start of each A/B window with its frame in the audio dump.
+fn reverb_ab_gain(s: &mut State, at: u64, rate: u32) -> f32 {
+    let mut db = crate::tune::get(crate::tune::REV_DB) as f32;
+    let win = crate::tune::get(crate::tune::REV_AB);
+    s.port_fold = false;
+    if win > 0 {
+        // (dB, ports 4-7 folded onto 0-3)
+        const STEPS: [(f32, bool); 5] = [(0.0, false), (12.0, false), (18.0, false), (24.0, false), (0.0, true)];
+        let w = at / (win as u64 * rate.max(1) as u64);
+        let (d, fold) = STEPS[(w % STEPS.len() as u64) as usize];
+        db += d;
+        s.port_fold = fold;
+        if s.rev_ab_window != Some(w) {
+            s.rev_ab_window = Some(w);
+            crate::info!("NGS2 reverb A/B: {db:+.0} dB{} from rendered sample {at} (port 1 dump frame {})", if fold { ", ports folded" } else { "" }, crate::audio::dumped_frames(0));
+        }
+    }
+    if db == 0.0 { 1.0 } else { 10f32.powf(db / 20.0) }
+}
+
 /// One grain of the system: samplers, then mixing voices in patch order, then
 /// the mastering voice into the render buffers.
 fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_CH]> {
+    let at = s.systems.get(&system).map_or(0, |y| y.renders.saturating_sub(1)) * grain as u64;
+    let rev_gain = reverb_ab_gain(s, at, rate);
     let racks: Vec<(u64, u32)> = s.racks.iter().filter(|(_, r)| r.system == system).map(|(&h, r)| (h, r.rack_id)).collect();
     let mut all: Vec<u64> = Vec::new();
     for (rh, _) in &racks {
@@ -1225,7 +1304,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             match v.kind {
                 Kind::Reverb => {
                     let och = (v.out_channels as usize).clamp(1, MAX_CH);
-                    (input.clone(), Some(reverb_grain(v, &input, ch, och, rate)), och)
+                    (input.clone(), Some(reverb_grain(v, &input, ch, och, rate, rev_gain)), och)
                 }
                 Kind::Custom if v.taps.is_some() => {
                     let och = (v.out_channels as usize).clamp(1, MAX_CH);
@@ -1316,7 +1395,7 @@ fn note_dc(v: &Voice, buf: &[[f32; MAX_CH]], ch: usize) {
 
 /// One grain of a reverb rack: the reverberation of the input's mean (front
 /// pair; no centre or LFE) times wet, plus the input times dry.
-fn reverb_grain(v: &mut Voice, input: &[[f32; MAX_CH]], ich: usize, och: usize, rate: u32) -> Vec<[f32; MAX_CH]> {
+fn reverb_grain(v: &mut Voice, input: &[[f32; MAX_CH]], ich: usize, och: usize, rate: u32, wet_gain: f32) -> Vec<[f32; MAX_CH]> {
     let p = v.i3dl2;
     if !v.reverb.as_ref().is_some_and(|r| r.matches(&p, rate)) {
         v.reverb = Some(Reverb::new(p, rate));
@@ -1329,9 +1408,9 @@ fn reverb_grain(v: &mut Voice, input: &[[f32; MAX_CH]], ich: usize, och: usize, 
             let mono = fr[..ich].iter().sum::<f32>() / ich as f32;
             let [l, rr] = r.process(mono);
             let mut o = [0f32; MAX_CH];
-            o[0] = l;
+            o[0] = l * wet_gain;
             if och > 1 {
-                o[1] = rr;
+                o[1] = rr * wet_gain;
             }
             if dry != 0.0 {
                 for c in 0..och.min(ich) {
@@ -1488,7 +1567,8 @@ sysv! {
                         .map(|pa| {
                             let dest = if s.voices.contains_key(&pa.dest) { Some(pa.dest) } else { s.racks.get(&pa.dest).and_then(|r| r.voices.first().copied()) };
                             let d = dest.and_then(|d| s.voices.get(&d).map(|dv| format!("{d:#x} {:?} {}ch", dv.kind, dv.channels))).unwrap_or_else(|| "?".into());
-                            format!("port {} vol {:.3} matrix {} -> {d} in {}", pa.port, v.port_volume[pa.port as usize & 3], v.port_matrix[pa.port as usize & 3], pa.dest_input)
+                            let port = if crate::tune::get(crate::tune::NGS2_COMPAT) & 2 != 0 { pa.port as usize & 3 } else { (pa.port as usize).min(MAX_PORTS - 1) };
+                            format!("port {} vol {:.3} matrix {} -> {d} in {}", pa.port, v.port_volume[port], v.port_matrix[port], pa.dest_input)
                         })
                         .collect();
                     let rack = s.racks.get(&v.rack).map_or(0, |r| r.rack_id);
@@ -1566,6 +1646,49 @@ pub fn register(r: &mut Registry) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One voice parameter ({u16 size; s16 next; u32 id}, then the payload
+    /// words), alone in its chain; u64 storage keeps handles aligned.
+    fn param(id: u32, words: &[u32]) -> Vec<u64> {
+        let size = 8 + 4 * words.len();
+        let mut b = vec![0u64; size.div_ceil(8)];
+        let p = b.as_mut_ptr() as *mut u8;
+        unsafe {
+            *(p as *mut u16) = size as u16;
+            *(p.add(4) as *mut u32) = id;
+            for (i, w) in words.iter().enumerate() {
+                *(p.add(8 + 4 * i) as *mut u32) = *w;
+            }
+        }
+        b
+    }
+
+    #[test]
+    fn port_4_volume_and_kill_unpatches() {
+        let mut s = State::default();
+        let (sam, dry, send) = (0x1_0000u64, 0x2_0000u64, 0x3_0000u64);
+        s.voices.insert(sam, Voice::new(0x100, Kind::Sampler, 0));
+        s.voices.insert(dry, Voice::new(0x200, Kind::Submixer, 0));
+        s.voices.insert(send, Voice::new(0x300, Kind::Submixer, 0));
+        let patch = |port: u32, dest: u64| param(PARAM_PATCH, &[port, 0, dest as u32, (dest >> 32) as u32]);
+        let set = |s: &mut State, b: Vec<u64>| assert_eq!(unsafe { control(s, sam, b.as_ptr() as *const u8) }, 0);
+        set(&mut s, patch(0, dry));
+        set(&mut s, patch(4, send));
+        set(&mut s, param(PARAM_PORT_VOLUME, &[4, 0.25f32.to_bits()]));
+        // Mono into a stereo bus without a matrix: the front pair, at each
+        // port's own volume (port 4 is not port 0).
+        route(&mut s, sam, &[[1.0; MAX_CH]; 4], 1);
+        assert_eq!(s.voices[&dry].input[0][..2], [1.0, 1.0]);
+        assert_eq!(s.voices[&send].input[0][..2], [0.25, 0.25]);
+        // KILL drops the patches: nothing reaches the old destinations.
+        set(&mut s, param(PARAM_EVENT, &[EVENT_KILL]));
+        assert!(s.voices[&sam].patches.is_empty());
+        for d in [dry, send] {
+            s.voices.get_mut(&d).unwrap().input.clear();
+        }
+        route(&mut s, sam, &[[1.0; MAX_CH]; 4], 1);
+        assert!(s.voices[&send].input.iter().chain(&s.voices[&dry].input).all(|f| f[0] == 0.0));
+    }
 
     #[test]
     fn peak_matches_folding_max() {

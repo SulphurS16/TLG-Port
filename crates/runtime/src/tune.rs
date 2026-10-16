@@ -629,8 +629,21 @@ pub const HOIST_FWD: usize = 103;
 /// `tune guest_prio`; an in-run A/B at the 31% clamp measured no difference
 /// in underruns or fps (LOG: Playtest of 0.3.1).
 pub const GUEST_PRIO: usize = 104;
+/// Measurement only: the wet output of NGS2 reverb racks scaled by this many
+/// dB (`TLG_REV_DB`, 0), for comparing reverb levels with a PS4 recording.
+pub const REV_DB: usize = 105;
+/// Measurement only: with N > 0 the reverb output gain cycles through 0,
+/// +12, +18 and +24 dB (on top of `rev_db`), then 0 dB with voice ports 4-7
+/// taking port & 3's volume and matrix (as before they had their own), in
+/// windows of N seconds of rendered audio, each window's start logged with
+/// its frame in the audio dump (`TLG_REV_AB`, 0).
+pub const REV_AB: usize = 106;
+/// Measurement only: NGS2 voice routing as before 0.3.3 (`TLG_NGS2_COMPAT`,
+/// 0; bit mask): 1 = a killed sampler voice keeps its patches, 2 = voice
+/// ports 4-7 take port & 3's volume and matrix.
+pub const NGS2_COMPAT: usize = 107;
 
-const TABLE: [(&str, &str, i64); 105] = [
+const TABLE: [(&str, &str, i64); 108] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -736,6 +749,9 @@ const TABLE: [(&str, &str, i64); 105] = [
     ("page_marks", "TLG_PAGE_MARKS", 1),
     ("hoist_fwd", "TLG_HOIST_FWD", 1),
     ("guest_prio", "TLG_GUEST_PRIO", 256),
+    ("rev_db", "TLG_REV_DB", 0),
+    ("rev_ab", "TLG_REV_AB", 0),
+    ("ngs2_compat", "TLG_NGS2_COMPAT", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
