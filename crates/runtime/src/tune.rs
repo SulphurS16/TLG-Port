@@ -655,8 +655,21 @@ pub const PIPE_ASYNC: usize = 108;
 /// submission's new pipelines compile side by side instead of one after the
 /// other as the CP reaches them.
 pub const PIPE_AHEAD: usize = 109;
+/// The NGS2 mixer computes with flush-to-zero and denormals-are-zero set
+/// whatever the calling thread's MXCSR (`TLG_NGS2_FTZ`, 1; Windows' initial
+/// 0x1F80 has neither, `ps4_fpu` sets both): the reverbs' and filters'
+/// decaying tails reach subnormal values, which the CPU handles ~100 times
+/// slower (values below 1e-38: no audible difference). The thread's MXCSR is
+/// restored when the call returns.
+pub const NGS2_FTZ: usize = 110;
+/// Guest threads start with the PS4's floating-point state: MXCSR 0x9FC0
+/// (exceptions masked, flush-to-zero, denormals-are-zero) and x87 control
+/// word 0x037F, the default environment of the title's own libc
+/// (`__fe_dfl_env` in libc.prx), where Windows starts threads with 0x1F80
+/// (denormals kept, and ~100 times slower) and 0x027F (`TLG_PS4_FPU`, 1).
+pub const PS4_FPU: usize = 111;
 
-const TABLE: [(&str, &str, i64); 110] = [
+const TABLE: [(&str, &str, i64); 112] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -767,6 +780,8 @@ const TABLE: [(&str, &str, i64); 110] = [
     ("ngs2_compat", "TLG_NGS2_COMPAT", 0),
     ("pipe_async", "TLG_PIPE_ASYNC", -1),
     ("pipe_ahead", "TLG_PIPE_AHEAD", 1),
+    ("ngs2_ftz", "TLG_NGS2_FTZ", 1),
+    ("ps4_fpu", "TLG_PS4_FPU", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

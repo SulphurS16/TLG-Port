@@ -521,7 +521,21 @@ pub fn enter(t: &'static GuestThread) {
 /// Runs guest code `entry(a0, a1)` on the current (already entered) thread.
 /// Returns when the function returns or the thread calls pthread_exit.
 pub fn run_entry(t: &'static GuestThread, entry: u64, a0: u64, a1: u64) -> u64 {
+    set_ps4_fpu();
     unsafe { tlg_guest_thread_call(entry, a0, a1, t.saved_rsp.as_ptr()) }
+}
+
+/// The PS4's initial floating-point state for guest code (`tune ps4_fpu`):
+/// MXCSR 0x9FC0 - all exceptions masked, flush-to-zero, denormals-are-zero -
+/// and the x87 control word 0x037F (64-bit precision), as in the default
+/// environment of the title's libc (`__fe_dfl_env` in libc.prx). Windows
+/// starts threads with 0x1F80 and 0x027F.
+fn set_ps4_fpu() {
+    if crate::tune::get(crate::tune::PS4_FPU) == 0 {
+        return;
+    }
+    let (mxcsr, fcw): (u32, u16) = (0x9FC0, 0x037F);
+    unsafe { std::arch::asm!("ldmxcsr [{0}]", "fldcw [{1}]", in(reg) &mxcsr, in(reg) &fcw, options(nostack)) };
 }
 
 /// Terminates the current guest thread with `value` (pthread_exit semantics).
@@ -612,4 +626,20 @@ pub fn join(t: &'static GuestThread) -> u64 {
         t.exit_cv.wait(&mut g);
     }
     g.unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    /// Guest code starts with the PS4's MXCSR (flush-to-zero, denormals-are-zero,
+    /// exceptions masked) and x87 control word: a subnormal product is zero.
+    #[test]
+    fn ps4_fpu_state() {
+        super::set_ps4_fpu();
+        let (mut mxcsr, mut fcw): (u32, u16) = (0, 0);
+        unsafe { std::arch::asm!("stmxcsr [{0}]", "fnstcw [{1}]", in(reg) &mut mxcsr, in(reg) &mut fcw, options(nostack)) };
+        assert_eq!(mxcsr & !0x3F, 0x9FC0);
+        assert_eq!(fcw, 0x037F);
+        let tiny = std::hint::black_box(1e-30f32);
+        assert_eq!(std::hint::black_box(tiny * 1e-10f32), 0.0);
+    }
 }

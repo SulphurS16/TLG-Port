@@ -1233,9 +1233,41 @@ fn reverb_ab_gain(s: &mut State, at: u64, rate: u32) -> f32 {
     if db == 0.0 { 1.0 } else { 10f32.powf(db / 20.0) }
 }
 
+/// MXCSR with flush-to-zero and denormals-are-zero (bits 15 and 6) for the
+/// mixer's own arithmetic while it lives (`tune ngs2_ftz`), the caller's
+/// restored after.
+struct FtzGuard(Option<u32>);
+
+impl FtzGuard {
+    fn new() -> FtzGuard {
+        if crate::tune::get(crate::tune::NGS2_FTZ) == 0 {
+            return FtzGuard(None);
+        }
+        let mut old = 0u32;
+        unsafe { std::arch::asm!("stmxcsr [{0}]", in(reg) &mut old, options(nostack)) };
+        static LOGGED: std::sync::Once = std::sync::Once::new();
+        LOGGED.call_once(|| crate::info!("NGS2: the rendering thread's MXCSR is {old:#06x}; the mixer computes with flush-to-zero and denormals-are-zero"));
+        let new = old | 0x8040;
+        if new == old {
+            return FtzGuard(None);
+        }
+        unsafe { std::arch::asm!("ldmxcsr [{0}]", in(reg) &new, options(nostack)) };
+        FtzGuard(Some(old))
+    }
+}
+
+impl Drop for FtzGuard {
+    fn drop(&mut self) {
+        if let Some(old) = self.0 {
+            unsafe { std::arch::asm!("ldmxcsr [{0}]", in(reg) &old, options(nostack)) };
+        }
+    }
+}
+
 /// One grain of the system: samplers, then mixing voices in patch order, then
 /// the mastering voice into the render buffers.
 fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_CH]> {
+    let _ftz = FtzGuard::new();
     let at = s.systems.get(&system).map_or(0, |y| y.renders.saturating_sub(1)) * grain as u64;
     let rev_gain = reverb_ab_gain(s, at, rate);
     let racks: Vec<(u64, u32)> = s.racks.iter().filter(|(_, r)| r.system == system).map(|(&h, r)| (h, r.rack_id)).collect();
