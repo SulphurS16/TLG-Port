@@ -193,7 +193,25 @@ pub fn cpu_report() {
 /// of them.
 #[inline]
 pub fn spin_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) -> bool {
-    let t0 = std::time::Instant::now();
+    // (Timed with the time stamp counter: `Instant::elapsed` converts the
+    // performance counter with a 128-bit multiply and divide, which after
+    // every pause made the copy and record threads' polls mostly arithmetic
+    // - power the heat-limited CPU's other threads need.)
+    let hz = crate::hle::kernel::time::tsc_hz_or(0);
+    if hz == 0 {
+        let t0 = std::time::Instant::now();
+        loop {
+            if done() {
+                return true;
+            }
+            std::hint::spin_loop();
+            if t0.elapsed() >= limit {
+                return done();
+            }
+        }
+    }
+    let ticks = (limit.as_nanos().min(u64::MAX as u128) as u64).saturating_mul(hz / 1000) / 1_000_000;
+    let t0 = unsafe { core::arch::x86_64::_rdtsc() };
     let per = crate::tune::get(crate::tune::SPIN_PAUSES).max(1);
     loop {
         for _ in 0..per {
@@ -202,7 +220,7 @@ pub fn spin_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) ->
             }
             std::hint::spin_loop();
         }
-        if t0.elapsed() >= limit {
+        if unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0) >= ticks {
             return done();
         }
     }

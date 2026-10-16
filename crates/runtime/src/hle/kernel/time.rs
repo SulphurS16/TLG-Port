@@ -56,6 +56,11 @@ pub fn tsc_hz() -> u64 {
     clock().tsc_hz
 }
 
+/// The TSC frequency, or `default` before `init`.
+pub fn tsc_hz_or(default: u64) -> u64 {
+    CLOCK.get().map_or(default, |c| c.tsc_hz)
+}
+
 fn realtime() -> Duration {
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
 }
