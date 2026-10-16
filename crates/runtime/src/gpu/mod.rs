@@ -1079,7 +1079,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             })
             .collect();
         let fg = [render::FORGETS[0].swap(0, Ordering::Relaxed), render::FORGETS[1].swap(0, Ordering::Relaxed)];
-        crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {}); upload-copy forgets {} over {} entries", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers, fg[0], fg[1]);
+        let hf = [render::HOISTED_FWD[0].swap(0, Ordering::Relaxed), render::HOISTED_FWD[1].swap(0, Ordering::Relaxed)];
+        crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {}; forwards there for {} uploads, {} mirror copy-ins); upload-copy forgets {} over {} entries", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers, hf[0], hf[1], fg[0], fg[1]);
         // (TLG_PERF=2: the shaders whose commands' descriptors cost most.)
         if let Some(m) = render::SHADER_DESC.lock().take() {
             let mut v: Vec<((u8, u64), render::ShaderDesc)> = m.into_iter().collect();

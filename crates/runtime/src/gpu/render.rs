@@ -1773,6 +1773,9 @@ pub(super) struct BatchCtx {
     /// the copies not yet recorded (`flush_forwards`).
     upload_forwarded: bool,
     fwd_pending: Vec<(vk::Buffer, vk::BufferCopy)>,
+    /// The last `upload_guest` recorded its forwards in the batch prologue
+    /// (`tune hoist_fwd`): its ring range is complete before the batch.
+    upload_hoisted: bool,
     /// Read-only guest ranges copied into ring segments in CPU epoch
     /// `upload_reuse_epoch`, by (aligned) base: (bytes, ring buffer and
     /// offset, write-tracker stamp after the copy, CP queue, batch of the
@@ -2530,6 +2533,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 marks: Vec::new(),
                 pending_noted: FastSet::default(),
                 upload_forwarded: false,
+                upload_hoisted: false,
                 fwd_pending: Vec::new(),
                 upload_reuse: FastMap::default(),
                 upload_reuse_epoch: 0,
@@ -2850,6 +2854,9 @@ pub static DISPATCH_SYNC: [[(std::sync::atomic::AtomicU64, std::sync::atomic::At
 pub static BARRIER_WHY: [[[std::sync::atomic::AtomicU64; 2]; 4]; 2] = [const { [const { [const { std::sync::atomic::AtomicU64::new(0) }; 2] }; 4] }; 2];
 /// TLG_PERF: mirror copy-ins recorded in their batch and ahead of it.
 pub static COPYIN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// TLG_PERF: forwards recorded in batch prologues (`tune hoist_fwd`): by
+/// uploads, by mirror copy-ins.
+pub static HOISTED_FWD: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// Pipelines created (graphics, compute): count and nanoseconds in the
 /// creation calls (reported with the renderer times).
 pub static PIPE_CREATES: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 2] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 2];
@@ -6179,19 +6186,35 @@ impl Renderer {
                 })
                 .collect();
             // Ahead of the batch (`tune hoist_copyins`): pages no command of
-            // this batch used yet, nothing forwarded into them and no
-            // in-place write of the batch to their source: the prologue
-            // orders the copy behind earlier batches and before this one
-            // (no barriers inside the batch, rendering not interrupted).
+            // this batch used yet, nothing forwarded into them but writes of
+            // batches in flight (`tune hoist_fwd`) and no in-place write of
+            // the batch to their source: the prologue orders the copy behind
+            // earlier batches and before this one (no barriers inside the
+            // batch, rendering not interrupted).
+            let fwd_batch = !fwd_copies.is_empty() && self.cx.writebacks.iter().any(|p| p.dev_buf != vbuf && abs.iter().any(|&(a, b)| p.base < b && a < p.base + p.size));
             let hoist = crate::tune::get(crate::tune::HOIST_COPYINS) != 0
                 && !regions.is_empty()
-                && fwd_copies.is_empty()
+                && (fwd_copies.is_empty() || (crate::tune::get(crate::tune::HOIST_FWD) != 0 && !fwd_batch))
                 && !abs.iter().any(|&(a, b)| self.cx.batch_mirror_used.overlaps(a, b) || self.cx.zc_writes.iter().any(|&(x, y)| x < b && a < y));
             COPYIN_STATS[hoist as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.begin();
             if hoist {
                 let pro = self.prologue_cmd();
                 unsafe { REC.cmd_copy_buffer(pro, src, vbuf, &regions) };
+                // (The forwards land after the copy-in and the earlier
+                // forwards they overlap, as below.)
+                let mut since: Vec<(u64, u64)> = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
+                for (pbuf, over) in &fwd_copies {
+                    if over.iter().any(|r| since.iter().any(|&(x, y)| r.dst_offset < y && x < r.dst_offset + r.size)) {
+                        prologue_barrier(pro);
+                        since.clear();
+                    }
+                    since.extend(over.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)));
+                    unsafe { REC.cmd_copy_buffer(pro, *pbuf, vbuf, over) };
+                }
+                if !fwd_copies.is_empty() && perf_on() {
+                    HOISTED_FWD[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
             } else {
                 // (After a full barrier: earlier commands of this batch may
                 // have written the source in place.)
@@ -6870,6 +6893,7 @@ impl Renderer {
     /// Returns the buffer and offset.
     fn upload_guest_ex(&mut self, base: u64, size: u64, devcopy: bool) -> Result<(vk::Buffer, u64), String> {
         self.cx.upload_devcopy = false;
+        self.cx.upload_hoisted = false;
         // Shader writes of submitted batches that have not reached guest
         // memory yet: forwarded from their device-ring copies (intact until
         // their slot is reused, which the queue orders after this batch)
@@ -6944,7 +6968,16 @@ impl Renderer {
                 .collect()
         };
         bpart(13, tc);
-        self.cx.upload_forwarded = !regions.is_empty();
+        // (`tune hoist_fwd`: forwards from batches in flight only go into the
+        // prologue, which runs behind them - the range is complete before the
+        // batch, no barrier in it. With a write of this batch over the range
+        // all are recorded in the batch, in landing order.)
+        let hoist = !regions.is_empty()
+            && crate::tune::get(crate::tune::HOIST_FWD) != 0
+            && crate::tune::get(crate::tune::PROLOGUE) != 0
+            && !(bloom_maybe(&self.cx.wb_bloom, base, size) && self.cx.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size));
+        self.cx.upload_forwarded = !regions.is_empty() && !hoist;
+        self.cx.upload_hoisted = hoist;
         if perf_detail() && !regions.is_empty() {
             let mut g = FORWARD_SITES.lock();
             let m = g.get_or_insert_with(HashMap::new);
@@ -6957,7 +6990,24 @@ impl Renderer {
                 *m.entry(format!("{base:#x}+{size:#x} read by {shader:#x}: {:#x}+{:#x} written in this batch ({})", p.base, p.size, if p.mirror { "mirror" } else { "device-ring copy" })).or_default() += 1;
             }
         }
-        if !regions.is_empty() {
+        if hoist {
+            // (In landing order; one over an earlier one's range behind a
+            // barrier, as in `flush_forwards`.)
+            let pro = self.prologue_cmd();
+            let mut since: smallvec::SmallVec<[(u64, u64); 8]> = smallvec::SmallVec::new();
+            for (buf, r) in &regions {
+                let (a, b) = (r.dst_offset, r.dst_offset + r.size);
+                if since.iter().any(|&(x, y)| a < y && x < b) {
+                    prologue_barrier(pro);
+                    since.clear();
+                }
+                since.push((a, b));
+                unsafe { REC.cmd_copy_buffer(pro, *buf, self.cx.ring.buffer, std::slice::from_ref(r)) };
+            }
+            if perf_on() {
+                HOISTED_FWD[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        } else if !regions.is_empty() {
             // Recorded by `flush_forwards` before the copy is used: the
             // forwards of all of a draw's bindings under one barrier.
             self.flushes[5] += 1;
@@ -6994,6 +7044,7 @@ impl Renderer {
                         self.prof[2] += t0.elapsed();
                     }
                     self.cx.upload_forwarded = false;
+                    self.cx.upload_hoisted = false;
                     self.cx.upload_devcopy = false;
                     self.bar_uploads.0 += 1;
                     self.bar_uploads.1 += size;
@@ -7841,13 +7892,18 @@ impl Renderer {
                         let off = self.upload_guest(base, size)?;
                         let t0 = bpart(9, t0);
                         let forwarded = self.cx.upload_forwarded;
+                        let hoisted = self.cx.upload_hoisted;
                         self.flush_forwards();
                         let dev_off = self.cx.dring.alloc(size).ok_or("device ring full")?;
                         let region = vk::BufferCopy { src_offset: off, dst_offset: dev_off, size };
                         if !forwarded && crate::tune::get(crate::tune::PROLOGUE) != 0 {
                             // (The guest data as copied now, into a range
-                            // nothing used yet: ahead of the batch.)
+                            // nothing used yet: ahead of the batch - after
+                            // the forwards `upload_guest` put there.)
                             let pro = self.prologue_cmd();
+                            if hoisted {
+                                prologue_barrier(pro);
+                            }
                             unsafe { REC.cmd_copy_buffer(pro, self.cx.ring.buffer, self.cx.dring.buffer, &[region]) };
                         } else {
                             self.end_rendering();

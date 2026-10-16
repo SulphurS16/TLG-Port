@@ -615,8 +615,14 @@ pub const MEMO_BASE: usize = 101;
 /// .. -082408; 2: a plain atomic per lane and store). Part of the translation
 /// key: switching translates again.
 pub const PAGE_MARKS: usize = 102;
+/// Forwards of GPU writes that only batches in flight made (their device
+/// copies, not in guest memory yet) are recorded in the batch prologue,
+/// which runs behind those batches, instead of in the batch behind a full
+/// barrier (`TLG_HOIST_FWD`, 1): for read-only and written buffer uploads and
+/// mirror copy-ins; forwards of the batch's own writes stay in the batch.
+pub const HOIST_FWD: usize = 103;
 
-const TABLE: [(&str, &str, i64); 103] = [
+const TABLE: [(&str, &str, i64); 104] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -720,6 +726,7 @@ const TABLE: [(&str, &str, i64); 103] = [
     ("shader_stats", "TLG_SHADER_STATS", 0),
     ("memo_base", "TLG_MEMO_BASE", 1),
     ("page_marks", "TLG_PAGE_MARKS", 1),
+    ("hoist_fwd", "TLG_HOIST_FWD", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
