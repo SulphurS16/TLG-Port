@@ -28,10 +28,18 @@ macro_rules! set_gpu_written {
     }};
 }
 
+/// A full barrier in the context in use, counted in its generation.
+macro_rules! full_barrier {
+    ($s:expr) => {{
+        $s.cx.barrier_gen += 1;
+        global_barrier($s.cx.cmd);
+    }};
+}
+
 macro_rules! unordered {
     ($s:expr) => {{
         $s.cx.barrier_needed = true;
-        $s.cx.unordered_gen = CTX_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        $s.cx.unordered_gen = $s.cx.barrier_gen;
         $s.cx.unordered_line = line!();
     }};
 }
@@ -895,8 +903,13 @@ pub struct CpView {
     cp_writes: Vec<(u64, u64)>,
 }
 
-pub static CP_VIEW: parking_lot::Mutex<CpView> = parking_lot::Mutex::new(CpView { pending: Ranges::new(), reads: Ranges::new(), cp_writes: Vec::new() });
-static CP_WRITES_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static CP_VIEWS: [parking_lot::Mutex<CpView>; 2] = [const { parking_lot::Mutex::new(CpView { pending: Ranges::new(), reads: Ranges::new(), cp_writes: Vec::new() }) }; 2];
+
+/// The CP view of renderer instance `inst` (`queue_inst`).
+fn cp_view(inst: usize) -> &'static parking_lot::Mutex<CpView> {
+    &CP_VIEWS[inst]
+}
+static CP_WRITES_QUEUED: [std::sync::atomic::AtomicBool; 2] = [const { std::sync::atomic::AtomicBool::new(false) }; 2];
 
 fn cp_view_on() -> bool {
     crate::tune::get(crate::tune::CP_SYNC_VIEW) != 0
@@ -919,6 +932,8 @@ struct Closed {
 /// Work performed (in submission order) when a batch completes.
 struct Completion {
     seq: u64,
+    /// The renderer instance that submitted it.
+    inst: u8,
     fence: vk::Fence,
     /// The batch's start/end timestamps (null: none).
     exec: vk::QueryPool,
@@ -1030,7 +1045,18 @@ pub static WB_NS_SUM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU6
 pub static WB_RESETS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static WB_RESET_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Batches submitted by renderer instance (TLG_PERF).
+pub static INST_BATCHES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// The last batch sequence number assigned (all renderer instances).
+pub fn submitted_seq() -> u64 {
+    *SUBMIT_SEQ.lock()
+}
+
 fn push_completion(mut c: Completion) {
+    if perf_on() {
+        INST_BATCHES[c.inst as usize & 1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
     let spans = c.writebacks.iter().map(|&(w, _, n)| (w, w + n)).chain(c.actions.iter().filter_map(|a| a.span()).map(|(a, n)| (a, a + n)));
     c.cpu_span = spans.reduce(|x, y| (x.0.min(y.0), x.1.max(y.1)));
     COMPLETIONS.lock().push_back(std::sync::Arc::new(c));
@@ -1616,6 +1642,8 @@ pub(super) struct BatchCtx {
     hz_seen: FastSet<(vk::Buffer, u64, u64, bool)>,
     /// Epoch validations for the command being recorded must reach
     /// (graphics or compute queue, see `super::CPU_EPOCH`).
+    /// The queue class of the command being recorded (`set_required_epoch`).
+    req_class: usize,
     required_epoch: u64,
     /// Shader of the draw/dispatch being recorded (diagnostics).
     cur_shader: u64,
@@ -1678,7 +1706,8 @@ pub(super) struct BatchCtx {
     last_elide: &'static str,
     /// The occlusion query active in the command buffer being recorded.
     occl_active: Option<u32>,
-    /// `CTX_BARRIERS` of this context while the other one is in use.
+    /// Full barriers recorded in this context (`full_barrier!`): the hazard
+    /// tracking's generation.
     barrier_gen: u64,
     /// The compute queues' context.
     compute: bool,
@@ -1753,6 +1782,17 @@ pub struct MemModel {
     stale_sorted: bool,
     stale_span_max: u64,
     stale_unbounded_lo: u64,
+    /// Per renderer instance: guest ranges its open batch copied into mirror
+    /// windows or made resident there (the other instance relies on them
+    /// once it is submitted).
+    open_copyins: [Ranges; 2],
+    /// Per renderer instance: mirror buffers the other one retired, whose
+    /// page-copy sets it releases (`Renderer::dirty_set`).
+    purge_dirty: [Vec<vk::Buffer>; 2],
+    /// Images and mirror windows retired with two renderers: freed once the
+    /// batch of each marker (per renderer: its open batch's marker, numbered
+    /// at its submission, or a submitted batch) has completed.
+    shared_retired: Vec<([u64; 2], Retired)>,
 }
 
 /// The image state, shared by the renderers (`Renderer::img_g`): the images,
@@ -1785,13 +1825,18 @@ struct ImgState {
     /// creation parameters (the key with base 0), and how many there are.
     image_pool: FastMap<ImageKey, Vec<resources::PooledImage>>,
     image_pool_n: usize,
+    /// Per renderer instance: guest bases of the images its open batch bound
+    /// (the other instance relies on them once it is submitted).
+    open_bases: [FastSet<u64>; 2],
 }
 
 pub struct Renderer {
     /// Sequence number of this renderer's last submitted batch.
     pub last_seq: u64,
-    /// This renderer's open-batch marker (`OPEN_SEQ`).
+    /// This renderer's open-batch marker (`OPEN_SEQ` - `inst`).
     open_seq: u64,
+    /// The instance: 0 the graphics queue's, 1 the compute queues'.
+    pub inst: u8,
     samplers: Samplers,
     modules: FastMap<u64, vk::ShaderModule>,
     gfx_pipes: FastMap<GfxKey, Pipe>,
@@ -1983,25 +2028,88 @@ struct PendingWrite {
 }
 
 static RENDERER_CELL: Mutex<Option<Renderer>> = Mutex::new(None);
+static RENDERER_CS_CELL: Mutex<Option<Renderer>> = Mutex::new(None);
 
-/// The renderer lock. Its guard (`RGuard`) releases the shared-state guards
+/// A renderer's lock. Its guard (`RGuard`) releases the shared-state guards
 /// the renderer took while it was held (`Renderer::release_shared`), so none
 /// outlives it and blocks another renderer.
-pub struct RendererLock;
-pub static RENDERER: RendererLock = RendererLock;
+pub struct RendererLock(&'static Mutex<Option<Renderer>>, usize);
+/// The graphics queue's renderer (instance 0; all queues without `cs_inst`).
+pub static RENDERER: RendererLock = RendererLock(&RENDERER_CELL, 0);
+/// The compute queues' renderer (instance 1, `tune cs_inst`). For now it is
+/// used under the graphics renderer's lock too: taken after it.
+pub static RENDERER_CS: RendererLock = RendererLock(&RENDERER_CS_CELL, 1);
 
 impl RendererLock {
     pub fn lock(&self) -> RGuard {
-        RGuard(Some(RENDERER_CELL.lock()))
+        let g = self.0.lock();
+        RGuard(Some(g), super::rec::set_inst(self.1)).images_first(self.1)
     }
     pub fn try_lock_for(&self, d: std::time::Duration) -> Option<RGuard> {
-        RENDERER_CELL.try_lock_for(d).map(|g| RGuard(Some(g)))
+        self.0.try_lock_for(d).map(|g| RGuard(Some(g), super::rec::set_inst(self.1)).images_first(self.1))
+    }
+    fn try_lock(&self) -> Option<RGuard> {
+        self.0.try_lock().map(|g| RGuard(Some(g), super::rec::set_inst(self.1)).images_first(self.1))
     }
 }
 
-pub struct RGuard(Option<parking_lot::MutexGuard<'static, Option<Renderer>>>);
+/// The compute queues have their own renderer (`tune cs_inst` at start).
+static CS_INST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn cs_inst() -> bool {
+    CS_INST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The compute queues' renderer has its own lock (`tune cs_inst 2`).
+static CS_SEPARATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn cs_separate() -> bool {
+    CS_SEPARATE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Per renderer instance (`cs_inst 2`): recorded work not yet submitted (set
+/// when it starts recording, cleared at its submission), its submissions so
+/// far, and a request from the other renderer to submit its open batch
+/// (served when its current command ends).
+static OPEN_WORK: [std::sync::atomic::AtomicBool; 2] = [const { std::sync::atomic::AtomicBool::new(false) }; 2];
+static SUBMIT_GEN: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static SUBMIT_REQ: [std::sync::atomic::AtomicBool; 2] = [const { std::sync::atomic::AtomicBool::new(false) }; 2];
+/// Per renderer instance: its last submitted batch, and whether a command is
+/// being recorded with it (for `retire_shared`).
+static LAST_SEQS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+static IN_CMD: [std::sync::atomic::AtomicBool; 2] = [const { std::sync::atomic::AtomicBool::new(false) }; 2];
+
+/// The renderer instance a command processor's queue records with (`tune
+/// cs_route` switches the compute queues back to the graphics renderer).
+pub fn queue_inst(q: usize) -> usize {
+    (q != 0 && cs_inst() && crate::tune::get(crate::tune::CS_ROUTE) != 0) as usize
+}
+
+/// The renderer instance each queue last recorded with (`TimedRenderer`).
+static QUEUE_INST: [std::sync::atomic::AtomicU8; 64] = [const { std::sync::atomic::AtomicU8::new(0) }; 64];
+
+/// Runs `f` with the renderer of queue `q` (its locks held).
+pub fn with_queue<R>(q: usize, f: impl FnOnce(&mut Renderer) -> R) -> Option<R> {
+    let mut g = TimedRenderer::lock(q);
+    g.as_mut().map(f)
+}
+
+/// A renderer lock's guard; the thread records for the instance it locks
+/// until the guard drops (then for the one before: `rec::set_inst`).
+pub struct RGuard(Option<parking_lot::MutexGuard<'static, Option<Renderer>>>, usize);
 
 impl RGuard {
+    /// (`cs_inst 2`) The graphics renderer holds the image state with its
+    /// lock: it never takes it after the memory model.
+    fn images_first(mut self, inst: usize) -> RGuard {
+        if inst == 0 && cs_separate() {
+            if let Some(r) = self.0.as_mut().and_then(|g| g.as_mut()) {
+                take_images(r);
+            }
+        }
+        self
+    }
+
     /// Releases the lock to a waiting thread (parking_lot's fair unlock).
     fn unlock_fair(mut self) {
         let mut g = self.0.take().unwrap();
@@ -2009,6 +2117,7 @@ impl RGuard {
             r.release_shared();
         }
         parking_lot::MutexGuard::unlock_fair(g);
+        super::rec::set_inst(self.1);
     }
 }
 
@@ -2018,6 +2127,8 @@ impl Drop for RGuard {
             if let Some(r) = g.as_mut() {
                 r.release_shared();
             }
+            drop(g);
+            super::rec::set_inst(self.1);
         }
     }
 }
@@ -2043,12 +2154,72 @@ fn lock_mem() -> parking_lot::MutexGuard<'static, MemModel> {
 }
 
 /// The memory model for this renderer: its guard, taken on first use and
-/// held until the renderer lock is released (or `release_shared`).
+/// held until the renderer lock is released (or `release_shared`). (The
+/// write tracker's per-command fields are this renderer's whenever it holds
+/// the guard: another renderer may have set them meanwhile.)
 macro_rules! mem {
-    ($s:expr) => {
-        (&mut **$s.mem_g.get_or_insert_with(lock_mem))
-    };
+    ($s:expr) => {{
+        if $s.mem_g.is_none() {
+            let mut g = lock_mem();
+            g.writes.required = $s.cx.required_epoch;
+            g.writes.class = $s.cx.req_class;
+            $s.mem_g = Some(g);
+        }
+        &mut **$s.mem_g.as_mut().unwrap()
+    }};
 }
+
+/// (`cs_inst 2`) Has renderer `other`'s open batch submitted, holding no
+/// shared-state guard: if its lock is free (between commands) the batch is
+/// submitted here, else `other` is asked to (`SUBMIT_REQ`, served when its
+/// command ends) and this waits until it has. A waiting graphics renderer has
+/// submitted its own open work first, so the compute renderer's wait for it
+/// (R1) never waits for a renderer that waits for it.
+fn submit_other(other: usize, why: usize) {
+    use std::sync::atomic::Ordering::{Acquire, Relaxed};
+    let lock = if other == 0 { &RENDERER } else { &RENDERER_CS };
+    let seen = SUBMIT_GEN[other].load(Acquire);
+    let mut asked = false;
+    let t0 = std::time::Instant::now();
+    loop {
+        if !OPEN_WORK[other].load(Acquire) || SUBMIT_GEN[other].load(Acquire) != seen {
+            break;
+        }
+        if let Some(mut g) = lock.try_lock() {
+            if let Some(r) = g.as_mut().filter(|r| r.open_work()) {
+                if perf_on() {
+                    CROSS_SUBMITS[why].fetch_add(1, Relaxed);
+                }
+                r.submit_batch(Vec::new());
+            }
+            break;
+        }
+        if !asked {
+            asked = true;
+            if perf_on() {
+                CROSS_SUBMITS[why].fetch_add(1, Relaxed);
+            }
+            SUBMIT_REQ[other].store(true, std::sync::atomic::Ordering::Release);
+        }
+        std::thread::yield_now();
+    }
+    if perf_on() {
+        CROSS_WAIT_NS[other].fetch_add(t0.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
+/// (`cs_inst 2`) Mirror bindings the compute renderer declined (pages not
+/// current, no window: bound from its own copy instead), and its dispatches
+/// recorded with the graphics renderer because they bind images (TLG_PERF).
+pub static CS_MIRROR_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// (`cs_inst 2`) Mirror bindings the graphics renderer declined: over the
+/// compute renderer's open copy-ins (TLG_PERF).
+pub static GFX_MIRROR_DECLINED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CS_IMAGE_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// (`cs_inst 2`) Time spent waiting for the other renderer's submission, by
+/// the renderer waited for (TLG_PERF).
+pub static CROSS_WAIT_NS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// The last batch sequence number assigned (all renderers). Held for a
 /// batch's whole submission - closing its contexts (lazy write-back skips),
@@ -2075,6 +2246,10 @@ pub const IMG_FIRST_LINES: usize = 16384;
 pub static IMG_FIRST: [std::sync::atomic::AtomicU32; 4 * IMG_FIRST_LINES] = [const { std::sync::atomic::AtomicU32::new(0) }; 4 * IMG_FIRST_LINES];
 pub static IMG_HOLDS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
+fn try_lock_img() -> Option<parking_lot::MutexGuard<'static, ImgState>> {
+    IMG_CELL.get().expect("renderer not initialized").try_lock()
+}
+
 fn lock_img(compute: bool, after_mem: bool, line: u32) -> parking_lot::MutexGuard<'static, ImgState> {
     if perf_on() {
         let i = (compute as usize * 2 + after_mem as usize) * IMG_FIRST_LINES + (line as usize).min(IMG_FIRST_LINES - 1);
@@ -2087,9 +2262,28 @@ fn lock_img(compute: bool, after_mem: bool, line: u32) -> parking_lot::MutexGuar
 /// until the renderer lock is released (or `release_shared`).
 macro_rules! img {
     ($s:expr) => {{
-        let (compute, after_mem) = ($s.cx.cmd_queue != 0, $s.mem_g.is_some());
-        &mut **$s.img_g.get_or_insert_with(|| lock_img(compute, after_mem, line!()))
+        if $s.img_g.is_none() {
+            let (compute, after_mem) = ($s.cx.cmd_queue != 0, $s.mem_g.is_some());
+            // (`cs_inst 2`: images before the memory model - its guard let
+            // go first when the image state is busy.)
+            let g = match (after_mem && cs_separate()).then(try_lock_img).flatten() {
+                Some(g) => g,
+                None => {
+                    if after_mem && cs_separate() {
+                        $s.mem_g = None;
+                    }
+                    lock_img(compute, after_mem, line!())
+                }
+            };
+            $s.img_g = Some(g);
+        }
+        &mut **$s.img_g.as_mut().unwrap()
     }};
+}
+
+/// The image state's guard for renderer `r` (`RGuard::images_first`).
+fn take_images(r: &mut Renderer) {
+    let _ = img!(r);
 }
 
 /// A recording context: its command pool, the batch slots (command buffers,
@@ -2175,6 +2369,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 target_cache: None,
                 hz_bufs: smallvec::SmallVec::new(),
                 hz_seen: FastSet::default(),
+                req_class: 0,
                 required_epoch: 0,
                 cur_shader: 0,
                 prep_shader: 0,
@@ -2268,6 +2463,9 @@ pub fn init() -> Result<(), String> {
             stale_sorted: false,
             stale_span_max: 0,
             stale_unbounded_lo: u64::MAX,
+            open_copyins: [Ranges::new(), Ranges::new()],
+            purge_dirty: [Vec::new(), Vec::new()],
+            shared_retired: Vec::new(),
         })).ok();
         IMG_CELL.set(parking_lot::Mutex::new(ImgState {
             images: FastMap::default(),
@@ -2282,91 +2480,19 @@ pub fn init() -> Result<(), String> {
             evicted_keys: FastMap::default(),
             image_pool: FastMap::default(),
             image_pool_n: 0,
+            open_bases: [FastSet::default(), FastSet::default()],
         })).ok();
-        *RENDERER.lock() = Some(Renderer {
-            last_seq: 0,
-            open_seq: OPEN_SEQ,
-            samplers: Samplers::new(),
-            modules: FastMap::default(),
-            gfx_pipes: FastMap::default(),
-            cs_pipes: FastMap::default(),
-            hz_stats: (0, 0),
-            hz_reasons: [0; 3],
-            hz_other_lines: FastMap::default(),
-            prof: Default::default(),
-            flushes: [0; 6],
-            upload_bytes: [0; 4],
-            uploads: 0,
-            hashed_bytes: 0,
-            reported: FastMap::default(),
-            draws: 0,
-            dispatches: 0,
-            skipped: 0,
-            gds,
-            remap: None,
-            indirect_pipe: None,
-            depth_copy_pipe: None,
-            dirty_pipe: None,
-            dirty_sets: FastMap::default(),
-            meta_pipes: None,
-            meta_gpu: 0,
-            indirect_diag: None,
-            indirect_rejected: 0,
-            tile_maps: FastMap::default(),
-            push_layouts: FastSet::default(),
-            tex_path_hits: (0, 0),
-            desc_templates: FastMap::default(),
-            desc_template_uses: (0, 0),
-            target_hits: (0, 0),
-            gpu_remaps: [0; 2],
-            gpu_tex_uploads: 0,
-            dprof: [0; 8],
-            dprof_draws: 0,
-            cprof: [[0; 7]; 2],
-            cprof_n: [0; 2],
-            dsub: [0; 6],
-            bsub: [0; 11],
-            bcnt: [0; 11],
-            ring_retries: 0,
-            scratch: None,
-            prepare_syncs: 0,
-            scatters: 0,
-            elided: 0,
-            copyin_kept: 0,
-            dma_mirror: 0,
-            upload_reused: (0, 0),
-            bar_uploads: (0, 0, 0),
-            index_mirrored: (0, 0),
-            retired_scratch: Vec::new(),
-            scratch_mem: None,
-            grown: 0,
-            tile_map_bytes: 0,
-            evicted: (0, 0),
-            retired: Vec::new(),
-            next_trim: 0,
-            pressure: 0,
-            pressure_reported: None,
-            recreated: (0, 0),
-            pro_ops: 0,
-            indirect_draw_pipe: None,
-            indirect_draw_diag: None,
-            indirect_draw_rejected: 0,
-            image_reuse: (0, 0),
-            depth_trace: FastMap::default(),
-            debug_out: None,
-            occl_windows: 0,
-            occl_ended: Vec::new(),
-            occl_next: 0,
-            tess_bufs: None,
-            reused_skips: 0,
-            reused_targets: 0,
-            edge_skips: 0,
-            mem_g: None,
-            img_g: None,
-            cx: Box::new(cx),
-            cx_park: Box::new(cx_park),
-            cx_cs: false,
-        });
+        *RENDERER.lock() = Some(Renderer::build(gds, cx, cx_park, 0));
+        if crate::tune::get(crate::tune::CS_INST) != 0 {
+            // (Rings as large as the graphics queue's: smaller ones overflow.)
+            let cx = new_batch_ctx(c, resources::RING_SIZE, resources::DEV_RING_SIZE, resources::BAR_RING_SIZE, true)?;
+            let cx_park = new_batch_ctx(c, resources::CS_RING_SIZE, resources::CS_DEV_RING_SIZE, resources::CS_BAR_RING_SIZE, true)?;
+            *RENDERER_CS.lock() = Some(Renderer::build(gds, cx, cx_park, 1));
+            CS_INST.store(true, std::sync::atomic::Ordering::Relaxed);
+            let separate = crate::tune::get(crate::tune::CS_INST) >= 2 && crate::tune::get(crate::tune::RECORDER) != 0;
+            CS_SEPARATE.store(separate, std::sync::atomic::Ordering::Relaxed);
+            crate::info!("renderer: the compute queues record with their own instance (cs_inst; {})", if separate { "its own lock" } else { "under the graphics renderer's lock" });
+        }
     }
     crate::info!("renderer initialized (ring {} MiB)", resources::RING_SIZE >> 20);
     Ok(())
@@ -2661,14 +2787,18 @@ pub static BUFFER_UPLOAD_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, boo
 /// per 4 KiB page: 64 KiB cover 2 GiB of written ranges).
 const BITS_ARENA_BYTES: u64 = 64 << 10;
 
+/// Submissions of one renderer instance's open batch for the other (TLG_PERF;
+/// `cs_inst`): R1 graphics before a compute batch; R2 compute before the
+/// graphics queue relies on its mirror copy-ins, image bases, pending
+/// writes; R3 before retiring a shared object.
+pub static CROSS_SUBMITS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+pub const CROSS_SUBMIT_NAMES: [&str; 5] = ["graphics before compute", "compute copy-ins", "compute image bases", "compute pending writes", "(objects retired for both renderers)"];
+
 /// Full barriers and render-pass begins recorded (TLG_PERF).
 pub static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Submissions made because a CP started recording in the other context
 /// (`enter_ctx`; TLG_PERF).
 pub static CTX_SUBMITS: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
-/// Full barriers recorded into the context in use (`select_ctx` saves and
-/// restores it per context): the hazard tracking's generation.
-static CTX_BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PASS_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A full barrier in a batch prologue: orders the prologue against earlier
@@ -2686,7 +2816,6 @@ pub static PRO_BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 #[track_caller]
 fn global_barrier(cmd: vk::CommandBuffer) {
     BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    CTX_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some()) {
         let line = std::panic::Location::caller().line();
@@ -2789,7 +2918,7 @@ impl Renderer {
         unsafe {
             REC.begin_command_buffer(self.cx.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         }
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         // The page bitmaps of this batch's write-backs, zeroed once here
         // (no fill and barrier for each). After the batch-start barrier:
         // batches still running may read this segment (forwards and device
@@ -2799,7 +2928,7 @@ impl Renderer {
         self.cx.bits_arena = match self.cx.dring.alloc(BITS_ARENA_BYTES).filter(|_| crate::tune::get(crate::tune::BITS_ARENA) != 0) {
             Some(off) => {
                 unsafe { REC.cmd_fill_buffer(self.cx.cmd, self.cx.dring.buffer, off, BITS_ARENA_BYTES, 0) };
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 (self.cx.batch, off, 0, BITS_ARENA_BYTES / 4)
             }
             None => (u64::MAX, 0, 0, 0),
@@ -2813,6 +2942,7 @@ impl Renderer {
         }
         self.cx.batch_mirror_used = Ranges::new();
         self.cx.recording = true;
+        OPEN_WORK[self.inst as usize].store(true, std::sync::atomic::Ordering::Release);
         self.cx.dyn_state = None;
         self.cx.bound_gfx = vk::Pipeline::null();
         self.cx.bound_cs = vk::Pipeline::null();
@@ -2975,6 +3105,7 @@ impl Renderer {
     fn set_required_epoch(&mut self, compute_queue: bool) {
         let e = if compute_queue { &super::CS_EPOCH } else { &super::GFX_EPOCH };
         self.cx.required_epoch = e.load(std::sync::atomic::Ordering::Relaxed);
+        self.cx.req_class = compute_queue as usize;
         mem!(self).writes.required = self.cx.required_epoch;
         mem!(self).writes.class = compute_queue as usize;
         super::REQUIRED_EPOCH.with(|r| r.set(self.cx.required_epoch));
@@ -2997,10 +3128,272 @@ impl Renderer {
         self.prof[0] += t0.elapsed();
     }
 
-    /// Submits the recorded work (if any) without waiting; `actions` are
-    /// performed after it and everything before it has completed. Returns the
-    /// batch's sequence number.
-    #[track_caller]
+    /// A renderer instance (`inst`: 0 the graphics queue's, 1 the compute
+    /// queues') with its recording contexts.
+    fn build(gds: vk::Buffer, cx: BatchCtx, cx_park: BatchCtx, inst: u8) -> Renderer {
+        Renderer {
+        last_seq: 0,
+        open_seq: OPEN_SEQ - inst as u64,
+        inst,
+        samplers: Samplers::new(),
+        modules: FastMap::default(),
+        gfx_pipes: FastMap::default(),
+        cs_pipes: FastMap::default(),
+        hz_stats: (0, 0),
+        hz_reasons: [0; 3],
+        hz_other_lines: FastMap::default(),
+        prof: Default::default(),
+        flushes: [0; 6],
+        upload_bytes: [0; 4],
+        uploads: 0,
+        hashed_bytes: 0,
+        reported: FastMap::default(),
+        draws: 0,
+        dispatches: 0,
+        skipped: 0,
+        gds,
+        remap: None,
+        indirect_pipe: None,
+        depth_copy_pipe: None,
+        dirty_pipe: None,
+        dirty_sets: FastMap::default(),
+        meta_pipes: None,
+        meta_gpu: 0,
+        indirect_diag: None,
+        indirect_rejected: 0,
+        tile_maps: FastMap::default(),
+        push_layouts: FastSet::default(),
+        tex_path_hits: (0, 0),
+        desc_templates: FastMap::default(),
+        desc_template_uses: (0, 0),
+        target_hits: (0, 0),
+        gpu_remaps: [0; 2],
+        gpu_tex_uploads: 0,
+        dprof: [0; 8],
+        dprof_draws: 0,
+        cprof: [[0; 7]; 2],
+        cprof_n: [0; 2],
+        dsub: [0; 6],
+        bsub: [0; 11],
+        bcnt: [0; 11],
+        ring_retries: 0,
+        scratch: None,
+        prepare_syncs: 0,
+        scatters: 0,
+        elided: 0,
+        copyin_kept: 0,
+        dma_mirror: 0,
+        upload_reused: (0, 0),
+        bar_uploads: (0, 0, 0),
+        index_mirrored: (0, 0),
+        retired_scratch: Vec::new(),
+        scratch_mem: None,
+        grown: 0,
+        tile_map_bytes: 0,
+        evicted: (0, 0),
+        retired: Vec::new(),
+        next_trim: 0,
+        pressure: 0,
+        pressure_reported: None,
+        recreated: (0, 0),
+        pro_ops: 0,
+        indirect_draw_pipe: None,
+        indirect_draw_diag: None,
+        indirect_draw_rejected: 0,
+        image_reuse: (0, 0),
+        depth_trace: FastMap::default(),
+        debug_out: None,
+        occl_windows: 0,
+        occl_ended: Vec::new(),
+        occl_next: 0,
+        tess_bufs: None,
+        reused_skips: 0,
+        reused_targets: 0,
+        edge_skips: 0,
+        mem_g: None,
+        img_g: None,
+        cx: Box::new(cx),
+        cx_park: Box::new(cx_park),
+        cx_cs: false,
+        }
+    }
+
+    /// (Graphics renderer, `cs_inst`) Before a command's bindings: when its
+    /// resources overlap what the compute renderer's open batch copied into
+    /// mirror windows or images it bound, that batch is submitted first (R2;
+    /// not in the middle of the bindings, whose batch must stay open).
+    fn cross_precheck(&mut self, stages: &[&Prepared]) {
+        // (`cs_inst 2`: bindings decline those ranges instead.)
+        if self.inst != 0 || !cs_inst() || cs_separate() {
+            return;
+        }
+        let hit = {
+            let im = img!(self);
+            let m = mem!(self);
+            stages.iter().any(|p| {
+                p.resources.iter().any(|r| match r {
+                    ResolvedRes::Buffer(v) => !m.open_copyins[1].is_empty() && m.open_copyins[1].overlaps(v.base, v.base + v.size().max(1)),
+                    ResolvedRes::Image(t) => im.open_bases[1].contains(&t.base),
+                    ResolvedRes::Sampler(_) => false,
+                })
+            })
+        };
+        if hit {
+            let why = if stages.iter().any(|p| p.resources.iter().any(|r| matches!(r, ResolvedRes::Image(_)))) { 2 } else { 1 };
+            self.submit_cs_first(why);
+            self.begin();
+        }
+    }
+
+    /// Recorded work not yet submitted (either context).
+    fn open_work(&self) -> bool {
+        self.cx.recording || self.cx_park.recording
+    }
+
+    /// (Graphics instance, `cs_inst`) Submits this renderer's open batch,
+    /// then the compute queues' renderer's (`why`: `CROSS_SUBMITS` index):
+    /// what the graphics queue is about to rely on of the compute instance's
+    /// open work lands first, in batches before its own next one.
+    fn submit_cs_first(&mut self, why: usize) {
+        if self.open_work() {
+            self.submit_batch(Vec::new());
+        }
+        self.release_shared();
+        if cs_separate() {
+            submit_other(1, why);
+            if cs_separate() {
+                let _ = img!(self);
+            }
+            return;
+        }
+        // (W4a: the graphics renderer's lock is held by this thread, so no
+        // compute CP holds the compute instance's.)
+        let mut g = RENDERER_CS.lock();
+        if let Some(c) = g.as_mut().filter(|c| c.open_work()) {
+            if perf_on() {
+                CROSS_SUBMITS[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            c.submit_inner(Vec::new());
+        }
+    }
+
+    /// (Compute instance) Submits the graphics renderer's open batch (`why`:
+    /// `CROSS_SUBMITS` index).
+    fn submit_gfx_first(&mut self, why: usize) {
+        self.release_shared();
+        if cs_separate() {
+            submit_other(0, why);
+            return;
+        }
+        // SAFETY (W4a): the compute queues' renderer is used only with the
+        // graphics renderer's lock held by this thread (`TimedRenderer`), and
+        // nothing of the graphics renderer is borrowed meanwhile.
+        if let Some(g) = unsafe { (*RENDERER_CELL.data_ptr()).as_mut() } {
+            if g.open_work() {
+                if perf_on() {
+                    CROSS_SUBMITS[why].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let prev = super::rec::set_inst(0);
+                g.submit_batch(Vec::new());
+                super::rec::set_inst(prev);
+            }
+            g.release_shared();
+        }
+    }
+
+    /// Retires an image or a mirror window: after this renderer's open batch
+    /// (`after`: this renderer's marker, or a batch), and with two renderers
+    /// after the other's open batch if it has open work or is inside a
+    /// command, else after its last submitted one (it cannot find the object
+    /// any more: out of the shared state, under the guard).
+    fn retire_shared(&mut self, after: u64, r: Retired) {
+        if !cs_inst() {
+            self.retired.push((after, r));
+            return;
+        }
+        use std::sync::atomic::Ordering::Acquire;
+        let own = self.inst as usize;
+        let other = 1 - own;
+        let mut marks = [0u64; 2];
+        marks[own] = after;
+        marks[other] = if OPEN_WORK[other].load(Acquire) || IN_CMD[other].load(Acquire) { OPEN_SEQ - other as u64 } else { LAST_SEQS[other].load(Acquire) };
+        if perf_on() {
+            CROSS_SUBMITS[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        mem!(self).shared_retired.push((marks, r));
+    }
+
+    /// Frees the retired objects whose batches have completed.
+    fn free_retired(&mut self) {
+        let done = *DONE.lock();
+        // (Shared objects whose batches - both renderers' - have completed:
+        // moved to this renderer's list, freed below.)
+        if cs_inst() && mem!(self).shared_retired.iter().any(|(m, _)| m[0] <= done && m[1] <= done) {
+            let m = mem!(self);
+            let mut i = 0;
+            while i < m.shared_retired.len() {
+                if m.shared_retired[i].0.iter().all(|&s| s <= done) {
+                    let (_, r) = m.shared_retired.swap_remove(i);
+                    self.retired.push((0, r));
+                } else {
+                    i += 1;
+                }
+            }
+        }
+        if self.retired.iter().any(|(s, _)| *s <= done) {
+            let c = ctx();
+            let mut budget = if self.pressure >= 2 { usize::MAX } else { RETIRE_PER_PASS };
+            let mut blocks = Vec::new();
+            let mut pooled: Vec<(ImageKey, resources::PooledImage)> = Vec::new();
+            self.retired.retain_mut(|(s, r)| {
+                if *s > done || budget == 0 {
+                    return true;
+                }
+                budget -= 1;
+                unsafe {
+                    match r {
+                        Retired::Image(i, m, views) => {
+                            for &v in views.iter() {
+                                c.device.destroy_image_view(v, None);
+                            }
+                            c.device.destroy_image(*i, None);
+                            c.free(*m);
+                        }
+                        Retired::Buffer(b, m) => {
+                            c.device.destroy_buffer(*b, None);
+                            c.free(*m);
+                        }
+                        Retired::Window(b, m, bound) => {
+                            c.device.destroy_buffer(*b, None);
+                            if *m != vk::DeviceMemory::null() {
+                                c.free(*m);
+                            }
+                            blocks.append(bound);
+                        }
+                        Retired::Set(pool, set) => {
+                            c.device.free_descriptor_sets(*pool, &[*set]).ok();
+                        }
+                        Retired::Pooled(k, p) => {
+                            pooled.push((*k, std::mem::take(p)));
+                        }
+                    }
+                }
+                false
+            });
+            if let Some(p) = mem!(self).sparse_pool.as_mut() {
+                p.give(blocks);
+            }
+            for (k, p) in pooled {
+                if img!(self).image_pool_n < IMAGE_POOL_MAX && self.pressure < 2 {
+                    img!(self).image_pool.entry(k).or_default().push(p);
+                    img!(self).image_pool_n += 1;
+                } else {
+                    p.destroy();
+                }
+            }
+        }
+    }
+
     /// Drops the shared-state guards this renderer holds.
     fn release_shared(&mut self) {
         if perf_on() {
@@ -3022,15 +3415,13 @@ impl Renderer {
         if self.cx_cs == compute {
             return;
         }
-        use std::sync::atomic::Ordering::Relaxed;
-        self.cx.barrier_gen = CTX_BARRIERS.load(Relaxed);
         std::mem::swap(&mut self.cx, &mut self.cx_park);
-        CTX_BARRIERS.store(self.cx.barrier_gen, Relaxed);
         self.cx_cs = compute;
     }
 
     /// Closes the open batch of the context in use for a submission:
     /// its write-back copies recorded, its command buffers ended.
+    #[track_caller]
     fn close_ctx(&mut self) -> Closed {
         // (Forwards still queued belong to a command that was abandoned:
         // their ring ranges are used by nothing.)
@@ -3081,7 +3472,7 @@ impl Renderer {
             // once the batch's fence signals. Ranges with a page bitmap: only
             // the marked pages, and the bitmap for the completion's write-back.
             self.end_rendering();
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             if pending.iter().any(|p| p.bits.is_some()) && self.record_dirty_copies(&pending).is_err() {
                 // (Without the kernel: whole ranges, as before.)
                 for p in &mut pending {
@@ -3163,11 +3554,20 @@ impl Renderer {
         if m.gpu_pending_all == open {
             m.gpu_pending_all = seq;
         }
+        m.open_copyins[self.inst as usize] = Ranges::new();
+        for (marks, _) in m.shared_retired.iter_mut() {
+            if marks[self.inst as usize] == open {
+                marks[self.inst as usize] = seq;
+            }
+        }
+        OPEN_WORK[self.inst as usize].store(false, std::sync::atomic::Ordering::Release);
+        SUBMIT_GEN[self.inst as usize].fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         noted.clear();
         self.cx.pending_noted = noted;
         for r in self.retired.iter_mut().filter(|r| r.0 == open) {
             r.0 = seq;
         }
+        img!(self).open_bases[self.inst as usize].clear();
     }
 
     /// Moves the context in use to its next slot once that slot's previous
@@ -3227,7 +3627,23 @@ impl Renderer {
         self.select_ctx(compute);
     }
 
+    /// Submits the recorded work (if any) without waiting; `actions` are
+    /// performed after it and everything before it has completed. Returns the
+    /// batch's sequence number.
+    #[track_caller]
     pub fn submit_batch(&mut self, actions: Vec<super::cp::EopAction>) -> u64 {
+        if self.inst == 1 {
+            // (R1: the graphics queue's open work first.)
+            self.submit_gfx_first(0);
+            let seq = self.submit_inner(actions);
+            self.free_retired();
+            return seq;
+        }
+        self.submit_inner(actions)
+    }
+
+    #[track_caller]
+    fn submit_inner(&mut self, actions: Vec<super::cp::EopAction>) -> u64 {
         // (The shared state first: the lock order.)
         let _ = img!(self);
         let _ = mem!(self);
@@ -3267,9 +3683,10 @@ impl Renderer {
             // Ordering-only completion (nothing new to wait for on the GPU).
             *submit += 1;
             self.last_seq = *submit;
-            push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: rings[0], ring_ptr_cs: rings[1], wb_cs, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
+            LAST_SEQS[self.inst as usize].store(self.last_seq, std::sync::atomic::Ordering::Release);
+            push_completion(Completion { seq: self.last_seq, inst: self.inst, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: rings[0], ring_ptr_cs: rings[1], wb_cs, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
             // (In COMPLETIONS now: the view may forget them.)
-            CP_VIEW.lock().pending = Ranges::new();
+            cp_view(self.inst as usize).lock().pending = Ranges::new();
             self.seal_open(self.last_seq);
             drop(submit);
             if early {
@@ -3304,6 +3721,7 @@ impl Renderer {
         }
         self.last_seq = seq;
         *submit = seq;
+        LAST_SEQS[self.inst as usize].store(seq, std::sync::atomic::Ordering::Release);
         let tail = TAIL_PROFILE.swap(false, std::sync::atomic::Ordering::Relaxed);
         let profile = (g.recording && queries != vk::QueryPool::null() && self.cx.marks.len() > 1).then(|| {
             let mut m = std::mem::take(&mut self.cx.marks);
@@ -3314,10 +3732,10 @@ impl Renderer {
             }
             (queries, m)
         });
-        push_completion(Completion { seq, fence, exec, ring_ptr: rings[0], ring_ptr_cs: rings[1], wb_cs, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
+        push_completion(Completion { seq, inst: self.inst, fence, exec, ring_ptr: rings[0], ring_ptr_cs: rings[1], wb_cs, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
         // (In COMPLETIONS now: the view may forget them.)
         {
-            let mut v = CP_VIEW.lock();
+            let mut v = cp_view(self.inst as usize).lock();
             v.pending = Ranges::new();
             v.reads = Ranges::new();
         }
@@ -3685,7 +4103,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         if self.cx.barrier_needed {
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             self.cx.barrier_needed = false;
         }
         let regions: Vec<vk::ImageCopy> = (0..old.levels.max(1))
@@ -3746,8 +4164,9 @@ impl Renderer {
         }
         img!(self).shadows.retain(|sk, (dk, _)| sk.0 != old && *dk != old);
         img!(self).image_bytes -= o.bytes;
-        // (Used by the batch being recorded: freed once it completes.)
-        self.retired.push((self.open_seq, Retired::Image(o.image, o.memory, o.views.values().copied().collect())));
+        // (Used by the batch being recorded: freed once it completes, and the
+        // other renderer's.)
+        self.retire_shared(self.open_seq, Retired::Image(o.image, o.memory, o.views.values().copied().collect()));
         self.grown += 1;
         if self.grown <= 20 {
             crate::info!("image {:#x} {}x{}x{} {:?}: {} -> {} mip levels (view of level {level})", old.base, old.width, old.height, old.layers, old.format, old.levels, levels);
@@ -3778,7 +4197,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         if self.cx.barrier_needed {
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             self.cx.barrier_needed = false;
         }
         let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: layers };
@@ -3869,12 +4288,35 @@ impl Renderer {
         }
         let done = *DONE.lock();
         let mut need = if mem!(self).gpu_pending_all > done { mem!(self).gpu_pending_all } else { 0 };
+        let open = self.open_seq;
+        let (mut own, mut other) = (need == open, need >= OPEN_MIN && need != open);
         for &a in reads {
             if let Some(s) = mem!(self).gpu_pending_pages.get(a >> 12) {
                 if s > done {
+                    own |= s == open;
+                    other |= s >= OPEN_MIN && s != open;
                     need = need.max(s);
                 }
             }
+        }
+        if other {
+            // (The other renderer instance's open batch writes them: it is
+            // submitted, then everything submitted is waited for.)
+            self.prepare_syncs += 1;
+            if self.inst == 0 {
+                self.submit_cs_first(3);
+            } else {
+                self.submit_gfx_first(3);
+            }
+            if own {
+                self.flush_for(1);
+            } else {
+                let last = *SUBMIT_SEQ.lock();
+                let t0 = std::time::Instant::now();
+                wait_done(last);
+                SYNC_WAIT_NS.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+            }
+            return true;
         }
         if mem!(self).gpu_pending_pages.len() > 1 << 12 {
             mem!(self).gpu_pending_pages.retain_after(done);
@@ -3903,7 +4345,7 @@ impl Renderer {
                 break;
             }
         }
-        if need >= OPEN_MIN {
+        if own {
             // (The open batch writes them.)
             self.flush_for(1);
         } else {
@@ -3949,7 +4391,7 @@ impl Renderer {
             return;
         }
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         for (dev_off, zbuf, zoff, size) in std::mem::take(&mut self.cx.gpu_wb) {
             unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: dev_off, dst_offset: zoff, size }]) };
         }
@@ -4166,7 +4608,7 @@ impl Renderer {
             } else {
                 self.end_rendering();
                 unsafe { REC.cmd_fill_buffer(self.cx.cmd, self.cx.dring.buffer, bits, words as u64 * 4, 0) };
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
             }
             bits
         };
@@ -4233,7 +4675,7 @@ impl Renderer {
             self.begin();
             self.end_rendering();
             if self.cx.barrier_needed {
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 self.cx.barrier_needed = false;
             }
             let aspect = if skey.depth { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
@@ -4269,7 +4711,7 @@ impl Renderer {
         let Some((db, doff)) = self.inplace_dest(dv.base, bytes)? else { return Ok(false) };
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe { REC.cmd_copy_buffer(self.cx.cmd, sb, db, &[vk::BufferCopy { src_offset: so, dst_offset: doff, size: bytes }]) };
         unordered!(self);
         if !mirrored {
@@ -4307,7 +4749,7 @@ impl Renderer {
             self.begin();
             self.end_rendering();
             if self.cx.barrier_needed {
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 self.cx.barrier_needed = false;
             }
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: key.levels.max(1), base_array_layer: layers.0, layer_count: layers.1 };
@@ -4346,7 +4788,7 @@ impl Renderer {
         let pattern = u32::from_le_bytes(word[..4].try_into().unwrap());
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe { REC.cmd_fill_buffer(self.cx.cmd, zbuf, zoff, bytes, pattern) };
         unordered!(self);
         if !mirrored {
@@ -4394,7 +4836,7 @@ impl Renderer {
         }
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe { REC.cmd_copy_buffer(self.cx.cmd, sbuf, zbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: zoff, size: bytes }]) };
         if sbuf != self.cx.dring.buffer {
             self.zc_read(src, src + bytes);
@@ -4432,7 +4874,7 @@ impl Renderer {
         }
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe { REC.cmd_copy_buffer(self.cx.cmd, sbuf, dbuf, &[vk::BufferCopy { src_offset: soff, dst_offset: doff, size: bytes }]) };
         unordered!(self);
         mem!(self).writes.note_gpu_write(dst, bytes);
@@ -4480,7 +4922,7 @@ impl Renderer {
         let Some((sbuf, soff)) = self.gpu_source(src, n) else { return false };
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe { REC.cmd_copy_buffer(self.cx.cmd, sbuf, self.gds, &[vk::BufferCopy { src_offset: soff, dst_offset: o, size: n }]) };
         if sbuf != self.cx.dring.buffer {
             self.zc_read(src, src + n);
@@ -4558,6 +5000,10 @@ impl Renderer {
     /// `load_only`: the shader only loads texels by integer coordinates
     /// (`Prepared::load_only`).
     fn texture(&mut self, t: &Tsharp, storage: bool, load_only: bool) -> Result<vk::ImageView, String> {
+        if cs_inst() && self.inst == 1 {
+            // (Bases of images the compute renderer's open batch binds: R2.)
+            img!(self).open_bases[1].insert(t.base);
+        }
         let Some(vfmt) = desc::vk_format(t.dfmt, t.nfmt) else {
             return self.dummy_texture(t, storage, "unsupported format");
         };
@@ -4910,6 +5356,15 @@ impl Renderer {
     /// (`small`: ranges below VCACHE_MIN too, in windows that exist.)
     fn vcache_bind_ex(&mut self, base: u64, size: u64, overwrite: bool, small: bool) -> Option<(vk::Buffer, u64)> {
         self.drain_cp_writes();
+        // (`cs_inst 2`: not over what the compute renderer's open batch copied
+        // in or bound - its own copy instead.)
+        if self.inst == 0 && cs_separate() && mem!(self).open_copyins[1].overlaps(base, base + size.max(1)) {
+            if perf_on() {
+                GFX_MIRROR_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            return None;
+        }
+
         // (Bindings up to a window: callers limit written ones to VCACHE_MAX.)
         if size == 0 || size > VWIN_SIZE || (size < VCACHE_MIN && !small) || crate::tune::get(crate::tune::VCACHE) == 0 {
             return None;
@@ -5003,9 +5458,11 @@ impl Renderer {
                     return None;
                 }
                 // Overlapped windows (made before the mapping grew) are
-                // released once the batches using them have completed.
+                // released once the batches using them have completed (both
+                // renderers': `retire_shared`).
                 let seq = self.open_seq;
                 let mut gone = Vec::new();
+                let mut retire = Vec::new();
                 if let Some(vc) = mem!(self).vcache.as_mut() {
                     // (Same slot only: windows of neighbouring slots overlap
                     // by design, see `VWIN_SIZE`.)
@@ -5016,8 +5473,11 @@ impl Renderer {
                         super::lazywb::release_buffer(w.buf);
                         vc.bytes -= w.bytes();
                         gone.push(w.buf);
-                        self.retired.push((seq, w.retire()));
+                        retire.push(w.retire());
                     }
+                }
+                for r in retire {
+                    self.retire_shared(seq, r);
                 }
                 for b in gone {
                     self.retire_dirty_set(b, seq);
@@ -5038,6 +5498,9 @@ impl Renderer {
         }
         w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         let r = self.vcache_fill(k, base, size, epoch, required, overwrite);
+        if r.is_none() && self.inst == 1 && cs_separate() && perf_on() {
+            CS_MIRROR_DECLINED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         if r.is_some() {
             self.cx.batch_mirror_used.insert(base, base + size);
         }
@@ -5103,6 +5566,7 @@ impl Renderer {
         let Some(w) = windows.get_mut(&k) else { return false };
         let Some(sp) = w.sparse.as_mut() else { return true };
         let (b0, b1) = ((base - w.lo) / sp.block, (base + size - 1 - w.lo) / sp.block);
+        let span = (w.lo + b0 * sp.block, (w.lo + (b1 + 1) * sp.block).min(w.hi));
         let mut binds = Vec::new();
         let mut ok = true;
         for b in b0..=b1 {
@@ -5121,6 +5585,10 @@ impl Renderer {
             *bytes += sp.block;
         }
         if !binds.is_empty() {
+            if self.inst == 1 {
+                // (Resident once this batch is submitted: the whole blocks.)
+                m.open_copyins[1].insert(span.0, span.1);
+            }
             let buf = w.buf;
             match self.cx.sparse_binds.iter_mut().find(|(b, _)| *b == buf) {
                 Some((_, v)) => v.extend(binds),
@@ -5191,7 +5659,21 @@ impl Renderer {
             return None;
         }
         self.vcache_check(k, base, size, epoch, required)?;
-        let vc = mem!(self).vcache.as_mut().unwrap();
+        let m = mem!(self);
+        let vc = m.vcache.as_mut().unwrap();
+        let w = vc.windows.get_mut(&k)?;
+        if self.inst == 1 && cs_separate() {
+            // (`cs_inst 2`: no copy-in over pages the graphics renderer's open
+            // batch writes - it would land after their data.)
+            let (p0, p1) = (((base - w.lo) >> 12) as usize, ((base + size - w.lo + 0xFFF) >> 12) as usize);
+            let gfx_open = OPEN_SEQ;
+            let lo_page = w.lo >> 12;
+            let over = bits_clear_runs(&w.valid, p0, p1).iter().any(|&(a, b)| (a..b).any(|pg| m.gpu_pending_pages.get(lo_page + pg as u64) == Some(gfx_open)));
+            if over || m.gpu_pending_all == gfx_open {
+                return None;
+            }
+        }
+        let vc = m.vcache.as_mut().unwrap();
         let w = vc.windows.get_mut(&k)?;
         if overwrite {
             // Whole pages the caller overwrites: current once it has.
@@ -5305,14 +5787,14 @@ impl Renderer {
                 // (After a full barrier: earlier commands of this batch may
                 // have written the source in place.)
                 self.end_rendering();
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 if !regions.is_empty() {
                     unsafe { REC.cmd_copy_buffer(self.cx.cmd, src, vbuf, &regions) };
                 }
                 let mut since: Vec<(u64, u64)> = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
                 for (pbuf, over) in &fwd_copies {
                     if over.iter().any(|r| since.iter().any(|&(x, y)| r.dst_offset < y && x < r.dst_offset + r.size)) {
-                        global_barrier(self.cx.cmd);
+                        full_barrier!(self);
                         since.clear();
                     }
                     since.extend(over.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)));
@@ -5321,7 +5803,13 @@ impl Renderer {
                 }
                 unordered!(self);
             }
-            let vc = mem!(self).vcache.as_mut().unwrap();
+            let m = mem!(self);
+            if self.inst == 1 {
+                for &(a, b) in &abs {
+                    m.open_copyins[1].insert(a, b);
+                }
+            }
+            let vc = m.vcache.as_mut().unwrap();
             let w = vc.windows.get_mut(&k).unwrap();
             for &(a, b) in &runs {
                 bits_set(&mut w.valid, a, b, true);
@@ -5518,7 +6006,7 @@ impl Renderer {
             // fit a host ring segment.
             let scratch = self.scratch_buffer(w as u64 * h as u64 * bpp)?;
             let off = 0;
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             let to_buf = vk::BufferImageCopy {
                 buffer_offset: off,
                 buffer_row_length: 0,
@@ -5530,7 +6018,7 @@ impl Renderer {
             let to_img = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, ..to_buf };
             unsafe {
                 REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&src].image, vk::ImageLayout::GENERAL, scratch, &[to_buf]);
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 REC.cmd_copy_buffer_to_image(self.cx.cmd, scratch, img!(self).images[&dst_key].image, vk::ImageLayout::GENERAL, &[to_img]);
             }
             unordered!(self);
@@ -5594,7 +6082,7 @@ impl Renderer {
         let pc: Vec<u8> = [w, h].iter().flat_map(|v| v.to_le_bytes()).collect();
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.cx.bound_cs = vk::Pipeline::null();
             REC.cmd_bind_descriptor_sets(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
             REC.cmd_push_constants(self.cx.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &pc);
@@ -5645,7 +6133,7 @@ impl Renderer {
             self.begin();
             self.end_rendering();
             if self.cx.barrier_needed {
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 self.cx.barrier_needed = false;
             }
             for &(k, at) in &parts {
@@ -5697,7 +6185,7 @@ impl Renderer {
         self.begin();
         self.end_rendering();
         if self.cx.barrier_needed {
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             self.cx.barrier_needed = false;
         }
         let (bpp, block) = resources::element_bits(t.dfmt);
@@ -5781,31 +6269,32 @@ impl Renderer {
     /// A write-back this batch performs at completion (also entered in
     /// `CP_VIEW`).
     fn push_writeback(&mut self, w: PendingWrite) {
-        CP_VIEW.lock().pending.insert(w.base, w.base + w.size.max(1));
+        cp_view(self.inst as usize).lock().pending.insert(w.base, w.base + w.size.max(1));
         self.cx.writebacks.push(w);
     }
 
     /// An in-place GPU write of this batch (also entered in `CP_VIEW`).
     fn push_zc_write(&mut self, base: u64, len: u64) {
-        CP_VIEW.lock().pending.insert(base, base + len.max(1));
+        cp_view(self.inst as usize).lock().pending.insert(base, base + len.max(1));
         self.cx.zc_writes.push((base, len));
     }
 
     /// An in-place GPU read of this batch (also entered in `CP_VIEW`).
     fn zc_read(&mut self, lo: u64, hi: u64) {
-        CP_VIEW.lock().reads.insert(lo, hi);
+        cp_view(self.inst as usize).lock().reads.insert(lo, hi);
         self.cx.zc_reads.insert(lo, hi);
     }
 
     /// Applies the mirror and upload-cache invalidations of direct CP writes
     /// queued by `sync_write` (before any command that may use those caches).
     fn drain_cp_writes(&mut self) {
-        if !CP_WRITES_QUEUED.load(std::sync::atomic::Ordering::Acquire) {
+        let inst = self.inst as usize;
+        if !CP_WRITES_QUEUED[inst].load(std::sync::atomic::Ordering::Acquire) {
             return;
         }
         let writes = {
-            let mut v = CP_VIEW.lock();
-            CP_WRITES_QUEUED.store(false, std::sync::atomic::Ordering::Release);
+            let mut v = cp_view(inst).lock();
+            CP_WRITES_QUEUED[inst].store(false, std::sync::atomic::Ordering::Release);
             std::mem::take(&mut v.cp_writes)
         };
         for (a, n) in writes {
@@ -6188,7 +6677,7 @@ impl Renderer {
         for (buf, r) in &regions {
             let (a, b) = (r.dst_offset, r.dst_offset + r.size);
             if since.is_empty() || since.iter().any(|&(x, y)| a < y && x < b) {
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 since.clear();
             }
             since.push((a, b));
@@ -6410,7 +6899,7 @@ impl Renderer {
             if let Some(lin_off) = gpu_off {
                 self.begin();
                 self.end_rendering();
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 let region = vk::BufferImageCopy {
                     buffer_offset: lin_off,
                     buffer_row_length: 0,
@@ -6451,7 +6940,7 @@ impl Renderer {
             };
             self.begin();
             self.end_rendering();
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             let region = vk::BufferImageCopy {
                 buffer_offset: off,
                 buffer_row_length: 0,
@@ -6838,7 +7327,7 @@ impl Renderer {
                                 bpath = 7;
                                 let dev_off = self.cx.dring.alloc(size).ok_or("device ring full")?;
                                 self.end_rendering();
-                                global_barrier(self.cx.cmd);
+                                full_barrier!(self);
                                 unsafe { REC.cmd_copy_buffer(self.cx.cmd, zbuf, self.cx.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: dev_off, size }]) };
                                 unordered!(self);
                                 self.cx.gpu_wb.push((dev_off, zbuf, zoff, size));
@@ -6916,7 +7405,7 @@ impl Renderer {
                         } else {
                             self.end_rendering();
                             if forwarded {
-                                global_barrier(self.cx.cmd);
+                                full_barrier!(self);
                             }
                             unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.ring.buffer, self.cx.dring.buffer, &[region]) };
                             unordered!(self);
@@ -7274,6 +7763,10 @@ impl Renderer {
             vs = shaders::prepare_tess(&StageRegs { stage: Stage::Vertex, regs }, ds)?;
             ps = if ps_addr != 0 { Some(shaders::prepare(&StageRegs { stage: Stage::Fragment, regs })?) } else { None };
         }
+        {
+            let stages: smallvec::SmallVec<[&Prepared; 2]> = std::iter::once(&vs).chain(ps.as_ref()).collect();
+            self.cross_precheck(&stages);
+        }
         if let Some(tp) = tp {
             self.prof[5] += tp.elapsed();
         }
@@ -7505,7 +7998,7 @@ impl Renderer {
         if !same {
             self.end_rendering();
             if self.cx.barrier_needed && crate::tune::get(crate::tune::PASS_BARRIER) != 0 {
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 self.cx.barrier_needed = false;
             }
             self.begin_rendering(&colors, depth, extent)?;
@@ -7805,7 +8298,7 @@ impl Renderer {
         let size = k.width as u64 * k.height as u64 * texel;
         self.flush();
         self.begin();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         let off = self.cx.ring.alloc(size)?;
         let region = vk::BufferImageCopy {
             buffer_offset: off,
@@ -8301,7 +8794,7 @@ impl Renderer {
         self.begin();
         let (set, _) = self.descriptors_with_retry(set_layout, &[p])?;
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe {
             REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.cx.bound_cs = vk::Pipeline::null();
             set.bind(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, layout);
@@ -8371,6 +8864,7 @@ impl Renderer {
             self.begin();
             cs = shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs })?;
         }
+        self.cross_precheck(&[&cs]);
         self.cx.cur_shader = cs.addr;
         // GPU-read indirect arguments: not for kernels whose handling needs
         // the group counts here (scatter ranges, utility operations) or
@@ -8481,7 +8975,7 @@ impl Renderer {
         // dispatches since the last barrier whose buffer accesses conflict
         // with this one's (a write on either side of an overlap).
         let hazards = crate::tune::get(crate::tune::DISPATCH_HAZARDS) != 0;
-        let bgen = CTX_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        let bgen = self.cx.barrier_gen;
         if self.cx.hz_gen != bgen {
             self.cx.hz.clear();
             self.cx.hz_seen.clear();
@@ -8533,12 +9027,12 @@ impl Renderer {
             }
         }
         if need {
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             self.cx.hz.clear();
             self.cx.hz_seen.clear();
             self.cx.hz_bufs.clear();
             self.cx.hz_unknown = false;
-            self.cx.hz_gen = CTX_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+            self.cx.hz_gen = self.cx.barrier_gen;
             self.hz_stats.0 += 1;
         } else if self.cx.barrier_needed {
             self.hz_stats.1 += 1;
@@ -8716,7 +9210,7 @@ impl Renderer {
         let (set_layout, layout, detile, _) = self.remap_pipes()?;
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         let c = ctx();
         let mut lin_at = 0u64;
         let cmd_batch = self.cx.batch;
@@ -8751,7 +9245,7 @@ impl Renderer {
             }
             lin_at += lin_sizes[i];
         }
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         if ctx().ext_host.is_some() {
             self.zc_read(t.base, t.base + bytes);
         }
@@ -8802,7 +9296,7 @@ impl Renderer {
             let total: u64 = levels.iter().map(|l| l.width as u64 * l.height as u64 * eb * layers as u64).sum();
             self.begin();
             self.end_rendering();
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
             let Some(host) = (self.cx.ring.remaining() >= total + 4096).then(|| self.cx.ring.alloc(total)).flatten() else { continue };
             let mut regions: smallvec::SmallVec<[vk::BufferImageCopy; 16]> = smallvec::SmallVec::new();
             let mut pos = host;
@@ -8882,7 +9376,7 @@ impl Renderer {
             return Ok(None);
         }
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.ring.buffer, self.cx.dring.buffer, &[vk::BufferCopy { src_offset: up, dst_offset: dev, size }]) };
         unordered!(self);
         Ok(Some((self.cx.dring.buffer, dev)))
@@ -8954,6 +9448,13 @@ impl Renderer {
     /// The page copy's descriptor set for source buffer `src` (whole
     /// buffers: `src`, the host ring, the device ring).
     fn dirty_set(&mut self, src: vk::Buffer) -> Result<vk::DescriptorSet, String> {
+        // (Windows the other renderer retired: their sets released here.)
+        if cs_inst() && !mem!(self).purge_dirty[self.inst as usize].is_empty() {
+            let purge = std::mem::take(&mut mem!(self).purge_dirty[self.inst as usize]);
+            for b in purge {
+                self.retire_own_dirty_set(b, self.open_seq);
+            }
+        }
         // (Kept only for live mirror windows: a retired window's handle can
         // be reused by a new buffer once it is destroyed.)
         let live = mem!(self).vcache.as_ref().is_some_and(|vc| vc.windows.values().any(|w| w.buf == src));
@@ -8978,8 +9479,16 @@ impl Renderer {
     }
 
     /// Releases the page copy's set of a buffer being retired (after batch
-    /// `seq`; 0: now, the GPU is idle).
+    /// `seq`; 0: now, the GPU is idle), and has the other renderer release
+    /// its own (`purge_dirty`, before its next lookup).
     fn retire_dirty_set(&mut self, buf: vk::Buffer, seq: u64) {
+        if cs_inst() {
+            mem!(self).purge_dirty[1 - self.inst as usize].push(buf);
+        }
+        self.retire_own_dirty_set(buf, seq);
+    }
+
+    fn retire_own_dirty_set(&mut self, buf: vk::Buffer, seq: u64) {
         let (Some(set), Some((_, _, _, pool))) = (self.dirty_sets.remove(&buf), self.dirty_pipe) else { return };
         if seq == 0 {
             unsafe { ctx().device.free_descriptor_sets(pool, &[set]).ok() };
@@ -9100,7 +9609,7 @@ impl Renderer {
         let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
             REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.cx.bound_cs = vk::Pipeline::null();
@@ -9223,7 +9732,7 @@ impl Renderer {
         let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.end_rendering();
         // (After the writers of the arguments; before the draw's reads.)
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
             REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.cx.bound_cs = vk::Pipeline::null();
@@ -9231,7 +9740,7 @@ impl Renderer {
             REC.cmd_push_constants(self.cx.cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
             REC.cmd_dispatch(self.cx.cmd, 1, 1, 1);
         }
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         self.mark(|| "indirect draw arguments".into());
         Ok(slot)
     }
@@ -9291,7 +9800,7 @@ impl Renderer {
         }
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         let (src, src_off) = match ring_off {
             Some(off) => (self.cx.ring.buffer, off),
             None => {
@@ -9314,7 +9823,7 @@ impl Renderer {
             }
         };
         unsafe { REC.cmd_copy_buffer(self.cx.cmd, src, buf, &[vk::BufferCopy { src_offset: src_off, dst_offset: 0, size: bytes.len() as u64 }]) };
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         self.tile_maps.insert(mk, (buf, n));
         self.tile_map_bytes += bytes.len() as u64;
         Ok(Some((buf, n)))
@@ -9357,7 +9866,7 @@ impl Renderer {
         let Some((zbuf, zoff)) = dest else { return Ok(false) };
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         let batch = self.cx.batch;
         let set = self.alloc_set(set_layout)?;
         if self.cx.batch != batch {
@@ -9374,7 +9883,7 @@ impl Renderer {
             // guest contents.
             if n * (bpp / 8) as u64 > lin_slice {
                 unsafe { REC.cmd_copy_buffer(self.cx.cmd, zbuf, self.cx.dring.buffer, &[vk::BufferCopy { src_offset: zoff, dst_offset: o, size: total }]) };
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
             }
             Some(o)
         } else {
@@ -9403,10 +9912,10 @@ impl Renderer {
                 REC.cmd_dispatch(self.cx.cmd, (n as u32).div_ceil(64), 1, 1);
             }
         }
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         if let Some(o) = tiled_off {
             unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: total }]) };
-            global_barrier(self.cx.cmd);
+            full_barrier!(self);
         }
         if mirrored {
             // The mirror now holds the tiled surface: written back to guest
@@ -9509,7 +10018,7 @@ impl Renderer {
         self.cx.ring.write(off, &lin);
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         let region = vk::BufferImageCopy {
             buffer_offset: off,
             buffer_row_length: 0,
@@ -9650,7 +10159,7 @@ impl Renderer {
                     let value = vk::ClearDepthStencilValue { depth: f32r(regs.ctx(0xA00B)), stencil: regs.ctx(0xA00A) & 0xFF };
                     self.begin();
                     self.end_rendering();
-                    global_barrier(self.cx.cmd);
+                    full_barrier!(self);
                     let range = vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: key.layers };
                     unsafe { REC.cmd_clear_depth_stencil_image(self.cx.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
                     unordered!(self);
@@ -9673,7 +10182,7 @@ impl Renderer {
                     };
                     self.begin();
                     self.end_rendering();
-                    global_barrier(self.cx.cmd);
+                    full_barrier!(self);
                     let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: key.layers };
                     unsafe { REC.cmd_clear_color_image(self.cx.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
                     unordered!(self);
@@ -9809,7 +10318,7 @@ impl Renderer {
         let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe {
             c.device.update_descriptor_sets(&writes, &[]);
             REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, probe); self.cx.bound_cs = vk::Pipeline::null();
@@ -9819,7 +10328,7 @@ impl Renderer {
         }
         // (The predicates: visible to the expand kernel and to conditional
         // rendering; the probe's reads precede the expanded state's writes.)
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         unsafe {
             // (Same layout: the set and push constants stay bound.)
             REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, expand); self.cx.bound_cs = vk::Pipeline::null();
@@ -9900,7 +10409,7 @@ impl Renderer {
                 let Some((o, n)) = clamp(offset, bytes) else { return Ok(()) };
                 self.begin();
                 self.end_rendering();
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 unsafe { REC.cmd_fill_buffer(self.cx.cmd, self.gds, o, n, value) };
             }
             GdsOp::Load { offset, src, bytes } => {
@@ -9910,7 +10419,7 @@ impl Renderer {
                 let off = self.upload_guest(src, n)?;
                 self.flush_forwards();
                 self.end_rendering();
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 let region = vk::BufferCopy { src_offset: off, dst_offset: o, size: n };
                 unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.ring.buffer, self.gds, &[region]) };
             }
@@ -9925,7 +10434,7 @@ impl Renderer {
                 let in_place = crate::tune::get(crate::tune::DMA_GPU) != 0 && !cpu_pending;
                 if let Some((zbuf, zoff, _)) = self.zc_binding(dst, n).filter(|z| z.2 >= n && in_place) {
                     self.end_rendering();
-                    global_barrier(self.cx.cmd);
+                    full_barrier!(self);
                     unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.gds, zbuf, &[vk::BufferCopy { src_offset: o, dst_offset: zoff, size: n }]) };
                     self.note_inplace_gpu_write(dst, n);
                     unordered!(self);
@@ -9936,7 +10445,7 @@ impl Renderer {
                 let host_off = self.cx.ring.alloc(n).ok_or("ring full")?;
                 let dev_off = self.cx.dring.alloc(n).ok_or("device ring full")?;
                 self.end_rendering();
-                global_barrier(self.cx.cmd);
+                full_barrier!(self);
                 let region = vk::BufferCopy { src_offset: o, dst_offset: dev_off, size: n };
                 unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.gds, self.cx.dring.buffer, &[region]) };
                 self.push_writeback(PendingWrite { base: dst, size: n, host_off, dev_off, dev_buf: self.cx.dring.buffer, mirror: false, bits: None });
@@ -9972,59 +10481,7 @@ impl Renderer {
     /// behind would otherwise accumulate until the OS pages video memory --
     /// and, under pressure, idle VRAM mirror windows.
     pub fn housekeeping(&mut self) {
-        let done = *DONE.lock();
-        if self.retired.iter().any(|(s, _)| *s <= done) {
-            let c = ctx();
-            let mut budget = if self.pressure >= 2 { usize::MAX } else { RETIRE_PER_PASS };
-            let mut blocks = Vec::new();
-            let mut pooled: Vec<(ImageKey, resources::PooledImage)> = Vec::new();
-            self.retired.retain_mut(|(s, r)| {
-                if *s > done || budget == 0 {
-                    return true;
-                }
-                budget -= 1;
-                unsafe {
-                    match r {
-                        Retired::Image(i, m, views) => {
-                            for &v in views.iter() {
-                                c.device.destroy_image_view(v, None);
-                            }
-                            c.device.destroy_image(*i, None);
-                            c.free(*m);
-                        }
-                        Retired::Buffer(b, m) => {
-                            c.device.destroy_buffer(*b, None);
-                            c.free(*m);
-                        }
-                        Retired::Window(b, m, bound) => {
-                            c.device.destroy_buffer(*b, None);
-                            if *m != vk::DeviceMemory::null() {
-                                c.free(*m);
-                            }
-                            blocks.append(bound);
-                        }
-                        Retired::Set(pool, set) => {
-                            c.device.free_descriptor_sets(*pool, &[*set]).ok();
-                        }
-                        Retired::Pooled(k, p) => {
-                            pooled.push((*k, std::mem::take(p)));
-                        }
-                    }
-                }
-                false
-            });
-            if let Some(p) = mem!(self).sparse_pool.as_mut() {
-                p.give(blocks);
-            }
-            for (k, p) in pooled {
-                if img!(self).image_pool_n < IMAGE_POOL_MAX && self.pressure < 2 {
-                    img!(self).image_pool.entry(k).or_default().push(p);
-                    img!(self).image_pool_n += 1;
-                } else {
-                    p.destroy();
-                }
-            }
-        }
+        self.free_retired();
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
         if frame < self.next_trim || self.cx.recording || self.cx.rendering.is_some() || crate::tune::get(crate::tune::EVICT) == 0 {
             return;
@@ -10040,7 +10497,8 @@ impl Renderer {
             img!(self).image_pool_n = 0;
         }
         let age = EVICT_AGE[self.pressure as usize];
-        // (Not recording: every command using these has been submitted.)
+        // (Not recording: every command of this renderer using these has been
+        // submitted; the other renderer's: `retire_shared`.)
         let seq = self.last_seq;
         // Image eviction is opt-in (TLG_EVICT_IMAGES=1): under VRAM pressure 3
         // on the development machine (budget 2.6 GB while another process used
@@ -10120,9 +10578,9 @@ impl Renderer {
             freed += img.bytes;
             img!(self).image_bytes -= img.bytes;
             if img.bytes <= SMALL_IMAGE_BYTES && crate::tune::get(crate::tune::IMAGE_POOL) != 0 {
-                self.retired.push((seq, Retired::Pooled(ImageKey { base: 0, ..*k }, resources::PooledImage::of(img))));
+                self.retire_shared(seq, Retired::Pooled(ImageKey { base: 0, ..*k }, resources::PooledImage::of(img)));
             } else {
-                self.retired.push((seq, Retired::Image(img.image, img.memory, img.views.values().copied().collect())));
+                self.retire_shared(seq, Retired::Image(img.image, img.memory, img.views.values().copied().collect()));
             }
         }
         if !victims.is_empty() {
@@ -10137,6 +10595,7 @@ impl Renderer {
         let mut released = 0;
         if self.pressure >= 2 && release_windows {
             let mut gone = Vec::new();
+            let mut retire = Vec::new();
             if let Some(vc) = mem!(self).vcache.as_mut() {
                 let idle: Vec<u64> = vc.windows.iter().filter(|(_, w)| w.last_used + age <= frame).map(|(k, _)| *k).collect();
                 for k in idle {
@@ -10145,8 +10604,11 @@ impl Renderer {
                     vc.bytes -= w.bytes();
                     released += w.bytes();
                     gone.push(w.buf);
-                    self.retired.push((seq, w.retire()));
+                    retire.push(w.retire());
                 }
+            }
+            for r in retire {
+                self.retire_shared(seq, r);
             }
             for b in gone {
                 self.retire_dirty_set(b, seq);
@@ -10159,6 +10621,7 @@ impl Renderer {
                 }
             }
         }
+
         if self.pressure >= 2 && self.pressure_reported.is_none_or(|t| t.elapsed().as_secs() >= 30) {
             self.pressure_reported = Some(std::time::Instant::now());
             crate::warn!(
@@ -10245,7 +10708,7 @@ impl Renderer {
         }
         self.begin();
         self.end_rendering();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         let off = self.cx.ring.alloc((w * h * 4) as u64)?;
         let region = vk::BufferImageCopy {
             buffer_offset: off,
@@ -10328,7 +10791,7 @@ impl Renderer {
         let size = (k.width * k.height * texel) as u64;
         self.flush();
         self.begin();
-        global_barrier(self.cx.cmd);
+        full_barrier!(self);
         let Some(off) = self.cx.ring.alloc(size) else { return };
         let region = vk::BufferImageCopy {
             buffer_offset: off,
@@ -10637,7 +11100,12 @@ pub static QUEUE_WAIT_REG_NS: [std::sync::atomic::AtomicU64; 64] = [const { std:
 static GFX_LOCK_WAITING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 struct TimedRenderer {
-    g: std::mem::ManuallyDrop<RGuard>,
+    /// The graphics renderer's guard (W4a: compute CPs take it too; `cs_inst
+    /// 2`: only the graphics CP).
+    g: Option<std::mem::ManuallyDrop<RGuard>>,
+    /// The compute queues' renderer (`cs_inst`), taken after the graphics
+    /// renderer's lock for queues other than 0.
+    c: Option<std::mem::ManuallyDrop<RGuard>>,
     q: usize,
     /// When the lock was taken (TLG_PERF).
     since: Option<std::time::Instant>,
@@ -10645,6 +11113,29 @@ struct TimedRenderer {
 
 impl TimedRenderer {
     fn lock(q: usize) -> TimedRenderer {
+        Self::lock_as(q, queue_inst(q))
+    }
+
+    /// (`cs_inst 2`) A compute queue's dispatch with the renderer that can
+    /// record it: the graphics one when it binds images.
+    fn lock_dispatch(q: usize, pre: Option<&Result<Prepared, String>>) -> TimedRenderer {
+        let mut inst = queue_inst(q);
+        if inst == 1 && cs_separate() {
+            let images = match pre {
+                Some(Ok(p)) => p.translated.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::Image(_) | BindingKind::StorageImage(_))),
+                _ => true,
+            };
+            if images {
+                inst = 0;
+                if perf_on() {
+                    CS_IMAGE_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        }
+        Self::lock_as(q, inst)
+    }
+
+    fn lock_as(q: usize, inst: usize) -> TimedRenderer {
         let t0 = perf_on().then(std::time::Instant::now);
         // (`tune lock_fair 3`: the graphics CP, the frame's critical path,
         // goes first while it waits.)
@@ -10655,19 +11146,37 @@ impl TimedRenderer {
                 std::thread::yield_now();
             }
         }
-        let mut g = RENDERER.lock();
+        let separate = cs_separate();
+        if q != 0 && cs_inst() && QUEUE_INST[q & 63].swap(inst as u8, std::sync::atomic::Ordering::Relaxed) as usize != inst {
+            // (The queue's earlier commands are in the other renderer's open
+            // batch: submitted before it records with this one; no lock held
+            // here.)
+            if inst == 0 {
+                let _g = (!separate).then(|| RENDERER.lock());
+                if let Some(c) = RENDERER_CS.lock().as_mut().filter(|c| c.open_work()) {
+                    c.submit_batch(Vec::new());
+                }
+            } else if let Some(r) = RENDERER.lock().as_mut().filter(|r| r.open_work()) {
+                r.submit_batch(Vec::new());
+            }
+        }
+        let mut g = (inst == 0 || !separate).then(|| RENDERER.lock());
         if q == 0 {
             GFX_LOCK_WAITING.store(false, std::sync::atomic::Ordering::Relaxed);
         }
-        if let Some(r) = g.as_mut() {
-            r.enter_ctx(q);
+        let c = (inst == 1).then(|| std::mem::ManuallyDrop::new(RENDERER_CS.lock()));
+        if c.is_none() {
+            if let Some(r) = g.as_mut().and_then(|g| g.as_mut()) {
+                r.enter_ctx(q);
+            }
         }
+        IN_CMD[inst].store(true, std::sync::atomic::Ordering::Release);
         let since = t0.map(|t0| {
             let now = std::time::Instant::now();
             QUEUE_LOCK_WAIT_NS[q & 63].fetch_add((now - t0).as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             now
         });
-        TimedRenderer { g: std::mem::ManuallyDrop::new(g), q, since }
+        TimedRenderer { g: g.map(std::mem::ManuallyDrop::new), c, q, since }
     }
 }
 
@@ -10676,8 +11185,21 @@ impl Drop for TimedRenderer {
         if let Some(since) = self.since {
             QUEUE_LOCK_HOLD_NS[self.q & 63].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
+        // (`cs_inst 2`: the other renderer asked for this one's open batch.)
+        let inst = if self.c.is_some() { 1 } else { 0 };
+        IN_CMD[inst].store(false, std::sync::atomic::Ordering::Release);
+        if SUBMIT_REQ[inst].load(std::sync::atomic::Ordering::Relaxed) && SUBMIT_REQ[inst].swap(false, std::sync::atomic::Ordering::AcqRel) {
+            if let Some(r) = self.as_mut().filter(|r| r.open_work()) {
+                r.submit_batch(Vec::new());
+            }
+        }
+        if let Some(c) = self.c.as_mut() {
+            // SAFETY: `c` is not used after this.
+            drop(unsafe { std::mem::ManuallyDrop::take(c) });
+        }
+        let Some(g) = self.g.as_mut() else { return };
         // SAFETY: `g` is not used after this.
-        let mut g = unsafe { std::mem::ManuallyDrop::take(&mut self.g) };
+        let mut g = unsafe { std::mem::ManuallyDrop::take(g) };
         // (Other users of the lock find the graphics queue's context in use.)
         if let Some(r) = g.as_mut() {
             r.select_ctx(false);
@@ -10696,13 +11218,21 @@ impl Drop for TimedRenderer {
 impl std::ops::Deref for TimedRenderer {
     type Target = Option<Renderer>;
     fn deref(&self) -> &Option<Renderer> {
-        &self.g
+        match (&self.c, &self.g) {
+            (Some(c), _) => c,
+            (None, Some(g)) => g,
+            (None, None) => unreachable!(),
+        }
     }
 }
 
 impl std::ops::DerefMut for TimedRenderer {
     fn deref_mut(&mut self) -> &mut Option<Renderer> {
-        &mut self.g
+        match (&mut self.c, &mut self.g) {
+            (Some(c), _) => c,
+            (None, Some(g)) => g,
+            (None, None) => unreachable!(),
+        }
     }
 }
 
@@ -10775,7 +11305,7 @@ impl Hooks for VkHooks {
         if let Some(Ok(p)) = pre.as_ref().filter(|_| crate::tune::get(crate::tune::PREFETCH) != 0) {
             prefetch_reads(p);
         }
-        let mut g = TimedRenderer::lock(cp.queue);
+        let mut g = TimedRenderer::lock_dispatch(cp.queue, pre.as_ref());
         let Some(r) = g.as_mut() else { return self.fallback.dispatch(cp, x, y, z) };
         r.cx.pre_cs = pre;
         if let Err(e) = r.dispatch_inner(cp, x, y, z, None) {
@@ -10792,8 +11322,13 @@ impl Hooks for VkHooks {
         if skip == 6 && (17..=19).contains(&cp.queue) {
             return true;
         }
-        let mut g = TimedRenderer::lock(cp.queue);
+        // (`cs_inst 2`: prepared here to choose the renderer, as `dispatch`.)
+        let pre = (cs_separate() && cp.queue != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs }));
+        let mut g = TimedRenderer::lock_dispatch(cp.queue, pre.as_ref());
         let Some(r) = g.as_mut() else { return false };
+        if pre.is_some() {
+            r.cx.pre_cs = pre;
+        }
         let done = match r.dispatch_inner(cp, 0, 0, 0, Some(addr)) {
             Ok(done) => done,
             Err(e) => {
@@ -10833,8 +11368,8 @@ impl Hooks for VkHooks {
             r.report(format!("GDS transfer skipped: {e}"));
         }
     }
-    fn flush(&mut self, _cp: &CommandProcessor) {
-        if let Some(r) = RENDERER.lock().as_mut() {
+    fn flush(&mut self, cp: &CommandProcessor) {
+        if let Some(r) = TimedRenderer::lock(cp.queue).as_mut() {
             r.flush_for(0);
             // The caller is about to access guest memory directly (DMA etc.).
             r.new_epoch(EpochKind::Both);
@@ -10842,7 +11377,7 @@ impl Hooks for VkHooks {
     }
     fn sync_range(&mut self, cp: &CommandProcessor, addr: u64, len: u64) {
         // (Without overlap in the view, nothing of this batch is in the way.)
-        if !cp_view_on() || CP_VIEW.lock().pending.overlaps(addr, addr + len.max(1)) {
+        if !cp_view_on() || cp_view(queue_inst(cp.queue)).lock().pending.overlaps(addr, addr + len.max(1)) {
             if let Some(r) = TimedRenderer::lock(cp.queue).as_mut() {
                 if r.pending_write_overlaps(addr, len) {
                     r.flushes[1] += 1;
@@ -10858,24 +11393,29 @@ impl Hooks for VkHooks {
     fn gds_load_on_gpu(&mut self, cp: &CommandProcessor, offset: u32, src: u64, bytes: u32) -> bool {
         TimedRenderer::lock(cp.queue).as_mut().is_some_and(|r| r.gds_load_on_gpu(offset, src, bytes))
     }
-    fn sync_write(&mut self, _cp: &CommandProcessor, addr: u64, len: u64) {
+    fn sync_write(&mut self, cp: &CommandProcessor, addr: u64, len: u64) {
         // (Queued ring copies of this memory read it first.)
         super::copier::wait_overlapping(addr, len);
         let end = addr + len.max(1);
+        let own = queue_inst(cp.queue);
         let read = if cp_view_on() {
-            let mut v = CP_VIEW.lock();
-            v.cp_writes.push((addr, len));
-            CP_WRITES_QUEUED.store(true, std::sync::atomic::Ordering::Release);
-            v.reads.overlaps(addr, end)
+            // (Every instance's caches; reads in place of the CP's own.)
+            for inst in 0..1 + cs_inst() as usize {
+                cp_view(inst).lock().cp_writes.push((addr, len));
+                CP_WRITES_QUEUED[inst].store(true, std::sync::atomic::Ordering::Release);
+            }
+            cp_view(own).lock().reads.overlaps(addr, end)
         } else {
-            if let Some(r) = RENDERER.lock().as_mut() {
-                r.vcache_invalidate_src(addr, len, 2);
-                r.forget_uploads(addr, len);
+            for q in [0, cp.queue] {
+                if let Some(r) = TimedRenderer::lock(q).as_mut() {
+                    r.vcache_invalidate_src(addr, len, 2);
+                    r.forget_uploads(addr, len);
+                }
             }
             true
         };
         if read {
-            if let Some(r) = RENDERER.lock().as_mut() {
+            if let Some(r) = TimedRenderer::lock(cp.queue).as_mut() {
                 if r.zc_reads_overlap(addr, end) {
                     r.flushes[1] += 1;
                     r.submit_batch(Vec::new());
@@ -10899,9 +11439,9 @@ impl Hooks for VkHooks {
             r.order_barrier();
         }
     }
-    fn label_only(&mut self, _cp: &CommandProcessor, addr: u64, len: u64) -> bool {
+    fn label_only(&mut self, cp: &CommandProcessor, addr: u64, len: u64) -> bool {
         let end = addr + len.max(1);
-        let g = RENDERER.lock();
+        let g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_ref() else { return false };
         if r.pending_write_overlaps(addr, len) || r.zc_reads_overlap(addr, end) {
             return false;

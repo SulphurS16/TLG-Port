@@ -110,15 +110,34 @@ struct Queue {
     data: Vec<PushEntry>,
 }
 
-/// Operations queued but not yet published to the recorder. Only renderer
-/// methods queue operations, with the renderer lock held: that lock
-/// serializes all access.
+/// Operations queued but not yet published to the recorder, per renderer
+/// instance. Only renderer methods queue operations, with that renderer's
+/// lock held: that lock serializes all access to its queue.
 struct Local(std::cell::UnsafeCell<Queue>);
 
-// SAFETY: accessed only under the renderer lock (see `push`).
+// SAFETY: accessed only under the lock of the renderer it belongs to (see
+// `local`).
 unsafe impl Sync for Local {}
 
-static LOCAL: Local = Local(std::cell::UnsafeCell::new(Queue { ops: Vec::new(), data: Vec::new() }));
+static LOCAL: [Local; 2] = [const { Local(std::cell::UnsafeCell::new(Queue { ops: Vec::new(), data: Vec::new() })) }; 2];
+
+thread_local! {
+    /// The renderer instance whose lock this thread holds (`set_inst`).
+    static INST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// This thread records for renderer instance `inst` (while it holds that
+/// renderer's lock); returns the instance it recorded for before.
+pub fn set_inst(inst: usize) -> usize {
+    INST.with(|c| c.replace(inst))
+}
+
+/// The unpublished operations of the renderer this thread records for.
+fn local() -> &'static mut Queue {
+    // SAFETY: only renderer methods queue operations, under the lock of the
+    // renderer `INST` names, which serializes every access to its queue.
+    unsafe { &mut *LOCAL[INST.with(|c| c.get())].0.get() }
+}
 
 static QUEUE: Mutex<Queue> = Mutex::new(Queue { ops: Vec::new(), data: Vec::new() });
 static CV: Condvar = Condvar::new();
@@ -164,8 +183,8 @@ pub fn set_mode(defer: bool) {
             crate::thread::spawn_host("GPU-record", 8 << 20, Box::new(run)).expect("recorder thread");
         });
     } else {
-        // SAFETY: the renderer lock is held (a batch is starting).
-        publish(unsafe { &mut *LOCAL.0.get() }, true);
+        // (The renderer's lock is held: a batch is starting.)
+        publish(local(), true);
         drain();
     }
     DEFERRED.store(defer, Ordering::Relaxed);
@@ -174,9 +193,7 @@ pub fn set_mode(defer: bool) {
 /// Queues `op` (renderer lock held: see `Local`); `now` publishes the
 /// operations collected so far at once and wakes the recorder (submits).
 fn push(op: Op, now: bool) {
-    // SAFETY: only renderer methods queue operations, under the renderer
-    // lock, which serializes every access to `LOCAL`.
-    let l = unsafe { &mut *LOCAL.0.get() };
+    let l = local();
     l.ops.push(op);
     if now || l.ops.len() >= crate::tune::get(crate::tune::REC_BATCH).max(1) as usize {
         publish(l, now);
@@ -533,9 +550,8 @@ impl Rec {
     /// vkCmdPushDescriptorSetKHR with the descriptors `w`.
     pub unsafe fn cmd_push_descriptor_set(&self, cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, w: &[PushEntry]) {
         if deferred() {
-            // SAFETY: renderer lock held (see `push`); the data is published
-            // with the operation that refers to it.
-            let l = unsafe { &mut *LOCAL.0.get() };
+            // (The data is published with the operation that refers to it.)
+            let l = local();
             let start = l.data.len() as u32;
             l.data.extend_from_slice(w);
             return push(Op::PushSet(cb, bp, layout, set, start, w.len() as u32), false);

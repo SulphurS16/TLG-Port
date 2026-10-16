@@ -502,6 +502,39 @@ fn cross_waits_for(q: usize) -> bool {
 /// counts of the gap under 0.1 / 0.5 / 1 / 2 ms and longer.
 pub static CHAIN_GAPS: [std::sync::atomic::AtomicU64; 8] = [const { std::sync::atomic::AtomicU64::new(0) }; 8];
 
+/// Commit requests (`tune early_release`): set for a queue whose queued
+/// writes another queue's wait needs; it commits at its next packet.
+pub static COMMIT_REQ: [std::sync::atomic::AtomicBool; 64] = [const { std::sync::atomic::AtomicBool::new(false) }; 64];
+/// Commits made on request (TLG_PERF).
+pub static COMMITS_REQUESTED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn early_release() -> bool {
+    crate::tune::get(crate::tune::EARLY_RELEASE) != 0
+}
+
+/// The queue (other than `except_queue`) whose queued writes leave a value
+/// at `addr` that `test` accepts (the last one covering it): asked to commit
+/// them.
+fn request_commit(addr: u64, except_queue: usize, test: impl Fn(u32) -> bool) {
+    let mut found = None;
+    for (q, writes) in QUEUED.lock().iter() {
+        if *q == except_queue {
+            continue;
+        }
+        for &(a, data_sel, lo, hi) in writes {
+            let n = if data_sel == 1 { 4 } else { 8 };
+            if addr < a || addr + 4 > a + n {
+                continue;
+            }
+            found = Some((*q, if data_sel == 1 || addr == a { lo } else { hi }));
+        }
+    }
+    if let Some((q, v)) = found.filter(|&(_, v)| test(v)) {
+        let _ = v;
+        COMMIT_REQ[q & 63].store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 pub fn queued_label_value(addr: u64, except_queue: usize) -> Option<u32> {
     let mut val = None;
     for (q, writes) in QUEUED.lock().iter() {
@@ -692,6 +725,13 @@ impl CommandProcessor {
     fn step(&mut self, s: &mut Stream, engine: Engine, hooks: &mut dyn Hooks) -> Step {
         if s.done() {
             return Step::Done;
+        }
+        // (`tune early_release`: another queue waits for our queued writes.)
+        if COMMIT_REQ[self.queue & 63].load(std::sync::atomic::Ordering::Relaxed) && COMMIT_REQ[self.queue & 63].swap(false, std::sync::atomic::Ordering::Acquire) {
+            if super::render::perf_on() {
+                COMMITS_REQUESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            self.commit(hooks);
         }
         let (cur, end) = s.top();
         if !guest_ok(cur, 4) {
@@ -1486,9 +1526,10 @@ impl CommandProcessor {
     }
 
     /// Makes this CP's queued writes with known data visible to the other
-    /// queues' waits (`queued_label_value`) and wakes waiters.
+    /// queues' waits (`queued_label_value`, `request_commit`) and wakes
+    /// waiters.
     fn publish_pending(&self) {
-        if crate::tune::get(crate::tune::CROSS_WAITS) == 0 {
+        if crate::tune::get(crate::tune::CROSS_WAITS) == 0 && !early_release() {
             return;
         }
         let writes = self.pending.iter().filter(|p| matches!(p.data_sel, 1 | 2)).map(|p| (p.addr, p.data_sel, p.lo, p.hi));
@@ -1623,6 +1664,11 @@ impl CommandProcessor {
                 hooks.order_barrier(self);
                 return;
             }
+            // (`tune early_release`: another queue's queued writes would meet
+            // it; that queue commits them at its next packet.)
+            if virtual_waits && early_release() {
+                request_commit(addr, self.queue, &test);
+            }
             // The awaited value may come from our own queued end-of-pipe
             // writes or from shader writes not yet written back.
             self.commit(hooks);
@@ -1709,6 +1755,9 @@ impl CommandProcessor {
                     self.stats.cross_waits += 1;
                     hooks.order_barrier(self);
                     return;
+                }
+                if virtual_waits && early_release() {
+                    request_commit(addr, self.queue, &test);
                 }
             }
             if !warned && start.elapsed() > Duration::from_millis(250) {

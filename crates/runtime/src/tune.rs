@@ -551,7 +551,23 @@ pub const EARLY_EOP: usize = 92;
 /// fps); the base for recording the compute queues without that lock.
 pub const CS_CTX: usize = 93;
 
-const TABLE: [(&str, &str, i64); 94] = [
+/// The compute queues record with a renderer instance of their own
+/// (`TLG_CS_INST`, 0; set at start): its own batches and submissions, the
+/// memory model and image state shared with the graphics queue's. For now
+/// under the graphics renderer's lock (`gpu::render::RENDERER_CS`).
+pub const CS_INST: usize = 94;
+
+/// Labels released early (`TLG_EARLY_RELEASE`, 0): a queue about to wait for
+/// a value another queue's queued (not yet committed) writes would produce
+/// asks that queue to commit them at its next packet instead of at its own
+/// next commit point (`gpu::cp::COMMIT_REQ`).
+pub const EARLY_RELEASE: usize = 95;
+
+/// With `cs_inst`: the compute queues record with their own renderer
+/// (`TLG_CS_ROUTE`, 1) or with the graphics queue's (0; for A/B windows).
+pub const CS_ROUTE: usize = 96;
+
+const TABLE: [(&str, &str, i64); 97] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -646,6 +662,9 @@ const TABLE: [(&str, &str, i64); 94] = [
     ("attach_once", "TLG_ATTACH_ONCE", 1),
     ("early_eop", "TLG_EARLY_EOP", 0),
     ("cs_ctx", "TLG_CS_CTX", 0),
+    ("cs_inst", "TLG_CS_INST", 0),
+    ("early_release", "TLG_EARLY_RELEASE", 0),
+    ("cs_route", "TLG_CS_ROUTE", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -801,9 +801,7 @@ fn compute_thread(cq: &'static ComputeQueue, name: String, vq: usize) {
         };
         // The title may have written guest memory before ringing: textures
         // and cached buffers this queue's work reads are validated again.
-        if let Some(r) = render::RENDERER.lock().as_mut() {
-            r.new_epoch(render::EpochKind::Compute);
-        }
+        render::with_queue(vq, |r| r.new_epoch(render::EpochKind::Compute));
         // Execute [from, to) with wrap-around.
         let mut pos = from;
         while pos != to {
@@ -814,9 +812,7 @@ fn compute_thread(cq: &'static ComputeQueue, name: String, vq: usize) {
         }
         set_qphase(vq, phase::SUBMIT_WAIT, to as u64);
         cp.commit(&mut hooks);
-        if let Some(r) = render::RENDERER.lock().as_mut() {
-            r.submit_batch(Vec::new());
-        }
+        render::with_queue(vq, |r| r.submit_batch(Vec::new()));
         if std::env::var_os("TLG_COMPUTE_LOG").is_some() {
             let mut words = Vec::new();
             let mut p = from;
@@ -962,7 +958,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
     }
     let Some(mut g) = render::RENDERER.try_lock_for(std::time::Duration::from_millis(200)) else { return };
     let Some(r) = g.as_mut() else { return };
-    let now = PerfSnap {
+    let mut now = PerfSnap {
         frames: FRAMES.load(Ordering::Relaxed),
         draws: r.draws,
         dispatches: r.dispatches,
@@ -997,7 +993,45 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         pro_barriers: render::PRO_BARRIERS.load(Ordering::Relaxed),
         tsc: unsafe { core::arch::x86_64::_rdtsc() },
     };
+    // (The compute queues' renderer, `cs_inst`: its counters added - its lock
+    // taken after the graphics renderer's is released; batches counted over
+    // both.)
     drop(g);
+    if render::cs_inst() {
+        if let Some(c) = render::RENDERER_CS.try_lock_for(std::time::Duration::from_millis(200)).as_mut().and_then(|g| g.as_mut()) {
+            now.draws += c.draws;
+            now.dispatches += c.dispatches;
+            now.uploads += c.uploads;
+            now.hashed += c.hashed_bytes;
+            now.dprof_draws += c.dprof_draws;
+            now.pro_ops += c.pro_ops;
+            for i in 0..6 {
+                now.flushes[i] += c.flushes[i];
+                now.dsub[i] += c.dsub[i];
+            }
+            for i in 0..7 {
+                now.prof[i] += c.prof[i];
+            }
+            for i in 0..8 {
+                now.dprof[i] += c.dprof[i];
+            }
+            for k in 0..2 {
+                now.cprof_n[k] += c.cprof_n[k];
+                for i in 0..7 {
+                    now.cprof[k][i] += c.cprof[k][i];
+                }
+            }
+            for i in 0..11 {
+                now.bsub[i] += c.bsub[i];
+                now.bcnt[i] += c.bcnt[i];
+            }
+            for (a, b) in [(&mut now.target_hits, c.target_hits), (&mut now.desc_template_uses, c.desc_template_uses), (&mut now.tex_path_hits, c.tex_path_hits), (&mut now.image_reuse, c.image_reuse)] {
+                a.0 += b.0;
+                a.1 += b.1;
+            }
+        }
+        now.batches = render::submitted_seq();
+    }
     if let Some(p) = prev {
         let fl: Vec<String> = render::FLUSH_REASONS.iter().zip(now.flushes.iter().zip(p.flushes.iter())).filter(|(_, (a, b))| a != b).map(|(n, (a, b))| format!("{n} {}", a - b)).collect();
         let pr: Vec<String> = render::PROF_NAMES.iter().zip(now.prof.iter().zip(p.prof.iter())).map(|(n, (a, b))| format!("{n} {}ms", (*a - *b).as_millis())).collect();
@@ -1152,6 +1186,19 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let ih: [u64; 4] = std::array::from_fn(|i| render::IMG_HOLDS[i].swap(0, Ordering::Relaxed));
             if ih.iter().any(|&n| n != 0) {
                 recorder.push_str(&format!("; lock holds with the image state: graphics {} of {}, compute queues {} of {}", ih[1], ih[0] + ih[1], ih[3], ih[2] + ih[3]));
+            }
+            // (Two renderer instances: batches by instance, submissions of one
+            // instance's open batch for the other, by rule.)
+            if render::cs_inst() {
+                let ib: [u64; 2] = std::array::from_fn(|i| render::INST_BATCHES[i].swap(0, Ordering::Relaxed));
+                let xs: Vec<String> = render::CROSS_SUBMIT_NAMES.iter().zip(render::CROSS_SUBMITS.iter()).map(|(n, c)| format!("{n} {}", c.swap(0, Ordering::Relaxed))).collect();
+                recorder.push_str(&format!("; batches by renderer: graphics {} compute {}; cross-renderer submissions: {}", ib[0], ib[1], xs.join(", ")));
+                let cw: [u64; 2] = std::array::from_fn(|i| render::CROSS_WAIT_NS[i].swap(0, Ordering::Relaxed));
+                recorder.push_str(&format!("; waits for the other renderer's submission: for graphics {} ms, for compute {} ms; mirror bindings declined: compute {}, graphics {}; compute dispatches with images on the graphics renderer {}", cw[0] / 1_000_000, cw[1] / 1_000_000, render::CS_MIRROR_DECLINED.swap(0, Ordering::Relaxed), render::GFX_MIRROR_DECLINED.swap(0, Ordering::Relaxed), render::CS_IMAGE_DISPATCHES.swap(0, Ordering::Relaxed)));
+            }
+            let cr = cp::COMMITS_REQUESTED.swap(0, Ordering::Relaxed);
+            if cr != 0 {
+                recorder.push_str(&format!("; commits requested by waiting queues {cr}"));
             }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
             let ts: [u64; 5] = std::array::from_fn(|i| TAIL_STATS[i].swap(0, Ordering::Relaxed));
