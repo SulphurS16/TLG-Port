@@ -600,14 +600,20 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
         48..=61 => Some(4),
         _ => None,
     };
-    if let Some(nb) = written_bytes {
-        let k = tr.u(nb - 1);
-        let last = e(tr.b.i_add(u, None, addr, k))?;
-        mark_dirty(tr, r, addr, last)?;
-    }
+    // (Marked in the store's own branch of the active lanes.)
+    let mark = match written_bytes {
+        // (Up to a dword: these stores and atomics address the dword at
+        // addr / 4, whose bytes share the first byte's page.)
+        Some(nb) if nb <= 4 => Some((r, addr, None)),
+        Some(nb) => {
+            let k = tr.u(nb - 1);
+            Some((r, addr, Some(e(tr.b.i_add(u, None, addr, k))?)))
+        }
+        None => None,
+    };
     if is_format_store {
         let n = (op & 3) + 1;
-        return store_formatted(tr, var, addr, vd, n as u32, dfmt, nfmt);
+        return store_formatted(tr, var, addr, vd, n as u32, dfmt, nfmt, mark);
     }
     let two = tr.u(2);
     match op {
@@ -653,6 +659,9 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
             tr.b.selection_merge(merge, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
             tr.b.branch_conditional(act, body, merge, []).map_err(|x| format!("{x:?}"))?;
             e(tr.b.begin_block(Some(body)))?;
+            if let Some((r, a, l)) = mark {
+                mark_dirty(tr, r, a, l)?;
+            }
             if n > 0 {
                 for k in 0..n {
                     let kk = tr.u(k);
@@ -697,6 +706,9 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
             tr.b.selection_merge(merge, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
             tr.b.branch_conditional(act, body, merge, []).map_err(|x| format!("{x:?}"))?;
             e(tr.b.begin_block(Some(body)))?;
+            if let Some((r, a, l)) = mark {
+                mark_dirty(tr, r, a, l)?;
+            }
             let old = match op {
                 48 => e(tr.b.atomic_exchange(u, None, p, scope, sem, v))?,
                 49 => {
@@ -728,10 +740,16 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
 }
 
 /// Sets the `DirtyBits` bit of the pages of written buffer `r` holding byte
-/// offsets `first` and `last` (one store; at most two pages) for the active
-/// lanes. When a subgroup's lanes all hit one bitmap dword, one lane sets
-/// their bits together (stores of a wave usually share pages).
-fn mark_dirty(tr: &mut T, r: usize, first: Word, last: Word) -> R<()> {
+/// offsets `first` and `last` (one store; at most two pages; no `last`: the
+/// store stays in the first byte's page), in the store's own branch of the
+/// active lanes. When a subgroup's lanes all hit one bitmap dword, one lane
+/// sets their bits together (stores of a wave usually share pages) - or as
+/// `Spec::page_marks` says.
+fn mark_dirty(tr: &mut T, r: usize, first: Word, last: Option<Word>) -> R<()> {
+    let probe = super::PROBE_MARKS.with(|s| s.get());
+    if probe == 1 {
+        return Ok(());
+    }
     let Some((_, bits)) = tr.dirty else { return Ok(()) };
     let Some(&(base, head, limit)) = tr.dirty_res.get(&r) else { return Ok(()) };
     let u = tr.t.u32;
@@ -739,16 +757,88 @@ fn mark_dirty(tr: &mut T, r: usize, first: Word, last: Word) -> R<()> {
     let sg = tr.u(spirv::Scope::Subgroup as u32);
     let dev = tr.u(spirv::Scope::Device as u32);
     let sem = tr.u(0);
+    if probe == 2 || (probe == 0 && tr.spec.page_marks == 2) {
+        // One plain atomic per page and active lane.
+        for at in std::iter::once(first).chain(last) {
+            let (k12, k5, k31, one) = (tr.u(12), tr.u(5), tr.u(31), tr.u(1));
+            let a = e(tr.b.i_add(u, None, at, head))?;
+            let page = e(tr.b.shift_right_logical(u, None, a, k12))?;
+            let word = e(tr.b.shift_right_logical(u, None, page, k5))?;
+            let word = tr.glsl2(u, GLOp::UMin, word, limit)?;
+            let word = e(tr.b.i_add(u, None, word, base))?;
+            let bit_i = e(tr.b.bitwise_and(u, None, page, k31))?;
+            let bit = e(tr.b.shift_left_logical(u, None, one, bit_i))?;
+            let z = tr.u(0);
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, bits, [z, word]))?;
+            e(tr.b.atomic_or(u, None, p, dev, sem, bit))?;
+        }
+        return Ok(());
+    }
+    // Kept per invocation (`page_marks` 1): the bits of one bitmap word,
+    // set in place while the stores stay in it; the word's bits go into the
+    // bitmap when a store moves on to another word, the rest at
+    // `flush_dirty` - no subgroup operation per store.
+    if let Some(&(pw_v, pb_v)) = tr.dirty_pend.get(&r) {
+        let (k12, k5, k31, one, z) = (tr.u(12), tr.u(5), tr.u(31), tr.u(1), tr.u(0));
+        let word_bit = |tr: &mut T, at: Word| -> R<(Word, Word)> {
+            let a = e(tr.b.i_add(u, None, at, head))?;
+            let page = e(tr.b.shift_right_logical(u, None, a, k12))?;
+            let word = e(tr.b.shift_right_logical(u, None, page, k5))?;
+            let word = tr.glsl2(u, GLOp::UMin, word, limit)?;
+            let word = e(tr.b.i_add(u, None, word, base))?;
+            let bit_i = e(tr.b.bitwise_and(u, None, page, k31))?;
+            Ok((word, e(tr.b.shift_left_logical(u, None, one, bit_i))?))
+        };
+        let (word, bit_f) = word_bit(tr, first)?;
+        // (The last byte's page: in the same word for nearly every store.)
+        let two = match last {
+            Some(last) => {
+                let (word_l, bit_l) = word_bit(tr, last)?;
+                let one_word = e(tr.b.i_equal(bt, None, word, word_l))?;
+                let bit_l1 = e(tr.b.select(u, None, one_word, bit_l, z))?;
+                Some((one_word, word_l, bit_l, e(tr.b.bitwise_or(u, None, bit_f, bit_l1))?))
+            }
+            None => None,
+        };
+        let bit = two.map_or(bit_f, |t| t.3);
+        let pw = e(tr.b.load(u, None, pw_v, None, []))?;
+        let pb = e(tr.b.load(u, None, pb_v, None, []))?;
+        let same = e(tr.b.i_equal(bt, None, word, pw))?;
+        let has = e(tr.b.i_not_equal(bt, None, pb, z))?;
+        let moved = e(tr.b.logical_not(bt, None, same))?;
+        let flush = e(tr.b.logical_and(bt, None, moved, has))?;
+        let m2 = tr.b.id();
+        let b2 = tr.b.id();
+        tr.b.selection_merge(m2, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
+        tr.b.branch_conditional(flush, b2, m2, []).map_err(|x| format!("{x:?}"))?;
+        e(tr.b.begin_block(Some(b2)))?;
+        let p = e(tr.b.access_chain(tr.t.sb_u32, None, bits, [z, pw]))?;
+        e(tr.b.atomic_or(u, None, p, dev, sem, pb))?;
+        tr.b.branch(m2).map_err(|x| format!("{x:?}"))?;
+        e(tr.b.begin_block(Some(m2)))?;
+        let or = e(tr.b.bitwise_or(u, None, pb, bit))?;
+        let nb = e(tr.b.select(u, None, same, or, bit))?;
+        tr.b.store(pw_v, word, None, []).map_err(|x| format!("{x:?}"))?;
+        tr.b.store(pb_v, nb, None, []).map_err(|x| format!("{x:?}"))?;
+        // (Otherwise the last byte's word directly.)
+        if let Some((one_word, word_l, bit_l, _)) = two {
+            let two_words = e(tr.b.logical_not(bt, None, one_word))?;
+            let m3 = tr.b.id();
+            let b3 = tr.b.id();
+            tr.b.selection_merge(m3, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
+            tr.b.branch_conditional(two_words, b3, m3, []).map_err(|x| format!("{x:?}"))?;
+            e(tr.b.begin_block(Some(b3)))?;
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, bits, [z, word_l]))?;
+            e(tr.b.atomic_or(u, None, p, dev, sem, bit_l))?;
+            tr.b.branch(m3).map_err(|x| format!("{x:?}"))?;
+            e(tr.b.begin_block(Some(m3)))?;
+        }
+        return Ok(());
+    }
     tr.b.capability(spirv::Capability::GroupNonUniform);
     tr.b.capability(spirv::Capability::GroupNonUniformVote);
     tr.b.capability(spirv::Capability::GroupNonUniformArithmetic);
-    let act = tr.active()?;
-    let merge = tr.b.id();
-    let body = tr.b.id();
-    tr.b.selection_merge(merge, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
-    tr.b.branch_conditional(act, body, merge, []).map_err(|x| format!("{x:?}"))?;
-    e(tr.b.begin_block(Some(body)))?;
-    for at in [first, last] {
+    for at in std::iter::once(first).chain(last) {
         let (k12, k5, k31, one) = (tr.u(12), tr.u(5), tr.u(31), tr.u(1));
         let a = e(tr.b.i_add(u, None, at, head))?;
         let page = e(tr.b.shift_right_logical(u, None, a, k12))?;
@@ -775,8 +865,54 @@ fn mark_dirty(tr: &mut T, r: usize, first: Word, last: Word) -> R<()> {
         tr.b.branch(m2).map_err(|x| format!("{x:?}"))?;
         e(tr.b.begin_block(Some(m2)))?;
     }
-    tr.b.branch(merge).map_err(|x| format!("{x:?}"))?;
-    e(tr.b.begin_block(Some(merge)))?;
+    Ok(())
+}
+
+/// Before the program ends or kills its fragment: the page marks still
+/// pending in this invocation (`mark_dirty`) into the bitmaps - one atomic
+/// per subgroup where its invocations share the word.
+pub(crate) fn flush_dirty(tr: &mut T) -> R<()> {
+    if tr.dirty_pend.is_empty() {
+        return Ok(());
+    }
+    let Some((_, bits)) = tr.dirty else { return Ok(()) };
+    let (u, bt) = (tr.t.u32, tr.t.bool_);
+    let sg = tr.u(spirv::Scope::Subgroup as u32);
+    let dev = tr.u(spirv::Scope::Device as u32);
+    let (sem, z) = (tr.u(0), tr.u(0));
+    tr.b.capability(spirv::Capability::GroupNonUniform);
+    tr.b.capability(spirv::Capability::GroupNonUniformVote);
+    tr.b.capability(spirv::Capability::GroupNonUniformArithmetic);
+    let pend: Vec<(Word, Word)> = tr.dirty_pend.values().copied().collect();
+    for (pw_v, pb_v) in pend {
+        let pw = e(tr.b.load(u, None, pw_v, None, []))?;
+        let pb = e(tr.b.load(u, None, pb_v, None, []))?;
+        let has = e(tr.b.i_not_equal(bt, None, pb, z))?;
+        let merge = tr.b.id();
+        let body = tr.b.id();
+        tr.b.selection_merge(merge, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
+        tr.b.branch_conditional(has, body, merge, []).map_err(|x| format!("{x:?}"))?;
+        e(tr.b.begin_block(Some(body)))?;
+        let same = e(tr.b.group_non_uniform_all_equal(bt, None, sg, pw))?;
+        let all = e(tr.b.group_non_uniform_bitwise_or(u, None, sg, spirv::GroupOperation::Reduce, pb, None))?;
+        let elected = e(tr.b.group_non_uniform_elect(bt, None, sg))?;
+        let lead = e(tr.b.logical_and(bt, None, same, elected))?;
+        let alone = e(tr.b.logical_not(bt, None, same))?;
+        let go = e(tr.b.logical_or(bt, None, lead, alone))?;
+        let val = e(tr.b.select(u, None, same, all, pb))?;
+        let m2 = tr.b.id();
+        let b2 = tr.b.id();
+        tr.b.selection_merge(m2, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
+        tr.b.branch_conditional(go, b2, m2, []).map_err(|x| format!("{x:?}"))?;
+        e(tr.b.begin_block(Some(b2)))?;
+        let p = e(tr.b.access_chain(tr.t.sb_u32, None, bits, [z, pw]))?;
+        e(tr.b.atomic_or(u, None, p, dev, sem, val))?;
+        tr.b.branch(m2).map_err(|x| format!("{x:?}"))?;
+        e(tr.b.begin_block(Some(m2)))?;
+        tr.b.store(pb_v, z, None, []).map_err(|x| format!("{x:?}"))?;
+        tr.b.branch(merge).map_err(|x| format!("{x:?}"))?;
+        e(tr.b.begin_block(Some(merge)))?;
+    }
     Ok(())
 }
 
@@ -791,7 +927,10 @@ impl T<'_> {
     }
 }
 
-fn store_formatted(tr: &mut T, var: Word, addr: Word, vd: u32, n: u32, dfmt: u8, nfmt: u8) -> R<()> {
+/// A format store; `mark`: the written buffer's page mark (resource, first
+/// and last byte), made in the same branch of the active lanes.
+#[allow(clippy::too_many_arguments)]
+fn store_formatted(tr: &mut T, var: Word, addr: Word, vd: u32, n: u32, dfmt: u8, nfmt: u8, mark: Option<(usize, Word, Option<Word>)>) -> R<()> {
     let u = tr.t.u32;
     let f = tr.t.f32;
     let act = tr.active()?;
@@ -800,6 +939,9 @@ fn store_formatted(tr: &mut T, var: Word, addr: Word, vd: u32, n: u32, dfmt: u8,
     tr.b.selection_merge(merge, spirv::SelectionControl::NONE).map_err(|x| format!("{x:?}"))?;
     tr.b.branch_conditional(act, body, merge, []).map_err(|x| format!("{x:?}"))?;
     e(tr.b.begin_block(Some(body)))?;
+    if let Some((r, a, l)) = mark {
+        mark_dirty(tr, r, a, l)?;
+    }
     let two = tr.u(2);
     match (dfmt, nfmt) {
         (4 | 11 | 13 | 14, _) => {
@@ -1442,6 +1584,8 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
     // writes EXEC has none: a discard would cost depth-only draws their
     // early depth tests).
     if tr.spec.stage == Stage::Fragment && ins.exp_vm() && tr.exec_written {
+        // (Their pending page marks first: a killed fragment's stores happened.)
+        flush_dirty(tr)?;
         let nact = e(tr.b.logical_not(tr.t.bool_, None, act))?;
         let merge = tr.b.id();
         let kill = tr.b.id();

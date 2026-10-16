@@ -626,6 +626,7 @@ pub(crate) fn emit(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>],
                 return Ok(());
             }
             Node::Return => {
+                super::mem::flush_dirty(tr)?;
                 tr.b.ret().map_err(ef)?;
                 return Ok(());
             }
@@ -635,7 +636,10 @@ pub(crate) fn emit(tr: &mut T, code: &[Inst], ranges: &[std::ops::Range<usize>],
         Some(l) => tr.b.branch(l).map_err(ef),
         // (A loop body that ends without a jump continues; the top level returns.)
         None if lp.is_some() => tr.b.branch(lp.unwrap().0).map_err(ef),
-        None => tr.b.ret().map_err(ef),
+        None => {
+            super::mem::flush_dirty(tr)?;
+            tr.b.ret().map_err(ef)
+        }
     }
 }
 

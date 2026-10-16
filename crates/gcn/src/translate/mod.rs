@@ -21,6 +21,15 @@ use rspirv::spirv::{self, BuiltIn, Capability, Decoration, ExecutionMode, Execut
 use crate::DetMap as HashMap;
 use std::collections::BTreeSet;
 
+thread_local! {
+    /// Measurements only (the runtime's `TLG_COMPILE_PROBE`): 1 = buffer
+    /// stores leave out their page marks (`mem::mark_dirty`; the bindings
+    /// stay); 2 = they mark with a plain atomic per active lane (no subgroup
+    /// operations), so the driver's compile time can be compared. Such
+    /// shaders are never used.
+    pub static PROBE_MARKS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Stage {
     Vertex,
@@ -150,6 +159,12 @@ pub struct Spec {
     /// MRT k (the last capture to any further MRTs). The flag converts the
     /// captured registers from unsigned integers to floats.
     pub debug_capture: Vec<(u32, u32, bool)>,
+    /// How buffer stores mark their pages (`mem::mark_dirty`): 1 = kept per
+    /// invocation and flushed when a store moves on to another bitmap word
+    /// and before the program ends; 0 = one subgroup-coalesced mark per store
+    /// (its subgroup operations made such shaders compile ~1.8x slower);
+    /// 2 = a plain atomic per lane and store.
+    pub page_marks: u8,
 }
 
 /// Clip/cull distances of a vertex shader's extra position exports
@@ -369,6 +384,10 @@ pub(crate) struct T<'a> {
     pub dirty: Option<(Word, Word)>,
     /// Per written buffer: its DirtyInfo (bitmap base, head, limit).
     pub dirty_res: HashMap<usize, (Word, Word, Word)>,
+    /// Per written buffer (`Spec::page_marks` 1): function variables holding
+    /// this invocation's pending bitmap word and its bits (`mem::mark_dirty`,
+    /// `mem::flush_dirty`).
+    pub dirty_pend: HashMap<usize, (Word, Word)>,
     pub lane_id: Option<Word>,
     /// SubgroupLocalInvocationId input (created on first use).
     pub sg_lane_var: Option<Word>,
@@ -889,6 +908,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         gds: None,
         dirty: None,
         dirty_res: HashMap::default(),
+        dirty_pend: HashMap::default(),
         lane_id: None,
         sg_lane_var: None,
         lane_slots: HashMap::default(),
@@ -1006,11 +1026,29 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
         let v = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
         tr.dbg_vars.push(v);
     }
+    // Page marks of written buffers pending in this invocation (word, bits).
+    if tr.dirty.is_some() && spec.page_marks == 1 && PROBE_MARKS.with(|s| s.get()) == 0 {
+        for (i, r) in plan.resources.iter().enumerate() {
+            if r.kind == ResKind::Buffer && r.written {
+                let w = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+                let b = tr.b.variable(tr.t.fn_u32, None, StorageClass::Function, None);
+                tr.dirty_pend.insert(i, (w, b));
+            }
+        }
+    }
     // Initial state.
     let f = tr.bool_c(false);
     tr.set_scc(f)?;
     let one = tr.u(1);
     let zero = tr.u(0);
+    let pend: Vec<(Word, Word)> = tr.dirty_pend.values().copied().collect();
+    if !pend.is_empty() {
+        let none = tr.u(u32::MAX);
+        for (w, b) in pend {
+            tr.b.store(w, none, None, []).map_err(|x| format!("{x:?}"))?;
+            tr.b.store(b, zero, None, []).map_err(|x| format!("{x:?}"))?;
+        }
+    }
     tr.set_sreg(crate::OP_EXEC_LO as u32, one)?;
     tr.set_sreg(crate::OP_EXEC_HI as u32, zero)?;
     tr.set_sreg(crate::OP_VCC_LO as u32, zero)?;
@@ -1079,6 +1117,7 @@ pub fn translate(code: &[Inst], plan: &Plan, spec: &Spec) -> R<Output> {
             }
             translate_inst(&mut tr, ins)?;
         }
+        mem::flush_dirty(&mut tr)?;
         tr.b.ret().map_err(|x| format!("{x:?}"))?;
     } else {
         // Structured control flow when the CFG allows it (TLG_STRUCTURED=0
@@ -1289,6 +1328,7 @@ fn emit_dispatch_loop(tr: &mut T, code: &[Inst], starts: &BTreeSet<u32>) -> R<()
     let done = e(tr.b.i_equal(tr.t.bool_, None, pc2, ex))?;
     tr.b.branch_conditional(done, exit, header, []).map_err(|x| format!("{x:?}"))?;
     e(tr.b.begin_block(Some(exit)))?;
+    mem::flush_dirty(tr)?;
     tr.b.ret().map_err(|x| format!("{x:?}"))?;
     Ok(())
 }
@@ -1371,6 +1411,7 @@ mod tests {
             buffer_strides: Vec::new(),
             binding_base: 0,
             debug_capture: Vec::new(),
+            page_marks: 1,
         }
     }
 
@@ -1434,5 +1475,38 @@ mod tests {
         assert_eq!(kills(&[0xBEEB_0383, 0xF800_1890, 0, 0xBF81_0000]), 0);
         // v_cmpx_gt_u32 vcc, v0, v1 first (an alpha test): lanes may die.
         assert_eq!(kills(&[0x7DA8_0300, 0xF800_1890, 0, 0xBF81_0000]), 1);
+    }
+
+    #[test]
+    fn page_marks_are_flushed_once_at_the_end() {
+        // buffer_store_dword v0, v1, s[0:3], 0 offen; buffer_store_dwordx2
+        // v[2:3], v1, s[0:3], 0 offen; s_endpgm
+        let code = crate::decode_program(&[0xE070_1000, 0x8000_0001, 0xE074_1000, 0x8000_0201, 0xBF81_0000]).unwrap();
+        let plan = crate::analysis::analyze(&code, 4, 0);
+        assert!(plan.resources.iter().any(|r| r.kind == ResKind::Buffer && r.written));
+        let spec = Spec { stage: Stage::Compute, user_sgprs: 4, resources: vec![ResSpec::Buffer { dfmt: 4, nfmt: 4, dst_sel: 0 }], buffer_strides: vec![0], ..vertex_spec(0) };
+        let ops_of = |page_marks: u8| -> Vec<spirv::Op> {
+            let out = translate(&code, &plan, &Spec { page_marks, ..spec.clone() }).unwrap();
+            let m = rspirv::dr::load_words(&out.spirv).unwrap();
+            m.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions).map(|i| i.class.opcode).collect()
+        };
+        let ops = ops_of(1);
+        let count = |ops: &[spirv::Op], op: spirv::Op| ops.iter().filter(|&&o| o == op).count();
+        // Per store an atomic for the word left behind (the dword store's
+        // bytes share a page; the dwordx2's last byte may be in another
+        // word: one more), one subgroup-coalesced atomic at the end.
+        assert_eq!(count(&ops, spirv::Op::GroupNonUniformAllEqual), 1);
+        assert_eq!(count(&ops, spirv::Op::GroupNonUniformElect), 1);
+        assert_eq!(count(&ops, spirv::Op::AtomicOr), 1 + 2 + 1);
+        // The flush comes before the return.
+        let last_atomic = ops.iter().rposition(|&o| o == spirv::Op::AtomicOr).unwrap();
+        assert!(ops[last_atomic..].contains(&spirv::Op::Return));
+        // The per-store marks: a subgroup reduction per page (1 + 2); plain
+        // atomics: one per page, no subgroup operation.
+        let old = ops_of(0);
+        assert_eq!(count(&old, spirv::Op::GroupNonUniformAllEqual), 3);
+        let plain = ops_of(2);
+        assert_eq!(count(&plain, spirv::Op::GroupNonUniformAllEqual), 0);
+        assert_eq!(count(&plain, spirv::Op::AtomicOr), 3);
     }
 }

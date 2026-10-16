@@ -30,6 +30,19 @@ static PROGRAMS: Mutex<Option<FastMap<u64, Program>>> = Mutex::new(None);
 pub struct Translated {
     pub out: Arc<Output>,
     pub key_hash: u64,
+    /// `TLG_COMPILE_PROBE`: the same translation without page marks, and
+    /// with plain per-lane atomics as the marks.
+    pub probe: [Option<Arc<Output>>; 2],
+}
+
+/// Pipeline compile-time measurements (`TLG_COMPILE_PROBE=1`): each shader
+/// with written buffers is also translated without the stores' page marks,
+/// and each pipeline the CPs create is created a second time from those
+/// (timed, then destroyed). Use with `TLG_PIPELINE_CACHE=0` and
+/// `TLG_SPIRV_NONCE`, so both compile afresh.
+pub fn compile_probe() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_COMPILE_PROBE").is_ok_and(|v| v == "1"))
 }
 
 static CACHE: Mutex<Option<FastMap<(u64, u64), Translated>>> = Mutex::new(None);
@@ -947,6 +960,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         binding_base: if sr.stage == Stage::Fragment { PS_BINDING_BASE } else { 0 },
         // (Set below, once the rest of the key is known.)
         debug_capture: Vec::new(),
+        page_marks: crate::tune::get(crate::tune::PAGE_MARKS).clamp(0, 2) as u8,
     };
     match sr.stage {
         Stage::Fragment => {
@@ -1032,7 +1046,20 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
                     let bytes: Vec<u8> = out.spirv.iter().flat_map(|w| w.to_le_bytes()).collect();
                     super::shader_dump::write_file(format!("{stage_name}_{addr:x}_{key_hash:016x}.spv"), bytes);
                 }
-                let t = Translated { out: Arc::new(out), key_hash };
+                // (`TLG_COMPILE_PROBE`: also without page marks, for the
+                // pipeline compile-time comparison - never used.)
+                let probe = if compile_probe() && out.bindings.iter().any(|b| b.kind == translate::BindingKind::DirtyBits) {
+                    let variant = |mode: u8| {
+                        translate::PROBE_MARKS.with(|s| s.set(mode));
+                        let p = translate::translate(code, plan, &spec);
+                        translate::PROBE_MARKS.with(|s| s.set(0));
+                        p.ok().map(Arc::new)
+                    };
+                    [variant(1), variant(2)]
+                } else {
+                    [None, None]
+                };
+                let t = Translated { out: Arc::new(out), key_hash, probe };
                 map.insert((code_hash, key_hash), t.clone());
                 t
             }

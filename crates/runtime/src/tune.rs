@@ -608,7 +608,15 @@ pub const SHADER_STATS: usize = 100;
 /// 20261016-070734, memo hits 24,300 vs 24,400 per second.)
 pub const MEMO_BASE: usize = 101;
 
-const TABLE: [(&str, &str, i64); 102] = [
+/// Shaders' page marks of buffer stores kept per invocation and flushed when
+/// a store moves on to another bitmap word and at the end (`TLG_PAGE_MARKS`,
+/// 1; 0: one subgroup-coalesced mark per store - its subgroup operations made
+/// shaders with buffer stores compile ~1.8x slower, cold runs 20261016-074024
+/// .. -082408; 2: a plain atomic per lane and store). Part of the translation
+/// key: switching translates again.
+pub const PAGE_MARKS: usize = 102;
+
+const TABLE: [(&str, &str, i64); 103] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -711,6 +719,7 @@ const TABLE: [(&str, &str, i64); 102] = [
     ("tex_memo", "TLG_TEX_MEMO", 1),
     ("shader_stats", "TLG_SHADER_STATS", 0),
     ("memo_base", "TLG_MEMO_BASE", 1),
+    ("page_marks", "TLG_PAGE_MARKS", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

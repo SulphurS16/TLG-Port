@@ -2853,6 +2853,29 @@ pub static COPYIN_STATS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync:
 /// Pipelines created (graphics, compute): count and nanoseconds in the
 /// creation calls (reported with the renderer times).
 pub static PIPE_CREATES: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 2] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 2];
+/// `TLG_COMPILE_PROBE` (graphics, compute): pipelines probed, nanoseconds
+/// of their creation as used, without page marks and with plain atomics.
+pub static COMPILE_PROBE: [[std::sync::atomic::AtomicU64; 4]; 2] = [const { [const { std::sync::atomic::AtomicU64::new(0) }; 4] }; 2];
+
+/// Records a compile probe; the first 40 slow pipelines are logged too.
+fn note_compile_probe(kind: usize, ns: u64, probe_ns: [u64; 2], a: u64, b: u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    COMPILE_PROBE[kind][0].fetch_add(1, Relaxed);
+    COMPILE_PROBE[kind][1].fetch_add(ns, Relaxed);
+    COMPILE_PROBE[kind][2].fetch_add(probe_ns[0], Relaxed);
+    COMPILE_PROBE[kind][3].fetch_add(probe_ns[1], Relaxed);
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if ns >= 100_000_000 && N.fetch_add(1, Relaxed) < 40 {
+        crate::info!(
+            "compile probe: {} {a:#x}{}: {} ms, without page marks {} ms, with plain atomics {} ms",
+            ["graphics pipeline for vs", "compute pipeline for cs"][kind],
+            if b != 0 { format!(" ps {b:#x}") } else { String::new() },
+            ns / 1_000_000,
+            probe_ns[0] / 1_000_000,
+            probe_ns[1] / 1_000_000
+        );
+    }
+}
 
 /// TLG_PERF: mirror bindings served by the binding cache, and all.
 pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
@@ -9005,6 +9028,44 @@ impl Renderer {
         let set_layout = self.set_layout(&stages_p)?;
         let layouts = [set_layout];
         let layout = unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None) }.map_err(|e| e.to_string())?;
+        let t0 = std::time::Instant::now();
+        let pipeline = self.gfx_pipeline_with(key, vsm, psm, gsm, layout)?;
+        pipeline_cache_dirty();
+        crate::debug!("created graphics pipeline vs {:#x} ps {:?} colors {:?} depth {:?} rect {}", vs.addr, ps.map(|p| p.addr), key.colors, key.depth, key.rect);
+        // (`TLG_COMPILE_PROBE`: the same pipeline from the stages' probe
+        // variants, timed and dropped.)
+        let has_probe = vs.translated.probe[0].is_some() || ps.is_some_and(|p| p.translated.probe[0].is_some());
+        if shaders::compile_probe() && key.tess.is_none() && has_probe {
+            let ns = t0.elapsed().as_nanos() as u64;
+            let module = |spirv: &[u32]| unsafe { c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None) }.map_err(|e| format!("vkCreateShaderModule: {e}"));
+            let mut pns = [0u64; 2];
+            for (v, t) in pns.iter_mut().enumerate() {
+                let pv = module(vs.translated.probe[v].as_ref().map_or(&vs.translated.out.spirv, |p| &p.spirv))?;
+                let pp = match ps {
+                    Some(p) => Some(module(p.translated.probe[v].as_ref().map_or(&p.translated.out.spirv, |o| &o.spirv))?),
+                    None => None,
+                };
+                let t1 = std::time::Instant::now();
+                let probe = self.gfx_pipeline_with(key, pv, pp, gsm, layout);
+                *t = t1.elapsed().as_nanos() as u64;
+                unsafe {
+                    if let Ok(p) = probe {
+                        c.device.destroy_pipeline(p, None);
+                    }
+                    c.device.destroy_shader_module(pv, None);
+                    if let Some(m) = pp {
+                        c.device.destroy_shader_module(m, None);
+                    }
+                }
+            }
+            note_compile_probe(0, ns, pns, vs.addr, ps.map_or(0, |p| p.addr));
+        }
+        Ok(Pipe { pipeline, layout, set_layout })
+    }
+
+    /// `create_gfx_pipeline`'s pipeline from the given stage modules and layout.
+    fn gfx_pipeline_with(&mut self, key: &GfxKey, vsm: vk::ShaderModule, psm: Option<vk::ShaderModule>, gsm: Option<vk::ShaderModule>, layout: vk::PipelineLayout) -> Result<vk::Pipeline, String> {
+        let c = ctx();
         let main = c"main";
         let mut stages = Vec::new();
         if let Some((tf_param, min, max)) = key.tess {
@@ -9106,9 +9167,7 @@ impl Renderer {
             .layout(layout)
             .push_next(&mut rinfo);
         let pipeline = unsafe { c.device.create_graphics_pipelines(pipeline_cache(), &[gpci], None) }.map_err(|(_, e)| format!("vkCreateGraphicsPipelines: {e}"))?[0];
-        pipeline_cache_dirty();
-        crate::debug!("created graphics pipeline vs {:#x} ps {:?} colors {:?} depth {:?} rect {}", vs.addr, ps.map(|p| p.addr), key.colors, key.depth, key.rect);
-        Ok(Pipe { pipeline, layout, set_layout })
+        Ok(pipeline)
     }
 
     // -------------------------------------------------------------------
@@ -9398,6 +9457,27 @@ impl Renderer {
             PIPE_CREATES[1].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             PIPE_CREATES[1].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let ms = t0.elapsed().as_millis();
+            // (`TLG_COMPILE_PROBE`: the same from the probe variants, timed and dropped.)
+            if shaders::compile_probe() && cs.translated.probe[0].is_some() {
+                let ns = t0.elapsed().as_nanos() as u64;
+                let mut pns = [0u64; 2];
+                for (v, t) in pns.iter_mut().enumerate() {
+                    let Some(probe) = cs.translated.probe[v].as_ref() else { continue };
+                    let pm = unsafe { c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&probe.spirv), None) }.map_err(|e| format!("vkCreateShaderModule: {e}"))?;
+                    let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(pm).name(c"main");
+                    let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE);
+                    let t1 = std::time::Instant::now();
+                    let p = unsafe { c.device.create_compute_pipelines(pipeline_cache(), &[ci], None) };
+                    *t = t1.elapsed().as_nanos() as u64;
+                    unsafe {
+                        if let Ok(p) = p {
+                            c.device.destroy_pipeline(p[0], None);
+                        }
+                        c.device.destroy_shader_module(pm, None);
+                    }
+                }
+                note_compile_probe(1, ns, pns, cs.addr, 0);
+            }
             if ms >= 100 {
                 crate::info!("compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms to create", cs.addr, cs.translated.out.spirv.len());
             }

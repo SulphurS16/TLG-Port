@@ -725,6 +725,15 @@ fn gfx_thread() {
                 let pc = |i: usize| (render::PIPE_CREATES[i].0.load(Ordering::Relaxed), render::PIPE_CREATES[i].1.load(Ordering::Relaxed) as f64 / 1e9);
                 let (g, c) = (pc(0), pc(1));
                 crate::info!("pipelines created so far: graphics {} ({:.2} s), compute {} ({:.2} s)", g.0, g.1, c.0, c.1);
+                if shaders::compile_probe() {
+                    let p: Vec<String> = (0..2)
+                        .map(|k| {
+                            let v: [u64; 4] = std::array::from_fn(|i| render::COMPILE_PROBE[k][i].load(Ordering::Relaxed));
+                            format!("{} {} pipelines {:.2} s as used, {:.2} s without page marks, {:.2} s with plain atomics", ["graphics", "compute"][k], v[0], v[1] as f64 / 1e9, v[2] as f64 / 1e9, v[3] as f64 / 1e9)
+                        })
+                        .collect();
+                    crate::info!("compile probe: {}", p.join("; "));
+                }
             }
         }
     }
