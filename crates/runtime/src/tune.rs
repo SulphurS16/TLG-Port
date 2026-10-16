@@ -621,8 +621,15 @@ pub const PAGE_MARKS: usize = 102;
 /// barrier (`TLG_HOIST_FWD`, 1): for read-only and written buffer uploads and
 /// mirror copy-ins; forwards of the batch's own writes stay in the batch.
 pub const HOIST_FWD: usize = 103;
+/// Guest threads of SceKernel priority at or above (numerically at most)
+/// this run above normal on the host, as our GPU threads (`TLG_GUEST_PRIO`,
+/// 256; 0: all normal). The title's sound mixer (`sndx_out_thread`) and
+/// render submission ask for 256, its job workers for 552: at normal priority
+/// the sound thread lost the CPU to them and the audio device ran dry.
+/// Applied when a thread starts.
+pub const GUEST_PRIO: usize = 104;
 
-const TABLE: [(&str, &str, i64); 104] = [
+const TABLE: [(&str, &str, i64); 105] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -727,6 +734,7 @@ const TABLE: [(&str, &str, i64); 104] = [
     ("memo_base", "TLG_MEMO_BASE", 1),
     ("page_marks", "TLG_PAGE_MARKS", 1),
     ("hoist_fwd", "TLG_HOIST_FWD", 1),
+    ("guest_prio", "TLG_GUEST_PRIO", 256),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

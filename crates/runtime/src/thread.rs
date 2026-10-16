@@ -346,6 +346,16 @@ pub fn raise_priority() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
 }
 
+/// The calling guest thread's host priority for its SceKernel priority
+/// (256 highest .. 767 lowest): above normal at `tune::GUEST_PRIO` or
+/// higher, else normal.
+pub fn apply_guest_priority(prio: i32) {
+    let limit = crate::tune::get(crate::tune::GUEST_PRIO);
+    if limit > 0 && (prio as i64) <= limit {
+        raise_priority();
+    }
+}
+
 /// The current thread at raised (`raise_priority`) or normal priority.
 pub fn set_raised_priority(raised: bool) {
     use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL};
@@ -559,6 +569,7 @@ pub fn spawn(t: &'static GuestThread) -> std::io::Result<()> {
         host_stack,
         Box::new(move || {
             enter(t);
+            apply_guest_priority(t.priority.load(Ordering::Relaxed));
             crate::debug!("thread '{}' start entry={:#x} arg={:#x}", t.name(), t.entry, t.arg);
             let v = run_entry(t, t.entry, t.arg, 0);
             run_key_destructors(t);

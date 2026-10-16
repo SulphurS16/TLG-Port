@@ -18,7 +18,7 @@
 //! delays, peak meters. Unknown parameter ids are logged with their payload.
 
 use super::atrac9;
-use super::ngs2_fx::{Biquad, Compressor, Envelope, FilterKind, I3dl2, Reverb, Taps};
+use super::ngs2_fx::{Biquad, Compressor, Envelope, FilterKind, I3dl2, Limiter, Reverb, Taps};
 use crate::gpu::render::FastMap;
 use crate::hle::Registry;
 use crate::{reg, sysv};
@@ -271,9 +271,10 @@ struct Voice {
     /// Output channels of reverb and custom racks.
     out_channels: u32,
     /// Mastering: LFE gain (channel 3; `gain` for the others) and limiter
-    /// threshold (0: off).
+    /// threshold (0: off); the output stage (DC blocker and limiter).
     lfe_gain: f32,
     limit: f32,
+    limiter: Option<Limiter>,
 }
 
 impl Voice {
@@ -310,6 +311,7 @@ impl Voice {
             out_channels: 2,
             lfe_gain: 1.0,
             limit: 0.0,
+            limiter: None,
         }
     }
 }
@@ -638,10 +640,12 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     // {float fbwLevel; float lfeLevel}
                     v.gain = f32_at(8);
                     v.lfe_gain = f32_at(12);
+                    note_mastering("gain", vh, v.gain, v.lfe_gain);
                 }
                 MASTERING_LIMITER => {
                     // {u32 enable; float threshold}
                     v.limit = if u32_at(8) != 0 { f32_at(12).max(0.0) } else { 0.0 };
+                    note_mastering("limiter", vh, u32_at(8) as f32, f32_at(12));
                 }
                 REVERB_I3DL2 if v.kind == Kind::Reverb => {
                     let i = |off: usize| u32_at(off) as i32;
@@ -1181,6 +1185,9 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
             let v = s.voices.get_mut(vh).unwrap();
             render_sampler(v, grain, rate, &mut buf);
             let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
+            if trace_voices() {
+                note_dc(v, &buf, ch);
+            }
             run_eq(v, &mut buf, ch, rate);
             v.peak = peak_of(&buf, ch);
             v.peak_win = v.peak_win.max(v.peak);
@@ -1243,26 +1250,68 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
     // Mastering voices: their inputs, scaled by their gain, summed.
     let mut out = vec![[0f32; MAX_CH]; grain];
     for vh in &all {
-        let Some(v) = s.voices.get(vh) else { continue };
+        let Some(v) = s.voices.get_mut(vh) else { continue };
         if v.kind != Kind::Mastering {
             continue;
         }
         let pk = peak_of(&v.input[..v.input.len().min(grain)], MAX_CH);
-        if let Some(m) = s.voices.get_mut(vh) {
-            m.peak_win = m.peak_win.max(pk);
+        v.peak_win = v.peak_win.max(pk);
+        if v.limiter.as_ref().is_none_or(|l| l.rate() != rate) {
+            v.limiter = Some(Limiter::new(rate));
         }
-        let Some(v) = s.voices.get(vh) else { continue };
-        for (i, fr) in v.input.iter().enumerate().take(grain) {
+        let (gain, lfe, limit) = (v.gain, v.lfe_gain, v.limit);
+        let Voice { input, limiter, .. } = v;
+        let lim = limiter.as_mut().unwrap();
+        for (i, fr) in input.iter().enumerate().take(grain) {
+            let mut x: [f32; MAX_CH] = *fr;
+            for (c, s) in x.iter_mut().enumerate() {
+                *s *= if c == 3 { lfe } else { gain };
+            }
+            lim.process(&mut x, limit);
             for c in 0..MAX_CH {
-                let mut x = fr[c] * if c == 3 { v.lfe_gain } else { v.gain };
-                if v.limit > 0.0 {
-                    x = x.clamp(-v.limit, v.limit);
-                }
-                out[i][c] += x;
+                out[i][c] += x[c];
             }
         }
     }
     out
+}
+
+/// The mastering voices' gain and limiter settings (logged the first times).
+fn note_mastering(what: &str, vh: u64, a: f32, b: f32) {
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
+        crate::info!("NGS2 mastering {what} on {vh:#x}: {a} {b}");
+    }
+}
+
+/// TLG_NGS2_TRACE: a sampler voice whose grain has a large DC level (a
+/// mean far from 0: a thump or an offset in the waveform), named with what it
+/// plays (the first 32).
+fn note_dc(v: &Voice, buf: &[[f32; MAX_CH]], ch: usize) {
+    if buf.is_empty() {
+        return;
+    }
+    let n = buf.len() as f32;
+    let dc = (0..ch).map(|c| buf.iter().map(|f| f[c]).sum::<f32>() / n).fold(0f32, |m, x| if x.abs() > m.abs() { x } else { m });
+    if dc.abs() < 0.2 {
+        return;
+    }
+    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+        let sm = &v.sampler;
+        crate::info!(
+            "NGS2 voice (rack {:#x} #{}) grain DC {dc:.3}: waveform type {:#x}, {} ch at {} Hz, pitch {:.3}, data {:#x}, {} samples decoded, filters {:?}",
+            v.rack,
+            v.index,
+            sm.wf_type,
+            sm.channels,
+            sm.rate,
+            sm.pitch,
+            sm.data,
+            sm.decoded_samples,
+            v.eq_params.iter().flatten().map(|p| (p.0, p.1 as u32)).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// One grain of a reverb rack: the reverberation of the input's mean (front

@@ -165,6 +165,11 @@ pub struct Reverb {
     damp: f32,
     in_coef: f32,
     in_lp: f32,
+    /// The input's DC-blocking high-pass (`REVERB_HP_HZ`): previous input
+    /// and output, pole.
+    hp_x: f32,
+    hp_y: f32,
+    hp_r: f32,
     /// Output scale: energy normalization x Room x Reverb x wet.
     late_gain: f32,
     refl_gain: f32,
@@ -208,6 +213,9 @@ impl Reverb {
             damp,
             in_coef,
             in_lp: 0.0,
+            hp_x: 0.0,
+            hp_y: 0.0,
+            hp_r: one_pole_r(REVERB_HP_HZ, rate),
             late_gain: norm * room * mb(p.reverb) * p.wet,
             refl_gain: room * mb(p.reflections) * p.wet,
         }
@@ -220,7 +228,14 @@ impl Reverb {
 
     /// One frame: mono input (the channels' mean), a stereo pair out.
     pub fn process(&mut self, x: f32) -> [f32; 2] {
-        self.in_lp = x * (1.0 - self.in_coef) + self.in_lp * self.in_coef;
+        // (DC and the lowest rumble kept out: at DC every comb's gain is
+        // 1 / (1 - fb), ~13 times the reverb's broadband level for a 3 s
+        // decay, so a low thump came back as a DC swell of the decay's
+        // length.)
+        let hp = x - self.hp_x + self.hp_r * self.hp_y;
+        self.hp_x = x;
+        self.hp_y = if hp.abs() < 1e-20 { 0.0 } else { hp };
+        self.in_lp = hp * (1.0 - self.in_coef) + self.in_lp * self.in_coef;
         let n = self.pre.len();
         self.pre[self.pre_pos] = self.in_lp;
         let at = |d: usize| {
@@ -247,6 +262,73 @@ impl Reverb {
             out[k] = s * self.late_gain + refl;
         }
         out
+    }
+}
+
+/// Corner of the reverb input's DC-blocking high-pass (Hz).
+const REVERB_HP_HZ: f32 = 40.0;
+/// Corner of the mastering output's DC blocker (Hz): below hearing.
+const MASTER_DC_HZ: f32 = 10.0;
+/// Decay time constant of the mastering limiter's peak envelope (s).
+const LIMITER_RELEASE_S: f32 = 0.1;
+
+/// Pole of a one-pole filter with corner `hz` at `rate`.
+fn one_pole_r(hz: f32, rate: u32) -> f32 {
+    (-std::f32::consts::TAU * hz / rate.max(8000) as f32).exp()
+}
+
+/// The mastering voice's output stage: a DC blocker per channel, then the
+/// limiter (parameter {enable, threshold}) as gain reduction - a peak
+/// envelope that jumps to each new peak of the frame's loudest channel and
+/// decays with `LIMITER_RELEASE_S`, the gain threshold / envelope above the
+/// threshold - instead of clipping each sample at the threshold (which
+/// distorted every loud sound). No sample leaves above the threshold, and
+/// only the peaks themselves reach it.
+#[derive(Clone, Debug)]
+pub struct Limiter {
+    env: f32,
+    rel: f32,
+    dc_r: f32,
+    dc_x: [f32; 8],
+    dc_y: [f32; 8],
+    rate: u32,
+}
+
+impl Limiter {
+    pub fn new(rate: u32) -> Limiter {
+        let fs = rate.max(8000) as f32;
+        Limiter { env: 0.0, rel: (-1.0 / (LIMITER_RELEASE_S * fs)).exp(), dc_r: one_pole_r(MASTER_DC_HZ, rate), dc_x: [0.0; 8], dc_y: [0.0; 8], rate }
+    }
+
+    pub fn rate(&self) -> u32 {
+        self.rate
+    }
+
+    /// The gain applied at this threshold now.
+    pub fn gain(&self, threshold: f32) -> f32 {
+        if threshold > 0.0 && self.env > threshold { threshold / self.env } else { 1.0 }
+    }
+
+    /// One frame of 8 channels in place; `threshold` 0 = no limiting.
+    pub fn process(&mut self, fr: &mut [f32; 8], threshold: f32) {
+        let mut peak = 0f32;
+        for c in 0..8 {
+            let y = fr[c] - self.dc_x[c] + self.dc_r * self.dc_y[c];
+            self.dc_x[c] = fr[c];
+            self.dc_y[c] = if y.abs() < 1e-20 { 0.0 } else { y };
+            fr[c] = y;
+            peak = peak.max(y.abs());
+        }
+        self.env = peak.max(self.env * self.rel);
+        if self.env < 1e-20 {
+            self.env = 0.0;
+        }
+        let g = self.gain(threshold);
+        if g < 1.0 {
+            for x in fr.iter_mut() {
+                *x *= g;
+            }
+        }
     }
 }
 
@@ -692,6 +774,69 @@ mod tests {
         }
         assert!(e[0] > 0.3 && e[0] < 3.0, "energy {e:?}");
         assert!(late < early * 1e-3, "early {early} late {late}");
+    }
+
+    #[test]
+    fn reverb_passes_no_dc() {
+        // A constant input (DC) leaves no lasting output: the combs used to
+        // hold ~13 times the broadband gain at DC.
+        let mut r = Reverb::new(I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 3.0, decay_hf: 0.8, reflections: 0, reflections_delay: 0.02, reverb: 0, reverb_delay: 0.04 }, 48000);
+        let mut last = 0f32;
+        for i in 0..48000 * 3 {
+            let [l, _] = r.process(1.0);
+            if i >= 48000 * 5 / 2 {
+                last = last.max(l.abs());
+            }
+        }
+        assert!(last < 0.01, "lasting output {last}");
+        // (Speech-band content still reverberates.)
+        let mut r = Reverb::new(I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 3.0, decay_hf: 0.8, reflections: 0, reflections_delay: 0.02, reverb: 0, reverb_delay: 0.04 }, 48000);
+        let mut e = 0f32;
+        for i in 0..48000 {
+            let x = if i < 4800 { (i as f32 * std::f32::consts::TAU * 440.0 / 48000.0).sin() } else { 0.0 };
+            let [l, _] = r.process(x);
+            if i >= 9600 {
+                e += l * l;
+            }
+        }
+        assert!(e > 1.0, "tail energy {e}");
+    }
+
+    #[test]
+    fn limiter_reduces_gain_instead_of_clipping() {
+        let mut l = Limiter::new(48000);
+        // A 1 kHz tone at twice the threshold: no sample over it, and the
+        // waveform's shape kept - no flat tops (runs of 3 or more equal
+        // samples; clipping at the threshold makes most of each cycle one).
+        let (mut flat, mut run) = (0, 0);
+        let mut prev = 0f32;
+        let mut over = 0f32;
+        for i in 0..4800 {
+            let x = 2.0 * (i as f32 * std::f32::consts::TAU * 1000.0 / 48000.0).sin();
+            let mut fr = [x, -x, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            l.process(&mut fr, 0.5);
+            over = over.max(fr[0].abs() - 0.5);
+            run = if i > 480 && (fr[0] - prev).abs() < 1e-7 && fr[0].abs() > 0.4 { run + 1 } else { 0 };
+            if run == 2 {
+                flat += 1;
+            }
+            prev = fr[0];
+        }
+        assert!(over <= 1e-6, "over the threshold by {over}");
+        assert!(flat == 0, "{flat} flat tops");
+        // Below the threshold the gain recovers toward 1.
+        for _ in 0..48000 {
+            let mut fr = [0.1, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            l.process(&mut fr, 0.5);
+        }
+        assert!(l.gain(0.5) > 0.99, "gain {}", l.gain(0.5));
+        // DC is removed.
+        let mut fr = [0.0; 8];
+        for _ in 0..48000 {
+            fr = [0.3; 8];
+            l.process(&mut fr, 0.0);
+        }
+        assert!(fr[0].abs() < 0.01, "dc {}", fr[0]);
     }
 
     #[test]

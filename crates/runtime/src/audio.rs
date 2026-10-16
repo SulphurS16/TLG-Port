@@ -27,6 +27,8 @@ struct Port {
     fifo: VecDeque<[f32; 2]>,
     /// Has had audio (underruns count only after that).
     started: bool,
+    /// Ran dry in the last mix: its next frames fade in (`FADE`).
+    dry: bool,
     /// Per-channel gain (sceAudioOutSetVolume, 32768 = 0 dB).
     volume: [f32; 8],
     dump: Option<std::fs::File>,
@@ -37,9 +39,11 @@ struct Mixer {
     /// The device thread is playing.
     playing: bool,
     started: bool,
+    /// The output limiter's peak envelope (`mix`).
+    limit_env: f32,
 }
 
-static MIXER: Mutex<Mixer> = Mutex::new(Mixer { ports: Vec::new(), playing: false, started: false });
+static MIXER: Mutex<Mixer> = Mutex::new(Mixer { ports: Vec::new(), playing: false, started: false, limit_env: 0.0 });
 static CV: Condvar = Condvar::new();
 
 fn enabled() -> bool {
@@ -57,7 +61,7 @@ pub fn open_port(idx: usize) {
     if m.ports.len() <= idx {
         m.ports.resize_with(idx + 1, || None);
     }
-    m.ports[idx] = Some(Port { fifo: VecDeque::new(), started: false, volume: [1.0; 8], dump });
+    m.ports[idx] = Some(Port { fifo: VecDeque::new(), started: false, dry: false, volume: [1.0; 8], dump });
     if !m.started && enabled() {
         m.started = true;
         std::thread::Builder::new().name("audio-out".into()).spawn(device_thread).ok();
@@ -157,20 +161,47 @@ fn mix(out: &mut [f32]) {
         if !p.fifo.is_empty() {
             p.started = true;
         }
-        for frame in out.chunks_exact_mut(2) {
-            let Some(s) = p.fifo.pop_front() else { break };
-            frame[0] += s[0];
-            frame[1] += s[1];
+        // Around a gap the audio fades out and back in (`FADE` frames)
+        // instead of stepping to silence and back, which clicked.
+        let n = p.fifo.len().min(want);
+        let gap = n < want && p.started;
+        for (k, frame) in out.chunks_exact_mut(2).take(n).enumerate() {
+            let s = p.fifo.pop_front().unwrap_or([0.0; 2]);
+            let mut g = 1.0;
+            if p.dry && k < FADE {
+                g = (k + 1) as f32 / FADE as f32;
+            }
+            if gap && n - k <= FADE {
+                g *= (n - k) as f32 / (FADE + 1) as f32;
+            }
+            frame[0] += s[0] * g;
+            frame[1] += s[1] * g;
         }
+        p.dry = gap;
     }
     note_underrun(short);
     let gain = master_gain();
-    for v in out.iter_mut() {
-        *v = (*v * gain).clamp(-1.0, 1.0);
+    // (The downmix of 8 channels each limited at full scale can exceed it:
+    // gain reduction - a peak envelope that jumps to each new peak and
+    // decays in 100 ms - instead of clipping; the clamp only as a safety.)
+    let mut env = m.limit_env;
+    for frame in out.chunks_exact_mut(2) {
+        let (l, r) = (frame[0] * gain, frame[1] * gain);
+        env = l.abs().max(r.abs()).max(env * LIMIT_DECAY);
+        let g = if env > LIMIT { LIMIT / env } else { 1.0 };
+        frame[0] = (l * g).clamp(-1.0, 1.0);
+        frame[1] = (r * g).clamp(-1.0, 1.0);
     }
+    m.limit_env = if env < 1e-20 { 0.0 } else { env };
     drop(m);
     CV.notify_all();
 }
+
+/// The output limiter's level and its envelope's per-frame decay (100 ms).
+const LIMIT: f32 = 0.98;
+const LIMIT_DECAY: f32 = 0.999_791_7;
+/// Frames of the fades around an underrun's gap (~2.7 ms).
+const FADE: usize = 128;
 
 /// Underrun statistics: frames the device asked for that a playing port did
 /// not have, logged every 10 s while there are any.
@@ -205,6 +236,12 @@ fn master_gain() -> f32 {
 
 fn device_thread() {
     crate::log::set_thread_name("audio-out");
+    // (It waits on the device's event and mixes a buffer's worth per wake:
+    // time-critical, so a busy CPU does not leave the device without data.)
+    {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL};
+        unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) };
+    }
     let mut failures = 0u32;
     loop {
         let r = unsafe { run_device() };

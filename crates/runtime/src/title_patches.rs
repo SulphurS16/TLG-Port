@@ -483,8 +483,9 @@ pub fn camlog(flips: u32) {
 }
 
 /// At each displayed flip while `camlog` runs: the camera's pitch and yaw
-/// (+0x2240/+0x2244, radians), eye (+0x2370) and pivot (+0x23c0), and the
-/// mouse turn applied in the last integrator pass.
+/// (+0x2240/+0x2244, radians), eye (+0x2370) and pivot (+0x23c0), its follow
+/// target (+0x22b0: the boy) and the mouse turn applied in the last
+/// integrator pass.
 pub fn camlog_tick(flip: u64) {
     if CAMLOG.load(Ordering::Relaxed) == 0 {
         return;
@@ -499,7 +500,7 @@ pub fn camlog_tick(flip: u64) {
     let s = CAM_SLOTS.load(Ordering::Relaxed);
     let applied = if s != 0 { unsafe { (std::ptr::read_volatile((s + 12) as *const f32), std::ptr::read_volatile((s + 16) as *const f32)) } } else { (0.0, 0.0) };
     crate::info!(
-        "camlog flip {flip} t {:.1}: pitch {:.5} yaw {:.5} eye ({:.3} {:.3} {:.3}) pivot ({:.3} {:.3} {:.3}) applied ({:.5} {:.5})",
+        "camlog flip {flip} t {:.1}: pitch {:.5} yaw {:.5} eye ({:.3} {:.3} {:.3}) pivot ({:.3} {:.3} {:.3}) boy ({:.3} {:.3} {:.3}) applied ({:.5} {:.5})",
         crate::log::elapsed_ms(),
         f(0x2240),
         f(0x2244),
@@ -509,6 +510,9 @@ pub fn camlog_tick(flip: u64) {
         f(0x23c0),
         f(0x23c4),
         f(0x23c8),
+        f(0x22b0),
+        f(0x22b4),
+        f(0x22b8),
         applied.0,
         applied.1
     );
