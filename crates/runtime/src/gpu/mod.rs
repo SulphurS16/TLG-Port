@@ -558,7 +558,7 @@ fn gfx_thread() {
                 let images = r.image_count();
                 crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}; color shadows: copies {}, texel-load lookups {} ({} served by the target)", r.draws, r.dispatches, r.skipped, images, r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed));
                 let ub = r.upload_bytes;
-                crate::info!("buffer copies: written {} MiB, misaligned {} MiB, pending writes {} MiB, indices {} MiB; read-only copies reused {} times ({} MiB); read-only copies into the BAR ring {} ({} MiB; {} to the host ring for want of room); index data from the mirror {} draws ({} MiB)", ub[0] >> 20, ub[1] >> 20, ub[2] >> 20, ub[3] >> 20, r.upload_reused.0, r.upload_reused.1 >> 20, r.bar_uploads.0, r.bar_uploads.1 >> 20, r.bar_uploads.2, r.index_mirrored.0, r.index_mirrored.1 >> 20);
+                crate::info!("buffer copies: written {} MiB, misaligned {} MiB, pending writes {} MiB, indices {} MiB; read-only copies reused {} times ({} MiB; {} made by an earlier batch); read-only copies into the BAR ring {} ({} MiB; {} to the host ring for want of room); index data from the mirror {} draws ({} MiB)", ub[0] >> 20, ub[1] >> 20, ub[2] >> 20, ub[3] >> 20, r.upload_reused.0, r.upload_reused.1 >> 20, r.upload_xreused, r.bar_uploads.0, r.bar_uploads.1 >> 20, r.bar_uploads.2, r.index_mirrored.0, r.index_mirrored.1 >> 20);
                 crate::info!("render targets (de)tiled on the GPU: reloads {}, write-backs {}; textures detiled on the GPU {}; ring-full retries {}", r.gpu_remaps[0], r.gpu_remaps[1], r.gpu_tex_uploads, r.ring_retries);
                 let ((hp, hs), (dp, ds)) = r.ring_peaks();
                 crate::info!("rings since last report: host peak {} of {} MiB per segment, device peak {} of {} MiB", hp >> 20, hs >> 20, dp >> 20, ds >> 20);
@@ -941,6 +941,7 @@ struct PerfSnap {
     target_hits: (u64, u64),
     desc_template_uses: (u64, u64),
     tex_path_hits: (u64, u64),
+    tex_memo_hits: u64,
     dsub: [u64; 6],
     bsub: [u64; 11],
     bcnt: [u64; 11],
@@ -985,6 +986,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         target_hits: r.target_hits,
         desc_template_uses: r.desc_template_uses,
         tex_path_hits: r.tex_path_hits,
+        tex_memo_hits: r.tex_memo_hits,
         dsub: r.dsub,
         bsub: r.bsub,
         bcnt: r.bcnt,
@@ -1025,6 +1027,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 now.bsub[i] += c.bsub[i];
                 now.bcnt[i] += c.bcnt[i];
             }
+            now.tex_memo_hits += c.tex_memo_hits;
             for (a, b) in [(&mut now.target_hits, c.target_hits), (&mut now.desc_template_uses, c.desc_template_uses), (&mut now.tex_path_hits, c.tex_path_hits), (&mut now.image_reuse, c.image_reuse)] {
                 a.0 += b.0;
                 a.1 += b.1;
@@ -1065,7 +1068,24 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 format!("{n} {c} x {:.1} us", now.bsub[i].wrapping_sub(p.bsub[i]) as f64 / hz * 1e6 / c as f64)
             })
             .collect();
-        crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {})", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers);
+        let fg = [render::FORGETS[0].swap(0, Ordering::Relaxed), render::FORGETS[1].swap(0, Ordering::Relaxed)];
+        crate::info!("buffer bindings/s by path: {}; batch prologue operations {} (prologue barriers {}); upload-copy forgets {} over {} entries", bp.join(", "), now.pro_ops - p.pro_ops, now.pro_barriers - p.pro_barriers, fg[0], fg[1]);
+        // (TLG_PERF=2: the shaders whose commands' descriptors cost most.)
+        if let Some(m) = render::SHADER_DESC.lock().take() {
+            let mut v: Vec<((u8, u64), render::ShaderDesc)> = m.into_iter().collect();
+            let all: u64 = v.iter().map(|e| e.1 .1).sum();
+            v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            let us = |c: u64| c as f64 / hz * 1e6;
+            let top: Vec<String> = v
+                .iter()
+                .take(14)
+                .map(|((k, a), (n, c, pn, pc))| {
+                    let paths: Vec<String> = (0..11).filter(|&i| pn[i] > 0).map(|i| format!("{} {:.1} x {:.1}", render::BUFFER_PATHS[i], pn[i] as f64 / *n as f64, us(pc[i]) / pn[i] as f64)).collect();
+                    format!("{} {a:#x} {n} x {:.1} us = {:.1} ms [{}]", ["draw ps", "gfx cs", "acb cs"][*k as usize], us(*c) / *n as f64, us(*c) / 1e3, paths.join(", "))
+                })
+                .collect();
+            crate::info!("descriptors by shader (of {:.1} ms): {}", us(all) / 1e3, top.join("; "));
+        }
         // (Their steps: us each, count.)
         static LAST_BP: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);
         let cur: [(u64, u64); 25] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
@@ -1076,10 +1096,11 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             .collect();
         if !parts.is_empty() {
             let x = [render::XBATCH[0].swap(0, Ordering::Relaxed), render::XBATCH[1].swap(0, Ordering::Relaxed)];
+            let xb: Vec<String> = render::XBATCH_BACK.iter().map(|a| a.swap(0, Ordering::Relaxed).to_string()).collect();
             let v = [render::VBIND_STATS[0].swap(0, Ordering::Relaxed), render::VBIND_STATS[1].swap(0, Ordering::Relaxed), render::VBIND_STATS[2].swap(0, Ordering::Relaxed)];
             let h: [u64; 5] = std::array::from_fn(|i| writes::HV_STATS[i].swap(0, Ordering::Relaxed));
             let b: [u64; 4] = std::array::from_fn(|i| writes::BULK_STATS[i].swap(0, Ordering::Relaxed));
-            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served (TLG_PERF=2): {} same CPU epoch, {} same required epoch; mirror binding cache {} of {} ({} after a recheck); validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none); bulk rounds {} ({} runs, {} pages, {} written pages found)", parts.join("; "), x[0], x[1], v[0], v[1], v[2], h[0], h[1], h[2], h[3], h[4], b[0], b[1], b[2], b[3]);
+            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served (TLG_PERF=2): {} same CPU epoch (1..6+ batches back: {}), {} same required epoch; mirror binding cache {} of {} ({} after a recheck); validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none); bulk rounds {} ({} runs, {} pages, {} written pages found)", parts.join("; "), x[0], xb.join("/"), x[1], v[0], v[1], v[2], h[0], h[1], h[2], h[3], h[4], b[0], b[1], b[2], b[3]);
             let miss: Vec<String> = (0..2)
                 .map(|c| {
                     let m: Vec<String> = render::VBIND_MISS_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {}", render::VBIND_MISS[c][i].swap(0, Ordering::Relaxed))).collect();
@@ -1100,7 +1121,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         if !parts.is_empty() {
             crate::info!("buffer binding steps/s of compute queues: {}", parts.join("; "));
         }
-        crate::info!("render targets/s: {} lookups, {} reused from the previous draw; descriptor sets written by template: {}, with write structures for another binding order: {}; sampled textures: {} lookups, {} by the cached guest-memory path", now.target_hits.1.saturating_sub(p.target_hits.1), now.target_hits.0.saturating_sub(p.target_hits.0), now.desc_template_uses.0.saturating_sub(p.desc_template_uses.0), now.desc_template_uses.1.saturating_sub(p.desc_template_uses.1), now.tex_path_hits.1.saturating_sub(p.tex_path_hits.1), now.tex_path_hits.0.saturating_sub(p.tex_path_hits.0));
+        crate::info!("render targets/s: {} lookups, {} reused from the previous draw; descriptor sets written by template: {}, with write structures for another binding order: {}; sampled textures: {} lookups, {} by the cached guest-memory path ({} from the memo)", now.target_hits.1.saturating_sub(p.target_hits.1), now.target_hits.0.saturating_sub(p.target_hits.0), now.desc_template_uses.0.saturating_sub(p.desc_template_uses.0), now.desc_template_uses.1.saturating_sub(p.desc_template_uses.1), now.tex_path_hits.1.saturating_sub(p.tex_path_hits.1), now.tex_path_hits.0.saturating_sub(p.tex_path_hits.0), now.tex_memo_hits.saturating_sub(p.tex_memo_hits));
         let wi = [render::WB_IMAGES[0].swap(0, Ordering::Relaxed), render::WB_IMAGES[1].swap(0, Ordering::Relaxed)];
         if wi[0] != 0 {
             crate::info!("render-target write-back checks/s: {} (stale intervals {:.1} each)", wi[0], wi[1] as f64 / wi[0] as f64);

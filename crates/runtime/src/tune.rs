@@ -567,7 +567,25 @@ pub const EARLY_RELEASE: usize = 95;
 /// (`TLG_CS_ROUTE`, 1) or with the graphics queue's (0; for A/B windows).
 pub const CS_ROUTE: usize = 96;
 
-const TABLE: [(&str, &str, i64); 97] = [
+/// Read-only ring copies reused by later batches of the same CPU epoch and
+/// CP queue, up to this many batches back (`TLG_UPLOAD_XBATCH`, at most 4;
+/// 0: within their batch only, as before). The upload ring has 4 segments
+/// more than there are batch slots, so a copy's segment is written again
+/// only after every batch that may reuse it has completed.
+pub const UPLOAD_XBATCH: usize = 97;
+
+/// Write-back overlap checks answered from indexes when nothing can overlap
+/// (`TLG_SCAN_INDEX`, 1): the in-flight batches' write-backs counted per
+/// 2 MiB granule (no lock), the open batch's in a bloom filter of 64 KiB
+/// blocks; 0: every check scans the lists.
+pub const SCAN_INDEX: usize = 98;
+
+/// Sampled textures that took the guest-memory path in the current
+/// validation epoch return the same view again while no image at their base
+/// and none of the image set changed (`TLG_TEX_MEMO`; with `tex_cache`).
+pub const TEX_MEMO: usize = 99;
+
+const TABLE: [(&str, &str, i64); 100] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -665,6 +683,9 @@ const TABLE: [(&str, &str, i64); 97] = [
     ("cs_inst", "TLG_CS_INST", 0),
     ("early_release", "TLG_EARLY_RELEASE", 0),
     ("cs_route", "TLG_CS_ROUTE", 1),
+    ("upload_xbatch", "TLG_UPLOAD_XBATCH", 0),
+    ("scan_index", "TLG_SCAN_INDEX", 1),
+    ("tex_memo", "TLG_TEX_MEMO", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
