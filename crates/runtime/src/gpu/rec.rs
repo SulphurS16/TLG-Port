@@ -56,6 +56,8 @@ fn push_set_now(cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::Pi
 enum Op {
     Barrier(vk::CommandBuffer, vk::PipelineStageFlags, vk::PipelineStageFlags, vk::MemoryBarrier<'static>),
     BindPipeline(vk::CommandBuffer, vk::PipelineBindPoint, vk::Pipeline),
+    /// A pipeline still compiling (`pcompile`): bound once it is made.
+    BindPipelineSlot(vk::CommandBuffer, vk::PipelineBindPoint, std::sync::Arc<super::pcompile::PipeSlot>),
     BindSet(vk::CommandBuffer, vk::PipelineBindPoint, vk::PipelineLayout, u32, vk::DescriptorSet),
     /// Descriptors [start, start+len) of the published operations' push data.
     PushSet(vk::CommandBuffer, vk::PipelineBindPoint, vk::PipelineLayout, u32, u32, u32),
@@ -308,17 +310,58 @@ fn run() {
     }
 }
 
+/// Draws (index 0) or dispatches (1) are left out until the next pipeline
+/// bind of their kind: the last pipeline bound for them failed to compile
+/// (`pcompile`; the CP recorded the commands that use it before that).
+static NO_PIPELINE: [AtomicBool; 2] = [const { AtomicBool::new(false) }; 2];
+
+fn bp_index(bp: vk::PipelineBindPoint) -> usize {
+    (bp == vk::PipelineBindPoint::COMPUTE) as usize
+}
+
+fn skipping(bp: vk::PipelineBindPoint) -> bool {
+    NO_PIPELINE[bp_index(bp)].load(Ordering::Relaxed)
+}
+
+/// Binds a compiling pipeline's slot: waits until it is made.
+unsafe fn bind_slot(d: &ash::Device, cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, s: &super::pcompile::PipeSlot) {
+    match s.wait() {
+        Ok(p) => {
+            NO_PIPELINE[bp_index(bp)].store(false, Ordering::Relaxed);
+            unsafe { d.cmd_bind_pipeline(cb, bp, p) }
+        }
+        // (Logged by the compile.)
+        Err(_) => NO_PIPELINE[bp_index(bp)].store(true, Ordering::Relaxed),
+    }
+}
+
 unsafe fn perform(d: &ash::Device, op: Op, data: &[PushEntry], unsignaled: &mut Option<vk::Semaphore>) {
     unsafe {
         match op {
             Op::Barrier(cb, src, dst, mb) => d.cmd_pipeline_barrier(cb, src, dst, vk::DependencyFlags::empty(), &[mb], &[], &[]),
-            Op::BindPipeline(cb, bp, p) => d.cmd_bind_pipeline(cb, bp, p),
+            Op::BindPipeline(cb, bp, p) => {
+                NO_PIPELINE[bp_index(bp)].store(false, Ordering::Relaxed);
+                d.cmd_bind_pipeline(cb, bp, p)
+            }
+            Op::BindPipelineSlot(cb, bp, s) => bind_slot(d, cb, bp, &s),
             Op::BindSet(cb, bp, layout, first, set) => d.cmd_bind_descriptor_sets(cb, bp, layout, first, &[set], &[]),
             Op::PushSet(cb, bp, layout, set, start, len) => push_set_now(cb, bp, layout, set, &data[start as usize..(start + len) as usize]),
             Op::PushConstants(cb, layout, stages, off, data) => d.cmd_push_constants(cb, layout, stages, off, &data),
-            Op::Dispatch(cb, x, y, z) => d.cmd_dispatch(cb, x, y, z),
-            Op::Draw(cb, a, b, c, e) => d.cmd_draw(cb, a, b, c, e),
-            Op::DrawIndexed(cb, a, b, c, v, e) => d.cmd_draw_indexed(cb, a, b, c, v, e),
+            Op::Dispatch(cb, x, y, z) => {
+                if !skipping(vk::PipelineBindPoint::COMPUTE) {
+                    d.cmd_dispatch(cb, x, y, z)
+                }
+            }
+            Op::Draw(cb, a, b, c, e) => {
+                if !skipping(vk::PipelineBindPoint::GRAPHICS) {
+                    d.cmd_draw(cb, a, b, c, e)
+                }
+            }
+            Op::DrawIndexed(cb, a, b, c, v, e) => {
+                if !skipping(vk::PipelineBindPoint::GRAPHICS) {
+                    d.cmd_draw_indexed(cb, a, b, c, v, e)
+                }
+            }
             Op::BindIndexBuffer(cb, buf, off, ty) => d.cmd_bind_index_buffer(cb, buf, off, ty),
             Op::CopyBuffer(cb, src, dst, regions) => d.cmd_copy_buffer(cb, src, dst, &regions),
             Op::FillBuffer(cb, buf, off, size, data) => d.cmd_fill_buffer(cb, buf, off, size, data),
@@ -533,7 +576,17 @@ impl Rec {
         if deferred() {
             return push(Op::BindPipeline(cb, bp, p), false);
         }
+        NO_PIPELINE[bp_index(bp)].store(false, Ordering::Relaxed);
         unsafe { ctx().device.cmd_bind_pipeline(cb, bp, p) }
+    }
+
+    /// Binds the pipeline of `slot` (`pcompile`) once it is compiled: the
+    /// recorder waits for it there; recording directly, this waits.
+    pub unsafe fn cmd_bind_pipeline_slot(&self, cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, slot: std::sync::Arc<super::pcompile::PipeSlot>) {
+        if deferred() {
+            return push(Op::BindPipelineSlot(cb, bp, slot), false);
+        }
+        unsafe { bind_slot(&ctx().device, cb, bp, &slot) }
     }
 
     pub unsafe fn cmd_bind_descriptor_sets(&self, cb: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout, first: u32, sets: &[vk::DescriptorSet], dynamic: &[u32]) {
@@ -570,49 +623,75 @@ impl Rec {
         if deferred() {
             return push(Op::Dispatch(cb, x, y, z), false);
         }
-        unsafe { ctx().device.cmd_dispatch(cb, x, y, z) }
+        if !skipping(vk::PipelineBindPoint::COMPUTE) {
+            unsafe { ctx().device.cmd_dispatch(cb, x, y, z) }
+        }
     }
 
     pub unsafe fn cmd_dispatch_base(&self, cb: vk::CommandBuffer, bx: u32, by: u32, bz: u32, x: u32, y: u32, z: u32) {
+        let f = move |d: &ash::Device| {
+            if !skipping(vk::PipelineBindPoint::COMPUTE) {
+                unsafe { d.cmd_dispatch_base(cb, bx, by, bz, x, y, z) }
+            }
+        };
         if deferred() {
-            return thunk(move |d| unsafe { d.cmd_dispatch_base(cb, bx, by, bz, x, y, z) });
+            return thunk(f);
         }
-        unsafe { ctx().device.cmd_dispatch_base(cb, bx, by, bz, x, y, z) }
+        f(&ctx().device)
     }
 
     pub unsafe fn cmd_dispatch_indirect(&self, cb: vk::CommandBuffer, buf: vk::Buffer, off: u64) {
+        let f = move |d: &ash::Device| {
+            if !skipping(vk::PipelineBindPoint::COMPUTE) {
+                unsafe { d.cmd_dispatch_indirect(cb, buf, off) }
+            }
+        };
         if deferred() {
-            return thunk(move |d| unsafe { d.cmd_dispatch_indirect(cb, buf, off) });
+            return thunk(f);
         }
-        unsafe { ctx().device.cmd_dispatch_indirect(cb, buf, off) }
+        f(&ctx().device)
     }
 
     pub unsafe fn cmd_draw(&self, cb: vk::CommandBuffer, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
         if deferred() {
             return push(Op::Draw(cb, vertices, instances, first_vertex, first_instance), false);
         }
-        unsafe { ctx().device.cmd_draw(cb, vertices, instances, first_vertex, first_instance) }
+        if !skipping(vk::PipelineBindPoint::GRAPHICS) {
+            unsafe { ctx().device.cmd_draw(cb, vertices, instances, first_vertex, first_instance) }
+        }
     }
 
     pub unsafe fn cmd_draw_indexed(&self, cb: vk::CommandBuffer, indices: u32, instances: u32, first_index: u32, vertex_offset: i32, first_instance: u32) {
         if deferred() {
             return push(Op::DrawIndexed(cb, indices, instances, first_index, vertex_offset, first_instance), false);
         }
-        unsafe { ctx().device.cmd_draw_indexed(cb, indices, instances, first_index, vertex_offset, first_instance) }
+        if !skipping(vk::PipelineBindPoint::GRAPHICS) {
+            unsafe { ctx().device.cmd_draw_indexed(cb, indices, instances, first_index, vertex_offset, first_instance) }
+        }
     }
 
     pub unsafe fn cmd_draw_indirect(&self, cb: vk::CommandBuffer, buf: vk::Buffer, off: u64, count: u32, stride: u32) {
+        let f = move |d: &ash::Device| {
+            if !skipping(vk::PipelineBindPoint::GRAPHICS) {
+                unsafe { d.cmd_draw_indirect(cb, buf, off, count, stride) }
+            }
+        };
         if deferred() {
-            return thunk(move |d| unsafe { d.cmd_draw_indirect(cb, buf, off, count, stride) });
+            return thunk(f);
         }
-        unsafe { ctx().device.cmd_draw_indirect(cb, buf, off, count, stride) }
+        f(&ctx().device)
     }
 
     pub unsafe fn cmd_draw_indexed_indirect(&self, cb: vk::CommandBuffer, buf: vk::Buffer, off: u64, count: u32, stride: u32) {
+        let f = move |d: &ash::Device| {
+            if !skipping(vk::PipelineBindPoint::GRAPHICS) {
+                unsafe { d.cmd_draw_indexed_indirect(cb, buf, off, count, stride) }
+            }
+        };
         if deferred() {
-            return thunk(move |d| unsafe { d.cmd_draw_indexed_indirect(cb, buf, off, count, stride) });
+            return thunk(f);
         }
-        unsafe { ctx().device.cmd_draw_indexed_indirect(cb, buf, off, count, stride) }
+        f(&ctx().device)
     }
 
     pub unsafe fn cmd_bind_index_buffer(&self, cb: vk::CommandBuffer, buf: vk::Buffer, off: u64, ty: vk::IndexType) {

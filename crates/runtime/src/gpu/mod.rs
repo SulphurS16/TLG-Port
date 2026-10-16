@@ -5,6 +5,7 @@ pub mod cp;
 pub mod cpuwatch;
 pub mod desc;
 pub mod lazywb;
+pub mod pcompile;
 pub mod pm4;
 pub mod prepahead;
 pub mod rec;
@@ -724,7 +725,15 @@ fn gfx_thread() {
                 crate::info!("renderer time: {}", parts.join(", "));
                 let pc = |i: usize| (render::PIPE_CREATES[i].0.load(Ordering::Relaxed), render::PIPE_CREATES[i].1.load(Ordering::Relaxed) as f64 / 1e9);
                 let (g, c) = (pc(0), pc(1));
-                crate::info!("pipelines created so far: graphics {} ({:.2} s), compute {} ({:.2} s)", g.0, g.1, c.0, c.1);
+                crate::info!(
+                    "pipelines created so far: graphics {} ({:.2} s), compute {} ({:.2} s); by compile workers {} ({:.2} s)",
+                    g.0,
+                    g.1,
+                    c.0,
+                    c.1,
+                    pcompile::DONE.load(Ordering::Relaxed),
+                    pcompile::BUSY_NS.load(Ordering::Relaxed) as f64 / 1e9
+                );
                 if shaders::compile_probe() {
                     let p: Vec<String> = (0..2)
                         .map(|k| {

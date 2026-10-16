@@ -489,6 +489,8 @@ pub fn shutdown(code: i32) -> ! {
     hle::libs::savedata::wait_writes(Duration::from_secs(3));
     gpu::vk::window::restore_display();
     if code == 0 {
+        // (Pipelines compiling on workers go into the cache too.)
+        gpu::pcompile::idle(Duration::from_secs(3));
         gpu::render::save_pipeline_cache(Duration::ZERO);
         if let Some(p) = config::try_paths() {
             let _ = std::fs::remove_file(p.running_marker());

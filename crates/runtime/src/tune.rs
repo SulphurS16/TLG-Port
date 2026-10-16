@@ -642,8 +642,15 @@ pub const REV_AB: usize = 106;
 /// 0; bit mask): 1 = a killed sampler voice keeps its patches, 2 = voice
 /// ports 4-7 take port & 3's volume and matrix.
 pub const NGS2_COMPAT: usize = 107;
+/// Pipelines are created by this many worker threads while the CP goes on
+/// (`TLG_PIPE_ASYNC`, -1: the logical processors less 4, 2-8; 0: by the CP
+/// when it first needs them; `gpu::pcompile`). Cold boot to the cave and 60 s
+/// there, no pipeline or driver cache, ~95% clock: 190 s with 41.7 s in
+/// hitches (worst frame 4.2 s) on the CP, 171 s with 18.6 s (1.8 s) with 8
+/// workers. Workers start when a pipeline is first queued.
+pub const PIPE_ASYNC: usize = 108;
 
-const TABLE: [(&str, &str, i64); 108] = [
+const TABLE: [(&str, &str, i64); 109] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -752,6 +759,7 @@ const TABLE: [(&str, &str, i64); 108] = [
     ("rev_db", "TLG_REV_DB", 0),
     ("rev_ab", "TLG_REV_AB", 0),
     ("ngs2_compat", "TLG_NGS2_COMPAT", 0),
+    ("pipe_async", "TLG_PIPE_ASYNC", -1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

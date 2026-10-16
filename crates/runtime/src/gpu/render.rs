@@ -85,9 +85,38 @@ struct TessDraw {
 }
 
 struct Pipe {
+    /// (Null while `slot` compiles.)
     pipeline: vk::Pipeline,
     layout: vk::PipelineLayout,
     set_layout: vk::DescriptorSetLayout,
+    /// Being compiled by a worker (`tune pipe_async`).
+    slot: Option<std::sync::Arc<super::pcompile::PipeSlot>>,
+}
+
+impl Pipe {
+    /// The pipeline, its layouts and - while it still compiles - its slot to
+    /// bind; a finished compile's result moves into `pipeline` (a failed
+    /// one is this command's error, as a failed compile on the CP is).
+    fn take(&mut self) -> Result<(vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout, Option<std::sync::Arc<super::pcompile::PipeSlot>>), String> {
+        if let Some(r) = self.slot.as_ref().and_then(|s| s.get()) {
+            self.pipeline = r?;
+            self.slot = None;
+        }
+        Ok((self.pipeline, self.layout, self.set_layout, self.slot.clone()))
+    }
+}
+
+/// A graphics pipeline's stages and their modules.
+type GfxStages = smallvec::SmallVec<[(vk::ShaderStageFlags, vk::ShaderModule); 4]>;
+
+/// `vkCreateComputePipelines` with the persistent cache (on a compile
+/// worker or the CP).
+fn compute_pipeline(module: vk::ShaderModule, layout: vk::PipelineLayout, flags: vk::PipelineCreateFlags) -> Result<vk::Pipeline, String> {
+    let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+    let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(flags);
+    let pipeline = unsafe { ctx().device.create_compute_pipelines(pipeline_cache(), &[ci], None) }.map_err(|(_, e)| format!("vkCreateComputePipelines: {e}"))?[0];
+    pipeline_cache_dirty();
+    Ok(pipeline)
 }
 
 /// Pipeline cache persisted in `local-data/pipeline-cache.bin`: pipelines
@@ -8406,10 +8435,7 @@ impl Renderer {
             }
             self.gfx_pipes.insert(key.clone(), p);
         }
-        let (pipeline, layout, set_layout) = {
-            let p = &self.gfx_pipes[&key];
-            (p.pipeline, p.layout, p.set_layout)
-        };
+        let (pipeline, layout, set_layout, pslot) = self.gfx_pipes.get_mut(&key).unwrap().take()?;
         phase!(3);
         // Descriptors (may record uploads: must happen before rendering starts).
         let mut stages = smallvec::SmallVec::<[&shaders::Prepared; 2]>::new();
@@ -8557,7 +8583,12 @@ impl Renderer {
         phase!(6);
         let cmd = self.cx.cmd;
         unsafe {
-            if pipeline != self.cx.bound_gfx {
+            if let Some(s) = pslot {
+                // (Still compiling: bound by the recorder once made; the
+                // next draw binds again.)
+                REC.cmd_bind_pipeline_slot(cmd, vk::PipelineBindPoint::GRAPHICS, s);
+                self.cx.bound_gfx = vk::Pipeline::null();
+            } else if pipeline != self.cx.bound_gfx {
                 REC.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 self.cx.bound_gfx = pipeline;
             }
@@ -9085,8 +9116,16 @@ impl Renderer {
         let layouts = [set_layout];
         let layout = unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None) }.map_err(|e| e.to_string())?;
         let t0 = std::time::Instant::now();
+        // (`tune pipe_async`: the driver's compile on a worker; the modules
+        // and the layout stay alive with the renderer.)
+        if super::pcompile::workers() > 0 && !shaders::compile_probe() {
+            let stages = self.gfx_stages(key, vsm, psm, gsm)?;
+            let k = key.clone();
+            let slot = super::pcompile::spawn(Box::new(move || Self::gfx_pipeline_from(&k, &stages, layout)));
+            crate::debug!("compiling graphics pipeline vs {:#x} ps {:?} colors {:?} depth {:?} rect {}", vs.addr, ps.map(|p| p.addr), key.colors, key.depth, key.rect);
+            return Ok(Pipe { pipeline: vk::Pipeline::null(), layout, set_layout, slot: Some(slot) });
+        }
         let pipeline = self.gfx_pipeline_with(key, vsm, psm, gsm, layout)?;
-        pipeline_cache_dirty();
         crate::debug!("created graphics pipeline vs {:#x} ps {:?} colors {:?} depth {:?} rect {}", vs.addr, ps.map(|p| p.addr), key.colors, key.depth, key.rect);
         // (`TLG_COMPILE_PROBE`: the same pipeline from the stages' probe
         // variants, timed and dropped.)
@@ -9116,31 +9155,44 @@ impl Renderer {
             }
             note_compile_probe(0, ns, pns, vs.addr, ps.map_or(0, |p| p.addr));
         }
-        Ok(Pipe { pipeline, layout, set_layout })
+        Ok(Pipe { pipeline, layout, set_layout, slot: None })
     }
 
     /// `create_gfx_pipeline`'s pipeline from the given stage modules and layout.
     fn gfx_pipeline_with(&mut self, key: &GfxKey, vsm: vk::ShaderModule, psm: Option<vk::ShaderModule>, gsm: Option<vk::ShaderModule>, layout: vk::PipelineLayout) -> Result<vk::Pipeline, String> {
-        let c = ctx();
-        let main = c"main";
-        let mut stages = Vec::new();
+        let stages = self.gfx_stages(key, vsm, psm, gsm)?;
+        Self::gfx_pipeline_from(key, &stages, layout)
+    }
+
+    /// The stages of `key`'s pipeline with their modules (tessellation's
+    /// helper stages made here).
+    fn gfx_stages(&mut self, key: &GfxKey, vsm: vk::ShaderModule, psm: Option<vk::ShaderModule>, gsm: Option<vk::ShaderModule>) -> Result<GfxStages, String> {
+        let mut stages = GfxStages::new();
         if let Some((tf_param, min, max)) = key.tess {
             // Emulated tessellation: nothing per vertex, the HS's factors to
             // the tessellator, the domain shader as the evaluation stage.
             let null = self.tess_null_vs()?;
             let tcs = self.tess_control(tf_param, f32::from_bits(min), f32::from_bits(max))?;
-            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(null).name(main));
-            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::TESSELLATION_CONTROL).module(tcs).name(main));
-            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::TESSELLATION_EVALUATION).module(vsm).name(main));
+            stages.push((vk::ShaderStageFlags::VERTEX, null));
+            stages.push((vk::ShaderStageFlags::TESSELLATION_CONTROL, tcs));
+            stages.push((vk::ShaderStageFlags::TESSELLATION_EVALUATION, vsm));
         } else {
-            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::VERTEX).module(vsm).name(main));
+            stages.push((vk::ShaderStageFlags::VERTEX, vsm));
         }
         if let Some(g) = gsm {
-            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::GEOMETRY).module(g).name(main));
+            stages.push((vk::ShaderStageFlags::GEOMETRY, g));
         }
         if let Some(p) = psm {
-            stages.push(vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::FRAGMENT).module(p).name(main));
+            stages.push((vk::ShaderStageFlags::FRAGMENT, p));
         }
+        Ok(stages)
+    }
+
+    /// `vkCreateGraphicsPipelines` for `key` from its stages and layout, with
+    /// the persistent cache (on a compile worker or the CP).
+    fn gfx_pipeline_from(key: &GfxKey, stage_modules: &[(vk::ShaderStageFlags, vk::ShaderModule)], layout: vk::PipelineLayout) -> Result<vk::Pipeline, String> {
+        let c = ctx();
+        let stages: smallvec::SmallVec<[vk::PipelineShaderStageCreateInfo; 4]> = stage_modules.iter().map(|&(s, m)| vk::PipelineShaderStageCreateInfo::default().stage(s).module(m).name(c"main")).collect();
         let vi = vk::PipelineVertexInputStateCreateInfo::default();
         let topo = match key.topology_class {
             0 => vk::PrimitiveTopology::POINT_LIST,
@@ -9223,6 +9275,7 @@ impl Renderer {
             .layout(layout)
             .push_next(&mut rinfo);
         let pipeline = unsafe { c.device.create_graphics_pipelines(pipeline_cache(), &[gpci], None) }.map_err(|(_, e)| format!("vkCreateGraphicsPipelines: {e}"))?[0];
+        pipeline_cache_dirty();
         Ok(pipeline)
     }
 
@@ -9333,15 +9386,13 @@ impl Renderer {
             let set_layout = self.set_layout(&[p])?;
             let layouts = [set_layout];
             let layout = unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None) }.map_err(|e| e.to_string())?;
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main");
-            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
-            let pipeline = unsafe { c.device.create_compute_pipelines(pipeline_cache(), &[ci], None) }.map_err(|(_, e)| format!("vkCreateComputePipelines: {e}"))?[0];
-            pipeline_cache_dirty();
-            self.cs_pipes.insert(key, Pipe { pipeline, layout, set_layout });
+            let pipeline = compute_pipeline(m, layout, vk::PipelineCreateFlags::empty())?;
+            self.cs_pipes.insert(key, Pipe { pipeline, layout, set_layout, slot: None });
         }
         let (pipeline, layout, set_layout) = {
-            let q = &self.cs_pipes[&key];
-            (q.pipeline, q.layout, q.set_layout)
+            let (pipeline, layout, set_layout, slot) = self.cs_pipes.get_mut(&key).unwrap().take()?;
+            // (Made here, not on a worker: tessellation stages are rare.)
+            (if let Some(s) = slot { s.wait()? } else { pipeline }, layout, set_layout)
         };
         let (host, dev) = self.binding_bytes(&[p]);
         let tex = self.texture_upload_estimate(&[p]);
@@ -9505,11 +9556,13 @@ impl Renderer {
             let set_layout = self.set_layout(&[&cs])?;
             let layouts = [set_layout];
             let layout = unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None) }.map_err(|e| e.to_string())?;
-            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(m).name(c"main");
-            let ci = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout).flags(vk::PipelineCreateFlags::DISPATCH_BASE);
             let t0 = std::time::Instant::now();
-            let pipeline = unsafe { c.device.create_compute_pipelines(pipeline_cache(), &[ci], None) }.map_err(|(_, e)| format!("vkCreateComputePipelines: {e}"))?[0];
-            pipeline_cache_dirty();
+            // (`tune pipe_async`: compiled by a worker, bound once made.)
+            let (pipeline, slot) = if super::pcompile::workers() > 0 && !shaders::compile_probe() {
+                (vk::Pipeline::null(), Some(super::pcompile::spawn(Box::new(move || compute_pipeline(m, layout, vk::PipelineCreateFlags::DISPATCH_BASE)))))
+            } else {
+                (compute_pipeline(m, layout, vk::PipelineCreateFlags::DISPATCH_BASE)?, None)
+            };
             PIPE_CREATES[1].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             PIPE_CREATES[1].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
             let ms = t0.elapsed().as_millis();
@@ -9537,12 +9590,9 @@ impl Renderer {
             if ms >= 100 {
                 crate::info!("compute pipeline for cs {:#x} ({} SPIR-V words) took {ms} ms to create", cs.addr, cs.translated.out.spirv.len());
             }
-            self.cs_pipes.insert(key, Pipe { pipeline, layout, set_layout });
+            self.cs_pipes.insert(key, Pipe { pipeline, layout, set_layout, slot });
         }
-        let (pipeline, layout, set_layout) = {
-            let p = &self.cs_pipes[&key];
-            (p.pipeline, p.layout, p.set_layout)
-        };
+        let (pipeline, layout, set_layout, pslot) = self.cs_pipes.get_mut(&key).unwrap().take()?;
         phase!(1);
         let (host, dev) = self.binding_bytes(&[&cs]);
         let tex = self.texture_upload_estimate(&[&cs]);
@@ -9659,7 +9709,11 @@ impl Renderer {
         let regs = &cp.regs;
         let (sx, sy, sz) = (regs.sh(0x2E04), regs.sh(0x2E05), regs.sh(0x2E06));
         unsafe {
-            if pipeline != self.cx.bound_cs {
+            if let Some(s) = pslot {
+                // (Still compiling: bound by the recorder once made.)
+                REC.cmd_bind_pipeline_slot(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, s);
+                self.cx.bound_cs = vk::Pipeline::null();
+            } else if pipeline != self.cx.bound_cs {
                 REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.cx.bound_cs = pipeline;
             }
