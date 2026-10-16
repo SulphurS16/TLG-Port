@@ -623,10 +623,11 @@ pub const PAGE_MARKS: usize = 102;
 pub const HOIST_FWD: usize = 103;
 /// Guest threads of SceKernel priority at or above (numerically at most)
 /// this run above normal on the host, as our GPU threads (`TLG_GUEST_PRIO`,
-/// 256; 0: all normal). The title's sound mixer (`sndx_out_thread`) and
-/// render submission ask for 256, its job workers for 552: at normal priority
-/// the sound thread lost the CPU to them and the audio device ran dry.
-/// Applied when a thread starts.
+/// 256; 0: all normal): the title's sound mixer (`sndx_out_thread`) and
+/// render submission ask for 256, its job workers for 552, as the PS4
+/// schedules them. Applied when a thread starts and to every thread on
+/// `tune guest_prio`; an in-run A/B at the 31% clamp measured no difference
+/// in underruns or fps (LOG: Playtest of 0.3.1).
 pub const GUEST_PRIO: usize = 104;
 
 const TABLE: [(&str, &str, i64); 105] = [

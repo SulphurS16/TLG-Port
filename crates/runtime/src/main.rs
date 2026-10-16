@@ -388,7 +388,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
             }
             "tune" => {
                 let name = parts.next().unwrap_or("");
-                tune::set(name, parts.next().unwrap_or(""))
+                let r = tune::set(name, parts.next().unwrap_or(""));
+                if r.is_ok() && name == "guest_prio" {
+                    thread::reapply_guest_priorities();
+                }
+                r
             }
             "dumpafter" => {
                 // dumpafter <ps,...> [max]: in traced frames, dump the targets

@@ -346,14 +346,42 @@ pub fn raise_priority() {
     unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL) };
 }
 
-/// The calling guest thread's host priority for its SceKernel priority
-/// (256 highest .. 767 lowest): above normal at `tune::GUEST_PRIO` or
-/// higher, else normal.
-pub fn apply_guest_priority(prio: i32) {
+/// Whether a guest thread of SceKernel priority `prio` (256 highest .. 767
+/// lowest) runs above normal on the host: at `tune::GUEST_PRIO` or higher.
+fn guest_raised(prio: i32) -> bool {
     let limit = crate::tune::get(crate::tune::GUEST_PRIO);
-    if limit > 0 && (prio as i64) <= limit {
+    limit > 0 && (prio as i64) <= limit
+}
+
+/// The calling guest thread's host priority for its SceKernel priority.
+pub fn apply_guest_priority(prio: i32) {
+    if guest_raised(prio) {
         raise_priority();
     }
+}
+
+/// Every running guest thread's host priority again for the current
+/// `tune::GUEST_PRIO` (after `tune guest_prio`, for A/B within a run).
+pub fn reapply_guest_priorities() {
+    use windows_sys::Win32::System::Threading::{OpenThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL, THREAD_PRIORITY_NORMAL, THREAD_SET_INFORMATION};
+    let threads: Vec<&'static GuestThread> = THREADS.lock().clone();
+    let mut n = 0;
+    for t in threads {
+        let tid = t.host_tid.load(Ordering::SeqCst) as u32;
+        if tid == 0 || t.exited.lock().is_some() {
+            continue;
+        }
+        let up = guest_raised(t.priority.load(Ordering::Relaxed));
+        unsafe {
+            let h = OpenThread(THREAD_SET_INFORMATION, 0, tid);
+            if !h.is_null() {
+                SetThreadPriority(h, if up { THREAD_PRIORITY_ABOVE_NORMAL } else { THREAD_PRIORITY_NORMAL });
+                windows_sys::Win32::Foundation::CloseHandle(h);
+                n += u32::from(up);
+            }
+        }
+    }
+    crate::info!("guest thread priorities: {n} above normal (guest_prio {})", crate::tune::get(crate::tune::GUEST_PRIO));
 }
 
 /// The current thread at raised (`raise_priority`) or normal priority.
