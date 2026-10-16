@@ -19,6 +19,7 @@
 
 use super::atrac9;
 use super::ngs2_fx::{Biquad, Compressor, Envelope, FilterKind, I3dl2, Reverb, Taps};
+use crate::gpu::render::FastMap;
 use crate::hle::Registry;
 use crate::{reg, sysv};
 use parking_lot::Mutex;
@@ -228,10 +229,10 @@ struct Voice {
     channels: u32,
     port_volume: [f32; 4],
     port_matrix: [i32; 4],
-    matrices: HashMap<i32, Vec<f32>>,
+    matrices: FastMap<i32, Vec<f32>>,
     /// Where each matrix's levels came from (TLG_NGS2_TRACE: checked for
     /// later in-place changes).
-    matrix_src: HashMap<i32, (u64, usize)>,
+    matrix_src: FastMap<i32, (u64, usize)>,
     patches: Vec<Patch>,
     sampler: Sampler,
     /// Input bus (submixers, mastering): `grain` frames of MAX_CH channels.
@@ -285,8 +286,8 @@ impl Voice {
             channels: if kind == Kind::Sampler { 1 } else { 2 },
             port_volume: [1.0; 4],
             port_matrix: [-1; 4],
-            matrices: HashMap::new(),
-            matrix_src: HashMap::new(),
+            matrices: FastMap::default(),
+            matrix_src: FastMap::default(),
             patches: Vec::new(),
             sampler: Sampler::default(),
             input: Vec::new(),
@@ -315,9 +316,9 @@ impl Voice {
 
 #[derive(Default)]
 struct State {
-    systems: HashMap<u64, System>,
-    racks: HashMap<u64, Rack>,
-    voices: HashMap<u64, Voice>,
+    systems: FastMap<u64, System>,
+    racks: FastMap<u64, Rack>,
+    voices: FastMap<u64, Voice>,
     seen_params: HashSet<(u32, u16)>,
     noted: HashSet<&'static str>,
     /// Output peak since the last statistics line.
@@ -1093,7 +1094,6 @@ fn mix_rows(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], rows: &[[f32; MAX_
             cols[ic][oc] = row[ic];
         }
     }
-    let on: [bool; MAX_CH] = std::array::from_fn(|c| c < dch);
     for (o, fr) in dst.iter_mut().zip(src) {
         let mut acc = [0f32; MAX_CH];
         for ic in 0..src_ch {
@@ -1102,39 +1102,51 @@ fn mix_rows(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], rows: &[[f32; MAX_
                 acc[oc] += x * cols[ic][oc];
             }
         }
-        for oc in 0..MAX_CH {
-            if on[oc] {
-                o[oc] += acc[oc] * g;
-            }
+        for (oc, &a) in o[..dch].iter_mut().zip(&acc[..dch]) {
+            *oc += a * g;
         }
     }
 }
 
-/// dst[c] += src[c] * g for the channels c < n (the rest untouched), all
-/// lanes at once (the unused ones as zeros, not stored).
+/// dst[c] += src[c] * g for the channels c < n (the rest untouched). (The
+/// masked lanes of a per-lane form went through closures the compiler kept:
+/// ~8% of the sound thread.)
 fn mix_direct(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], n: usize, g: f32) {
-    let on: [bool; MAX_CH] = std::array::from_fn(|c| c < n);
-    for (o, fr) in dst.iter_mut().zip(src) {
-        let x: [f32; MAX_CH] = std::array::from_fn(|c| if on[c] { fr[c] } else { 0.0 });
-        for c in 0..MAX_CH {
-            if on[c] {
-                o[c] += x[c] * g;
+    let n = n.min(MAX_CH);
+    if n == MAX_CH {
+        for (o, fr) in dst.iter_mut().zip(src) {
+            for c in 0..MAX_CH {
+                o[c] += fr[c] * g;
             }
+        }
+        return;
+    }
+    for (o, fr) in dst.iter_mut().zip(src) {
+        for (oc, &x) in o[..n].iter_mut().zip(&fr[..n]) {
+            *oc += x * g;
         }
     }
 }
 
 /// The largest |x| in the first `ch` channels of `frames` (what folding
-/// `f32::max` gives: NaNs are passed over).
+/// `f32::max` gives: NaNs are passed over). Per lane over all frames, then
+/// over the first `ch` lanes: the same comparisons per value, in vector
+/// form.
 fn peak_of(frames: &[[f32; MAX_CH]], ch: usize) -> f32 {
     let ch = ch.min(MAX_CH);
-    let mut m = 0f32;
+    let mut lanes = [0f32; MAX_CH];
     for f in frames {
-        for &x in &f[..ch] {
-            let a = x.abs();
-            if a > m {
-                m = a;
+        for c in 0..MAX_CH {
+            let a = f[c].abs();
+            if a > lanes[c] {
+                lanes[c] = a;
             }
+        }
+    }
+    let mut m = 0f32;
+    for &x in &lanes[..ch] {
+        if x > m {
+            m = x;
         }
     }
     m
@@ -1179,8 +1191,8 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32) -> Vec<[f32; MAX_
     // Mixing voices: deepest upstream first (a voice runs after everything that
     // patches into it; cycles are cut).
     let mixers: Vec<u64> = all.iter().copied().filter(|vh| s.voices.get(vh).is_some_and(|v| matches!(v.kind, Kind::Submixer | Kind::Reverb | Kind::Custom))).collect();
-    let mut depth: HashMap<u64, u32> = HashMap::new();
-    fn depth_of(s: &State, vh: u64, memo: &mut HashMap<u64, u32>, guard: u32) -> u32 {
+    let mut depth: FastMap<u64, u32> = FastMap::default();
+    fn depth_of(s: &State, vh: u64, memo: &mut FastMap<u64, u32>, guard: u32) -> u32 {
         if let Some(&d) = memo.get(&vh) {
             return d;
         }

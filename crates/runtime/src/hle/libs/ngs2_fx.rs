@@ -263,6 +263,8 @@ pub struct Taps {
     pos: usize,
     lp: [f32; 8],
     coef: f32,
+    /// The feedback applied (`loop_feedback`).
+    fb: f32,
 }
 
 /// The longest tap delay kept (1.5 s).
@@ -288,7 +290,8 @@ impl Taps {
         let cutoff = if f(4).is_finite() && f(4) > 0.0 { f(4) } else { rate / 2.0 };
         let len = taps.iter().map(|t| t.1).max().unwrap_or(0) + 2;
         let coef = if cutoff >= rate / 2.0 { 0.0 } else { (-2.0 * std::f32::consts::PI * cutoff / rate).exp() };
-        Some(Taps { level, feedback, cutoff, taps, buf: vec![[0.0; 8]; len], pos: 0, lp: [0.0; 8], coef })
+        let fb = loop_feedback(&taps, feedback);
+        Some(Taps { level, feedback, cutoff, taps, buf: vec![[0.0; 8]; len], pos: 0, lp: [0.0; 8], coef, fb })
     }
 
     /// New parameters, keeping the delay line (the title glides between
@@ -308,6 +311,7 @@ impl Taps {
         self.cutoff = new.cutoff;
         self.taps = new.taps;
         self.coef = new.coef;
+        self.fb = new.fb;
     }
 
     /// One frame of `ch` channels.
@@ -315,14 +319,14 @@ impl Taps {
         let n = self.buf.len();
         let mut out = [0f32; 8];
         for &(g, d) in &self.taps {
-            let fr = &self.buf[(self.pos + n - d.min(n - 1)) % n];
+            // ((pos + n - d) mod n without a division: pos < n, d < n.)
+            let i = self.pos + n - d.min(n - 1);
+            let fr = &self.buf[if i >= n { i - n } else { i }];
             for c in 0..ch {
                 out[c] += g * fr[c];
             }
         }
-        // (Loop gain kept below 0.7: the taps' sum times the feedback.)
-        let sum: f32 = self.taps.iter().map(|t| t.0.abs()).sum();
-        let fb = if sum > 0.0 { self.feedback.min(0.7 / sum) } else { 0.0 };
+        let fb = self.fb;
         let mut w = [0f32; 8];
         for c in 0..ch {
             self.lp[c] = out[c] * (1.0 - self.coef) + self.lp[c] * self.coef;
@@ -330,9 +334,16 @@ impl Taps {
             w[c] = x[c] + self.lp[c] * fb;
         }
         self.buf[self.pos] = w;
-        self.pos = (self.pos + 1) % n;
+        self.pos = wrap_inc(self.pos, n);
         out
     }
+}
+
+/// The feedback of a multi-tap delay: loop gain kept below 0.7 (the taps'
+/// sum times the feedback).
+fn loop_feedback(taps: &[(f32, usize)], feedback: f32) -> f32 {
+    let sum: f32 = taps.iter().map(|t| t.0.abs()).sum();
+    if sum > 0.0 { feedback.min(0.7 / sum) } else { 0.0 }
 }
 
 /// Filter shapes of the sampler and submixer filter parameters (their type
@@ -445,23 +456,22 @@ impl Biquad {
         }
         let [b0, b1, b2] = self.b;
         let [a1, a2] = self.a;
-        let on: [bool; 8] = std::array::from_fn(|c| c < ch);
-        let mut z1: [f32; 8] = std::array::from_fn(|c| if on[c] { self.z[c][0] } else { 0.0 });
-        let mut z2: [f32; 8] = std::array::from_fn(|c| if on[c] { self.z[c][1] } else { 0.0 });
+        let (mut z1, mut z2) = ([0f32; 8], [0f32; 8]);
+        for c in 0..ch {
+            (z1[c], z2[c]) = (self.z[c][0], self.z[c][1]);
+        }
         for fr in frames.iter_mut() {
-            // (Unused lanes as zeros: no denormal or NaN arithmetic there.)
-            let x: [f32; 8] = std::array::from_fn(|c| if on[c] { fr[c] } else { 0.0 });
+            // (Unused lanes as zeros: no denormal or NaN arithmetic there.
+            // Plain copies: lanes picked by closures went through calls.)
+            let mut x = [0f32; 8];
+            x[..ch].copy_from_slice(&fr[..ch]);
             let mut y = [0f32; 8];
             for c in 0..8 {
                 y[c] = b0 * x[c] + z1[c];
                 z1[c] = b1 * x[c] - a1 * y[c] + z2[c];
                 z2[c] = b2 * x[c] - a2 * y[c];
             }
-            for c in 0..8 {
-                if on[c] {
-                    fr[c] = y[c];
-                }
-            }
+            fr[..ch].copy_from_slice(&y[..ch]);
         }
         for c in 0..ch {
             // (Denormals after silence.)
@@ -700,5 +710,41 @@ mod tests {
         assert!((ys[47] - 0.5).abs() < 1e-6, "{}", ys[47]);
         assert!((ys[95] - 0.25).abs() < 1e-6, "{}", ys[95]);
         assert!(ys.iter().enumerate().all(|(i, &v)| i == 47 || i == 95 || v == 0.0));
+    }
+
+    #[test]
+    fn taps_match_the_modulo_form() {
+        // Feedback, a low-pass and three taps (one at the longest delay):
+        // bit for bit what the per-frame modulo and feedback sum gave.
+        let w = [0, 0, 0.8f32.to_bits(), 0.6f32.to_bits(), 3000.0f32.to_bits(), 3, 0.5f32.to_bits(), 1.0f32.to_bits(), (-0.3f32).to_bits(), 2.5f32.to_bits(), 0.25f32.to_bits(), 4.0f32.to_bits()];
+        let mut t = Taps::from_words(&w, 48000).unwrap();
+        let (n, coef, level) = (t.buf.len(), t.coef, t.level);
+        let (mut buf, mut pos, mut lp) = (vec![[0f32; 8]; n], 0usize, [0f32; 8]);
+        let mut x = 0x2545_f491u32;
+        for _ in 0..2000 {
+            let fr: [f32; 8] = std::array::from_fn(|_| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (x as i32) as f32 / 2e9
+            });
+            let mut want = [0f32; 8];
+            for &(g, d) in &t.taps {
+                let f = &buf[(pos + n - d.min(n - 1)) % n];
+                for c in 0..3 {
+                    want[c] += g * f[c];
+                }
+            }
+            let sum: f32 = t.taps.iter().map(|t| t.0.abs()).sum();
+            let fb = if sum > 0.0 { t.feedback.min(0.7 / sum) } else { 0.0 };
+            let mut wr = [0f32; 8];
+            for c in 0..3 {
+                lp[c] = want[c] * (1.0 - coef) + lp[c] * coef;
+                want[c] = lp[c] * level;
+                wr[c] = fr[c] + lp[c] * fb;
+            }
+            buf[pos] = wr;
+            pos = (pos + 1) % n;
+            let got = t.process(&fr, 3);
+            assert!(got.iter().zip(&want).all(|(a, b)| a.to_bits() == b.to_bits()));
+        }
     }
 }
