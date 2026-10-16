@@ -5,7 +5,7 @@ members = ["crates/*"]
 default-members = ["crates/config", "crates/prep", "crates/runtime", "crates/gcn", "crates/sce-elf", "crates/tlgdis", "crates/tlgdbg"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
