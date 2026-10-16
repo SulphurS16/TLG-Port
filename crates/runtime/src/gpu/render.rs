@@ -2041,16 +2041,19 @@ macro_rules! mem {
 /// The image state, shared by the renderers (`Renderer::img_g`).
 static IMG_CELL: std::sync::OnceLock<parking_lot::Mutex<ImgState>> = std::sync::OnceLock::new();
 
-/// TLG_PERF: where the image state was taken while the memory model's guard
-/// was held (render.rs lines; a second renderer needs the image state taken
-/// first), and the renderer-lock holds that took it by queue class
-/// (graphics without, with; compute queues without, with).
-pub static IMG_AFTER_MEM: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
+/// TLG_PERF: where renderer-lock holds first took the image state, by
+/// (class, render.rs line): class bit 1 compute queues, bit 0 the memory
+/// model's guard held then (a second renderer needs the image state taken
+/// first); and the holds that took it by queue class (graphics without,
+/// with; compute queues without, with).
+pub const IMG_FIRST_LINES: usize = 16384;
+pub static IMG_FIRST: [std::sync::atomic::AtomicU32; 4 * IMG_FIRST_LINES] = [const { std::sync::atomic::AtomicU32::new(0) }; 4 * IMG_FIRST_LINES];
 pub static IMG_HOLDS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
 
-fn lock_img(after_mem: bool, line: u32) -> parking_lot::MutexGuard<'static, ImgState> {
-    if after_mem && perf_on() {
-        *IMG_AFTER_MEM.lock().get_or_insert_with(HashMap::new).entry(format!("render.rs:{line}")).or_default() += 1;
+fn lock_img(compute: bool, after_mem: bool, line: u32) -> parking_lot::MutexGuard<'static, ImgState> {
+    if perf_on() {
+        let i = (compute as usize * 2 + after_mem as usize) * IMG_FIRST_LINES + (line as usize).min(IMG_FIRST_LINES - 1);
+        IMG_FIRST[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     IMG_CELL.get().expect("renderer not initialized").lock()
 }
@@ -2059,8 +2062,8 @@ fn lock_img(after_mem: bool, line: u32) -> parking_lot::MutexGuard<'static, ImgS
 /// until the renderer lock is released (or `release_shared`).
 macro_rules! img {
     ($s:expr) => {{
-        let after_mem = $s.img_g.is_none() && $s.mem_g.is_some();
-        &mut **$s.img_g.get_or_insert_with(|| lock_img(after_mem, line!()))
+        let (compute, after_mem) = ($s.cx.cmd_queue != 0, $s.mem_g.is_some());
+        &mut **$s.img_g.get_or_insert_with(|| lock_img(compute, after_mem, line!()))
     }};
 }
 
@@ -6160,9 +6163,6 @@ impl Renderer {
         // free for the texture's GPU detiling -- without that, a 64 MiB
         // shadow map sampled from guest memory every frame fell back to the
         // CPU detiler, ~150 ms per frame.)
-        if img!(self).ready_bases.len() > 1 << 14 {
-            img!(self).ready_bases.clear();
-        }
         let mut n = 0u64;
         for p in stages {
             for b in &p.translated.out.bindings {
@@ -6183,7 +6183,12 @@ impl Renderer {
                             })
                         });
                         if ready {
-                            img!(self).ready_bases.insert(t.base, mem!(self).cpu_epoch);
+                            let cpu_epoch = mem!(self).cpu_epoch;
+                            let ready_bases = &mut img!(self).ready_bases;
+                            if ready_bases.len() > 1 << 14 {
+                                ready_bases.clear();
+                            }
+                            ready_bases.insert(t.base, cpu_epoch);
                         } else {
                             let layers = if t.ty == desc::T_3D { t.depth } else { t.total_layers() }.max(1);
                             n += resources::texture_bytes(t, layers).min(64 << 20);
@@ -8549,11 +8554,15 @@ impl Renderer {
     fn note_buffer_write(&mut self, base: u64, size: u64) {
         // (Images starting up to IMG_NEAR_BYTES below the write, and the
         // large ones further below; one found twice is marked twice.)
-        let im = img!(self);
         let m = mem!(self);
         let near = m.img_bases.range(base.saturating_sub(m.img_max_bytes.min(IMG_NEAR_BYTES))..base + size);
         let far = m.img_bases_large.range(base.saturating_sub(m.img_max_bytes)..base + size);
-        for (k, _) in near.chain(far).flat_map(|(_, ks)| ks.iter()).filter(|(k, bound)| k.base + bound > base) {
+        let keys: smallvec::SmallVec<[ImageKey; 8]> = near.chain(far).flat_map(|(_, ks)| ks.iter()).filter(|(k, bound)| k.base + bound > base).map(|(k, _)| *k).collect();
+        if keys.is_empty() {
+            return;
+        }
+        let im = img!(self);
+        for k in &keys {
             let Some(img) = im.images.get_mut(k) else { continue };
             if !img.gpu_written || k.ty3d {
                 continue;

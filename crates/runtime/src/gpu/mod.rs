@@ -659,7 +659,6 @@ fn gfx_thread() {
                         ("render-target reloads (target, at shader)", &render::RELOAD_SITES),
                         ("shader preparations that waited for pending GPU writes (reader, address, write)", &render::GUARD_SITES),
                         ("upload copies with forwards of pending GPU writes (read range, reader, write)", &render::FORWARD_SITES),
-                        ("image state taken while the memory model was held (site)", &render::IMG_AFTER_MEM),
                     ] {
                         let mut v: Vec<(String, u64)> = m.lock().take().unwrap_or_default().into_iter().collect();
                         v.sort_by(|x, y| y.1.cmp(&x.1));
@@ -667,6 +666,22 @@ fn gfx_thread() {
                         for (s, n) in v.iter().take(12) {
                             crate::info!("  {n:6}x {s}");
                         }
+                    }
+                }
+                if render::perf_on() {
+                    // (Where renderer-lock holds first took the image state.)
+                    let mut v: Vec<(u32, String)> = Vec::new();
+                    for (i, a) in render::IMG_FIRST.iter().enumerate() {
+                        let n = a.swap(0, Ordering::Relaxed);
+                        if n != 0 {
+                            let (class, line) = (i / render::IMG_FIRST_LINES, i % render::IMG_FIRST_LINES);
+                            v.push((n, format!("{} render.rs:{line}{}", if class & 2 != 0 { "compute" } else { "graphics" }, if class & 1 != 0 { " (memory model held)" } else { "" })));
+                        }
+                    }
+                    v.sort_by(|x, y| y.0.cmp(&x.0));
+                    crate::info!("renderer-lock holds that took the image state, where they first took it, since last report: {} sites, {} holds", v.len(), v.iter().map(|x| x.0 as u64).sum::<u64>());
+                    for (n, s) in v.iter().take(16) {
+                        crate::info!("  {n:7}x {s}");
                     }
                 }
                 if render::gpu_profile_on() {
