@@ -47,7 +47,7 @@ impl PipeSlot {
     }
 }
 
-type Job = Box<dyn FnOnce() -> Result<vk::Pipeline, String> + Send>;
+pub type Job = Box<dyn FnOnce() -> Result<vk::Pipeline, String> + Send>;
 
 struct Pool {
     jobs: Mutex<VecDeque<(Job, Arc<PipeSlot>)>>,
@@ -67,7 +67,11 @@ pub static BUSY_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// logical processors less 4 - the game's busiest threads -, 2 to 8).
 pub fn workers() -> usize {
     match crate::tune::get(crate::tune::PIPE_ASYNC) {
-        n if n < 0 => std::thread::available_parallelism().map_or(2, |p| p.get().saturating_sub(4)).clamp(2, 8),
+        n if n < 0 => {
+            // (Asked at every draw by the prepare thread, `render::ahead_draw`.)
+            static AUTO: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            *AUTO.get_or_init(|| std::thread::available_parallelism().map_or(2, |p| p.get().saturating_sub(4)).clamp(2, 8))
+        }
         n => n.min(8) as usize,
     }
 }

@@ -362,6 +362,12 @@ pub fn take_dispatch(regs: &Regs) -> Option<Result<Prepared, String>> {
     Some(cs)
 }
 
+thread_local! {
+    /// Indirect dispatches' shader addresses whose pipelines the prepare
+    /// thread considered (`PrepHooks::dry_dispatch_indirect`).
+    static INDIRECT_SEEN: std::cell::RefCell<crate::gpu::render::FastSet<u64>> = Default::default();
+}
+
 /// The dry-run CP's hooks: preparation of every draw and dispatch.
 struct PrepHooks {
     sub: u64,
@@ -429,6 +435,12 @@ impl Hooks for PrepHooks {
         let ps = (ps_addr != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Fragment, regs }));
         let log = shaders::dry_end();
         note_prep(t0, "draw with pixel shader", ps_addr);
+        // (`tune pipe_ahead`: its pipeline's compile starts here.)
+        match (&vs, &ps) {
+            (Ok(v), None) => crate::gpu::render::ahead_draw(regs, v, None),
+            (Ok(v), Some(Ok(p))) => crate::gpu::render::ahead_draw(regs, v, Some(p)),
+            _ => {}
+        }
         push(Entry { sub: self.sub, epoch: self.epoch, key, prep: Prep::Draw((vs, ps)), log });
     }
     fn dispatch(&mut self, cp: &CommandProcessor, _x: u32, _y: u32, _z: u32) {
@@ -439,7 +451,25 @@ impl Hooks for PrepHooks {
         let cs = shaders::prepare(&StageRegs { stage: Stage::Compute, regs });
         let log = shaders::dry_end();
         note_prep(t0, "dispatch of compute shader", ((regs.sh(0x2E0C) as u64) | ((regs.sh(0x2E0D) as u64) << 32)) << 8);
+        if let Ok(c) = &cs {
+            crate::gpu::render::ahead_dispatch(c);
+        }
         push(Entry { sub: self.sub, epoch: self.epoch, key, prep: Prep::Dispatch(cs), log });
+    }
+    fn dry_dispatch_indirect(&mut self, cp: &CommandProcessor) {
+        // (`tune pipe_ahead`: the pipeline of an indirect dispatch, whose
+        // stage the graphics CP prepares itself; once per shader address.)
+        let regs = &cp.regs;
+        let addr = ((regs.sh(0x2E0C) as u64) | ((regs.sh(0x2E0D) as u64) << 32)) << 8;
+        if !crate::gpu::render::ahead_on() || !INDIRECT_SEEN.with(|s| s.borrow_mut().insert(addr)) {
+            return;
+        }
+        shaders::dry_begin();
+        let cs = shaders::prepare(&StageRegs { stage: Stage::Compute, regs });
+        let _ = shaders::dry_end();
+        if let Ok(c) = &cs {
+            crate::gpu::render::ahead_dispatch(c);
+        }
     }
     fn dry_write(&mut self, addr: u64, data: &[u32]) {
         shaders::dry_write(addr, data);

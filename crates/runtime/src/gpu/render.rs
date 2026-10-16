@@ -119,6 +119,336 @@ fn compute_pipeline(module: vk::ShaderModule, layout: vk::PipelineLayout, flags:
     Ok(pipeline)
 }
 
+/// A pipeline compile on a worker, logged when slow (>= 250 ms, the first
+/// 96): `what` with shader addresses `a`, `b` and `words` of SPIR-V, started
+/// by the prepare thread (`ahead`) or the CP.
+fn timed_compile(what: &str, a: u64, b: u64, words: usize, ahead: bool, f: impl FnOnce() -> Result<vk::Pipeline, String>) -> Result<vk::Pipeline, String> {
+    let t0 = std::time::Instant::now();
+    let r = f();
+    let ms = t0.elapsed().as_millis();
+    if ms >= 250 {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 96 {
+            crate::info!("{what} pipeline {a:#x}/{b:#x} ({words} SPIR-V words) compiled in {ms} ms, started by the {}", if ahead { "prepare thread" } else { "CP" });
+        }
+    }
+    r
+}
+
+/// Pipelines the prepare thread started compiling ahead of the graphics CP
+/// (`tune pipe_ahead`: `ahead_draw`, `ahead_dispatch`), by key. The CP
+/// adopts one when it first needs its key (`ahead_take`); keys it made a
+/// pipeline for itself are known (nothing to start for them).
+enum Ahead {
+    Known,
+    /// Its modules and layouts being made by the prepare thread.
+    Pending,
+    Started(AheadPipe),
+}
+
+struct AheadPipe {
+    layout: vk::PipelineLayout,
+    set_layout: vk::DescriptorSetLayout,
+    /// The set layout is pushed (`make_set_layout`).
+    push: bool,
+    slot: std::sync::Arc<super::pcompile::PipeSlot>,
+    /// When the prepare thread queued it.
+    queued: std::time::Instant,
+}
+
+#[derive(Default)]
+struct AheadMaps {
+    gfx: FastMap<GfxKey, Ahead>,
+    cs: FastMap<u64, Ahead>,
+}
+
+fn gfx_map(m: &mut AheadMaps) -> &mut FastMap<GfxKey, Ahead> {
+    &mut m.gfx
+}
+
+fn cs_map(m: &mut AheadMaps) -> &mut FastMap<u64, Ahead> {
+    &mut m.cs
+}
+
+static AHEAD: Mutex<Option<AheadMaps>> = Mutex::new(None);
+/// Pipelines started ahead (graphics, compute), adopted by the CP (graphics,
+/// compute), made by the CP without one started (graphics, compute
+/// dispatches of the graphics queue); of those graphics ones, keys the
+/// prepare thread computes differently; pipelines the prepare thread was
+/// setting up when the CP made them; made by the CP without one started for
+/// indirect dispatches of the graphics queue, for the compute queues'
+/// dispatches; adopted ones compiled by then, and the time from their
+/// queueing to the adoption (us) (TLG_PERF).
+pub static AHEAD_STATS: [std::sync::atomic::AtomicU64; 12] = [const { std::sync::atomic::AtomicU64::new(0) }; 12];
+
+/// Whether the prepare thread starts pipelines ahead (`tune pipe_ahead`).
+pub fn ahead_on() -> bool {
+    crate::tune::get(crate::tune::PIPE_AHEAD) != 0 && super::pcompile::workers() > 0 && !shaders::compile_probe()
+}
+
+fn ahead_count(i: usize) -> u64 {
+    AHEAD_STATS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The prepare thread claims `key` to start its pipeline: false when one
+/// has been made or started for it.
+fn ahead_claim<K: Eq + std::hash::Hash + Clone>(map: fn(&mut AheadMaps) -> &mut FastMap<K, Ahead>, key: &K) -> bool {
+    let mut g = AHEAD.lock();
+    let m = map(g.get_or_insert_with(Default::default));
+    if m.contains_key(key) {
+        return false;
+    }
+    m.insert(key.clone(), Ahead::Pending);
+    true
+}
+
+/// The prepare thread queues `job` for its claimed `key`, unless the CP
+/// made the pipeline itself meanwhile (false: the caller destroys the
+/// objects it made).
+fn ahead_start<K: Eq + std::hash::Hash>(map: fn(&mut AheadMaps) -> &mut FastMap<K, Ahead>, key: &K, layout: vk::PipelineLayout, set_layout: vk::DescriptorSetLayout, push: bool, job: super::pcompile::Job) -> bool {
+    let mut g = AHEAD.lock();
+    let Some(e) = g.as_mut().and_then(|m| map(m).get_mut(key)) else { return false };
+    if !matches!(e, Ahead::Pending) {
+        return false;
+    }
+    *e = Ahead::Started(AheadPipe { layout, set_layout, push, slot: super::pcompile::spawn(job), queued: std::time::Instant::now() });
+    true
+}
+
+/// The CP needs `key`'s pipeline and has not made it: the one the prepare
+/// thread started, the CP's from now on; else None, and the key is known
+/// (the CP makes it).
+fn ahead_take<K: Eq + std::hash::Hash + Clone>(map: fn(&mut AheadMaps) -> &mut FastMap<K, Ahead>, key: &K) -> Option<AheadPipe> {
+    let mut g = AHEAD.lock();
+    match map(g.get_or_insert_with(Default::default)).insert(key.clone(), Ahead::Known) {
+        Some(Ahead::Started(p)) => Some(p),
+        _ => None,
+    }
+}
+
+/// A shader module, for a pipeline started ahead (destroyed once it is
+/// compiled).
+fn ahead_module(spirv: &[u32]) -> Result<vk::ShaderModule, String> {
+    unsafe { ctx().device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None) }.map_err(|e| format!("vkCreateShaderModule: {e}"))
+}
+
+/// The set and pipeline layouts for `stages` (`make_set_layout`), and
+/// whether the set layout is pushed.
+fn ahead_layouts(stages: &[&Prepared]) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout, bool), String> {
+    let (set_layout, push) = make_set_layout(stages)?;
+    let layouts = [set_layout];
+    match unsafe { ctx().device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None) } {
+        Ok(layout) => Ok((layout, set_layout, push)),
+        Err(e) => {
+            unsafe { ctx().device.destroy_descriptor_set_layout(set_layout, None) };
+            Err(e.to_string())
+        }
+    }
+}
+
+/// Destroys what the prepare thread made for a pipeline it did not start.
+fn ahead_discard(modules: &[vk::ShaderModule], layouts: Option<(vk::PipelineLayout, vk::DescriptorSetLayout)>) {
+    let d = &ctx().device;
+    unsafe {
+        for &m in modules {
+            d.destroy_shader_module(m, None);
+        }
+        if let Some((l, s)) = layouts {
+            d.destroy_pipeline_layout(l, None);
+            d.destroy_descriptor_set_layout(s, None);
+        }
+    }
+}
+
+/// A draw's pipeline key from its registers and shader stages, as
+/// `draw_inner` makes it (the attachment formats `draw_attachments` and
+/// `color_target`/`depth_target` derive from the registers); None for draws
+/// that make no pipeline there (patches, unsupported primitive types, no
+/// attachments).
+fn gfx_key_of(regs: &Regs, vs: &Prepared, ps: Option<&Prepared>) -> Option<GfxKey> {
+    let prim = regs.uconfig[(0xC242 - 0xC000) as usize];
+    if !matches!(prim, 1..=6 | 0x11) {
+        return None;
+    }
+    let target_mask = regs.ctx(0xA08E);
+    let mrt_mask = ps.map_or(0, |p| p.translated.out.mrt_mask);
+    let mut colors = smallvec::SmallVec::<[vk::Format; 8]>::new();
+    let mut blend = smallvec::SmallVec::<[u32; 8]>::new();
+    let mut masks = smallvec::SmallVec::<[u32; 8]>::new();
+    if (regs.ctx(0xA202) >> 4) & 7 != 0 {
+        for n in 0..8u32 {
+            let mask = (target_mask >> (4 * n)) & 0xF;
+            let info = regs.ctx(0xA318 + n * 0xF + 4);
+            let fmt = (info >> 2) & 0x1F;
+            if mask == 0 || mrt_mask & (1 << n) == 0 || fmt == 0 {
+                continue;
+            }
+            let Some(f) = cb_format(fmt, (info >> 8) & 7, (info >> 11) & 3) else { continue };
+            colors.resize(n as usize, vk::Format::UNDEFINED);
+            blend.resize(n as usize, 0);
+            masks.resize(n as usize, 0);
+            colors.push(f);
+            blend.push(regs.ctx(0xA1E0 + n));
+            masks.push(mask);
+        }
+    }
+    let depth = if regs.ctx(0xA200) & 7 != 0 || regs.ctx(0xA000) & 3 != 0 {
+        match (regs.ctx(0xA010) & 3, regs.ctx(0xA011) & 1 != 0) {
+            (0, false) => vk::Format::UNDEFINED,
+            (1, false) => vk::Format::D16_UNORM,
+            (_, true) => vk::Format::D32_SFLOAT_S8_UINT,
+            _ => vk::Format::D32_SFLOAT,
+        }
+    } else {
+        vk::Format::UNDEFINED
+    };
+    if colors.is_empty() && depth == vk::Format::UNDEFINED {
+        return None;
+    }
+    let rect = prim == 0x11;
+    Some(GfxKey {
+        vs: vs.translated.key_hash ^ vs.addr,
+        ps: ps.map(|p| p.translated.key_hash ^ p.addr),
+        rect,
+        gs_params: if rect { vs.translated.out.params } else { 0 },
+        colors,
+        blend,
+        masks,
+        depth,
+        stencil: depth == vk::Format::D32_SFLOAT_S8_UINT,
+        topology_class: match prim {
+            1 => 0,
+            2 | 3 => 1,
+            _ => 2,
+        },
+        polygon: ((regs.ctx(0xA205) >> 3) & 3) as u8,
+        depth_clamp: regs.ctx(0xA204) & (3 << 26) != 0,
+        tess: None,
+        push: crate::tune::get(crate::tune::PUSH_DESC) != 0,
+    })
+}
+
+/// The prepare thread at a draw (`tune pipe_ahead`): starts compiling its
+/// pipeline on a compile worker when none has been made or started for its
+/// key, from modules and layouts of its own.
+pub fn ahead_draw(regs: &Regs, vs: &Prepared, ps: Option<&Prepared>) {
+    if !ahead_on() {
+        return;
+    }
+    let Some(key) = gfx_key_of(regs, vs, ps) else { return };
+    if !ahead_claim(gfx_map, &key) {
+        return;
+    }
+    let gs = key.rect.then(|| gcn::translate::gs::rect_list_gs(key.gs_params));
+    let mut stages = GfxStages::new();
+    let mut made = Ok(());
+    for (flags, spirv) in [(vk::ShaderStageFlags::VERTEX, Some(&vs.translated.out.spirv[..])), (vk::ShaderStageFlags::GEOMETRY, gs.as_deref()), (vk::ShaderStageFlags::FRAGMENT, ps.map(|p| &p.translated.out.spirv[..]))] {
+        if let Some(spirv) = spirv {
+            match ahead_module(spirv) {
+                Ok(m) => stages.push((flags, m)),
+                Err(e) => made = Err(e),
+            }
+        }
+    }
+    let p_stages: smallvec::SmallVec<[&Prepared; 2]> = std::iter::once(vs).chain(ps).collect();
+    let made = made.and_then(|_| ahead_layouts(&p_stages));
+    let modules: smallvec::SmallVec<[vk::ShaderModule; 4]> = stages.iter().map(|s| s.1).collect();
+    let (layout, set_layout, push) = match made {
+        Ok(l) => l,
+        Err(e) => {
+            crate::debug!("pipeline ahead for vs {:#x}: {e}", vs.addr);
+            ahead_discard(&modules, None);
+            ahead_take(gfx_map, &key);
+            return;
+        }
+    };
+    let k = key.clone();
+    let (va, pa, words) = (vs.addr, ps.map_or(0, |p| p.addr), vs.translated.out.spirv.len() + ps.map_or(0, |p| p.translated.out.spirv.len()));
+    let job: super::pcompile::Job = Box::new(move || {
+        let r = timed_compile("graphics", va, pa, words, true, || Renderer::gfx_pipeline_from(&k, &stages, layout));
+        ahead_discard(&stages.iter().map(|s| s.1).collect::<smallvec::SmallVec<[vk::ShaderModule; 4]>>(), None);
+        r
+    });
+    if ahead_start(gfx_map, &key, layout, set_layout, push, job) {
+        ahead_count(0);
+    } else {
+        ahead_count(7);
+        ahead_discard(&modules, Some((layout, set_layout)));
+    }
+}
+
+/// The prepare thread at a dispatch (`ahead_draw`). Not for engine utility
+/// kernels the renderer performs as image operations.
+pub fn ahead_dispatch(cs: &Prepared) {
+    if !ahead_on() || cs.utility.is_some() && crate::tune::get(crate::tune::ELIDE_UTILITY) != 0 {
+        return;
+    }
+    let key = cs.translated.key_hash ^ cs.addr ^ push_mode_key();
+    if !ahead_claim(cs_map, &key) {
+        return;
+    }
+    let made = ahead_module(&cs.translated.out.spirv).and_then(|m| match ahead_layouts(&[cs]) {
+        Ok(l) => Ok((m, l)),
+        Err(e) => {
+            ahead_discard(&[m], None);
+            Err(e)
+        }
+    });
+    let (m, (layout, set_layout, push)) = match made {
+        Ok(r) => r,
+        Err(e) => {
+            crate::debug!("pipeline ahead for cs {:#x}: {e}", cs.addr);
+            ahead_take(cs_map, &key);
+            return;
+        }
+    };
+    let (ca, words) = (cs.addr, cs.translated.out.spirv.len());
+    let job: super::pcompile::Job = Box::new(move || {
+        let r = timed_compile("compute", ca, 0, words, true, || compute_pipeline(m, layout, vk::PipelineCreateFlags::DISPATCH_BASE));
+        ahead_discard(&[m], None);
+        r
+    });
+    if ahead_start(cs_map, &key, layout, set_layout, push, job) {
+        ahead_count(1);
+    } else {
+        ahead_count(7);
+        ahead_discard(&[m], Some((layout, set_layout)));
+    }
+}
+
+/// A descriptor set layout for the stages' bindings, and whether it is
+/// pushed (`tune push_desc`: pushed into the command buffer per command, no
+/// set to allocate and write on the CP thread; up to the device's limit of
+/// push descriptors).
+fn make_set_layout(stages: &[&Prepared]) -> Result<(vk::DescriptorSetLayout, bool), String> {
+    let mut bindings = Vec::new();
+    for p in stages {
+        let flags = match (p.stage, p.tess) {
+            (Stage::Vertex, TessRole::Ds) => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
+            (Stage::Vertex, _) => vk::ShaderStageFlags::VERTEX,
+            (Stage::Fragment, _) => vk::ShaderStageFlags::FRAGMENT,
+            (Stage::Compute, _) => vk::ShaderStageFlags::COMPUTE,
+        };
+        if p.tess == TessRole::Ds {
+            // The generated control stage's factor buffer.
+            bindings.push(vk::DescriptorSetLayoutBinding::default().binding(TESS_TF_BINDING).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::TESSELLATION_CONTROL));
+        }
+        for b in &p.translated.out.bindings {
+            let ty = match b.kind {
+                BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::DebugOut | BindingKind::Lds | BindingKind::DirtyInfo | BindingKind::DirtyBits => vk::DescriptorType::STORAGE_BUFFER,
+                BindingKind::Image(_) => vk::DescriptorType::SAMPLED_IMAGE,
+                BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
+                BindingKind::Sampler(_) => vk::DescriptorType::SAMPLER,
+            };
+            bindings.push(vk::DescriptorSetLayoutBinding::default().binding(b.binding).descriptor_type(ty).descriptor_count(1).stage_flags(flags));
+        }
+    }
+    let push = crate::tune::get(crate::tune::PUSH_DESC) != 0 && bindings.len() as u32 <= ctx().push_max;
+    let flags = if push { vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR } else { vk::DescriptorSetLayoutCreateFlags::empty() };
+    let l = unsafe { ctx().device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None) }.map_err(|e| format!("descriptor set layout: {e}"))?;
+    Ok((l, push))
+}
+
 /// Pipeline cache persisted in `local-data/pipeline-cache.bin`: pipelines
 /// the driver compiled in earlier runs load from it (the title's largest
 /// compute shader alone takes ~38 s to compile; loading compiled ~50 s of
@@ -4062,38 +4392,44 @@ impl Renderer {
     }
 
     fn set_layout(&mut self, stages: &[&Prepared]) -> Result<vk::DescriptorSetLayout, String> {
-        let mut bindings = Vec::new();
-        for p in stages {
-            let flags = match (p.stage, p.tess) {
-                (Stage::Vertex, TessRole::Ds) => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
-                (Stage::Vertex, _) => vk::ShaderStageFlags::VERTEX,
-                (Stage::Fragment, _) => vk::ShaderStageFlags::FRAGMENT,
-                (Stage::Compute, _) => vk::ShaderStageFlags::COMPUTE,
-            };
-            if p.tess == TessRole::Ds {
-                // The generated control stage's factor buffer.
-                bindings.push(vk::DescriptorSetLayoutBinding::default().binding(TESS_TF_BINDING).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::TESSELLATION_CONTROL));
-            }
-            for b in &p.translated.out.bindings {
-                let ty = match b.kind {
-                    BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::DebugOut | BindingKind::Lds | BindingKind::DirtyInfo | BindingKind::DirtyBits => vk::DescriptorType::STORAGE_BUFFER,
-                    BindingKind::Image(_) => vk::DescriptorType::SAMPLED_IMAGE,
-                    BindingKind::StorageImage(_) => vk::DescriptorType::STORAGE_IMAGE,
-                    BindingKind::Sampler(_) => vk::DescriptorType::SAMPLER,
-                };
-                bindings.push(vk::DescriptorSetLayoutBinding::default().binding(b.binding).descriptor_type(ty).descriptor_count(1).stage_flags(flags));
-            }
-        }
-        // (`tune push_desc`: pushed into the command buffer per command, no
-        // set to allocate and write on the CP thread; up to the device's
-        // limit of push descriptors.)
-        let push = crate::tune::get(crate::tune::PUSH_DESC) != 0 && bindings.len() as u32 <= ctx().push_max;
-        let flags = if push { vk::DescriptorSetLayoutCreateFlags::PUSH_DESCRIPTOR_KHR } else { vk::DescriptorSetLayoutCreateFlags::empty() };
-        let l = unsafe { ctx().device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None) }.map_err(|e| format!("descriptor set layout: {e}"))?;
+        let (l, push) = make_set_layout(stages)?;
         if push {
             self.push_layouts.insert(l);
         }
         Ok(l)
+    }
+
+    /// A pipeline the prepare thread started (`ahead_take`) as the CP's.
+    fn adopt(&mut self, a: AheadPipe) -> Pipe {
+        if a.slot.get().is_some() {
+            ahead_count(10);
+        }
+        AHEAD_STATS[11].fetch_add(a.queued.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+        if a.push {
+            self.push_layouts.insert(a.set_layout);
+        }
+        Pipe { pipeline: vk::Pipeline::null(), layout: a.layout, set_layout: a.set_layout, slot: Some(a.slot) }
+    }
+
+    /// `key`'s pipeline as the prepare thread started it (`ahead_draw`);
+    /// None when it did not (TLG_PERF: whether it would have computed the
+    /// same key).
+    fn ahead_gfx(&mut self, key: &GfxKey, regs: &Regs, vs: &Prepared, ps: Option<&Prepared>, tess: bool) -> Option<Pipe> {
+        if !ahead_on() {
+            return None;
+        }
+        if let Some(a) = ahead_take(gfx_map, key) {
+            ahead_count(2);
+            return Some(self.adopt(a));
+        }
+        ahead_count(4);
+        if !tess {
+            let k = gfx_key_of(regs, vs, ps);
+            if k.as_ref() != Some(key) && ahead_count(6) < 8 {
+                crate::info!("pipeline ahead: the prepare thread's key for vs {:#x} ps {:#x} would be {k:?}, the CP's is {key:?}", vs.addr, ps.map_or(0, |p| p.addr));
+            }
+        }
+        None
     }
 
     fn rect_gs(&mut self, params: u32) -> Result<vk::ShaderModule, String> {
@@ -8425,6 +8761,11 @@ impl Renderer {
         };
         phase!(2);
         if !self.gfx_pipes.contains_key(&key) {
+            if let Some(p) = self.ahead_gfx(&key, regs, &vs, ps.as_ref(), tess.is_some()) {
+                self.gfx_pipes.insert(key.clone(), p);
+            }
+        }
+        if !self.gfx_pipes.contains_key(&key) {
             let t0 = std::time::Instant::now();
             let p = self.create_gfx_pipeline(&key, &vs, ps.as_ref())?;
             PIPE_CREATES[0].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -9121,7 +9462,8 @@ impl Renderer {
         if super::pcompile::workers() > 0 && !shaders::compile_probe() {
             let stages = self.gfx_stages(key, vsm, psm, gsm)?;
             let k = key.clone();
-            let slot = super::pcompile::spawn(Box::new(move || Self::gfx_pipeline_from(&k, &stages, layout)));
+            let (va, pa, words) = (vs.addr, ps.map_or(0, |p| p.addr), vs.translated.out.spirv.len() + ps.map_or(0, |p| p.translated.out.spirv.len()));
+            let slot = super::pcompile::spawn(Box::new(move || timed_compile("graphics", va, pa, words, false, || Self::gfx_pipeline_from(&k, &stages, layout))));
             crate::debug!("compiling graphics pipeline vs {:#x} ps {:?} colors {:?} depth {:?} rect {}", vs.addr, ps.map(|p| p.addr), key.colors, key.depth, key.rect);
             return Ok(Pipe { pipeline: vk::Pipeline::null(), layout, set_layout, slot: Some(slot) });
         }
@@ -9550,6 +9892,21 @@ impl Renderer {
         }
         phase!(0);
         let key = cs.translated.key_hash ^ cs.addr ^ push_mode_key();
+        if !self.cs_pipes.contains_key(&key) && ahead_on() {
+            if let Some(a) = ahead_take(cs_map, &key) {
+                ahead_count(3);
+                let p = self.adopt(a);
+                self.cs_pipes.insert(key, p);
+            } else {
+                ahead_count(if cp.queue != 0 {
+                    9
+                } else if indirect.is_some() {
+                    8
+                } else {
+                    5
+                });
+            }
+        }
         if !self.cs_pipes.contains_key(&key) {
             let c = ctx();
             let m = self.module(key, &cs.translated.out.spirv)?;
@@ -9559,7 +9916,8 @@ impl Renderer {
             let t0 = std::time::Instant::now();
             // (`tune pipe_async`: compiled by a worker, bound once made.)
             let (pipeline, slot) = if super::pcompile::workers() > 0 && !shaders::compile_probe() {
-                (vk::Pipeline::null(), Some(super::pcompile::spawn(Box::new(move || compute_pipeline(m, layout, vk::PipelineCreateFlags::DISPATCH_BASE)))))
+                let (ca, words) = (cs.addr, cs.translated.out.spirv.len());
+                (vk::Pipeline::null(), Some(super::pcompile::spawn(Box::new(move || timed_compile("compute", ca, 0, words, false, || compute_pipeline(m, layout, vk::PipelineCreateFlags::DISPATCH_BASE))))))
             } else {
                 (compute_pipeline(m, layout, vk::PipelineCreateFlags::DISPATCH_BASE)?, None)
             };

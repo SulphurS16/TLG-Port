@@ -649,8 +649,14 @@ pub const NGS2_COMPAT: usize = 107;
 /// hitches (worst frame 4.2 s) on the CP, 171 s with 18.6 s (1.8 s) with 8
 /// workers. Workers start when a pipeline is first queued.
 pub const PIPE_ASYNC: usize = 108;
+/// The prepare thread starts the compiles of the pipelines a submission's
+/// draws and dispatches need that the CP has not made yet, before the CP
+/// gets there (`TLG_PIPE_AHEAD`, 1; with `pipe_async` and `prep_ahead`): a
+/// submission's new pipelines compile side by side instead of one after the
+/// other as the CP reaches them.
+pub const PIPE_AHEAD: usize = 109;
 
-const TABLE: [(&str, &str, i64); 109] = [
+const TABLE: [(&str, &str, i64); 110] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -760,6 +766,7 @@ const TABLE: [(&str, &str, i64); 109] = [
     ("rev_ab", "TLG_REV_AB", 0),
     ("ngs2_compat", "TLG_NGS2_COMPAT", 0),
     ("pipe_async", "TLG_PIPE_ASYNC", -1),
+    ("pipe_ahead", "TLG_PIPE_AHEAD", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

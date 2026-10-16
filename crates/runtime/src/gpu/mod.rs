@@ -734,6 +734,22 @@ fn gfx_thread() {
                     pcompile::DONE.load(Ordering::Relaxed),
                     pcompile::BUSY_NS.load(Ordering::Relaxed) as f64 / 1e9
                 );
+                let a: [u64; 12] = std::array::from_fn(|i| render::AHEAD_STATS[i].load(Ordering::Relaxed));
+                crate::info!(
+                    "pipelines started ahead by the prepare thread: graphics {} (CP took {}, made {} itself, {} with a different key), compute {} (took {}; made itself for {} direct and {} indirect dispatches of the graphics queue, {} of the compute queues); {} dropped for the CP's; {} compiled when taken, taken {:.1} ms after queueing on average",
+                    a[0],
+                    a[2],
+                    a[4],
+                    a[6],
+                    a[1],
+                    a[3],
+                    a[5],
+                    a[8],
+                    a[9],
+                    a[7],
+                    a[10],
+                    a[11] as f64 / 1e3 / (a[2] + a[3]).max(1) as f64
+                );
                 if shaders::compile_probe() {
                     let p: Vec<String> = (0..2)
                         .map(|k| {

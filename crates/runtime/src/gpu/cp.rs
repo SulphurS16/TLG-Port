@@ -363,6 +363,10 @@ pub trait Hooks {
     fn dry_sync(&mut self, addr: u64, len: u64) {
         let _ = (addr, len);
     }
+    /// A dry-run CP reached a DISPATCH_INDIRECT (`prepahead`: its pipeline).
+    fn dry_dispatch_indirect(&mut self, cp: &CommandProcessor) {
+        let _ = cp;
+    }
     /// A dry-run CP executed a type-3 packet (decoded stream, `prepahead`).
     fn dry_emit(&mut self, opcode: u32, body: &[u32], addr: u64, constant: bool) {
         let _ = (opcode, body, addr, constant);
@@ -1379,8 +1383,11 @@ impl CommandProcessor {
             | op::DRAW_INDEX_INDIRECT
             | op::DRAW_INDIRECT_MULTI
             | op::DRAW_INDEX_INDIRECT_MULTI
-            | op::DRAW_INDEX_INDIRECT_COUNT_MULTI
-            | op::DISPATCH_INDIRECT => true,
+            | op::DRAW_INDEX_INDIRECT_COUNT_MULTI => true,
+            op::DISPATCH_INDIRECT => {
+                hooks.dry_dispatch_indirect(self);
+                true
+            }
             _ => false,
         }
     }
