@@ -31,7 +31,7 @@ macro_rules! set_gpu_written {
 macro_rules! unordered {
     ($s:expr) => {{
         $s.cx.barrier_needed = true;
-        $s.cx.unordered_gen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        $s.cx.unordered_gen = CTX_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
         $s.cx.unordered_line = line!();
     }};
 }
@@ -892,13 +892,31 @@ fn cp_view_on() -> bool {
     crate::tune::get(crate::tune::CP_SYNC_VIEW) != 0
 }
 
+/// A recording context's part of a submission (`Renderer::close_ctx`).
+struct Closed {
+    recording: bool,
+    cmds: smallvec::SmallVec<[vk::CommandBuffer; 2]>,
+    pending: Vec<PendingWrite>,
+    dev_writes: Vec<(u64, vk::Buffer, u64, u64)>,
+    zc_writes: Vec<(u64, u64)>,
+    zc_reads: Ranges,
+    lazy: Option<u64>,
+    batch_copies: u64,
+    sparse_binds: Vec<(vk::Buffer, Vec<vk::SparseMemoryBind>)>,
+    ring_ptr: *mut u8,
+}
+
 /// Work performed (in submission order) when a batch completes.
 struct Completion {
     seq: u64,
     fence: vk::Fence,
     /// The batch's start/end timestamps (null: none).
     exec: vk::QueryPool,
+    /// The host rings holding the write-backs' data: the graphics queue's
+    /// context's, and the compute queues' for those marked in `wb_cs`.
     ring_ptr: *mut u8,
+    ring_ptr_cs: *mut u8,
+    wb_cs: Vec<bool>,
     writebacks: Vec<(u64, u64, u64)>,
     /// Per write-back: the host-ring offset and dwords of its page bitmap
     /// when only marked pages were copied out (and are written back).
@@ -1193,6 +1211,7 @@ fn completion_thread() {
             let bump = crate::tune::get(crate::tune::WB_LOCK_BUMP) != 0;
             let fine = crate::tune::get(crate::tune::WB_LOCK_BUMP) >= 2;
             for (k, &(addr, off, size)) in c.writebacks.iter().enumerate() {
+                let ring_ptr = if c.wb_cs.get(k).copied().unwrap_or(false) { c.ring_ptr_cs } else { c.ring_ptr };
                 if bump && k > 0 {
                     if let Some(g) = ww.as_mut() {
                         parking_lot::MutexGuard::bump(g);
@@ -1207,7 +1226,7 @@ fn completion_thread() {
                     // forgets these writes too), in runs of consecutive pages:
                     // each reset is a system call costing tens of microseconds.
                     let head = addr & 0xFFF;
-                    let bm = unsafe { std::slice::from_raw_parts(c.ring_ptr.add(bits as usize) as *const u32, words as usize) };
+                    let bm = unsafe { std::slice::from_raw_parts(ring_ptr.add(bits as usize) as *const u32, words as usize) };
                     let pages = (head + size).div_ceil(4096);
                     let marked = |p: u64| bm.get((p / 32) as usize).is_some_and(|w| w >> (p % 32) & 1 != 0);
                     let mut page = 0;
@@ -1235,7 +1254,7 @@ fn completion_thread() {
                         runs += 1;
                         let start = (first * 4096).saturating_sub(head);
                         let end = (page * 4096 - head).min(size);
-                        let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add((off + start) as usize), (end - start) as usize) };
+                        let src = unsafe { std::slice::from_raw_parts(ring_ptr.add((off + start) as usize), (end - start) as usize) };
                         crate::mem::forget_begin(addr + start, end - start);
                         resources::copy_to_guest(src, addr + start);
                         let tr = std::time::Instant::now();
@@ -1264,7 +1283,7 @@ fn completion_thread() {
                                 parking_lot::MutexGuard::bump(g);
                             }
                         }
-                        let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add((off + (a - addr)) as usize), (b - a) as usize) };
+                        let src = unsafe { std::slice::from_raw_parts(ring_ptr.add((off + (a - addr)) as usize), (b - a) as usize) };
                         crate::mem::forget_begin(a, b - a);
                         resources::copy_to_guest(src, a);
                         crate::mem::reset_write_watch(a, b - a);
@@ -1278,7 +1297,7 @@ fn completion_thread() {
                     super::lazywb::after_write(addr, size, mirror);
                     continue;
                 }
-                let src = unsafe { std::slice::from_raw_parts(c.ring_ptr.add(off as usize), size as usize) };
+                let src = unsafe { std::slice::from_raw_parts(ring_ptr.add(off as usize), size as usize) };
                 if mirror {
                     crate::mem::forget_begin(addr, size);
                 }
@@ -1649,6 +1668,10 @@ pub(super) struct BatchCtx {
     last_elide: &'static str,
     /// The occlusion query active in the command buffer being recorded.
     occl_active: Option<u32>,
+    /// `CTX_BARRIERS` of this context while the other one is in use.
+    barrier_gen: u64,
+    /// The compute queues' context.
+    compute: bool,
 }
 
 /// The memory model: what the GPU sees of guest memory and how current it
@@ -1656,70 +1679,70 @@ pub(super) struct BatchCtx {
 /// pending GPU writes by page, zero-copy spans, the CPU-write epoch.
 pub struct MemModel {
     /// Imported guest memory spans for zero-copy bindings: (start, end, buffer, memory).
-    pub zc_spans: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory)>,
+    zc_spans: Vec<(u64, u64, vk::Buffer, vk::DeviceMemory)>,
     /// `mem::MAP_GEN` the spans were validated against.
-    pub zc_gen: u64,
+    zc_gen: u64,
     /// See `new_epoch`.
-    pub cpu_epoch: u64,
+    cpu_epoch: u64,
     /// TLG_PERF: recent `note_pending_gpu_write` calls (base, len, shader,
     /// batch).
-    pub pending_log: Vec<(u64, u64, u64, u64)>,
+    pending_log: Vec<(u64, u64, u64, u64)>,
     /// Page write tracking for CPU-sourced textures.
     pub writes: super::writes::WriteTracker,
     /// Guest pages (4 KiB) with GPU writes that have not completed yet:
     /// page -> sequence number of the batch writing it.
-    pub gpu_pending_pages: PageSeqs,
+    gpu_pending_pages: PageSeqs,
     /// Batch with a pending GPU write too large to track by page.
-    pub gpu_pending_all: u64,
+    gpu_pending_all: u64,
     /// VRAM copies of read-only vertex/index data (`vcache_bind`).
-    pub vcache: Option<VCache>,
+    vcache: Option<VCache>,
     /// Sparse mirror windows' block memory (their binds: `BatchCtx`).
-    pub sparse_pool: Option<BlockPool>,
+    sparse_pool: Option<BlockPool>,
     /// VRAM-mirror bindings served (`tune vbind_cache`): (base, size) ->
     /// (window, its generation then, the oldest CPU-check epoch of the
     /// blocks, buffer, offset); and the generation counter of the windows.
-    pub vbind: FastMap<(u64, u64), (u64, u64, u64, vk::Buffer, u64)>,
-    pub vgen: u64,
+    vbind: FastMap<(u64, u64), (u64, u64, u64, vk::Buffer, u64)>,
+    vgen: u64,
     /// Texture validation epoch: CPU-sourced textures are re-hashed at most
     /// once per epoch. It advances per title submission and whenever guest
     /// memory may have been modified by the GPU side (write-backs, DMA).
-    pub epoch: u64,
+    epoch: u64,
     /// Images that were given a metadata surface (CMASK/HTILE): the writes
     /// that may change one (every buffer a shader writes) look only at
     /// these, not at every image (that scan was ~4% of the GPU thread).
-    pub meta_images: Vec<ImageKey>,
+    meta_images: Vec<ImageKey>,
     /// The metadata surfaces of `meta_images` sorted by address ([start, end),
     /// image) with the largest one's size, valid while `meta_gen` is
     /// `meta_cache.0` (bumped when an image's metadata, the list or the set
     /// of images changes): GPU buffer writes look them up instead of
     /// visiting every image with metadata.
-    pub meta_gen: u64,
-    pub meta_cache: (u64, Vec<(u64, u64, ImageKey)>, u64),
+    meta_gen: u64,
+    meta_cache: (u64, Vec<(u64, u64, ImageKey)>, u64),
     /// All images by guest base (range queries) with an upper bound of each
     /// one's guest surface size, and the largest bound.
-    pub img_bases: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
-    pub img_max_bytes: u64,
+    img_bases: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
+    img_max_bytes: u64,
     /// The images of `img_bases` whose bound exceeds IMG_NEAR_BYTES (few):
     /// writes are checked against the others within that distance only.
-    pub img_bases_large: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
+    img_bases_large: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
     /// Images that may hold contents newer than guest memory (`guest_stale`;
     /// a superset, entries are dropped lazily) by guest base, for range
     /// lookups in `writeback_images`; largest surface among them; frame of
     /// the last aging pass.
-    pub stale: std::collections::BTreeMap<u64, Vec<ImageKey>>,
-    pub stale_max: u64,
-    pub stale_aged: u64,
+    stale: std::collections::BTreeMap<u64, Vec<ImageKey>>,
+    stale_max: u64,
+    stale_aged: u64,
     /// Guest ranges the images of `stale` may cover (twice their layout's
     /// size; unbounded while it is unknown), rebuilt with each aging: lets
     /// `writeback_images` return at once for memory no stale image overlaps.
-    pub stale_ivals: Vec<(u64, u64)>,
+    stale_ivals: Vec<(u64, u64)>,
     /// `stale_ivals` sorted (false after additions), with the longest bounded
     /// interval and the lowest start of the unbounded ones (u64::MAX: none):
     /// `writeback_images` searches them instead of scanning (it runs for
     /// every read buffer binding).
-    pub stale_sorted: bool,
-    pub stale_span_max: u64,
-    pub stale_unbounded_lo: u64,
+    stale_sorted: bool,
+    stale_span_max: u64,
+    stale_unbounded_lo: u64,
 }
 
 pub struct Renderer {
@@ -1903,8 +1926,12 @@ pub struct Renderer {
     /// The memory model: VRAM mirror windows, their binding cache, the
     /// write tracker, pending GPU writes, zero-copy spans (`MemModel`).
     pub mem: MemModel,
-    /// The recording context (`BatchCtx`).
-    cx: BatchCtx,
+    /// The recording context in use (`BatchCtx`): the graphics queue's, or
+    /// while a compute CP records, the compute queues' (`select_ctx`).
+    cx: Box<BatchCtx>,
+    /// The other context, and whether `cx` is the compute queues'.
+    cx_park: Box<BatchCtx>,
+    cx_cs: bool,
 }
 
 unsafe impl Send for Renderer {}
@@ -1931,8 +1958,9 @@ struct PendingWrite {
 
 pub static RENDERER: Mutex<Option<Renderer>> = Mutex::new(None);
 
-pub fn init() -> Result<(), String> {
-    let c = ctx();
+/// A recording context: its command pool, the batch slots (command buffers,
+/// fences, descriptor pools, queries) and rings of the given sizes.
+fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, bar_bytes: u64, compute: bool) -> Result<BatchCtx, String> {
     unsafe {
         let pool = c
             .device
@@ -1962,14 +1990,14 @@ pub fn init() -> Result<(), String> {
                 seq: 0,
             });
         }
-        let mut ring = Ring::new(c, resources::RING_SIZE)?;
+        let mut ring = Ring::new(c, ring_bytes)?;
         ring.set_segment(0, SLOTS);
-        let mut dring = Ring::new_device(c, resources::DEV_RING_SIZE)?;
+        let mut dring = Ring::new_device(c, dring_bytes)?;
         dring.set_segment(0, SLOTS);
-        let bar = match Ring::new_bar(c, resources::BAR_RING_SIZE) {
+        let bar = match Ring::new_bar(c, bar_bytes) {
             Ok(mut b) => {
                 b.set_segment(0, SLOTS);
-                crate::info!("BAR ring: {} MiB of device-local host-visible memory for per-draw SGPR data", resources::BAR_RING_SIZE >> 20);
+                crate::info!("BAR ring: {} MiB of device-local host-visible memory for per-draw SGPR data", bar_bytes >> 20);
                 Some(b)
             }
             Err(e) => {
@@ -1977,6 +2005,80 @@ pub fn init() -> Result<(), String> {
                 None
             }
         };
+        Ok(BatchCtx {
+                pool,
+                cmd: slots[0].cmd,
+                desc_pool: slots[0].desc_pool,
+                slots,
+                cur: 0,
+                recording: false,
+                ring,
+                batch: 0,
+                rendering: None,
+                attach_marked: false,
+                barrier_needed: false,
+                unordered_gen: u64::MAX,
+                hz: smallvec::SmallVec::new(),
+                hz_gen: u64::MAX,
+                hz_unknown: false,
+                cur_access: smallvec::SmallVec::new(),
+                cur_unknown: true,
+                bits_arena: (u64::MAX, 0, 0, 0),
+                unordered_line: 0,
+                dyn_state: None,
+                bound_gfx: vk::Pipeline::null(),
+                bound_cs: vk::Pipeline::null(),
+                dring,
+                bar,
+                writebacks: Vec::new(),
+                zc_writes: Vec::new(),
+                batch_mirror_used: Ranges::new(),
+                zc_reads: Ranges::default(),
+                gpu_wb: Vec::new(),
+                dirty_sink: (u64::MAX, 0),
+                vc_why: "other",
+                work_seq: 0,
+                target_cache: None,
+                hz_bufs: smallvec::SmallVec::new(),
+                hz_seen: FastSet::default(),
+                required_epoch: 0,
+                cur_shader: 0,
+                prep_shader: 0,
+                prep_vs: 0,
+                batch_cmds: 0,
+                desc_retry: false,
+                marks: Vec::new(),
+                pending_noted: (0, FastSet::default()),
+                upload_forwarded: false,
+                fwd_pending: Vec::new(),
+                upload_reuse: FastMap::default(),
+                upload_reuse_epoch: 0,
+                upload_seen: FastMap::default(),
+                cmd_queue: 0,
+                batch_copies: 0,
+                sparse_binds: Vec::new(),
+                bind_sem: if c.sparse { c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| format!("semaphore: {e}"))? } else { vk::Semaphore::null() },
+                draw_targets: smallvec::SmallVec::new(),
+                indirect_draw: None,
+                vs_sgpr: None,
+                vgen_keep: vk::Buffer::null(),
+                pro_recording: false,
+                upload_devcopy: false,
+                pre_cs: None,
+                pre_draw: None,
+                last_elide: "",
+                occl_active: None,
+                barrier_gen: 0,
+                compute,
+            })
+    }
+}
+
+pub fn init() -> Result<(), String> {
+    let c = ctx();
+    unsafe {
+        let cx = new_batch_ctx(c, resources::RING_SIZE, resources::DEV_RING_SIZE, resources::BAR_RING_SIZE, false)?;
+        let slots = &cx.slots;
         let (gds, _gds_mem) = c.device_buffer(
             gcn::translate::GDS_BYTES as u64,
             vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST,
@@ -1992,6 +2094,14 @@ pub fn init() -> Result<(), String> {
             c.device.reset_fences(&[slots[0].fence]).map_err(|e| e.to_string())?;
             c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).map_err(|e| e.to_string())?;
         }
+        // The compute queues' context: rings as large as the graphics queue's
+        // when it is used (`tune cs_ctx` at start; smaller ones overflow every
+        // few dispatches), else small ones (nothing records into it).
+        let cx_park = if crate::tune::get(crate::tune::CS_CTX) != 0 {
+            new_batch_ctx(c, resources::RING_SIZE, resources::DEV_RING_SIZE, resources::BAR_RING_SIZE, true)?
+        } else {
+            new_batch_ctx(c, resources::CS_RING_SIZE, resources::CS_DEV_RING_SIZE, resources::CS_BAR_RING_SIZE, true)?
+        };
         let occl_pool = c
             .device
             .create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::OCCLUSION).query_count(OCCL_QUERIES), None)
@@ -2114,70 +2224,9 @@ pub fn init() -> Result<(), String> {
                 stale_span_max: 0,
                 stale_unbounded_lo: u64::MAX,
             },
-            cx: BatchCtx {
-                pool,
-                cmd: slots[0].cmd,
-                desc_pool: slots[0].desc_pool,
-                slots,
-                cur: 0,
-                recording: false,
-                ring,
-                batch: 0,
-                rendering: None,
-                attach_marked: false,
-                barrier_needed: false,
-                unordered_gen: u64::MAX,
-                hz: smallvec::SmallVec::new(),
-                hz_gen: u64::MAX,
-                hz_unknown: false,
-                cur_access: smallvec::SmallVec::new(),
-                cur_unknown: true,
-                bits_arena: (u64::MAX, 0, 0, 0),
-                unordered_line: 0,
-                dyn_state: None,
-                bound_gfx: vk::Pipeline::null(),
-                bound_cs: vk::Pipeline::null(),
-                dring,
-                bar,
-                writebacks: Vec::new(),
-                zc_writes: Vec::new(),
-                batch_mirror_used: Ranges::new(),
-                zc_reads: Ranges::default(),
-                gpu_wb: Vec::new(),
-                dirty_sink: (u64::MAX, 0),
-                vc_why: "other",
-                work_seq: 0,
-                target_cache: None,
-                hz_bufs: smallvec::SmallVec::new(),
-                hz_seen: FastSet::default(),
-                required_epoch: 0,
-                cur_shader: 0,
-                prep_shader: 0,
-                prep_vs: 0,
-                batch_cmds: 0,
-                desc_retry: false,
-                marks: Vec::new(),
-                pending_noted: (0, FastSet::default()),
-                upload_forwarded: false,
-                fwd_pending: Vec::new(),
-                upload_reuse: FastMap::default(),
-                upload_reuse_epoch: 0,
-                upload_seen: FastMap::default(),
-                cmd_queue: 0,
-                batch_copies: 0,
-                sparse_binds: Vec::new(),
-                bind_sem: if c.sparse { c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| format!("semaphore: {e}"))? } else { vk::Semaphore::null() },
-                draw_targets: smallvec::SmallVec::new(),
-                indirect_draw: None,
-                vs_sgpr: None,
-                vgen_keep: vk::Buffer::null(),
-                pro_recording: false,
-                upload_devcopy: false,
-                pre_cs: None,
-                pre_draw: None,
-                last_elide: "",
-                occl_active: None,
-            },
+            cx: Box::new(cx),
+            cx_park: Box::new(cx_park),
+            cx_cs: false,
         });
     }
     crate::info!("renderer initialized (ring {} MiB)", resources::RING_SIZE >> 20);
@@ -2475,6 +2524,12 @@ const BITS_ARENA_BYTES: u64 = 64 << 10;
 
 /// Full barriers and render-pass begins recorded (TLG_PERF).
 pub static BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Submissions made because a CP started recording in the other context
+/// (`enter_ctx`; TLG_PERF).
+pub static CTX_SUBMITS: [std::sync::atomic::AtomicU64; 32] = [const { std::sync::atomic::AtomicU64::new(0) }; 32];
+/// Full barriers recorded into the context in use (`select_ctx` saves and
+/// restores it per context): the hazard tracking's generation.
+static CTX_BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static PASS_BEGINS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A full barrier in a batch prologue: orders the prologue against earlier
@@ -2492,6 +2547,7 @@ pub static PRO_BARRIERS: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 #[track_caller]
 fn global_barrier(cmd: vk::CommandBuffer) {
     BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    CTX_BARRIERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some()) {
         let line = std::panic::Location::caller().line();
@@ -2610,7 +2666,7 @@ impl Renderer {
             None => (u64::MAX, 0, 0, 0),
         };
         let exec = self.cx.slots[self.cx.cur].exec;
-        if exec != vk::QueryPool::null() {
+        if exec != vk::QueryPool::null() && !self.cx.compute {
             unsafe {
                 REC.cmd_reset_query_pool(self.cx.cmd, exec, 0, 2);
                 REC.cmd_write_timestamp(self.cx.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, exec, 0);
@@ -2632,7 +2688,7 @@ impl Renderer {
         }
         // (Queries cannot span command buffers: an open window continues
         // with a new query.)
-        if self.occl_windows > 0 {
+        if self.occl_windows > 0 && !self.cx.compute {
             self.occl_begin_query();
         }
     }
@@ -2806,7 +2862,22 @@ impl Renderer {
     /// performed after it and everything before it has completed. Returns the
     /// batch's sequence number.
     #[track_caller]
-    pub fn submit_batch(&mut self, actions: Vec<super::cp::EopAction>) -> u64 {
+    /// Makes the compute queues' context (`compute`) or the graphics queue's
+    /// the one in use.
+    fn select_ctx(&mut self, compute: bool) {
+        if self.cx_cs == compute {
+            return;
+        }
+        use std::sync::atomic::Ordering::Relaxed;
+        self.cx.barrier_gen = CTX_BARRIERS.load(Relaxed);
+        std::mem::swap(&mut self.cx, &mut self.cx_park);
+        CTX_BARRIERS.store(self.cx.barrier_gen, Relaxed);
+        self.cx_cs = compute;
+    }
+
+    /// Closes the open batch of the context in use for a submission:
+    /// its write-back copies recorded, its command buffers ended.
+    fn close_ctx(&mut self) -> Closed {
         // (Forwards still queued belong to a command that was abandoned:
         // their ring ranges are used by nothing.)
         self.cx.fwd_pending.clear();
@@ -2829,7 +2900,7 @@ impl Renderer {
         // (In-flight forwards see the whole written ranges, lazy ones too.)
         let dev_writes: Vec<(u64, vk::Buffer, u64, u64)> = pending.iter().map(|p| (p.base, p.dev_buf, p.dev_off, p.size)).collect();
         // (Numbers of the skips, for `lazywb::submitted`.)
-        let mut lazy = Vec::new();
+        let mut lazy = None;
         if self.cx.recording && super::lazywb::enabled() {
             // Lazy ranges: only the partial pages at their ends are copied out.
             let mut kept = Vec::with_capacity(pending.len());
@@ -2837,7 +2908,7 @@ impl Renderer {
                 let inner = super::lazywb::inner_pages(p.base, p.size).filter(|_| p.mirror);
                 match inner.and_then(|(lo, hi)| super::lazywb::skip_writeback(lo, hi, p.dev_buf, p.dev_off + (lo - p.base)).map(|t| (lo, hi, t))) {
                     Some((lo, hi, t)) => {
-                        lazy.push(t);
+                        lazy = Some(t);
                         if lo > p.base {
                             kept.push(PendingWrite { base: p.base, size: lo - p.base, host_off: p.host_off, dev_off: p.dev_off, dev_buf: p.dev_buf, mirror: true, bits: None });
                         }
@@ -2883,10 +2954,6 @@ impl Renderer {
                 *m.entry((p.base, p.size, p.mirror)).or_default() += 1;
             }
         }
-        let writebacks: Vec<(u64, u64, u64)> = pending.iter().map(|p| (p.base, p.host_off, p.size)).collect();
-        let wb_bits: Vec<Option<(u64, u32)>> = pending.iter().map(|p| p.bits.map(|(_, host, words)| (host, words))).collect();
-        let mirror_writes: Vec<(u64, u64)> = pending.iter().filter(|p| p.mirror && p.bits.is_none()).map(|p| (p.base, p.size)).collect();
-        let wb_mirror: Vec<bool> = pending.iter().map(|p| p.mirror).collect();
         let zc_writes = std::mem::take(&mut self.cx.zc_writes);
         if self.cx.recording && !zc_writes.is_empty() {
             // Shader writes to imported guest memory: visible to the host after the fence.
@@ -2894,83 +2961,47 @@ impl Renderer {
             let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             unsafe { REC.cmd_pipeline_barrier(self.cx.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
         }
-        let early = crate::tune::get(crate::tune::EARLY_EOP) != 0 && actions.iter().any(|a| a.interrupt && a.gfx);
-        if !self.cx.recording {
-            if actions.is_empty() && writebacks.is_empty() {
-                return self.last_seq;
+        let mut cmds = smallvec::SmallVec::new();
+        let recording = self.cx.recording;
+        if recording {
+            self.end_rendering();
+            self.occl_end_query();
+            let slot = &self.cx.slots[self.cx.cur];
+            unsafe {
+                if slot.exec != vk::QueryPool::null() && !self.cx.compute {
+                    REC.cmd_write_timestamp(slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.exec, 1);
+                }
+                REC.end_command_buffer(slot.cmd).ok();
+                if self.cx.pro_recording {
+                    prologue_barrier(slot.pro);
+                    REC.end_command_buffer(slot.pro).ok();
+                    cmds.push(slot.pro);
+                }
             }
-            // Ordering-only completion (nothing new to wait for on the GPU).
-            self.last_seq += 1;
-            push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: self.cx.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads: Ranges::default(), wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
-            // (In COMPLETIONS now: the view may forget them.)
-            CP_VIEW.lock().pending = Ranges::new();
-            if early {
-                EARLY_SEQ.store(self.last_seq, std::sync::atomic::Ordering::SeqCst);
-                try_early_eop();
-            }
-            return self.last_seq;
-        }
-        self.end_rendering();
-        self.occl_end_query();
-        let c = ctx();
-        // Memory for sparse mirror blocks this batch uses: bound first.
-        let mut waits = smallvec::SmallVec::<[(vk::Semaphore, vk::PipelineStageFlags); 1]>::new();
-        if !self.cx.sparse_binds.is_empty() {
-            let binds = std::mem::take(&mut self.cx.sparse_binds);
-            match REC.bind_sparse(binds, self.cx.bind_sem) {
-                Ok(()) => waits.push((self.cx.bind_sem, vk::PipelineStageFlags::ALL_COMMANDS)),
-                Err(e) => crate::error!("render: {e}"),
-            }
-        }
-        let slot = &mut self.cx.slots[self.cx.cur];
-        unsafe {
-            if slot.exec != vk::QueryPool::null() {
-                REC.cmd_write_timestamp(slot.cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, slot.exec, 1);
-            }
-            REC.end_command_buffer(slot.cmd).ok();
-            let seq = self.last_seq + 1;
-            let r = if self.cx.pro_recording {
-                prologue_barrier(slot.pro);
-                REC.end_command_buffer(slot.pro).ok();
-                REC.submit(&[slot.pro, slot.cmd], &waits, slot.fence, lazy.last().copied(), seq, self.cx.batch_copies)
-            } else {
-                REC.submit(&[slot.cmd], &waits, slot.fence, lazy.last().copied(), seq, self.cx.batch_copies)
-            };
+            cmds.push(slot.cmd);
             self.cx.pro_recording = false;
-            if let Err(e) = r {
-                crate::error!("render submit: {e}");
-                if e.contains("lost") {
-                    super::vk::report_device_lost();
-                }
-            }
         }
-        self.last_seq += 1;
-        slot.seq = self.last_seq;
-        let tail = TAIL_PROFILE.swap(false, std::sync::atomic::Ordering::Relaxed);
-        let profile = (slot.queries != vk::QueryPool::null() && self.cx.marks.len() > 1).then(|| {
-            let mut m = std::mem::take(&mut self.cx.marks);
-            if tail {
-                for l in &mut m {
-                    l.insert_str(0, "tail: ");
-                }
-            }
-            (slot.queries, m)
-        });
-        let zc_reads = std::mem::take(&mut self.cx.zc_reads);
-        push_completion(Completion { seq: self.last_seq, fence: slot.fence, exec: slot.exec, ring_ptr: self.cx.ring.ptr, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
-        // (In COMPLETIONS now: the view may forget them.)
-        {
-            let mut v = CP_VIEW.lock();
-            v.pending = Ranges::new();
-            v.reads = Ranges::new();
+        Closed {
+            recording,
+            cmds,
+            pending,
+            dev_writes,
+            zc_writes,
+            zc_reads: std::mem::take(&mut self.cx.zc_reads),
+            lazy,
+            batch_copies: self.cx.batch_copies,
+            sparse_binds: std::mem::take(&mut self.cx.sparse_binds),
+            ring_ptr: self.cx.ring.ptr,
         }
-        if early {
-            EARLY_SEQ.store(self.last_seq, std::sync::atomic::Ordering::SeqCst);
-            try_early_eop();
-        }
+    }
+
+    /// Moves the context in use to its next slot once that slot's previous
+    /// batch has completed (after a submission that used its current slot).
+    fn rotate_ctx(&mut self, seq: u64) {
+        let c = ctx();
+        self.cx.slots[self.cx.cur].seq = seq;
         self.cx.recording = false;
         self.cx.batch += 1;
-        // Move to the next slot once its previous batch has completed.
         self.cx.cur = (self.cx.cur + 1) % SLOTS;
         let next = &self.cx.slots[self.cx.cur];
         if next.seq != 0 {
@@ -2996,7 +3027,128 @@ impl Renderer {
         if let Some(b) = self.cx.bar.as_mut() {
             b.set_segment(self.cx.cur, SLOTS);
         }
-        self.last_seq
+    }
+
+    /// Submits the open batches of both recording contexts as one batch,
+    /// the graphics queue's work first (the compute queues' work in it
+    /// follows a graphics label: after that queue's work is in order; a
+    /// graphics wait met by compute work not yet submitted commits first).
+    /// Returns its sequence number.
+    /// The context CP queue `q` records into: the compute queues' for the
+    /// per-frame compute queues (`tune cs_ctx`), else the graphics queue's.
+    /// One context records at a time: the other's open batch is submitted
+    /// first, so neither ever sees the other's unsubmitted work.
+    fn enter_ctx(&mut self, q: usize) {
+        let on = crate::tune::get(crate::tune::CS_CTX) != 0;
+        // (The device compute queue 13 joins the compute context while it
+        // records: its hand-offs would otherwise split both contexts' batches.)
+        let cs_open = if self.cx_cs { self.cx.recording } else { self.cx_park.recording };
+        let compute = on && ((17..=19).contains(&q) || (q == 13 && cs_open));
+        let other = if self.cx_cs == compute { &self.cx_park } else { &self.cx };
+        if other.recording {
+            CTX_SUBMITS[q.min(31)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.submit_batch(Vec::new());
+        }
+        self.select_ctx(compute);
+    }
+
+    pub fn submit_batch(&mut self, actions: Vec<super::cp::EopAction>) -> u64 {
+        let was_cs = self.cx_cs;
+        self.select_ctx(true);
+        let cs = self.close_ctx();
+        self.select_ctx(false);
+        let g = self.close_ctx();
+        let parts = [&g, &cs];
+        let mut writebacks: Vec<(u64, u64, u64)> = Vec::new();
+        let mut wb_bits: Vec<Option<(u64, u32)>> = Vec::new();
+        let mut mirror_writes: Vec<(u64, u64)> = Vec::new();
+        let mut wb_mirror: Vec<bool> = Vec::new();
+        let mut wb_cs: Vec<bool> = Vec::new();
+        for (k, part) in parts.iter().enumerate() {
+            writebacks.extend(part.pending.iter().map(|p| (p.base, p.host_off, p.size)));
+            wb_bits.extend(part.pending.iter().map(|p| p.bits.map(|(_, host, words)| (host, words))));
+            mirror_writes.extend(part.pending.iter().filter(|p| p.mirror && p.bits.is_none()).map(|p| (p.base, p.size)));
+            wb_mirror.extend(part.pending.iter().map(|p| p.mirror));
+            wb_cs.extend(part.pending.iter().map(|_| k == 1));
+        }
+        let dev_writes: Vec<(u64, vk::Buffer, u64, u64)> = g.dev_writes.iter().chain(cs.dev_writes.iter()).copied().collect();
+        let zc_writes: Vec<(u64, u64)> = g.zc_writes.iter().chain(cs.zc_writes.iter()).copied().collect();
+        let mut zc_reads = g.zc_reads;
+        for (lo, hi) in cs.zc_reads.0.iter().map(|(&lo, &hi)| (lo, hi)) {
+            zc_reads.insert(lo, hi);
+        }
+        let lazy = g.lazy.max(cs.lazy);
+        let early = crate::tune::get(crate::tune::EARLY_EOP) != 0 && actions.iter().any(|a| a.interrupt && a.gfx);
+        let rings = [g.ring_ptr, cs.ring_ptr];
+        if !g.recording && !cs.recording {
+            self.select_ctx(was_cs);
+            if actions.is_empty() && writebacks.is_empty() {
+                return self.last_seq;
+            }
+            // Ordering-only completion (nothing new to wait for on the GPU).
+            self.last_seq += 1;
+            push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: rings[0], ring_ptr_cs: rings[1], wb_cs, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
+            // (In COMPLETIONS now: the view may forget them.)
+            CP_VIEW.lock().pending = Ranges::new();
+            if early {
+                EARLY_SEQ.store(self.last_seq, std::sync::atomic::Ordering::SeqCst);
+                try_early_eop();
+            }
+            return self.last_seq;
+        }
+        // Memory for sparse mirror blocks this batch uses: bound first.
+        let mut waits = smallvec::SmallVec::<[(vk::Semaphore, vk::PipelineStageFlags); 1]>::new();
+        let binds: Vec<(vk::Buffer, Vec<vk::SparseMemoryBind>)> = g.sparse_binds.into_iter().chain(cs.sparse_binds).collect();
+        if !binds.is_empty() {
+            match REC.bind_sparse(binds, self.cx.bind_sem) {
+                Ok(()) => waits.push((self.cx.bind_sem, vk::PipelineStageFlags::ALL_COMMANDS)),
+                Err(e) => crate::error!("render: {e}"),
+            }
+        }
+        // (The graphics context's slot fence signals both: its slot moves on
+        // even when only the compute queues recorded.)
+        let cmds: smallvec::SmallVec<[vk::CommandBuffer; 4]> = g.cmds.iter().chain(cs.cmds.iter()).copied().collect();
+        let (fence, exec, queries) = {
+            let slot = &self.cx.slots[self.cx.cur];
+            (slot.fence, if g.recording { slot.exec } else { vk::QueryPool::null() }, slot.queries)
+        };
+        let seq = self.last_seq + 1;
+        let r = REC.submit(&cmds, &waits, fence, lazy, seq, g.batch_copies.max(cs.batch_copies));
+        if let Err(e) = r {
+            crate::error!("render submit: {e}");
+            if e.contains("lost") {
+                super::vk::report_device_lost();
+            }
+        }
+        self.last_seq = seq;
+        let tail = TAIL_PROFILE.swap(false, std::sync::atomic::Ordering::Relaxed);
+        let profile = (g.recording && queries != vk::QueryPool::null() && self.cx.marks.len() > 1).then(|| {
+            let mut m = std::mem::take(&mut self.cx.marks);
+            if tail {
+                for l in &mut m {
+                    l.insert_str(0, "tail: ");
+                }
+            }
+            (queries, m)
+        });
+        push_completion(Completion { seq, fence, exec, ring_ptr: rings[0], ring_ptr_cs: rings[1], wb_cs, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile, cpu_span: None });
+        // (In COMPLETIONS now: the view may forget them.)
+        {
+            let mut v = CP_VIEW.lock();
+            v.pending = Ranges::new();
+            v.reads = Ranges::new();
+        }
+        if early {
+            EARLY_SEQ.store(seq, std::sync::atomic::Ordering::SeqCst);
+            try_early_eop();
+        }
+        self.rotate_ctx(seq);
+        if cs.recording {
+            self.select_ctx(true);
+            self.rotate_ctx(seq);
+        }
+        self.select_ctx(was_cs);
+        seq
     }
 
     fn module(&mut self, key: u64, spirv: &[u32]) -> Result<vk::ShaderModule, String> {
@@ -5455,8 +5607,15 @@ impl Renderer {
         }
     }
 
+    /// Whether either context's open batch writes [base, base+size).
     fn pending_write_overlaps(&self, base: u64, size: u64) -> bool {
-        self.cx.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size) || self.zc_overlaps(base, size)
+        let over = |cx: &BatchCtx| cx.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size) || cx.zc_writes.iter().any(|&(w, n)| w < base + size && base < w + n);
+        over(&self.cx) || over(&self.cx_park)
+    }
+
+    /// Whether either context's open batch reads [lo, hi) in place.
+    fn zc_reads_overlap(&self, lo: u64, hi: u64) -> bool {
+        self.cx.zc_reads.overlaps(lo, hi) || self.cx_park.zc_reads.overlaps(lo, hi)
     }
 
     /// Whether zero-copy writes recorded in this batch overlap [base, base+size).
@@ -8097,7 +8256,7 @@ impl Renderer {
         // dispatches since the last barrier whose buffer accesses conflict
         // with this one's (a write on either side of an overlap).
         let hazards = crate::tune::get(crate::tune::DISPATCH_HAZARDS) != 0;
-        let bgen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+        let bgen = CTX_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
         if self.cx.hz_gen != bgen {
             self.cx.hz.clear();
             self.cx.hz_seen.clear();
@@ -8154,7 +8313,7 @@ impl Renderer {
             self.cx.hz_seen.clear();
             self.cx.hz_bufs.clear();
             self.cx.hz_unknown = false;
-            self.cx.hz_gen = BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
+            self.cx.hz_gen = CTX_BARRIERS.load(std::sync::atomic::Ordering::Relaxed);
             self.hz_stats.0 += 1;
         } else if self.cx.barrier_needed {
             self.hz_stats.1 += 1;
@@ -10256,9 +10415,12 @@ impl TimedRenderer {
                 std::thread::yield_now();
             }
         }
-        let g = RENDERER.lock();
+        let mut g = RENDERER.lock();
         if q == 0 {
             GFX_LOCK_WAITING.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(r) = g.as_mut() {
+            r.enter_ctx(q);
         }
         let since = t0.map(|t0| {
             let now = std::time::Instant::now();
@@ -10275,7 +10437,11 @@ impl Drop for TimedRenderer {
             QUEUE_LOCK_HOLD_NS[self.q & 63].fetch_add(since.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
         }
         // SAFETY: `g` is not used after this.
-        let g = unsafe { std::mem::ManuallyDrop::take(&mut self.g) };
+        let mut g = unsafe { std::mem::ManuallyDrop::take(&mut self.g) };
+        // (Other users of the lock find the graphics queue's context in use.)
+        if let Some(r) = g.as_mut() {
+            r.select_ctx(false);
+        }
         // (`tune lock_fair`: 1, the graphics CP lets a waiting compute CP in;
         // 2-3, the compute CPs let a waiting graphics CP in.)
         let fair = crate::tune::get(crate::tune::LOCK_FAIR);
@@ -10421,7 +10587,7 @@ impl Hooks for VkHooks {
         done
     }
     fn gds(&mut self, cp: &CommandProcessor, op: super::cp::GdsOp) {
-        let mut g = RENDERER.lock();
+        let mut g = TimedRenderer::lock(cp.queue);
         let Some(r) = g.as_mut() else { return self.fallback.gds(cp, op) };
         if let Err(e) = r.gds_op(op) {
             r.report(format!("GDS transfer skipped: {e}"));
@@ -10446,11 +10612,11 @@ impl Hooks for VkHooks {
         }
         wait_overlapping(addr, len);
     }
-    fn dma_on_gpu(&mut self, _cp: &CommandProcessor, src: u64, dst: u64, bytes: u64) -> bool {
-        RENDERER.lock().as_mut().is_some_and(|r| r.dma_on_gpu(src, dst, bytes))
+    fn dma_on_gpu(&mut self, cp: &CommandProcessor, src: u64, dst: u64, bytes: u64) -> bool {
+        TimedRenderer::lock(cp.queue).as_mut().is_some_and(|r| r.dma_on_gpu(src, dst, bytes))
     }
-    fn gds_load_on_gpu(&mut self, _cp: &CommandProcessor, offset: u32, src: u64, bytes: u32) -> bool {
-        RENDERER.lock().as_mut().is_some_and(|r| r.gds_load_on_gpu(offset, src, bytes))
+    fn gds_load_on_gpu(&mut self, cp: &CommandProcessor, offset: u32, src: u64, bytes: u32) -> bool {
+        TimedRenderer::lock(cp.queue).as_mut().is_some_and(|r| r.gds_load_on_gpu(offset, src, bytes))
     }
     fn sync_write(&mut self, _cp: &CommandProcessor, addr: u64, len: u64) {
         // (Queued ring copies of this memory read it first.)
@@ -10470,7 +10636,7 @@ impl Hooks for VkHooks {
         };
         if read {
             if let Some(r) = RENDERER.lock().as_mut() {
-                if r.cx.zc_reads.overlaps(addr, end) {
+                if r.zc_reads_overlap(addr, end) {
                     r.flushes[1] += 1;
                     r.submit_batch(Vec::new());
                 }
@@ -10488,8 +10654,8 @@ impl Hooks for VkHooks {
     fn occlusion_dump(&mut self, _cp: &CommandProcessor, begin: bool) -> Option<Vec<u32>> {
         RENDERER.lock().as_mut().map(|r| r.occlusion_dump(begin))
     }
-    fn order_barrier(&mut self, _cp: &CommandProcessor) {
-        if let Some(r) = RENDERER.lock().as_mut() {
+    fn order_barrier(&mut self, cp: &CommandProcessor) {
+        if let Some(r) = TimedRenderer::lock(cp.queue).as_mut() {
             r.order_barrier();
         }
     }
@@ -10497,7 +10663,7 @@ impl Hooks for VkHooks {
         let end = addr + len.max(1);
         let g = RENDERER.lock();
         let Some(r) = g.as_ref() else { return false };
-        if r.pending_write_overlaps(addr, len) || r.cx.zc_reads.overlaps(addr, end) {
+        if r.pending_write_overlaps(addr, len) || r.zc_reads_overlap(addr, end) {
             return false;
         }
         drop(g);

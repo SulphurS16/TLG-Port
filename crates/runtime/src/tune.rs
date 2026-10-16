@@ -542,7 +542,16 @@ pub const ATTACH_ONCE: usize = 91;
 /// results still in flight are not protected from the title meanwhile.
 pub const EARLY_EOP: usize = 92;
 
-const TABLE: [(&str, &str, i64); 93] = [
+/// The per-frame compute queues (17-19) record into their own context
+/// (`TLG_CS_CTX`, 0; set at start for its full-size rings): its own command
+/// buffers and rings, submitted with the graphics queue's batch after its
+/// work (merged submissions); one context records at a time - starting one
+/// submits the other's open batch; queue 13 joins it while it records.
+/// Neutral under the one renderer lock (run 20261016-000756: 10.0 vs 10.2
+/// fps); the base for recording the compute queues without that lock.
+pub const CS_CTX: usize = 93;
+
+const TABLE: [(&str, &str, i64); 94] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -636,6 +645,7 @@ const TABLE: [(&str, &str, i64); 93] = [
     ("frame_cap", "TLG_FRAME_CAP", -1),
     ("attach_once", "TLG_ATTACH_ONCE", 1),
     ("early_eop", "TLG_EARLY_EOP", 0),
+    ("cs_ctx", "TLG_CS_CTX", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

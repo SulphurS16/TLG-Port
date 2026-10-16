@@ -18,6 +18,12 @@ pub const DEV_RING_SIZE: u64 = 512 << 20;
 /// Per-draw SGPR data in device-local host-visible memory (the BAR window
 /// is ~256 MiB without resizable BAR).
 pub const BAR_RING_SIZE: u64 = 48 << 20;
+/// The compute queues' recording context while it is not used (`tune
+/// cs_ctx` off at start; used, it gets the graphics queue's sizes): host
+/// ring, device ring, BAR ring.
+pub const CS_RING_SIZE: u64 = 12 << 20;
+pub const CS_DEV_RING_SIZE: u64 = 12 << 20;
+pub const CS_BAR_RING_SIZE: u64 = 6 << 20;
 
 pub struct Ring {
     pub buffer: vk::Buffer,
