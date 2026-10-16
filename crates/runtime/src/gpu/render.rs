@@ -811,6 +811,16 @@ impl PageSeqs {
         self.0.insert(lo, (hi, seq));
     }
 
+    /// Entries of batch `from` overlapping pages [lo, hi) become batch `to`.
+    fn renumber(&mut self, lo: u64, hi: u64, from: u64, to: u64) {
+        let start = self.0.range(..=lo).next_back().filter(|&(_, &(e, _))| e > lo).map_or(lo, |(&s, _)| s);
+        for (_, v) in self.0.range_mut(start..hi) {
+            if v.1 == from {
+                v.1 = to;
+            }
+        }
+    }
+
     /// The batch of the newest pending write to `page`, if any.
     fn get(&self, page: u64) -> Option<u64> {
         self.0.range(..=page).next_back().filter(|&(_, &(e, _))| e > page).map(|(_, &(_, q))| q)
@@ -1620,10 +1630,10 @@ pub(super) struct BatchCtx {
     desc_retry: bool,
     /// Labels of the timestamps written in the current batch (TLG_GPU_PROFILE).
     marks: Vec<String>,
-    /// Ranges whose pages `gpu_pending_pages` already maps to batch
-    /// `pending_noted.0` (a buffer written by many commands of a batch is
-    /// entered once: 1,500 map inserts per binding of a 6 MiB buffer).
-    pending_noted: (u64, FastSet<(u64, u64)>),
+    /// Ranges whose pages `gpu_pending_pages` already maps to this batch (a
+    /// buffer written by many commands of a batch is entered once: 1,500 map
+    /// inserts per binding of a 6 MiB buffer); numbered at its submission.
+    pending_noted: FastSet<(u64, u64)>,
     /// The last `upload_guest` queued GPU copies into its ring range, and
     /// the copies not yet recorded (`flush_forwards`).
     upload_forwarded: bool,
@@ -1778,8 +1788,10 @@ struct ImgState {
 }
 
 pub struct Renderer {
-    /// Sequence number of the last submitted batch.
+    /// Sequence number of this renderer's last submitted batch.
     pub last_seq: u64,
+    /// This renderer's open-batch marker (`OPEN_SEQ`).
+    open_seq: u64,
     samplers: Samplers,
     modules: FastMap<u64, vk::ShaderModule>,
     gfx_pipes: FastMap<GfxKey, Pipe>,
@@ -2038,6 +2050,19 @@ macro_rules! mem {
     };
 }
 
+/// The last batch sequence number assigned (all renderers). Held for a
+/// batch's whole submission - closing its contexts (lazy write-back skips),
+/// the recorder's submit, its completion entry, `seal_open` - so batches
+/// reach the queue, COMPLETIONS and `lazywb::submitted` in sequence order.
+/// Lock order: a renderer, its image state and memory model, then this.
+static SUBMIT_SEQ: parking_lot::Mutex<u64> = parking_lot::Mutex::new(0);
+
+/// Open-batch markers (`Renderer::open_seq`): sequence-numbered state of a
+/// renderer's open batch carries `OPEN_SEQ - <renderer>` until its
+/// submission assigns the number; any value from `OPEN_MIN` up is one.
+const OPEN_SEQ: u64 = u64::MAX - 1;
+const OPEN_MIN: u64 = OPEN_SEQ - 7;
+
 /// The image state, shared by the renderers (`Renderer::img_g`).
 static IMG_CELL: std::sync::OnceLock<parking_lot::Mutex<ImgState>> = std::sync::OnceLock::new();
 
@@ -2157,7 +2182,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 batch_cmds: 0,
                 desc_retry: false,
                 marks: Vec::new(),
-                pending_noted: (0, FastSet::default()),
+                pending_noted: FastSet::default(),
                 upload_forwarded: false,
                 fwd_pending: Vec::new(),
                 upload_reuse: FastMap::default(),
@@ -2260,6 +2285,7 @@ pub fn init() -> Result<(), String> {
         })).ok();
         *RENDERER.lock() = Some(Renderer {
             last_seq: 0,
+            open_seq: OPEN_SEQ,
             samplers: Samplers::new(),
             modules: FastMap::default(),
             gfx_pipes: FastMap::default(),
@@ -3123,6 +3149,27 @@ impl Renderer {
         }
     }
 
+    /// At the submission of this renderer's open batch as `seq`: its pending
+    /// GPU writes by page, large-write mark and retired objects get the
+    /// number (`SUBMIT_SEQ` held).
+    fn seal_open(&mut self, seq: u64) {
+        let open = self.open_seq;
+        let mut noted = std::mem::take(&mut self.cx.pending_noted);
+        noted.extend(self.cx_park.pending_noted.drain());
+        let m = mem!(self);
+        for &(base, len) in &noted {
+            m.gpu_pending_pages.renumber(base >> 12, ((base + len.max(1) - 1) >> 12) + 1, open, seq);
+        }
+        if m.gpu_pending_all == open {
+            m.gpu_pending_all = seq;
+        }
+        noted.clear();
+        self.cx.pending_noted = noted;
+        for r in self.retired.iter_mut().filter(|r| r.0 == open) {
+            r.0 = seq;
+        }
+    }
+
     /// Moves the context in use to its next slot once that slot's previous
     /// batch has completed (after a submission that used its current slot).
     fn rotate_ctx(&mut self, seq: u64) {
@@ -3181,6 +3228,10 @@ impl Renderer {
     }
 
     pub fn submit_batch(&mut self, actions: Vec<super::cp::EopAction>) -> u64 {
+        // (The shared state first: the lock order.)
+        let _ = img!(self);
+        let _ = mem!(self);
+        let mut submit = SUBMIT_SEQ.lock();
         let was_cs = self.cx_cs;
         self.select_ctx(true);
         let cs = self.close_ctx();
@@ -3214,10 +3265,13 @@ impl Renderer {
                 return self.last_seq;
             }
             // Ordering-only completion (nothing new to wait for on the GPU).
-            self.last_seq += 1;
+            *submit += 1;
+            self.last_seq = *submit;
             push_completion(Completion { seq: self.last_seq, fence: vk::Fence::null(), exec: vk::QueryPool::null(), ring_ptr: rings[0], ring_ptr_cs: rings[1], wb_cs, writebacks, wb_bits, dev_writes, mirror_writes, zc_writes, zc_reads, wb_mirror, actions, submitted: std::time::Instant::now(), profile: None, cpu_span: None });
             // (In COMPLETIONS now: the view may forget them.)
             CP_VIEW.lock().pending = Ranges::new();
+            self.seal_open(self.last_seq);
+            drop(submit);
             if early {
                 EARLY_SEQ.store(self.last_seq, std::sync::atomic::Ordering::SeqCst);
                 try_early_eop();
@@ -3240,7 +3294,7 @@ impl Renderer {
             let slot = &self.cx.slots[self.cx.cur];
             (slot.fence, if g.recording { slot.exec } else { vk::QueryPool::null() }, slot.queries)
         };
-        let seq = self.last_seq + 1;
+        let seq = *submit + 1;
         let r = REC.submit(&cmds, &waits, fence, lazy, seq, g.batch_copies.max(cs.batch_copies));
         if let Err(e) = r {
             crate::error!("render submit: {e}");
@@ -3249,6 +3303,7 @@ impl Renderer {
             }
         }
         self.last_seq = seq;
+        *submit = seq;
         let tail = TAIL_PROFILE.swap(false, std::sync::atomic::Ordering::Relaxed);
         let profile = (g.recording && queries != vk::QueryPool::null() && self.cx.marks.len() > 1).then(|| {
             let mut m = std::mem::take(&mut self.cx.marks);
@@ -3266,6 +3321,8 @@ impl Renderer {
             v.pending = Ranges::new();
             v.reads = Ranges::new();
         }
+        self.seal_open(seq);
+        drop(submit);
         if early {
             EARLY_SEQ.store(seq, std::sync::atomic::Ordering::SeqCst);
             try_early_eop();
@@ -3690,7 +3747,7 @@ impl Renderer {
         img!(self).shadows.retain(|sk, (dk, _)| sk.0 != old && *dk != old);
         img!(self).image_bytes -= o.bytes;
         // (Used by the batch being recorded: freed once it completes.)
-        self.retired.push((self.last_seq + 1, Retired::Image(o.image, o.memory, o.views.values().copied().collect())));
+        self.retired.push((self.open_seq, Retired::Image(o.image, o.memory, o.views.values().copied().collect())));
         self.grown += 1;
         if self.grown <= 20 {
             crate::info!("image {:#x} {}x{}x{} {:?}: {} -> {} mip levels (view of level {level})", old.base, old.width, old.height, old.layers, old.format, old.levels, levels);
@@ -3772,7 +3829,7 @@ impl Renderer {
     /// [base, base+len) (in-place stores, write-backs at completion).
     fn note_pending_gpu_write(&mut self, base: u64, len: u64) {
         self.vcache_invalidate(base, len);
-        let seq = self.last_seq + 1;
+        let seq = self.open_seq;
         if perf_on() {
             if mem!(self).pending_log.len() >= 4096 {
                 mem!(self).pending_log.drain(..2048);
@@ -3784,12 +3841,8 @@ impl Renderer {
             return;
         }
         // (Entries of this batch stay until it completes: a range noted for
-        // it already is mapped.)
-        if self.cx.pending_noted.0 != seq {
-            self.cx.pending_noted.0 = seq;
-            self.cx.pending_noted.1.clear();
-        }
-        if !self.cx.pending_noted.1.insert((base, len)) {
+        // it already is mapped. `seal_open` numbers them at the submission.)
+        if !self.cx.pending_noted.insert((base, len)) {
             return;
         }
         mem!(self).gpu_pending_pages.insert(base >> 12, ((base + len.max(1) - 1) >> 12) + 1, seq);
@@ -3850,7 +3903,8 @@ impl Renderer {
                 break;
             }
         }
-        if need > self.last_seq {
+        if need >= OPEN_MIN {
+            // (The open batch writes them.)
             self.flush_for(1);
         } else {
             let t0 = std::time::Instant::now();
@@ -4950,7 +5004,7 @@ impl Renderer {
                 }
                 // Overlapped windows (made before the mapping grew) are
                 // released once the batches using them have completed.
-                let seq = self.last_seq + 1;
+                let seq = self.open_seq;
                 let mut gone = Vec::new();
                 if let Some(vc) = mem!(self).vcache.as_mut() {
                     // (Same slot only: windows of neighbouring slots overlap
@@ -5200,7 +5254,7 @@ impl Renderer {
                                 return None;
                             }
                         };
-                        self.retired.push((self.last_seq + 1, Retired::Buffer(sb, sm)));
+                        self.retired.push((self.open_seq, Retired::Buffer(sb, sm)));
                         (sb, 0, Some(sp))
                     }
                 };
@@ -6284,7 +6338,6 @@ impl Renderer {
             mem!(self).stale_unbounded_lo = mem!(self).stale_ivals.iter().filter(|e| e.1 == u64::MAX).map(|e| e.0).min().unwrap_or(u64::MAX);
             mem!(self).stale_sorted = true;
         }
-        let im = img!(self);
         let m = mem!(self);
         let near = || {
             let i0 = m.stale_ivals.partition_point(|e| e.0 < base.saturating_sub(m.stale_span_max));
@@ -6297,13 +6350,17 @@ impl Renderer {
         if m.stale_unbounded_lo >= end && !near() {
             return;
         }
+        // (The stale images near the range, then their state.)
+        let near_keys: smallvec::SmallVec<[ImageKey; 8]> = m.stale.range(base.saturating_sub(m.stale_max)..base + size).flat_map(|(_, ks)| ks.iter().copied()).collect();
+        if near_keys.is_empty() {
+            return;
+        }
+        let im = img!(self);
         let mut keys: Vec<ImageKey> = Vec::new();
-        for ks in m.stale.range(base.saturating_sub(m.stale_max)..base + size).map(|(_, ks)| ks) {
-            for &k in ks {
-                let Some(i) = im.images.get(&k) else { continue };
-                if i.guest_stale && !i.guest_newer && !k.ty3d && Self::image_guest_layout(&k, i).is_some_and(|g| base < k.base + g.3) {
-                    keys.push(k);
-                }
+        for k in near_keys {
+            let Some(i) = im.images.get(&k) else { continue };
+            if i.guest_stale && !i.guest_newer && !k.ty3d && Self::image_guest_layout(&k, i).is_some_and(|g| base < k.base + g.3) {
+                keys.push(k);
             }
         }
         if !keys.is_empty() {
@@ -8915,7 +8972,7 @@ impl Renderer {
         if live {
             self.dirty_sets.insert(src, set);
         } else {
-            self.retired.push((self.last_seq + 1, Retired::Set(pool, set)));
+            self.retired.push((self.open_seq, Retired::Set(pool, set)));
         }
         Ok(set)
     }
@@ -9252,7 +9309,7 @@ impl Renderer {
                     return Ok(None);
                 };
                 unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), sp, bytes.len()) };
-                self.retired.push((self.last_seq + 1, Retired::Buffer(sb, sm)));
+                self.retired.push((self.open_seq, Retired::Buffer(sb, sm)));
                 (sb, 0)
             }
         };
