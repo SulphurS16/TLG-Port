@@ -582,7 +582,8 @@ pub const SCAN_INDEX: usize = 98;
 
 /// Sampled textures that took the guest-memory path in the current
 /// validation epoch return the same view again while no image at their base
-/// and none of the image set changed (`TLG_TEX_MEMO`; with `tex_cache`).
+/// and none of the image set changed (`TLG_TEX_MEMO`, 1; with `tex_cache`);
+/// the guest-read checks skip such textures.
 pub const TEX_MEMO: usize = 99;
 
 const TABLE: [(&str, &str, i64); 100] = [
@@ -685,7 +686,7 @@ const TABLE: [(&str, &str, i64); 100] = [
     ("cs_route", "TLG_CS_ROUTE", 1),
     ("upload_xbatch", "TLG_UPLOAD_XBATCH", 0),
     ("scan_index", "TLG_SCAN_INDEX", 1),
-    ("tex_memo", "TLG_TEX_MEMO", 0),
+    ("tex_memo", "TLG_TEX_MEMO", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

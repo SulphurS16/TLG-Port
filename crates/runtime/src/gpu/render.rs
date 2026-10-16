@@ -993,11 +993,12 @@ unsafe impl Sync for Completion {}
 static COMPLETIONS: parking_lot::Mutex<std::collections::VecDeque<std::sync::Arc<Completion>>> = parking_lot::Mutex::new(std::collections::VecDeque::new());
 static COMPLETIONS_CV: parking_lot::Condvar = parking_lot::Condvar::new();
 
-/// Write-back and in-place ranges of the batches in `COMPLETIONS`, counted
-/// per 2 MiB granule (hashed into the table: a count may stand for several
-/// granules - false positives only), so `writeback_in_flight` takes the lock
-/// only where one may overlap (`tune scan_index`). Counted when a completion
-/// is queued, uncounted after it left the queue.
+/// Write-back, in-place and end-of-pipe write ranges of the batches in
+/// `COMPLETIONS`, counted per 2 MiB granule (hashed into the table: a count
+/// may stand for several granules - false positives only), so
+/// `writeback_in_flight` and `cpu_writeback_in_flight` take the lock only
+/// where one may overlap (`tune scan_index`). Counted when a completion is
+/// queued, uncounted after it left the queue.
 static INFLIGHT_WB: [std::sync::atomic::AtomicU32; INFLIGHT_SLOTS] = [const { std::sync::atomic::AtomicU32::new(0) }; INFLIGHT_SLOTS];
 /// In-flight ranges too wide for the table: checks then take the lock.
 static INFLIGHT_WIDE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -1029,10 +1030,14 @@ fn inflight_count(c: &Completion, add: bool) {
     for &(w, n) in &c.zc_writes {
         range(w, n);
     }
+    for (a, n) in c.actions.iter().filter_map(|a| a.span()) {
+        range(a, n);
+    }
 }
 
-/// Whether a batch in flight may write back or write in place into
-/// [addr, addr+len) (`INFLIGHT_WB`; true: look at `COMPLETIONS`).
+/// Whether a batch in flight may write back, write in place or perform an
+/// end-of-pipe write into [addr, addr+len) (`INFLIGHT_WB`; true: look at
+/// `COMPLETIONS`).
 fn inflight_maybe(addr: u64, len: u64) -> bool {
     use std::sync::atomic::Ordering::Acquire;
     if crate::tune::get(crate::tune::SCAN_INDEX) == 0 || INFLIGHT_WIDE.load(Acquire) != 0 {
@@ -1042,32 +1047,33 @@ fn inflight_maybe(addr: u64, len: u64) -> bool {
     g1 - g0 >= INFLIGHT_SLOTS as u64 || (g0..=g1).any(|g| INFLIGHT_WB[g as usize & (INFLIGHT_SLOTS - 1)].load(Acquire) != 0)
 }
 
-/// A batch's write-backs by 64 KiB block in a 256-bit filter
-/// (`BatchCtx::wb_bloom`): false positives only.
-fn bloom_bit(block: u64) -> usize {
-    (block.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize
+/// Guest ranges by 64 KiB block in a filter of `64 * N` bits (a batch's
+/// write-backs: `BatchCtx::wb_bloom`; the upload-reuse entries:
+/// `reuse_bloom`): false positives only.
+fn bloom_bit<const N: usize>(block: u64) -> usize {
+    (block.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - (64 * N).trailing_zeros())) as usize
 }
 
-fn bloom_add(f: &mut [u64; 4], base: u64, size: u64) {
+fn bloom_add<const N: usize>(f: &mut [u64; N], base: u64, size: u64) {
     let (b0, b1) = (base >> 16, base.saturating_add(size.max(1) - 1) >> 16);
     if b1 - b0 >= 64 {
-        *f = [u64::MAX; 4];
+        *f = [u64::MAX; N];
         return;
     }
     for b in b0..=b1 {
-        let i = bloom_bit(b);
+        let i = bloom_bit::<N>(b);
         f[i >> 6] |= 1 << (i & 63);
     }
 }
 
-/// Whether a write-back the filter holds may overlap [base, base+size).
-fn bloom_maybe(f: &[u64; 4], base: u64, size: u64) -> bool {
+/// Whether a range the filter holds may overlap [base, base+size).
+fn bloom_maybe<const N: usize>(f: &[u64; N], base: u64, size: u64) -> bool {
     if crate::tune::get(crate::tune::SCAN_INDEX) == 0 {
         return true;
     }
     let (b0, b1) = (base >> 16, base.saturating_add(size.max(1) - 1) >> 16);
     b1 - b0 >= 64 || (b0..=b1).any(|b| {
-        let i = bloom_bit(b);
+        let i = bloom_bit::<N>(b);
         f[i >> 6] >> (i & 63) & 1 != 0
     })
 }
@@ -1515,6 +1521,9 @@ pub fn take_gpu_profile() -> Vec<(String, u64, u64)> {
 /// end-of-pipe writes) overlapping [addr, addr+len): GPU readers must wait
 /// for those; GPU-performed writes are ordered on the queue.
 fn cpu_writeback_in_flight(addr: u64, len: u64) -> bool {
+    if !inflight_maybe(addr, len) {
+        return false;
+    }
     COMPLETIONS.lock().iter().any(|c| c.cpu_write_overlaps(addr, len))
 }
 
@@ -1768,6 +1777,9 @@ pub(super) struct BatchCtx {
     upload_reuse_epoch: u64,
     /// `writebacks` by 64 KiB block (`bloom_add`), for overlap checks.
     wb_bloom: [u64; 4],
+    /// `upload_reuse`'s ranges by 64 KiB block: CP writes elsewhere need no
+    /// look at the entries (`forget_uploads`). Rebuilt when entries go.
+    reuse_bloom: [u64; 16],
     /// Segments of `ring`, used in turn by batch number (`RING_SEGS`, or
     /// `SLOTS` for small rings).
     ring_segs: usize,
@@ -2497,6 +2509,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 upload_reuse: FastMap::default(),
                 upload_reuse_epoch: 0,
                 wb_bloom: [0; 4],
+                reuse_bloom: [0; 16],
                 eop_spans: Vec::new(),
                 ring_segs,
                 upload_seen: FastMap::default(),
@@ -3742,9 +3755,18 @@ impl Renderer {
         let keep = upload_xbatch();
         if keep == 0 {
             self.cx.upload_reuse.clear();
+            self.cx.reuse_bloom = [0; 16];
         } else {
             let b = self.cx.batch;
-            self.cx.upload_reuse.retain(|_, e| e.6 != usize::MAX && e.5 + keep >= b);
+            let mut bloom = [0u64; 16];
+            self.cx.upload_reuse.retain(|&base, e| {
+                let live = e.6 != usize::MAX && e.5 + keep >= b;
+                if live {
+                    bloom_add(&mut bloom, base, e.0);
+                }
+                live
+            });
+            self.cx.reuse_bloom = bloom;
             let done = *DONE.lock();
             self.cx.eop_spans.retain(|e| e.2 > done);
         }
@@ -5159,6 +5181,15 @@ impl Renderer {
     /// Image view for sampling/storing a T#.
     /// `load_only`: the shader only loads texels by integer coordinates
     /// (`Prepared::load_only`).
+    /// Whether `texture` would answer a sampled T# from the memo (`tune tex_memo`).
+    fn tex_memo_valid(&mut self, t: &Tsharp, load_only: bool) -> bool {
+        if crate::tune::get(crate::tune::TEX_MEMO) == 0 || crate::tune::get(crate::tune::TEX_CACHE) == 0 || trace_frame() {
+            return false;
+        }
+        let Some(&(e, g, n, _)) = self.tex_memo.get(&(*t, load_only)) else { return false };
+        e == mem!(self).epoch && n == img!(self).newer_gen && g == img!(self).base_gen.get(&t.base).copied().unwrap_or(0)
+    }
+
     fn texture(&mut self, t: &Tsharp, storage: bool, load_only: bool) -> Result<vk::ImageView, String> {
         if cs_inst() && self.inst == 1 {
             // (Bases of images the compute renderer's open batch binds: R2.)
@@ -6818,6 +6849,7 @@ impl Renderer {
         self.drain_cp_writes();
         if self.cx.upload_reuse_epoch != mem!(self).cpu_epoch {
             self.cx.upload_reuse.clear();
+            self.cx.reuse_bloom = [0; 16];
             self.cx.upload_reuse_epoch = mem!(self).cpu_epoch;
             return None;
         }
@@ -6849,6 +6881,7 @@ impl Renderer {
         }
         if self.cx.upload_reuse_epoch != mem!(self).cpu_epoch {
             self.cx.upload_reuse.clear();
+            self.cx.reuse_bloom = [0; 16];
             self.cx.upload_reuse_epoch = mem!(self).cpu_epoch;
         }
         // (Later batches only reuse copies in the host upload ring - its
@@ -6856,12 +6889,16 @@ impl Renderer {
         // end-of-pipe write may have changed since.)
         let later = buf == self.cx.ring.buffer && self.cx.ring_segs == RING_SEGS && upload_xbatch() != 0 && !self.cx.eop_spans.iter().any(|&(a, n, _)| a < base + size && base < a + n);
         let slot = if later { self.cx.cur } else { usize::MAX };
+        bloom_add(&mut self.cx.reuse_bloom, base, size);
         self.cx.upload_reuse.insert(base, (size, buf, off, mem!(self).writes.stamp(), self.cx.cmd_queue, self.cx.batch, slot));
     }
 
     /// The CP wrote guest [addr, addr+len) directly: copies of it are stale.
     fn forget_uploads(&mut self, addr: u64, len: u64) {
         let end = addr + len.max(1);
+        if self.cx.upload_reuse.is_empty() || !bloom_maybe(&self.cx.reuse_bloom, addr, len) {
+            return;
+        }
         if perf_on() {
             FORGETS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             FORGETS[1].fetch_add(self.cx.upload_reuse.len() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -7253,6 +7290,12 @@ impl Renderer {
                         }
                         BindingKind::Image(i) | BindingKind::StorageImage(i) if pass == 1 => {
                             if let ResolvedRes::Image(t) = &p.resources[i] {
+                                // (Sampled through the memo: validated in this
+                                // epoch with nothing changed at its base since -
+                                // the checks below would find it so again.)
+                                if b.kind == BindingKind::Image(i) && self.tex_memo_valid(t, p.load_only.get(i).copied().unwrap_or(false)) {
+                                    continue;
+                                }
                                 // Only guest-memory reads need this batch's
                                 // writes landed first (`sync_guest` checks them
                                 // again); a GPU-written image here is read on the
