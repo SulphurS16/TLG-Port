@@ -532,6 +532,11 @@ const EVICT_AGE: [u64; 4] = [5400, 600, 120, 30];
 const SMALL_IMAGE_BYTES: u64 = 64 << 10;
 const SMALL_IMAGE_AGE: u64 = 600;
 const SMALL_PER_PASS: usize = 256;
+/// `tune evict_small 2`: small images with the same creation parameters idle
+/// for this many frames beyond the most recently used `RECYCLE_KEEP` of them
+/// are evicted at once (into the pool).
+const RECYCLE_AGE: u64 = 30;
+const RECYCLE_KEEP: usize = 16;
 /// Small images kept for reuse at most (`Renderer::image_pool`).
 const IMAGE_POOL_MAX: usize = 512;
 /// Image bounds (`Renderer::img_bases`) up to this are "near": a buffer
@@ -1802,6 +1807,9 @@ pub(super) struct BatchCtx {
     /// Attachments of the draw being prepared: their images keep their keys
     /// until it is recorded (`grow_levels` leaves them alone).
     draw_targets: smallvec::SmallVec<[ImageKey; 9]>,
+    /// The attachments `apply_meta_clears` last found with clean metadata,
+    /// and `meta_dirty_gen` before that check.
+    meta_clean: Option<(u64, smallvec::SmallVec<[ImageKey; 9]>)>,
     /// The indirect draw being recorded with GPU-read arguments
     /// (`draw_indirect_gpu`), and the vertex stage's SGPR data of the draw
     /// being recorded (buffer, offset, bytes; `write_descriptors`).
@@ -1928,6 +1936,8 @@ struct ImgState {
     /// Bumped when an image becomes newer in guest memory, is created or is
     /// removed: a target cache entry with this value needs no per-image check.
     newer_gen: u64,
+    /// Bumped whenever an image's metadata becomes dirty (`note_meta_write`).
+    meta_dirty_gen: u64,
     /// RT image write counters for texture shadow copies.
     write_gen: FastMap<ImageKey, u64>,
     shadows: FastMap<(ImageKey, u32, u32, vk::Format), (ImageKey, u64)>,
@@ -2022,11 +2032,23 @@ pub struct Renderer {
     /// `ImgState::tex_paths` hits / lookups (TLG_PERF).
     pub tex_path_hits: (u64, u64),
     /// `tune tex_memo`: by (T#, load-only) the view the guest-memory path
-    /// returned, with the validation epoch, the base's `base_gen` and the
-    /// image set's `newer_gen` then (image creations, evictions and
-    /// GPU-written changes bump those); and the lookups it served (TLG_PERF).
-    tex_memo: FastMap<(Tsharp, bool), (u64, u64, u64, vk::ImageView)>,
+    /// returned (`MemoEntry`); and the lookups it served (TLG_PERF).
+    tex_memo: FastMap<(Tsharp, bool), MemoEntry>,
+    /// The epoch `tex_memo`'s entries belong to (the validation epoch, with
+    /// `tex_memo 2` the CPU epoch) and the mode: cleared when either moves
+    /// (older entries cannot match).
+    tex_memo_epoch: u64,
+    tex_memo_mode: i64,
+    /// This command's memo hits found by the guest-read pass: (the T#'s
+    /// address in its `Prepared`, load-only, the memo entry, the T#) - its
+    /// binding takes the view from here without hashing the T# again (the
+    /// T# compared too: an address can be reused).
+    memo_seen: smallvec::SmallVec<[(usize, bool, MemoEntry, Tsharp); 8]>,
     pub tex_memo_hits: u64,
+    /// The path the current `texture` call took (`TEX_PATH`).
+    tex_path: u8,
+    /// Push lists to fill again (`Descriptors::Push`).
+    push_pool: Vec<Box<super::rec::PushWrites>>,
     /// Update templates by set layout (`tune desc_templates`), made from the
     /// (binding, type) order of the layout's first write; writes in another
     /// order (none expected) use write structures. Uses and fallbacks
@@ -2442,9 +2464,12 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
             });
         }
         let mut ring = Ring::new(c, ring_bytes)?;
-        // (The small rings of the compute queues' own contexts: one segment
-        // per slot - no cross-batch reuse there.)
-        let ring_segs = if ring_bytes >= resources::RING_SIZE { RING_SEGS } else { SLOTS };
+        // (`RING_SEGS` only for cross-batch reuse, `tune upload_xbatch` set at
+        // start: smaller segments fill up - a draw reserves its textures'
+        // upload estimate, up to 64 MiB each - and end batches early, ~10
+        // times a second in the cave at 76.8 MiB. The small rings of the
+        // compute queues' own contexts: one segment per slot.)
+        let ring_segs = if ring_bytes >= resources::RING_SIZE && crate::tune::get(crate::tune::UPLOAD_XBATCH) != 0 { RING_SEGS } else { SLOTS };
         ring.set_segment(0, ring_segs);
         let mut dring = Ring::new_device(c, dring_bytes)?;
         dring.set_segment(0, SLOTS);
@@ -2518,6 +2543,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 sparse_binds: Vec::new(),
                 bind_sem: if c.sparse { c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| format!("semaphore: {e}"))? } else { vk::Semaphore::null() },
                 draw_targets: smallvec::SmallVec::new(),
+                meta_clean: None,
                 indirect_draw: None,
                 vs_sgpr: None,
                 vgen_keep: vk::Buffer::null(),
@@ -2604,6 +2630,7 @@ pub fn init() -> Result<(), String> {
             tex_paths: FastMap::default(),
             base_gen: FastMap::default(),
             newer_gen: 1,
+            meta_dirty_gen: 0,
             write_gen: FastMap::default(),
             shadows: FastMap::default(),
             image_bytes: 0,
@@ -2731,6 +2758,38 @@ pub static BATCH_SITES: parking_lot::Mutex<Option<HashMap<(&'static str, u32), (
 /// write since, by the same CP queue: in the same CPU epoch, and in the same
 /// required epoch (graphics or compute) though another CPU epoch began.
 pub static XBATCH: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// `texture` calls by the path that answered them (`TEX_PATH_NAMES`), with
+/// their TSC cycles, and the cycles of the slow path's walk over the images
+/// at the base (reused and guest-newer targets) - stats mode (`shader_stats`).
+pub static TEX_PATH: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 9] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 9];
+pub const TEX_PATH_NAMES: [&str; 9] = ["other", "memo", "stand-in", "GPU image", "GPU image (storage)", "depth shadow", "shadow", "guest memory", "image walk"];
+/// Time-stamp counter ticks per microsecond, from the last TLG_PERF report
+/// (0 before it).
+pub static TSC_PER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// `texture` calls over 100 us (stats mode): their TSC cycles and count.
+pub static TEX_SLOW: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64) = (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0));
+
+/// A `tex_memo` entry: the view the guest-memory path returned, with the
+/// validation epoch, the base's `base_gen` and the image set's `newer_gen`
+/// then (image creations, evictions and GPU-written changes bump those);
+/// for `tex_memo 2` also the image's CPU-checked epoch, the write tracker's
+/// stamp then and the texture's size in bytes.
+#[derive(Clone, Copy)]
+struct MemoEntry {
+    epoch: u64,
+    g: u64,
+    n: u64,
+    view: vk::ImageView,
+    cpu: u64,
+    stamp: u64,
+    bytes: u64,
+}
+
+/// `SHADER_DESC` collected (`TLG_PERF=2`, or `tune shader_stats` with TLG_PERF).
+pub fn shader_stats() -> bool {
+    perf_detail() || (perf_on() && crate::tune::get(crate::tune::SHADER_STATS) != 0)
+}
+
 /// TLG_PERF: `forget_uploads` calls and the upload-reuse entries they looked at.
 pub static FORGETS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 /// `XBATCH` same-epoch ones by batches back (1..5, 6 and more).
@@ -2760,25 +2819,18 @@ fn push_mode_key() -> u64 {
 }
 
 /// A command's descriptors: an allocated set, or the descriptors to push
-/// (`tune push_desc`).
+/// (`tune push_desc`; boxed - the list is ~1.4 KiB - and the box recycled,
+/// `Renderer::push_pool`).
 enum Descriptors {
     Set(vk::DescriptorSet),
-    Push(super::rec::PushWrites),
+    Push(Box<super::rec::PushWrites>),
 }
 
 impl Descriptors {
-    fn new(set: vk::DescriptorSet, push: Option<super::rec::PushWrites>) -> Descriptors {
+    fn new(set: vk::DescriptorSet, push: Option<Box<super::rec::PushWrites>>) -> Descriptors {
         match push {
             Some(w) => Descriptors::Push(w),
             None => Descriptors::Set(set),
-        }
-    }
-
-    /// Binds them as set 0 of `layout` (pipeline bound).
-    unsafe fn bind(self, cmd: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout) {
-        match self {
-            Descriptors::Set(set) => unsafe { REC.cmd_bind_descriptor_sets(cmd, bp, layout, 0, &[set], &[]) },
-            Descriptors::Push(w) => unsafe { REC.cmd_push_descriptor_set(cmd, bp, layout, 0, &w) },
         }
     }
 }
@@ -2914,7 +2966,7 @@ pub fn perf_detail() -> bool {
 /// cycles of their descriptors, per buffer path (`BUFFER_PATHS`) bindings
 /// and cycles); reported and cleared every second.
 pub static SHADER_DESC: parking_lot::Mutex<Option<HashMap<(u8, u64), ShaderDesc>>> = parking_lot::Mutex::new(None);
-pub type ShaderDesc = (u64, u64, [u64; 11], [u64; 11]);
+pub type ShaderDesc = (u64, u64, [u64; 11], [u64; 11], [u64; 6]);
 
 /// Images created (TLG_PERF): by (width, height, layers, levels, format) ->
 /// (count, last guest base), reported and cleared every second.
@@ -3316,7 +3368,12 @@ impl Renderer {
         push_layouts: FastSet::default(),
         tex_path_hits: (0, 0),
         tex_memo: FastMap::default(),
+        tex_memo_epoch: u64::MAX,
+        tex_memo_mode: 0,
+        memo_seen: smallvec::SmallVec::new(),
         tex_memo_hits: 0,
+        tex_path: 0,
+        push_pool: Vec::new(),
         desc_templates: FastMap::default(),
         desc_template_uses: (0, 0),
         target_hits: (0, 0),
@@ -4767,7 +4824,7 @@ impl Renderer {
     fn mirror_write_back(&mut self, base: u64, size: u64, buf: vk::Buffer, off: u64) -> Result<(u64, u32, u32), String> {
         let head = (base & 0xFFF) as u32;
         // (Only when no later write-back overlaps it: write-backs land in order.)
-        if let Some(w) = self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size).filter(|w| w.mirror && w.base == base && w.size == size && w.dev_buf == buf) {
+        if let Some(w) = bloom_maybe(&self.cx.wb_bloom, base, size).then(|| self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size)).flatten().filter(|w| w.mirror && w.base == base && w.size == size && w.dev_buf == buf) {
             if let Some((bits, _, words)) = w.bits {
                 return Ok((bits, words, head));
             }
@@ -4807,7 +4864,7 @@ impl Renderer {
     fn mirror_write_back_full(&mut self, base: u64, size: u64, buf: vk::Buffer, off: u64) -> Result<(), String> {
         // (Already registered and not overtaken by a later overlapping
         // write-back: lands with that one.)
-        if self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size).is_some_and(|w| w.mirror && w.bits.is_none() && w.base == base && w.size == size && w.dev_buf == buf && w.dev_off == off) {
+        if bloom_maybe(&self.cx.wb_bloom, base, size) && self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size).is_some_and(|w| w.mirror && w.bits.is_none() && w.base == base && w.size == size && w.dev_buf == buf && w.dev_off == off) {
             return Ok(());
         }
         let host_off = self.cx.ring.alloc(size).ok_or_else(|| format!("ring full: {size:#x}-byte write-back of {base:#x} (segment {:#x})", self.cx.ring.segment_size()))?;
@@ -5186,11 +5243,103 @@ impl Renderer {
         if crate::tune::get(crate::tune::TEX_MEMO) == 0 || crate::tune::get(crate::tune::TEX_CACHE) == 0 || trace_frame() {
             return false;
         }
-        let Some(&(e, g, n, _)) = self.tex_memo.get(&(*t, load_only)) else { return false };
-        e == mem!(self).epoch && n == img!(self).newer_gen && g == img!(self).base_gen.get(&t.base).copied().unwrap_or(0)
+        self.tex_memo_sync();
+        let Some(&entry) = self.tex_memo.get(&(*t, load_only)) else { return false };
+        let ok = self.tex_memo_current(t, entry);
+        if ok {
+            self.memo_seen.push((t as *const Tsharp as usize, load_only, entry, *t));
+        }
+        ok
     }
 
+    /// `tex_memo` holds entries of the current validation epoch only (`tex_memo
+    /// 2`: of the current CPU epoch).
+    fn tex_memo_sync(&mut self) {
+        let mode = crate::tune::get(crate::tune::TEX_MEMO);
+        let e = if mode == 2 { mem!(self).cpu_epoch } else { mem!(self).epoch };
+        if self.tex_memo_epoch != e || self.tex_memo_mode != mode {
+            self.tex_memo.clear();
+            self.tex_memo_epoch = e;
+            self.tex_memo_mode = mode;
+        }
+    }
+
+    /// Whether a memo entry still answers for `t`: the base's generation
+    /// unchanged (`tune memo_base 0`: the whole image set's too - the lookup
+    /// only consults images at its base, and every change there bumps the
+    /// base's), and the same validation epoch - with `tex_memo 2` instead (as
+    /// the guest-memory path's own shortcut) the image's CPU check counting
+    /// for this command and no GPU write registered over the texture since
+    /// the entry was made.
+    fn tex_memo_current(&mut self, t: &Tsharp, e: MemoEntry) -> bool {
+        let whole = crate::tune::get(crate::tune::MEMO_BASE) == 0;
+        if (whole && e.n != img!(self).newer_gen) || e.g != img!(self).base_gen.get(&t.base).copied().unwrap_or(0) {
+            return false;
+        }
+        if self.tex_memo_mode == 2 {
+            let required = self.cx.required_epoch;
+            let w = &mem!(self).writes;
+            return e.cpu != u64::MAX && e.cpu >= required && (e.stamp == w.stamp() || !w.gpu_written_since(t.base, e.bytes, e.stamp));
+        }
+        e.epoch == mem!(self).epoch
+    }
+
+    /// `texture_inner`, timed by path in stats mode (`TEX_PATH`).
     fn texture(&mut self, t: &Tsharp, storage: bool, load_only: bool) -> Result<vk::ImageView, String> {
+        if !shader_stats() {
+            return self.texture_inner(t, storage, load_only);
+        }
+        let t0 = unsafe { core::arch::x86_64::_rdtsc() };
+        self.tex_path = 0;
+        use std::sync::atomic::Ordering::Relaxed;
+        let (hashed, waited, flushes, made) = (self.hashed_bytes, self.prof[0], self.flushes, self.image_reuse);
+        let (ww, ww_ns, rounds) = (crate::mem::HARVESTS.load(Relaxed), crate::mem::HARVEST_NS.load(Relaxed), super::writes::BULK_STATS[0].load(Relaxed));
+        let r = self.texture_inner(t, storage, load_only);
+        let dt = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
+        let p = &TEX_PATH[self.tex_path as usize];
+        p.0.fetch_add(dt, Relaxed);
+        p.1.fetch_add(1, Relaxed);
+        // (The first lookups over 100 us: what they looked up, and what they
+        // waited for, flushed, asked the OS and created meanwhile.)
+        let per_us = TSC_PER_US.load(Relaxed);
+        if per_us != 0 && dt > 100 * per_us {
+            TEX_SLOW.0.fetch_add(dt, Relaxed);
+            TEX_SLOW.1.fetch_add(1, Relaxed);
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, Relaxed) < 60 {
+                crate::info!(
+                    "slow texture lookup ({}, {} us, {} B hashed, waited {} us, flushes +{}, write-watch {} calls {} us, bulk rounds +{}, images new {} pooled {}): {:#x} {}x{}x{} fmt {}/{} pitch {} levels {}..{} layers {}..{} type {} tiling {}{}",
+                    TEX_PATH_NAMES[self.tex_path as usize],
+                    dt / per_us,
+                    self.hashed_bytes - hashed,
+                    (self.prof[0] - waited).as_micros(),
+                    self.flushes.iter().zip(flushes.iter()).map(|(a, b)| a - b).sum::<u64>(),
+                    crate::mem::HARVESTS.load(Relaxed) - ww,
+                    (crate::mem::HARVEST_NS.load(Relaxed) - ww_ns) / 1000,
+                    super::writes::BULK_STATS[0].load(Relaxed) - rounds,
+                    self.image_reuse.0 - made.0,
+                    self.image_reuse.1 - made.1,
+                    t.base,
+                    t.width,
+                    t.height,
+                    t.depth,
+                    t.dfmt,
+                    t.nfmt,
+                    t.pitch,
+                    t.base_level,
+                    t.last_level,
+                    t.base_array,
+                    t.last_array,
+                    t.ty,
+                    t.tiling_index,
+                    if storage { " (storage)" } else { "" }
+                );
+            }
+        }
+        r
+    }
+
+    fn texture_inner(&mut self, t: &Tsharp, storage: bool, load_only: bool) -> Result<vk::ImageView, String> {
         if cs_inst() && self.inst == 1 {
             // (Bases of images the compute renderer's open batch binds: R2.)
             img!(self).open_bases[1].insert(t.base);
@@ -5199,18 +5348,25 @@ impl Renderer {
         // which a later lookup would take again with nothing to validate.)
         let memo = !storage && crate::tune::get(crate::tune::TEX_MEMO) != 0 && crate::tune::get(crate::tune::TEX_CACHE) != 0 && !trace_frame();
         if memo {
-            if let Some(&(e, g, n, view)) = self.tex_memo.get(&(*t, load_only)) {
-                if e == mem!(self).epoch && n == img!(self).newer_gen && g == img!(self).base_gen.get(&t.base).copied().unwrap_or(0) {
-                    if perf_on() {
-                        self.tex_memo_hits += 1;
-                        self.tex_path_hits.0 += 1;
-                        self.tex_path_hits.1 += 1;
-                    }
-                    return Ok(view);
+            self.tex_memo_sync();
+            let addr = t as *const Tsharp as usize;
+            let seen = self.memo_seen.iter().find(|s| s.0 == addr && s.1 == load_only && s.3 == *t).map(|s| s.2);
+            let entry = match seen {
+                Some(e) => Some(e),
+                None => self.tex_memo.get(&(*t, load_only)).copied(),
+            };
+            if let Some(entry) = entry.filter(|&e| self.tex_memo_current(t, e)) {
+                if perf_on() {
+                    self.tex_memo_hits += 1;
+                    self.tex_path_hits.0 += 1;
+                    self.tex_path_hits.1 += 1;
                 }
+                self.tex_path = 1;
+                return Ok(entry.view);
             }
         }
         let Some(vfmt) = desc::vk_format(t.dfmt, t.nfmt) else {
+            self.tex_path = 2;
             return self.dummy_texture(t, storage, "unsupported format");
         };
         if !crate::mem::is_guest(t.base, 1) {
@@ -5218,6 +5374,7 @@ impl Renderer {
             if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
                 crate::info!("texture outside guest memory: base {:#x} {}x{} dfmt {} nfmt {} type {}", t.base, t.width, t.height, t.dfmt, t.nfmt, t.ty);
             }
+            self.tex_path = 2;
             return self.dummy_texture(t, storage, "address outside guest memory");
         }
         let layers = t.layers().max(1);
@@ -5262,6 +5419,7 @@ impl Renderer {
             // `reused_target`), and those whose guest memory was since written by
             // buffer stores: reloaded before sampling (directly or via shadows).
             // (One walk over the images at the base for both.)
+            let tw = if shader_stats() { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
             let (mut old, mut newer) = (smallvec::SmallVec::<[ImageKey; 4]>::new(), smallvec::SmallVec::<[ImageKey; 4]>::new());
             let im = img!(self);
             if let Some(ks) = im.by_base.get(&t.base) {
@@ -5284,6 +5442,11 @@ impl Renderer {
             for k in newer {
                 self.refresh_from_guest(k, false)?;
             }
+            if tw != 0 {
+                let p = &TEX_PATH[8];
+                p.0.fetch_add(unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tw), std::sync::atomic::Ordering::Relaxed);
+                p.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             // GPU-written image with the same size at this address?
             if let Some(k) = self.find_compatible(key) {
                 if img!(self).images[&k].gpu_written || storage {
@@ -5294,6 +5457,7 @@ impl Renderer {
                     }
                     let img = img!(self).images.get_mut(&k).unwrap();
                     let v = img.view_levels(if storage { canonical(vfmt) } else { vfmt }, t.dst_sel, view_type, storage, view_base, layers, view_level, view_levels)?;
+                    self.tex_path = if storage { 4 } else { 3 };
                     return Ok(v);
                 }
             }
@@ -5302,6 +5466,7 @@ impl Renderer {
             if matches!(vfmt, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !storage {
                 let im = img!(self);
                 if let Some(src) = im.by_base.get(&t.base).and_then(|ks| ks.iter().copied().find(|k| k.depth && im.images[k].gpu_written && (k.format == vk::Format::D16_UNORM) == (vfmt == vk::Format::R16_UNORM))) {
+                    self.tex_path = 5;
                     return self.depth_shadow_view(src, t, vfmt, view_type, load_only);
                 }
             }
@@ -5317,6 +5482,7 @@ impl Renderer {
                 if trace_frame() {
                     crate::info!("FRAME texture {:#x} {}x{} {:?}: shadow of {}x{} {:?} (last write {})", t.base, t.width, t.height, vfmt, src.width, src.height, src.format, img!(self).images[&src].last_write);
                 }
+                self.tex_path = 6;
                 return self.shadow_view(src, t, vfmt, store_fmt, view_type, load_only);
             }
             if trace_frame() {
@@ -5333,6 +5499,7 @@ impl Renderer {
             }
         }
         self.init_image(key)?;
+        self.tex_path = 7;
         let batch = mem!(self).epoch;
         let mut needs_upload = {
             let img = &img!(self).images[&key];
@@ -5398,11 +5565,14 @@ impl Renderer {
         // (Only for an image validated in this epoch - by this lookup or an
         // earlier one - when nothing moved the epoch during the lookup.)
         if memo && mem!(self).epoch == batch && img!(self).images.get(&key).is_some_and(|i| !i.gpu_written && i.upload_batch == batch) {
+            self.tex_memo_sync();
             if self.tex_memo.len() > 1 << 14 {
                 self.tex_memo.clear();
             }
             let (g, n) = (img!(self).base_gen.get(&t.base).copied().unwrap_or(0), img!(self).newer_gen);
-            self.tex_memo.insert((*t, load_only), (batch, g, n, view));
+            let cpu = img!(self).images.get(&key).map_or(u64::MAX, |i| i.cpu_checked);
+            let (stamp, bytes) = (mem!(self).writes.stamp(), resources::texture_bytes(t, depth_layers.max(1)));
+            self.tex_memo.insert((*t, load_only), MemoEntry { epoch: batch, g, n, view, cpu, stamp, bytes });
         }
         Ok(view)
     }
@@ -7120,6 +7290,7 @@ impl Renderer {
                         i.guest_stale = false;
                         i.guest_newer = true;
                         img!(self).newer_gen += 1;
+                        *img!(self).base_gen.entry(key.base).or_default() += 1;
                     }
                     continue;
                 }
@@ -7231,6 +7402,7 @@ impl Renderer {
     /// buffer writes that its CPU-sourced textures may read (both may submit
     /// and wait, which is not allowed once preparation has started).
     fn prepare_guest_reads(&mut self, stages: &[&Prepared]) {
+        self.memo_seen.clear();
         self.zc_revalidate();
         // Buffers first: their render target write-backs may write guest
         // memory that CPU-sourced textures read.
@@ -7362,7 +7534,7 @@ impl Renderer {
 
     /// Writes the descriptors of `prepared` into `set`, or returns them for
     /// a push (`set` null: a push-descriptor layout).
-    fn write_descriptors(&mut self, set: vk::DescriptorSet, layout: vk::DescriptorSetLayout, prepared: &[&Prepared]) -> Result<Option<super::rec::PushWrites>, String> {
+    fn write_descriptors(&mut self, set: vk::DescriptorSet, layout: vk::DescriptorSetLayout, prepared: &[&Prepared]) -> Result<Option<Box<super::rec::PushWrites>>, String> {
         let c = ctx();
         enum Info {
             Buf(vk::DescriptorBufferInfo),
@@ -7744,16 +7916,15 @@ impl Renderer {
             }
         }
         if set == vk::DescriptorSet::null() {
-            let w: super::rec::PushWrites = infos
-                .iter()
-                .map(|(binding, ty, info)| {
-                    let d = match info {
-                        Info::Buf(b) => super::rec::DescInfo::Buf(*b),
-                        Info::Img(i) => super::rec::DescInfo::Img(*i),
-                    };
-                    (*binding, *ty, d)
-                })
-                .collect();
+            let mut w = self.push_pool.pop().unwrap_or_default();
+            w.clear();
+            w.extend(infos.iter().map(|(binding, ty, info)| {
+                let d = match info {
+                    Info::Buf(b) => super::rec::DescInfo::Buf(*b),
+                    Info::Img(i) => super::rec::DescInfo::Img(*i),
+                };
+                (*binding, *ty, d)
+            }));
             if perf {
                 self.dsub[4] += unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(tb);
             }
@@ -7834,6 +8005,20 @@ impl Renderer {
     /// are written again in the next one instead of dropping the command.
     /// Returns the set (for a push-descriptor layout the descriptors to push
     /// instead) and the pending-write count before it was written.
+    /// Binds a command's descriptors as set 0 of `layout` (pipeline bound);
+    /// a push list's box goes back to `push_pool`.
+    unsafe fn bind_descriptors(&mut self, d: Descriptors, cmd: vk::CommandBuffer, bp: vk::PipelineBindPoint, layout: vk::PipelineLayout) {
+        match d {
+            Descriptors::Set(set) => unsafe { REC.cmd_bind_descriptor_sets(cmd, bp, layout, 0, &[set], &[]) },
+            Descriptors::Push(w) => {
+                unsafe { REC.cmd_push_descriptor_set(cmd, bp, layout, 0, &w) };
+                if self.push_pool.len() < 8 {
+                    self.push_pool.push(w);
+                }
+            }
+        }
+    }
+
     fn descriptors_with_retry(&mut self, set_layout: vk::DescriptorSetLayout, stages: &[&Prepared]) -> Result<(Descriptors, usize), String> {
         let push = self.push_layouts.contains(&set_layout);
         let t0 = tsc();
@@ -8165,7 +8350,7 @@ impl Renderer {
         // Uploads end any active rendering; record them first.
         phase!(4);
         self.cx.vs_sgpr = None;
-        let sd = perf_detail().then(|| (unsafe { core::arch::x86_64::_rdtsc() }, self.bcnt, self.bsub));
+        let sd = shader_stats().then(|| (unsafe { core::arch::x86_64::_rdtsc() }, self.bcnt, self.bsub, self.dsub));
         let (mut set, mut wb_before) = self.descriptors_with_retry(set_layout, &stages)?;
         if let Some(sd) = sd {
             self.note_shader_desc(0, ps.as_ref().map_or(vs.addr, |p| p.addr), sd);
@@ -8297,7 +8482,7 @@ impl Renderer {
                 REC.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::GRAPHICS, pipeline);
                 self.cx.bound_gfx = pipeline;
             }
-            set.bind(cmd, vk::PipelineBindPoint::GRAPHICS, layout);
+            self.bind_descriptors(set, cmd, vk::PipelineBindPoint::GRAPHICS, layout);
             self.set_dynamic_state(regs, extent, prim, depth.is_some());
             // Depth/stencil clears requested through DB_RENDER_CONTROL.
             let rc = regs.ctx(0xA000);
@@ -9053,7 +9238,7 @@ impl Renderer {
         full_barrier!(self);
         unsafe {
             REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline); self.cx.bound_cs = vk::Pipeline::null();
-            set.bind(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, layout);
+            self.bind_descriptors(set, self.cx.cmd, vk::PipelineBindPoint::COMPUTE, layout);
             REC.cmd_dispatch(self.cx.cmd, groups, 1, 1);
         }
         self.mark(|| format!("{} {:#x}", if p.tess == TessRole::Ls { "ls" } else { "hs" }, p.addr));
@@ -9072,15 +9257,18 @@ impl Renderer {
     /// caller then waits for its arguments and dispatches directly).
     /// `SHADER_DESC`: one command's descriptors (from the time stamp and
     /// path counters taken before them).
-    fn note_shader_desc(&self, kind: u8, addr: u64, (t0, c0, s0): (u64, [u64; 11], [u64; 11])) {
+    fn note_shader_desc(&self, kind: u8, addr: u64, (t0, c0, s0, d0): (u64, [u64; 11], [u64; 11], [u64; 6])) {
         let t = unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t0);
         let mut g = SHADER_DESC.lock();
-        let e = g.get_or_insert_with(HashMap::new).entry((kind, addr)).or_insert((0, 0, [0; 11], [0; 11]));
+        let e = g.get_or_insert_with(HashMap::new).entry((kind, addr)).or_insert((0, 0, [0; 11], [0; 11], [0; 6]));
         e.0 += 1;
         e.1 += t;
         for i in 0..11 {
             e.2[i] += self.bcnt[i].wrapping_sub(c0[i]);
             e.3[i] += self.bsub[i].wrapping_sub(s0[i]);
+        }
+        for i in 0..6 {
+            e.4[i] += self.dsub[i].wrapping_sub(d0[i]);
         }
     }
 
@@ -9236,7 +9424,7 @@ impl Renderer {
         };
         self.cx.cur_unknown = true;
         phase!(2);
-        let sd = perf_detail().then(|| (unsafe { core::arch::x86_64::_rdtsc() }, self.bcnt, self.bsub));
+        let sd = shader_stats().then(|| (unsafe { core::arch::x86_64::_rdtsc() }, self.bcnt, self.bsub, self.dsub));
         let (set, wb_before) = self.descriptors_with_retry(set_layout, &[&cs])?;
         if let Some(sd) = sd {
             self.note_shader_desc(1 + class as u8, cs.addr, sd);
@@ -9339,7 +9527,7 @@ impl Renderer {
                 REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
                 self.cx.bound_cs = pipeline;
             }
-            set.bind(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, layout);
+            self.bind_descriptors(set, self.cx.cmd, vk::PipelineBindPoint::COMPUTE, layout);
             // (Measurement `zero_groups`: this queue's GPU work left out.)
             let zm = crate::tune::get(crate::tune::ZERO_GROUPS);
             let zero = zm != 0 && args_slot.is_none() && (zm >> cp.queue.min(29)) & 1 != 0 && (zm & (1 << 30) == 0 || x.max(1) * y.max(1) * z.max(1) == 1);
@@ -9404,6 +9592,7 @@ impl Renderer {
                 img.guest_newer = true;
                 img.guest_stale = false;
                 im.newer_gen += 1;
+                *im.base_gen.entry(k.base).or_default() += 1;
                 self.cx.attach_marked = false;
             }
         }
@@ -10322,9 +10511,11 @@ impl Renderer {
     /// HTILE/CMASK surface: examined when the target is next bound.
     fn note_meta_write(&mut self, base: u64, size: u64) {
         for k in self.meta_overlapping(base, size, false) {
-            if let Some(img) = img!(self).images.get_mut(&k) {
+            let im = img!(self);
+            if let Some(img) = im.images.get_mut(&k) {
                 img.meta_dirty = true;
                 img.meta_fill = None;
+                im.meta_dirty_gen += 1;
             }
         }
     }
@@ -10363,6 +10554,17 @@ impl Renderer {
     /// cleared state is applied to the image (fully cleared surfaces only;
     /// HTILE/CMASK are not otherwise emulated).
     fn apply_meta_clears(&mut self, regs: &Regs, colors: &[Option<Attachment>], depth: Option<Attachment>) {
+        // (The same attachments were found clean and no metadata became dirty
+        // since: nothing to apply. The generation is read before the check, so
+        // anything dirtied while it runs forces the next one.)
+        let dirty = img!(self).meta_dirty_gen;
+        let index = crate::tune::get(crate::tune::SCAN_INDEX) != 0;
+        if index && self.cx.meta_clean.as_ref().is_some_and(|(g, ks)| *g == dirty && ks[..] == self.cx.draw_targets[..]) {
+            return;
+        }
+        if index {
+            self.cx.meta_clean = Some((dirty, self.cx.draw_targets.clone()));
+        }
         let mut todo: Vec<(ImageKey, Option<u32>)> = Vec::new();
         for (n, a) in colors.iter().enumerate() {
             if let Some(a) = a {
@@ -10477,8 +10679,7 @@ impl Renderer {
             // record the expanded state: a later unrelated write near the
             // metadata must not make the stale "cleared" state reapply.
             if crate::mem::is_guest(mbase, msize) {
-                let expanded = vec![0xFFu8; msize as usize];
-                resources::copy_to_guest(&expanded, mbase);
+                resources::fill_guest(mbase, msize, 0xFF);
                 mem!(self).writes.note_gpu_write(mbase, msize);
             }
         }
@@ -10788,12 +10989,31 @@ impl Renderer {
         let release_windows = *WINDOWS.get_or_init(|| std::env::var("TLG_EVICT_WINDOWS").map(|v| v != "0").unwrap_or(true));
         static SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let evict_shadows = *SHADOWS.get_or_init(|| std::env::var("TLG_EVICT_SHADOWS").map(|v| v != "0").unwrap_or(true));
-        let small = crate::tune::get(crate::tune::EVICT_SMALL) != 0;
+        let small_mode = crate::tune::get(crate::tune::EVICT_SMALL);
+        let small = small_mode != 0;
+        let small_idle = |k: &ImageKey, i: &Image, unused: u64| small && !i.gpu_written && !is_shadow(k) && i.bytes <= SMALL_IMAGE_BYTES && i.last_used + unused <= frame;
+        // (`evict_small 2`: of the small images with the same creation
+        // parameters idle for `RECYCLE_AGE` frames, those beyond the
+        // `RECYCLE_KEEP` most recently used go now - the title's per-frame
+        // textures at new addresses, ~3 a frame; into the pool for the next.)
+        let mut recycle: FastSet<ImageKey> = FastSet::default();
+        if small_mode >= 2 {
+            let mut idle: FastMap<ImageKey, Vec<(u64, ImageKey)>> = FastMap::default();
+            for (k, i) in img!(self).images.iter().filter(|(k, i)| evictable(k, i) && small_idle(k, i, RECYCLE_AGE)) {
+                idle.entry(ImageKey { base: 0, ..*k }).or_default().push((i.last_used, *k));
+            }
+            for (_, mut v) in idle {
+                if v.len() > RECYCLE_KEEP {
+                    v.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+                    recycle.extend(v[RECYCLE_KEEP..].iter().map(|e| e.1));
+                }
+            }
+        }
         let mut candidates: Vec<(u64, u64, ImageKey)> = img!(self)
             .images
             .iter()
             .filter(|(k, i)| {
-                let tiny = small && !i.gpu_written && !is_shadow(k) && i.bytes <= SMALL_IMAGE_BYTES && i.last_used + SMALL_IMAGE_AGE.min(age) <= frame;
+                let tiny = small_idle(k, i, SMALL_IMAGE_AGE.min(age)) || recycle.contains(*k);
                 evictable(k, i) && (tiny || (evict_images && (evict_shadows || !is_shadow(k)) && i.last_used + age <= frame))
             })
             .map(|(k, i)| (i.last_used, i.bytes, *k))
@@ -10822,6 +11042,7 @@ impl Renderer {
         for k in &victims {
             let Some(img) = img!(self).images.remove(k) else { continue };
             img!(self).newer_gen += 1;
+            *img!(self).base_gen.entry(k.base).or_default() += 1;
             if img.meta_listed {
                 mem!(self).meta_images.retain(|x| x != k);
                 mem!(self).meta_gen += 1;

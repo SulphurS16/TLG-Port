@@ -144,6 +144,20 @@ pub fn copy_from_guest(dst: &mut [u8], addr: u64) {
     }
 }
 
+/// Fills guest [addr, addr+n) with `byte` (one mapped region), like
+/// `copy_to_guest` without a source buffer.
+pub fn fill_guest(addr: u64, n: u64, byte: u8) -> bool {
+    let st = crate::mem::MEM.lock();
+    match st.find(addr) {
+        Some(v) if v.kind != crate::mem::VmaKind::Reserved && addr + n <= v.end() => {
+            drop(st);
+            unsafe { std::ptr::write_bytes(addr as *mut u8, byte, n as usize) };
+            true
+        }
+        _ => false,
+    }
+}
+
 pub fn copy_to_guest(src: &[u8], addr: u64) -> bool {
     let n = src.len() as u64;
     let st = crate::mem::MEM.lock();

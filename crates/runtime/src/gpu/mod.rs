@@ -1045,6 +1045,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         let now_t = std::time::Instant::now();
         let secs = LAST_T.lock().replace(now_t).map_or(1.0, |t| now_t.duration_since(t).as_secs_f64().max(1e-3));
         let hz = now.tsc.wrapping_sub(p.tsc) as f64 / secs;
+        render::TSC_PER_US.store((hz / 1e6) as u64, Ordering::Relaxed);
         let nd = now.dprof_draws.saturating_sub(p.dprof_draws).max(1) as f64;
         let ph: Vec<String> = render::DRAW_PHASES.iter().enumerate().map(|(i, n)| format!("{n} {:.1}", now.dprof[i].wrapping_sub(p.dprof[i]) as f64 / hz * 1e6 / nd)).collect();
         let ds: Vec<String> = render::DESC_PARTS.iter().enumerate().map(|(i, n)| format!("{n} {:.1}", now.dsub[i].wrapping_sub(p.dsub[i]) as f64 / hz * 1e6 / nd)).collect();
@@ -1079,12 +1080,26 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let top: Vec<String> = v
                 .iter()
                 .take(14)
-                .map(|((k, a), (n, c, pn, pc))| {
+                .map(|((k, a), (n, c, pn, pc, dp))| {
                     let paths: Vec<String> = (0..11).filter(|&i| pn[i] > 0).map(|i| format!("{} {:.1} x {:.1}", render::BUFFER_PATHS[i], pn[i] as f64 / *n as f64, us(pc[i]) / pn[i] as f64)).collect();
-                    format!("{} {a:#x} {n} x {:.1} us = {:.1} ms [{}]", ["draw ps", "gfx cs", "acb cs"][*k as usize], us(*c) / *n as f64, us(*c) / 1e3, paths.join(", "))
+                    // (Descriptor parts per command: sgpr data, images, samplers and the rest.)
+                    let parts: Vec<String> = [1usize, 3, 4].iter().filter(|&&i| dp[i] > 0).map(|&i| format!("{} {:.1}", render::DESC_PARTS[i], us(dp[i]) / *n as f64)).collect();
+                    format!("{} {a:#x} {n} x {:.1} us = {:.1} ms [{}] ({})", ["draw ps", "gfx cs", "acb cs"][*k as usize], us(*c) / *n as f64, us(*c) / 1e3, paths.join(", "), parts.join(", "))
                 })
                 .collect();
             crate::info!("descriptors by shader (of {:.1} ms): {}", us(all) / 1e3, top.join("; "));
+        }
+        if render::shader_stats() {
+            let tp: Vec<String> = render::TEX_PATH
+                .iter()
+                .enumerate()
+                .filter_map(|(i, (c, n))| {
+                    let (c, n) = (c.swap(0, Ordering::Relaxed), n.swap(0, Ordering::Relaxed));
+                    (n > 0).then(|| format!("{} {n} x {:.1} us", render::TEX_PATH_NAMES[i], c as f64 / hz * 1e6 / n as f64))
+                })
+                .collect();
+            let slow = (render::TEX_SLOW.0.swap(0, Ordering::Relaxed), render::TEX_SLOW.1.swap(0, Ordering::Relaxed));
+            crate::info!("texture lookups by path/s: {}; over 100 us: {} ({:.1} ms)", tp.join(", "), slow.1, slow.0 as f64 / hz * 1e3);
         }
         // (Their steps: us each, count.)
         static LAST_BP: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);

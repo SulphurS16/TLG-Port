@@ -170,9 +170,16 @@ pub const INDEX_MIRROR: usize = 31;
 pub const CP_SYNC_VIEW: usize = 32;
 
 /// CPU-sourced textures of at most `SMALL_IMAGE_BYTES` unused for 600
-/// frames are evicted even with image eviction off (`TLG_EVICT_SMALL`, 1):
-/// the cave's tiny R32F textures sit at a new address in the title's
-/// per-frame memory every frame (~12 new images per second, never used again).
+/// frames are evicted even with image eviction off (`TLG_EVICT_SMALL`, 2;
+/// 1: only those): the cave's tiny R32F textures sit at a new address in the
+/// title's per-frame memory every frame (~30 new images per second, nearly
+/// never used again). 2: also, of those with the same creation parameters
+/// idle for 30 frames, all but the 16 most recently used at once, into the
+/// image pool - with 1 the pool stays empty until the first ones age out and
+/// each such texture costs a new image (~1 ms at 31% clock, 3 per frame for
+/// the first 600 frames after a load; run 20261016-070734: pooled ~85 frames
+/// after a load, ~920 live images instead of ~2,600, re-creations at the same
+/// rate).
 pub const EVICT_SMALL: usize = 33;
 
 /// Dispatches are ordered against earlier dispatches by the buffer ranges
@@ -569,9 +576,10 @@ pub const CS_ROUTE: usize = 96;
 
 /// Read-only ring copies reused by later batches of the same CPU epoch and
 /// CP queue, up to this many batches back (`TLG_UPLOAD_XBATCH`, at most 4;
-/// 0: within their batch only, as before). The upload ring has 4 segments
-/// more than there are batch slots, so a copy's segment is written again
-/// only after every batch that may reuse it has completed.
+/// 0: within their batch only, as before). Takes effect only when set at
+/// start: the upload ring then has 4 segments more than there are batch
+/// slots, so a copy's segment is written again only after every batch that
+/// may reuse it has completed (smaller segments: more batches end early).
 pub const UPLOAD_XBATCH: usize = 97;
 
 /// Write-back overlap checks answered from indexes when nothing can overlap
@@ -583,10 +591,24 @@ pub const SCAN_INDEX: usize = 98;
 /// Sampled textures that took the guest-memory path in the current
 /// validation epoch return the same view again while no image at their base
 /// and none of the image set changed (`TLG_TEX_MEMO`, 1; with `tex_cache`);
-/// the guest-read checks skip such textures.
+/// the guest-read checks skip such textures. 2: for the CPU epoch instead,
+/// while no GPU write registered since overlaps the texture (the validation
+/// epoch moves after every command that writes buffers).
 pub const TEX_MEMO: usize = 99;
 
-const TABLE: [(&str, &str, i64); 100] = [
+/// The `descriptors by shader` report with `TLG_PERF=1` too (`TLG_SHADER_STATS`,
+/// 0: only with `TLG_PERF=2`, whose per-copy hashing inflates the copy paths).
+pub const SHADER_STATS: usize = 100;
+
+/// Texture memo entries are checked against their base's generation only
+/// (`TLG_MEMO_BASE`, 1; 0: also the whole image set's, which every image
+/// creation and eviction anywhere bumps): a lookup only consults the images
+/// at its base, and every change there bumps the base's. (Neutral with
+/// `tex_memo 1`, whose entries last one validation epoch: run
+/// 20261016-070734, memo hits 24,300 vs 24,400 per second.)
+pub const MEMO_BASE: usize = 101;
+
+const TABLE: [(&str, &str, i64); 102] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -620,7 +642,7 @@ const TABLE: [(&str, &str, i64); 100] = [
     ("bar_uploads", "TLG_BAR_UPLOADS", 0),
     ("index_mirror", "TLG_INDEX_MIRROR", 1),
     ("cp_sync_view", "TLG_CP_SYNC_VIEW", 1),
-    ("evict_small", "TLG_EVICT_SMALL", 1),
+    ("evict_small", "TLG_EVICT_SMALL", 2),
     ("dispatch_hazards", "TLG_DISPATCH_HAZARDS", 1),
     ("bits_arena", "TLG_BITS_ARENA", 0),
     ("cpu_watch", "TLG_CPU_WATCH", 1),
@@ -687,6 +709,8 @@ const TABLE: [(&str, &str, i64); 100] = [
     ("upload_xbatch", "TLG_UPLOAD_XBATCH", 0),
     ("scan_index", "TLG_SCAN_INDEX", 1),
     ("tex_memo", "TLG_TEX_MEMO", 1),
+    ("shader_stats", "TLG_SHADER_STATS", 0),
+    ("memo_base", "TLG_MEMO_BASE", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
