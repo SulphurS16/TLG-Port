@@ -1745,11 +1745,41 @@ pub struct MemModel {
     stale_unbounded_lo: u64,
 }
 
+/// The image state, shared by the renderers (`Renderer::img_g`): the images,
+/// their generations and caches, the image pool, evicted keys, image memory.
+/// (The image indexes buffer bindings consult are in `MemModel`.)
+struct ImgState {
+    /// Images by key, and the keys of the images at each guest base.
+    images: FastMap<ImageKey, Image>,
+    by_base: FastMap<u64, Vec<ImageKey>>,
+    /// Texture bases `texture_upload_estimate` found needing no upload, with
+    /// the CPU epoch then.
+    ready_bases: FastMap<u64, u64>,
+    /// Sampled textures that took the guest-memory path (`tune tex_cache`),
+    /// with their base's `base_gen` then; per guest base, a count bumped when
+    /// an image there becomes GPU-written (or is replaced).
+    tex_paths: FastMap<(Tsharp, bool), u64>,
+    base_gen: FastMap<u64, u64>,
+    /// Bumped when an image becomes newer in guest memory, is created or is
+    /// removed: a target cache entry with this value needs no per-image check.
+    newer_gen: u64,
+    /// RT image write counters for texture shadow copies.
+    write_gen: FastMap<ImageKey, u64>,
+    shadows: FastMap<(ImageKey, u32, u32, vk::Format), (ImageKey, u64)>,
+    /// VRAM accounting (see `housekeeping`): device memory of all images.
+    image_bytes: u64,
+    /// Evicted keys with the frame of their eviction (`Renderer::recreated`:
+    /// how often one was needed again).
+    evicted_keys: FastMap<ImageKey, u64>,
+    /// Evicted small images kept for reuse (`tune image_pool`), by their
+    /// creation parameters (the key with base 0), and how many there are.
+    image_pool: FastMap<ImageKey, Vec<resources::PooledImage>>,
+    image_pool_n: usize,
+}
+
 pub struct Renderer {
     /// Sequence number of the last submitted batch.
     pub last_seq: u64,
-    images: FastMap<ImageKey, Image>,
-    by_base: FastMap<u64, Vec<ImageKey>>,
     samplers: Samplers,
     modules: FastMap<u64, vk::ShaderModule>,
     gfx_pipes: FastMap<GfxKey, Pipe>,
@@ -1817,14 +1847,7 @@ pub struct Renderer {
     tile_maps: FastMap<(u32, u32, u32, u8, u64, u32), (vk::Buffer, u64)>,
     /// Set layouts created for push descriptors (`tune push_desc`).
     push_layouts: FastSet<vk::DescriptorSetLayout>,
-    /// Texture bases `texture_upload_estimate` found needing no upload, with
-    /// the CPU epoch then.
-    ready_bases: FastMap<u64, u64>,
-    /// Sampled textures that took the guest-memory path (`tune tex_cache`),
-    /// with their base's `base_gen` then; per guest base, a count bumped when
-    /// an image there becomes GPU-written (or is replaced); hits / lookups.
-    tex_paths: FastMap<(Tsharp, bool), u64>,
-    base_gen: FastMap<u64, u64>,
+    /// `ImgState::tex_paths` hits / lookups (TLG_PERF).
     pub tex_path_hits: (u64, u64),
     /// Update templates by set layout (`tune desc_templates`), made from the
     /// (binding, type) order of the layout's first write; writes in another
@@ -1834,9 +1857,6 @@ pub struct Renderer {
     pub desc_template_uses: (u64, u64),
     /// Render-target cache hits / lookups (TLG_PERF; `BatchCtx::target_cache`).
     pub target_hits: (u64, u64),
-    /// Bumped when an image becomes newer in guest memory, is created or is
-    /// removed: a target cache entry with this value needs no per-image check.
-    newer_gen: u64,
     /// Render targets (de)tiled on the GPU: reloads, write-backs.
     pub gpu_remaps: [u64; 2],
     /// Textures read from guest memory and detiled on the GPU.
@@ -1869,32 +1889,23 @@ pub struct Renderer {
     pub index_mirrored: (u64, u64),
     retired_scratch: Vec<(vk::Buffer, vk::DeviceMemory)>,
     scratch_mem: Option<vk::DeviceMemory>,
-    /// RT image write counters for texture shadow copies.
-    write_gen: FastMap<ImageKey, u64>,
-    shadows: FastMap<(ImageKey, u32, u32, vk::Format), (ImageKey, u64)>,
     /// Images replaced by ones with more mip levels (`grow_levels`).
     grown: u64,
-    /// VRAM accounting (see `housekeeping`): device memory of all images and
-    /// of the GPU (de)tiling element maps; images evicted (count, bytes);
-    /// released objects with the batch sequence after which they are freed;
-    /// frame of the next eviction pass; pressure level (`vram_pressure`) and
-    /// when it was last reported.
-    image_bytes: u64,
+    /// VRAM accounting (see `housekeeping`): device memory of the GPU
+    /// (de)tiling element maps (the images': `ImgState::image_bytes`); images
+    /// evicted (count, bytes); released objects with the batch sequence after
+    /// which they are freed; frame of the next eviction pass; pressure level
+    /// (`vram_pressure`) and when it was last reported.
     tile_map_bytes: u64,
     pub evicted: (u64, u64),
     retired: Vec<(u64, Retired)>,
     next_trim: u64,
     pressure: u8,
     pressure_reported: Option<std::time::Instant>,
-    /// Evicted keys with the frame of their eviction, and how often one was
-    /// needed again (count, sum of frames in between): returning images show
-    /// whether eviction ages fit the title's reuse.
-    evicted_keys: FastMap<ImageKey, u64>,
+    /// How often an evicted image was needed again (count, sum of frames in
+    /// between; `ImgState::evicted_keys`): returning images show whether
+    /// eviction ages fit the title's reuse.
     pub recreated: (u64, u64),
-    /// Evicted small images kept for reuse (`tune image_pool`), by their
-    /// creation parameters (the key with base 0), and how many there are.
-    image_pool: FastMap<ImageKey, Vec<resources::PooledImage>>,
-    image_pool_n: usize,
     pub pro_ops: u64,
     /// The indirect draw kernel (set layout, layout, pipeline), its
     /// diagnostics buffer (buffer, memory, mapping) and the rejections seen.
@@ -1927,6 +1938,8 @@ pub struct Renderer {
     /// VRAM mirror windows, their binding cache, the write tracker, pending
     /// GPU writes, zero-copy spans (`MemModel`).
     mem_g: Option<parking_lot::MutexGuard<'static, MemModel>>,
+    /// The shared image state's guard while this renderer uses it (`img!`).
+    img_g: Option<parking_lot::MutexGuard<'static, ImgState>>,
     /// The recording context in use (`BatchCtx`): the graphics queue's, or
     /// while a compute CP records, the compute queues' (`select_ctx`).
     cx: Box<BatchCtx>,
@@ -2023,6 +2036,32 @@ macro_rules! mem {
     ($s:expr) => {
         (&mut **$s.mem_g.get_or_insert_with(lock_mem))
     };
+}
+
+/// The image state, shared by the renderers (`Renderer::img_g`).
+static IMG_CELL: std::sync::OnceLock<parking_lot::Mutex<ImgState>> = std::sync::OnceLock::new();
+
+/// TLG_PERF: where the image state was taken while the memory model's guard
+/// was held (render.rs lines; a second renderer needs the image state taken
+/// first), and the renderer-lock holds that took it by queue class
+/// (graphics without, with; compute queues without, with).
+pub static IMG_AFTER_MEM: parking_lot::Mutex<Option<HashMap<String, u64>>> = parking_lot::Mutex::new(None);
+pub static IMG_HOLDS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn lock_img(after_mem: bool, line: u32) -> parking_lot::MutexGuard<'static, ImgState> {
+    if after_mem && perf_on() {
+        *IMG_AFTER_MEM.lock().get_or_insert_with(HashMap::new).entry(format!("render.rs:{line}")).or_default() += 1;
+    }
+    IMG_CELL.get().expect("renderer not initialized").lock()
+}
+
+/// The image state for this renderer: its guard, taken on first use and held
+/// until the renderer lock is released (or `release_shared`).
+macro_rules! img {
+    ($s:expr) => {{
+        let after_mem = $s.img_g.is_none() && $s.mem_g.is_some();
+        &mut **$s.img_g.get_or_insert_with(|| lock_img(after_mem, line!()))
+    }};
 }
 
 /// A recording context: its command pool, the batch slots (command buffers,
@@ -2202,10 +2241,22 @@ pub fn init() -> Result<(), String> {
             stale_span_max: 0,
             stale_unbounded_lo: u64::MAX,
         })).ok();
-        *RENDERER.lock() = Some(Renderer {
-            last_seq: 0,
+        IMG_CELL.set(parking_lot::Mutex::new(ImgState {
             images: FastMap::default(),
             by_base: FastMap::default(),
+            ready_bases: FastMap::default(),
+            tex_paths: FastMap::default(),
+            base_gen: FastMap::default(),
+            newer_gen: 1,
+            write_gen: FastMap::default(),
+            shadows: FastMap::default(),
+            image_bytes: 0,
+            evicted_keys: FastMap::default(),
+            image_pool: FastMap::default(),
+            image_pool_n: 0,
+        })).ok();
+        *RENDERER.lock() = Some(Renderer {
+            last_seq: 0,
             samplers: Samplers::new(),
             modules: FastMap::default(),
             gfx_pipes: FastMap::default(),
@@ -2234,14 +2285,10 @@ pub fn init() -> Result<(), String> {
             indirect_rejected: 0,
             tile_maps: FastMap::default(),
             push_layouts: FastSet::default(),
-            ready_bases: FastMap::default(),
-            tex_paths: FastMap::default(),
-            base_gen: FastMap::default(),
             tex_path_hits: (0, 0),
             desc_templates: FastMap::default(),
             desc_template_uses: (0, 0),
             target_hits: (0, 0),
-            newer_gen: 1,
             gpu_remaps: [0; 2],
             gpu_tex_uploads: 0,
             dprof: [0; 8],
@@ -2263,20 +2310,14 @@ pub fn init() -> Result<(), String> {
             index_mirrored: (0, 0),
             retired_scratch: Vec::new(),
             scratch_mem: None,
-            write_gen: FastMap::default(),
-            shadows: FastMap::default(),
             grown: 0,
-            image_bytes: 0,
             tile_map_bytes: 0,
             evicted: (0, 0),
             retired: Vec::new(),
             next_trim: 0,
             pressure: 0,
             pressure_reported: None,
-            evicted_keys: FastMap::default(),
             recreated: (0, 0),
-            image_pool: FastMap::default(),
-            image_pool_n: 0,
             pro_ops: 0,
             indirect_draw_pipe: None,
             indirect_draw_diag: None,
@@ -2292,6 +2333,7 @@ pub fn init() -> Result<(), String> {
             reused_targets: 0,
             edge_skips: 0,
             mem_g: None,
+            img_g: None,
             cx: Box::new(cx),
             cx_park: Box::new(cx_park),
             cx_cs: false,
@@ -2932,7 +2974,12 @@ impl Renderer {
     #[track_caller]
     /// Drops the shared-state guards this renderer holds.
     fn release_shared(&mut self) {
+        if perf_on() {
+            let i = (self.cx.cmd_queue != 0) as usize * 2 + self.img_g.is_some() as usize;
+            IMG_HOLDS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.mem_g = None;
+        self.img_g = None;
     }
 
     /// The shared memory model (its guard taken if not held).
@@ -3287,7 +3334,7 @@ impl Renderer {
 
     fn register(&mut self, img: Image) {
         let k = img.key;
-        self.by_base.entry(k.base).or_default().push(k);
+        img!(self).by_base.entry(k.base).or_default().push(k);
         // (Tiled surfaces pad to macro tiles -- at least 64 KiB -- and texture
         // pitches may exceed the width: twice the linear size bounds both.
         // Block formats by their blocks, other formats without a class at 16
@@ -3304,18 +3351,18 @@ impl Renderer {
             mem!(self).img_bases_large.entry(k.base).or_default().push((k, bytes));
         }
         mem!(self).img_max_bytes = mem!(self).img_max_bytes.max(bytes);
-        self.image_bytes += img.bytes;
-        self.images.insert(k, img);
-        self.newer_gen += 1;
+        img!(self).image_bytes += img.bytes;
+        img!(self).images.insert(k, img);
+        img!(self).newer_gen += 1;
         mem!(self).meta_gen += 1;
-        *self.base_gen.entry(k.base).or_default() += 1;
+        *img!(self).base_gen.entry(k.base).or_default() += 1;
     }
 
     fn init_image(&mut self, key: ImageKey) -> Result<(), String> {
-        if self.images.contains_key(&key) {
+        if img!(self).images.contains_key(&key) {
             return Ok(());
         }
-        if let Some(at) = self.evicted_keys.remove(&key) {
+        if let Some(at) = img!(self).evicted_keys.remove(&key) {
             let gap = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(at);
             self.recreated.0 += 1;
             self.recreated.1 += gap;
@@ -3323,11 +3370,11 @@ impl Renderer {
                 crate::info!("VRAM: evicted image needed again after {gap} frames: {:#x} {}x{}x{} {:?}", key.base, key.width, key.height, key.layers, key.format);
             }
         }
-        let pooled = if crate::tune::get(crate::tune::IMAGE_POOL) != 0 { self.image_pool.get_mut(&ImageKey { base: 0, ..key }).and_then(|v| v.pop()) } else { None };
+        let pooled = if crate::tune::get(crate::tune::IMAGE_POOL) != 0 { img!(self).image_pool.get_mut(&ImageKey { base: 0, ..key }).and_then(|v| v.pop()) } else { None };
         let img = match pooled {
             Some(p) => {
                 // (Same creation parameters; cleared below like a new one.)
-                self.image_pool_n -= 1;
+                img!(self).image_pool_n -= 1;
                 self.image_reuse.1 += 1;
                 resources::reuse_image(key, p)
             }
@@ -3416,7 +3463,7 @@ impl Renderer {
             let hit = self.cx.target_cache.as_ref().filter(|c| {
                 c.seq + 1 == self.cx.work_seq
                     && c.regs == tregs
-                    && (c.newer == self.newer_gen || c.colors.iter().flatten().map(|a| a.key).chain(c.depth.map(|d| d.key)).all(|k| self.images.get(&k).is_some_and(|i| !i.guest_newer)))
+                    && (c.newer == img!(self).newer_gen || c.colors.iter().flatten().map(|a| a.key).chain(c.depth.map(|d| d.key)).all(|k| img!(self).images.get(&k).is_some_and(|i| !i.guest_newer)))
             });
             if perf_on() {
                 self.target_hits.0 += hit.is_some() as u64;
@@ -3454,8 +3501,8 @@ impl Renderer {
         // targets: buffer or storage-image stores may change its images.)
         let only_targets = [Some(vs), ps].into_iter().flatten().all(|p| p.written_buffers.is_empty() && !p.translated.out.bindings.iter().any(|b| matches!(b.kind, BindingKind::StorageImage(_))));
         if caching && only_targets {
-            let current = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).all(|k| self.images.get(&k).is_some_and(|i| !i.guest_newer));
-            let newer = if current { self.newer_gen } else { 0 };
+            let current = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).all(|k| img!(self).images.get(&k).is_some_and(|i| !i.guest_newer));
+            let newer = if current { img!(self).newer_gen } else { 0 };
             self.cx.target_cache = Some(TargetCache { regs: tregs, seq: self.cx.work_seq, colors: colors.clone(), blends: blends.clone(), masks: masks.clone(), depth, newer });
         }
         Ok((colors, blends, masks, depth))
@@ -3489,12 +3536,12 @@ impl Renderer {
         let key = ImageKey { base, width: pitch, height, layers: layers.max(1), levels: 1, format: storage_fmt, depth: false, ty3d: false };
         let key = self.find_compatible(key).unwrap_or(key);
         self.init_image(key)?;
-        if self.images[&key].guest_newer {
+        if img!(self).images[&key].guest_newer {
             self.refresh_from_guest(key, true)?;
         }
         self.sync_alias(key)?;
         // CB_COLOR*_ATTRIB.TILE_MODE_INDEX: guest surface layout for write-back.
-        let img = self.images.get_mut(&key).unwrap();
+        let img = img!(self).images.get_mut(&key).unwrap();
         img.tile_index = Some((regs.ctx(r + 5) & 0x1F) as u8);
         // CB_COLOR*_INFO.FAST_CLEAR: CMASK (4 bits per 8x8 tile) tracks fast clears.
         let cmask = (regs.ctx(r + 7) as u64) << 8;
@@ -3529,11 +3576,11 @@ impl Renderer {
         };
         let key = ImageKey { base, width: pitch, height, layers: 1, levels: 1, format, depth: true, ty3d: false };
         self.init_image(key)?;
-        if self.images[&key].guest_newer {
+        if img!(self).images[&key].guest_newer {
             self.refresh_from_guest(key, true)?;
         }
         // DB_Z_INFO.TILE_MODE_INDEX
-        let img = self.images.get_mut(&key).unwrap();
+        let img = img!(self).images.get_mut(&key).unwrap();
         img.tile_index = Some(((zinfo >> 20) & 7) as u8);
         // DB_Z_INFO.TILE_SURFACE_ENABLE: HTILE (one dword per 8x8 tile).
         let htile = (regs.ctx(0xA005) as u64) << 8;
@@ -3552,8 +3599,9 @@ impl Renderer {
     /// An existing image at the same base with the same size and format
     /// class and at least as many layers (the one with the most: views of
     /// single slices and whole arrays share the array's image).
-    fn find_compatible(&self, key: ImageKey) -> Option<ImageKey> {
-        self.by_base
+    fn find_compatible(&mut self, key: ImageKey) -> Option<ImageKey> {
+        let im = img!(self);
+        im.by_base
             .get(&key.base)?
             .iter()
             .copied()
@@ -3586,15 +3634,15 @@ impl Renderer {
                 vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: (old.width >> l).max(1), height: (old.height >> l).max(1), depth: 1 } }
             })
             .collect();
-        unsafe { REC.cmd_copy_image(self.cx.cmd, self.images[&old].image, vk::ImageLayout::GENERAL, self.images[&new].image, vk::ImageLayout::GENERAL, &regions) };
+        unsafe { REC.cmd_copy_image(self.cx.cmd, img!(self).images[&old].image, vk::ImageLayout::GENERAL, img!(self).images[&new].image, vk::ImageLayout::GENERAL, &regions) };
         unordered!(self);
         self.mark(|| "level grow copy".into());
         // The new image takes over the old one's state and index entries.
-        let o = self.images.remove(&old).unwrap();
-        self.newer_gen += 1;
-        *self.base_gen.entry(old.base).or_default() += 1;
-        *self.base_gen.entry(new.base).or_default() += 1;
-        let n = self.images.get_mut(&new).unwrap();
+        let o = img!(self).images.remove(&old).unwrap();
+        img!(self).newer_gen += 1;
+        *img!(self).base_gen.entry(old.base).or_default() += 1;
+        *img!(self).base_gen.entry(new.base).or_default() += 1;
+        let n = img!(self).images.get_mut(&new).unwrap();
         n.gpu_written = o.gpu_written;
         n.uploaded_hash = o.uploaded_hash;
         n.validated = o.validated;
@@ -3624,7 +3672,7 @@ impl Renderer {
         mem!(self).meta_gen += 1;
         // (`stale_ivals` rebuilt with the next aging.)
         mem!(self).stale_aged = u64::MAX;
-        if let Some(v) = self.by_base.get_mut(&old.base) {
+        if let Some(v) = img!(self).by_base.get_mut(&old.base) {
             v.retain(|x| *x != old);
         }
         if let Some(v) = mem!(self).img_bases.get_mut(&old.base) {
@@ -3633,11 +3681,11 @@ impl Renderer {
         if let Some(v) = mem!(self).img_bases_large.get_mut(&old.base) {
             v.retain(|x| x.0 != old);
         }
-        if let Some(g) = self.write_gen.remove(&old) {
-            self.write_gen.insert(new, g);
+        if let Some(g) = img!(self).write_gen.remove(&old) {
+            img!(self).write_gen.insert(new, g);
         }
-        self.shadows.retain(|sk, (dk, _)| sk.0 != old && *dk != old);
-        self.image_bytes -= o.bytes;
+        img!(self).shadows.retain(|sk, (dk, _)| sk.0 != old && *dk != old);
+        img!(self).image_bytes -= o.bytes;
         // (Used by the batch being recorded: freed once it completes.)
         self.retired.push((self.last_seq + 1, Retired::Image(o.image, o.memory, o.views.values().copied().collect())));
         self.grown += 1;
@@ -3656,13 +3704,14 @@ impl Renderer {
         if dst.depth {
             return Ok(());
         }
-        let Some(dlast) = self.images.get(&dst).map(|i| i.last_write) else { return Ok(()) };
-        let src = self.by_base.get(&dst.base).and_then(|ks| {
+        let Some(dlast) = img!(self).images.get(&dst).map(|i| i.last_write) else { return Ok(()) };
+        let im = img!(self);
+        let src = im.by_base.get(&dst.base).and_then(|ks| {
             ks.iter()
                 .copied()
                 .filter(|k| *k != dst && !k.depth && k.ty3d == dst.ty3d && format_class(k.format) == format_class(dst.format) && same_surface(k.width, k.height, dst.width, dst.height))
-                .filter(|k| self.images[k].gpu_written && self.images[k].last_write > dlast)
-                .max_by_key(|k| self.images[k].last_write)
+                .filter(|k| im.images[k].gpu_written && im.images[k].last_write > dlast)
+                .max_by_key(|k| im.images[k].last_write)
         });
         let Some(src) = src else { return Ok(()) };
         let (w, h, layers) = (src.width.min(dst.width), src.height.min(dst.height), src.layers.min(dst.layers).max(1));
@@ -3674,14 +3723,15 @@ impl Renderer {
         }
         let sub = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: layers };
         let region = vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: w, height: h, depth: 1 } };
-        unsafe { REC.cmd_copy_image(self.cx.cmd, self.images[&src].image, vk::ImageLayout::GENERAL, self.images[&dst].image, vk::ImageLayout::GENERAL, &[region]) };
+        unsafe { REC.cmd_copy_image(self.cx.cmd, img!(self).images[&src].image, vk::ImageLayout::GENERAL, img!(self).images[&dst].image, vk::ImageLayout::GENERAL, &[region]) };
         unordered!(self);
         self.mark(|| "alias copy".into());
-        let last = self.images[&src].last_write;
-        let d = self.images.get_mut(&dst).unwrap();
+        let im = img!(self);
+        let last = im.images[&src].last_write;
+        let d = im.images.get_mut(&dst).unwrap();
         d.last_write = last;
-        set_gpu_written!(self, d, dst.base);
-        *self.write_gen.entry(dst).or_default() += 1;
+        set_gpu_written!(im, d, dst.base);
+        *im.write_gen.entry(dst).or_default() += 1;
         if trace_frame() {
             crate::info!("FRAME alias {:#x}: {}x{} {:?} updated from newer {}x{} {:?}", dst.base, dst.width, dst.height, dst.format, src.width, src.height, src.format);
         }
@@ -3697,16 +3747,16 @@ impl Renderer {
     fn mark_stale(&mut self, key: ImageKey) {
         // Becoming stale: CPU writes to the image's memory from now on mean
         // the title has reused it (see `writeback_images`).
-        if let Some(total) = self.images.get(&key).filter(|i| !i.guest_stale).and_then(|i| Self::image_guest_layout(&key, i)).map(|g| g.3) {
+        if let Some(total) = img!(self).images.get(&key).filter(|i| !i.guest_stale).and_then(|i| Self::image_guest_layout(&key, i)).map(|g| g.3) {
             let (_, stamp) = mem!(self).writes.cpu_written_since(key.base, total, u64::MAX);
-            if let Some(i) = self.images.get_mut(&key) {
+            if let Some(i) = img!(self).images.get_mut(&key) {
                 i.stale_stamp = stamp;
             }
         }
         let ks = mem!(self).stale.entry(key.base).or_default();
         if !ks.contains(&key) {
             ks.push(key);
-            let total = self.images.get(&key).and_then(|i| Self::image_guest_layout(&key, i)).map(|g| g.3);
+            let total = img!(self).images.get(&key).and_then(|i| Self::image_guest_layout(&key, i)).map(|g| g.3);
             if let Some(t) = total {
                 mem!(self).stale_max = mem!(self).stale_max.max(t);
             }
@@ -3852,26 +3902,28 @@ impl Renderer {
 
     /// The image (not depth, not 3D) whose guest surface is exactly
     /// [base, base+bytes), most recently written first.
-    fn surface_image(&self, base: u64, bytes: u64) -> Option<ImageKey> {
-        self.by_base.get(&base)?.iter().copied().filter(|k| !k.depth && !k.ty3d && Self::image_guest_layout(k, &self.images[k]).is_some_and(|g| g.3 == bytes)).max_by_key(|k| self.images[k].last_write)
+    fn surface_image(&mut self, base: u64, bytes: u64) -> Option<ImageKey> {
+        let im = img!(self);
+        im.by_base.get(&base)?.iter().copied().filter(|k| !k.depth && !k.ty3d && Self::image_guest_layout(k, &im.images[k]).is_some_and(|g| g.3 == bytes)).max_by_key(|k| im.images[k].last_write)
     }
 
     /// An array image (not depth, not 3D) one of whose layers' guest slices
     /// is exactly [base, base+bytes): (image, layer), most recently written
     /// first.
-    fn surface_layer(&self, base: u64, bytes: u64) -> Option<(ImageKey, u32)> {
+    fn surface_layer(&mut self, base: u64, bytes: u64) -> Option<(ImageKey, u32)> {
         if bytes == 0 {
             return None;
         }
         let first = if crate::tune::get(crate::tune::ELIDE_EXT) & 8 != 0 { 0 } else { 1 };
+        let im = img!(self);
         (first..64u64)
             .filter_map(|l| {
                 let b = base.checked_sub(l * bytes)?;
-                let ks = self.by_base.get(&b)?;
+                let ks = im.by_base.get(&b)?;
                 ks.iter()
                     .copied()
-                    .filter(|k| !k.depth && !k.ty3d && k.layers as u64 > l && Self::image_guest_layout(k, &self.images[k]).is_some_and(|g| g.3 == bytes * k.layers as u64))
-                    .max_by_key(|k| self.images[k].last_write)
+                    .filter(|k| !k.depth && !k.ty3d && k.layers as u64 > l && Self::image_guest_layout(k, &im.images[k]).is_some_and(|g| g.3 == bytes * k.layers as u64))
+                    .max_by_key(|k| im.images[k].last_write)
                     .map(|k| (k, l as u32))
             })
             .next()
@@ -3881,15 +3933,16 @@ impl Renderer {
     fn note_image_written(&mut self, key: ImageKey) {
         let tick = self.draws + self.dispatches + 1;
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(img) = self.images.get_mut(&key) {
-            set_gpu_written!(self, img, key.base);
+        let im = img!(self);
+        if let Some(img) = im.images.get_mut(&key) {
+            set_gpu_written!(im, img, key.base);
             img.guest_stale = true;
             img.guest_newer = false;
             img.last_write = tick;
             img.last_write_frame = frame;
             self.mark_stale(key);
         }
-        *self.write_gen.entry(key).or_default() += 1;
+        *img!(self).write_gen.entry(key).or_default() += 1;
     }
 
     /// Performs an engine copy/fill kernel without running it. Copies of a
@@ -4106,9 +4159,10 @@ impl Renderer {
 
     fn elide_copy(&mut self, sv: &desc::Vsharp, dv: &desc::Vsharp, bytes: u64) -> Result<bool, String> {
         let ext = crate::tune::get(crate::tune::ELIDE_EXT);
-        let skey = self.by_base.get(&sv.base).and_then(|ks| {
+        let im = img!(self);
+        let skey = im.by_base.get(&sv.base).and_then(|ks| {
             ks.iter().copied().find(|k| {
-                let img = &self.images[k];
+                let img = &im.images[k];
                 img.gpu_written && !img.guest_newer && !k.ty3d && Self::image_guest_layout(k, img).is_some_and(|g| g.3 == bytes)
             })
         });
@@ -4117,8 +4171,8 @@ impl Renderer {
         if let Some(skey) = skey.filter(|_| !self.pending_write_overlaps(sv.base, bytes) && !writeback_in_flight(sv.base, bytes)) {
             let dkey = ImageKey { base: dv.base, ..skey };
             self.init_image(dkey)?;
-            let tile = self.images[&skey].tile_index;
-            self.images.get_mut(&dkey).unwrap().tile_index = tile;
+            let tile = img!(self).images[&skey].tile_index;
+            img!(self).images.get_mut(&dkey).unwrap().tile_index = tile;
             self.begin();
             self.end_rendering();
             if self.cx.barrier_needed {
@@ -4128,7 +4182,7 @@ impl Renderer {
             let aspect = if skey.depth { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
             let sub = vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: skey.layers.max(1) };
             let region = vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: skey.width, height: skey.height, depth: 1 } };
-            unsafe { REC.cmd_copy_image(self.cx.cmd, self.images[&skey].image, vk::ImageLayout::GENERAL, self.images[&dkey].image, vk::ImageLayout::GENERAL, &[region]) };
+            unsafe { REC.cmd_copy_image(self.cx.cmd, img!(self).images[&skey].image, vk::ImageLayout::GENERAL, img!(self).images[&dkey].image, vk::ImageLayout::GENERAL, &[region]) };
             unordered!(self);
             self.note_image_written(dkey);
             self.mark(|| "surface copy (image)".into());
@@ -4188,7 +4242,7 @@ impl Renderer {
         if let Some((key, layers, color)) = clear {
             if layers.1 < key.layers.max(1) {
                 // The other layers must be current in the image.
-                if self.images[&key].guest_newer {
+                if img!(self).images[&key].guest_newer {
                     self.refresh_from_guest(key, true)?;
                 }
                 self.sync_alias(key)?;
@@ -4200,7 +4254,7 @@ impl Renderer {
                 self.cx.barrier_needed = false;
             }
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: key.levels.max(1), base_array_layer: layers.0, layer_count: layers.1 };
-            unsafe { REC.cmd_clear_color_image(self.cx.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, &color, &[range]) };
+            unsafe { REC.cmd_clear_color_image(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, &color, &[range]) };
             unordered!(self);
             self.note_image_written(key);
             self.mark(|| "surface fill (clear)".into());
@@ -4397,11 +4451,12 @@ impl Renderer {
     /// Records a shader write to a storage image (for `sync_alias`).
     fn note_storage_write(&mut self, key: ImageKey) {
         let tick = self.draws + self.dispatches + 1;
-        if let Some(img) = self.images.get_mut(&key) {
-            set_gpu_written!(self, img, key.base);
+        let im = img!(self);
+        if let Some(img) = im.images.get_mut(&key) {
+            set_gpu_written!(im, img, key.base);
             img.last_write = tick;
         }
-        *self.write_gen.entry(key).or_default() += 1;
+        *img!(self).write_gen.entry(key).or_default() += 1;
     }
 
     /// Stand-in for a T# that cannot be honored (invalid descriptor, address
@@ -4435,8 +4490,9 @@ impl Renderer {
             ty3d,
         };
         self.init_image(key)?;
-        let img = self.images.get_mut(&key).unwrap();
-        set_gpu_written!(self, img, key.base); // never sourced from guest memory
+        let im = img!(self);
+        let img = im.images.get_mut(&key).unwrap();
+        set_gpu_written!(im, img, key.base); // never sourced from guest memory
         const IDENTITY_SEL: u16 = 4 | (5 << 3) | (6 << 6) | (7 << 9);
         img.view(format, IDENTITY_SEL, view_type, storage, 0, layers)
     }
@@ -4485,8 +4541,8 @@ impl Renderer {
         // before and no image at its base became GPU-written since.)
         let caching = !storage && crate::tune::get(crate::tune::TEX_CACHE) != 0 && !trace_frame();
         let hit = caching && {
-            let g = self.base_gen.get(&t.base).copied().unwrap_or(0);
-            self.tex_paths.get(&(*t, load_only)) == Some(&g)
+            let g = img!(self).base_gen.get(&t.base).copied().unwrap_or(0);
+            img!(self).tex_paths.get(&(*t, load_only)) == Some(&g)
         };
         if perf_on() && caching {
             self.tex_path_hits.0 += hit as u64;
@@ -4498,9 +4554,10 @@ impl Renderer {
             // buffer stores: reloaded before sampling (directly or via shadows).
             // (One walk over the images at the base for both.)
             let (mut old, mut newer) = (smallvec::SmallVec::<[ImageKey; 4]>::new(), smallvec::SmallVec::<[ImageKey; 4]>::new());
-            if let Some(ks) = self.by_base.get(&t.base) {
+            let im = img!(self);
+            if let Some(ks) = im.by_base.get(&t.base) {
                 for k in ks {
-                    let img = &self.images[k];
+                    let img = &im.images[k];
                     if img.gpu_written && !storage {
                         old.push(*k);
                     }
@@ -4520,13 +4577,13 @@ impl Renderer {
             }
             // GPU-written image with the same size at this address?
             if let Some(k) = self.find_compatible(key) {
-                if self.images[&k].gpu_written || storage {
+                if img!(self).images[&k].gpu_written || storage {
                     let k = self.grow_levels(k, view_level, levels)?;
                     self.sync_alias(k)?;
                     if storage {
                         self.note_storage_write(k);
                     }
-                    let img = self.images.get_mut(&k).unwrap();
+                    let img = img!(self).images.get_mut(&k).unwrap();
                     let v = img.view_levels(if storage { canonical(vfmt) } else { vfmt }, t.dst_sel, view_type, storage, view_base, layers, view_level, view_levels)?;
                     return Ok(v);
                 }
@@ -4534,48 +4591,51 @@ impl Renderer {
             // A depth render target at this address (sampled after a decompress):
             // copy its depth values into a color image of the sampled format.
             if matches!(vfmt, vk::Format::R32_SFLOAT | vk::Format::R16_UNORM) && !storage {
-                if let Some(src) = self.by_base.get(&t.base).and_then(|ks| ks.iter().copied().find(|k| k.depth && self.images[k].gpu_written && (k.format == vk::Format::D16_UNORM) == (vfmt == vk::Format::R16_UNORM))) {
+                let im = img!(self);
+                if let Some(src) = im.by_base.get(&t.base).and_then(|ks| ks.iter().copied().find(|k| k.depth && im.images[k].gpu_written && (k.format == vk::Format::D16_UNORM) == (vfmt == vk::Format::R16_UNORM))) {
                     return self.depth_shadow_view(src, t, vfmt, view_type, load_only);
                 }
             }
             // A render target at this address with padded dimensions: copy into a
             // shadow image (from the most recently rendered one if several exist).
-            if let Some(src) = self.by_base.get(&t.base).and_then(|ks| {
+            let im = img!(self);
+            if let Some(src) = im.by_base.get(&t.base).and_then(|ks| {
                 ks.iter()
                     .copied()
-                    .filter(|k| self.images[k].gpu_written && k.width >= t.width && k.height >= t.height && same_surface(k.width, k.height, t.width, t.height) && format_class(k.format) == format_class(store_fmt) && !k.depth)
-                    .max_by_key(|k| self.images[k].last_write)
+                    .filter(|k| im.images[k].gpu_written && k.width >= t.width && k.height >= t.height && same_surface(k.width, k.height, t.width, t.height) && format_class(k.format) == format_class(store_fmt) && !k.depth)
+                    .max_by_key(|k| im.images[k].last_write)
             }) {
                 if trace_frame() {
-                    crate::info!("FRAME texture {:#x} {}x{} {:?}: shadow of {}x{} {:?} (last write {})", t.base, t.width, t.height, vfmt, src.width, src.height, src.format, self.images[&src].last_write);
+                    crate::info!("FRAME texture {:#x} {}x{} {:?}: shadow of {}x{} {:?} (last write {})", t.base, t.width, t.height, vfmt, src.width, src.height, src.format, img!(self).images[&src].last_write);
                 }
                 return self.shadow_view(src, t, vfmt, store_fmt, view_type, load_only);
             }
             if trace_frame() {
-                let others: Vec<String> = self.by_base.get(&t.base).map(|ks| ks.iter().map(|k| format!("{}x{} {:?} gw {}", k.width, k.height, k.format, self.images[k].gpu_written)).collect()).unwrap_or_default();
+                let im = img!(self);
+                let others: Vec<String> = im.by_base.get(&t.base).map(|ks| ks.iter().map(|k| format!("{}x{} {:?} gw {}", k.width, k.height, k.format, im.images[k].gpu_written)).collect()).unwrap_or_default();
                 crate::info!("FRAME texture {:#x} {}x{} {:?}: guest memory (images here: [{}])", t.base, t.width, t.height, vfmt, others.join(", "));
             }
             if caching {
-                if self.tex_paths.len() > 1 << 16 {
-                    self.tex_paths.clear();
+                if img!(self).tex_paths.len() > 1 << 16 {
+                    img!(self).tex_paths.clear();
                 }
-                let g = self.base_gen.get(&t.base).copied().unwrap_or(0);
-                self.tex_paths.insert((*t, load_only), g);
+                let g = img!(self).base_gen.get(&t.base).copied().unwrap_or(0);
+                img!(self).tex_paths.insert((*t, load_only), g);
             }
         }
         self.init_image(key)?;
         let batch = mem!(self).epoch;
         let mut needs_upload = {
-            let img = &self.images[&key];
+            let img = &img!(self).images[&key];
             !img.gpu_written && img.upload_batch != batch
         };
         // Within one CPU epoch only GPU writes (tracked as ranges) can have
         // changed the texture: no write-watch query needed.
         if needs_upload {
             let bytes = resources::texture_bytes(t, depth_layers.max(1));
-            let img = &self.images[&key];
+            let img = &img!(self).images[&key];
             if img.cpu_checked != u64::MAX && img.cpu_checked >= self.cx.required_epoch && img.validated.is_some_and(|v| !mem!(self).writes.gpu_written_since(t.base, bytes, v)) {
-                self.images.get_mut(&key).unwrap().upload_batch = batch;
+                img!(self).images.get_mut(&key).unwrap().upload_batch = batch;
                 needs_upload = false;
             }
         }
@@ -4586,7 +4646,7 @@ impl Renderer {
             let t0 = std::time::Instant::now();
             // Hash only when the OS saw pages of the texture written (or the
             // GPU wrote there) since the last validation.
-            let since = self.images[&key].validated;
+            let since = img!(self).images[&key].validated;
             let (written, stamp) = mem!(self).writes.changed_since(t.base, bytes, since.unwrap_or(0));
             let mut changed = false;
             let mut h = 0;
@@ -4603,20 +4663,20 @@ impl Renderer {
             } else if written || since.is_none() || verify {
                 h = resources::hash_guest(t.base, bytes);
                 self.hashed_bytes += bytes;
-                changed = since.is_none() || self.images[&key].uploaded_hash != h;
+                changed = since.is_none() || img!(self).images[&key].uploaded_hash != h;
                 if changed && !written && since.is_some() {
                     self.report(format!("write tracking missed a change of texture {:#x} ({}x{}, {} bytes)", t.base, t.width, t.height, bytes));
                 }
                 let edges = page_edges(t.base, bytes);
-                self.images.get_mut(&key).unwrap().edges = edges;
+                img!(self).images.get_mut(&key).unwrap().edges = edges;
             }
             self.prof[3] += t0.elapsed();
-            self.images.get_mut(&key).unwrap().upload_batch = batch;
+            img!(self).images.get_mut(&key).unwrap().upload_batch = batch;
             if changed {
                 self.upload_texture(key, t, depth_layers.max(1))?;
-                self.images.get_mut(&key).unwrap().uploaded_hash = h;
+                img!(self).images.get_mut(&key).unwrap().uploaded_hash = h;
             }
-            let img = self.images.get_mut(&key).unwrap();
+            let img = img!(self).images.get_mut(&key).unwrap();
             img.validated = Some(stamp);
             img.cpu_checked = mem!(self).cpu_epoch;
         }
@@ -4624,7 +4684,7 @@ impl Renderer {
             self.sync_alias(key)?;
             self.note_storage_write(key);
         }
-        let img = self.images.get_mut(&key).unwrap();
+        let img = img!(self).images.get_mut(&key).unwrap();
         img.view_levels(if storage { canonical(vfmt) } else { vfmt }, t.dst_sel, view_type, storage, view_base, layers, view_level, view_levels)
     }
 
@@ -4638,18 +4698,19 @@ impl Renderer {
     /// count (data sharing its first or last page may change).
     fn reused_target(&mut self, k: ImageKey) -> bool {
         let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-        let Some(img) = self.images.get(&k) else { return false };
+        let Some(img) = img!(self).images.get(&k) else { return false };
         if !img.gpu_written || img.stale_stamp == 0 || img.last_write_frame + 2 >= frame || img.reuse_checked == frame || k.ty3d {
             return false;
         }
         let Some((_, _, _, total)) = Self::image_guest_layout(&k, img) else { return false };
         let since = img.stale_stamp;
-        self.images.get_mut(&k).unwrap().reuse_checked = frame;
+        img!(self).images.get_mut(&k).unwrap().reuse_checked = frame;
         let (lo, hi) = ((k.base + 0xFFF) & !0xFFF, (k.base + total) & !0xFFF);
         if lo >= hi || !mem!(self).writes.cpu_written_since(lo, hi - lo, since).0 {
             return false;
         }
-        let img = self.images.get_mut(&k).unwrap();
+        let im = img!(self);
+        let img = im.images.get_mut(&k).unwrap();
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
             crate::info!(
@@ -4662,7 +4723,7 @@ impl Renderer {
             );
         }
         img.gpu_written = false;
-        *self.base_gen.entry(k.base).or_default() += 1;
+        *im.base_gen.entry(k.base).or_default() += 1;
         img.guest_stale = false;
         img.guest_newer = false;
         img.validated = None;
@@ -4676,7 +4737,7 @@ impl Renderer {
     /// are the range's partially covered first/last page and the range's
     /// bytes there equal those saved at the last hash (`page_edges`).
     fn edges_unchanged(&mut self, key: ImageKey, base: u64, bytes: u64, since: u64) -> bool {
-        let Some(saved) = self.images.get(&key).and_then(|i| i.edges.as_deref()) else { return false };
+        let Some(saved) = img!(self).images.get(&key).and_then(|i| i.edges.as_deref()) else { return false };
         let end = base + bytes;
         let (head_page, tail_page) = (base & !0xFFF, (end - 1) & !0xFFF);
         let head_partial = base & 0xFFF != 0;
@@ -4711,18 +4772,18 @@ impl Renderer {
         }
         let layers = key.layers.max(1);
         let bytes = resources::texture_bytes(t, layers);
-        let img = self.images.get_mut(&key).unwrap();
+        let img = img!(self).images.get_mut(&key).unwrap();
         img.tile_index = Some(t.tiling_index);
         img.pitch = t.pitch.max(t.width);
-        if Self::image_guest_layout(&key, &self.images[&key]).map(|g| g.3) != Some(bytes) {
+        if Self::image_guest_layout(&key, &img!(self).images[&key]).map(|g| g.3) != Some(bytes) {
             self.report(format!("texture {:#x} {}x{}: GPU detiling declined (surface size)", t.base, t.width, t.height));
             return Ok(false);
         }
-        let since = self.images[&key].validated;
+        let since = img!(self).images[&key].validated;
         let (written, stamp) = mem!(self).writes.changed_since(t.base, bytes, since.unwrap_or(0));
         if !written && since.is_some() {
             let cpu_epoch = mem!(self).cpu_epoch;
-            let img = self.images.get_mut(&key).unwrap();
+            let img = img!(self).images.get_mut(&key).unwrap();
             img.upload_batch = batch;
             img.validated = Some(stamp);
             img.cpu_checked = cpu_epoch;
@@ -4764,13 +4825,13 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
         };
-        unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
+        unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.dring.buffer, img!(self).images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
         unordered!(self);
         self.uploads += 1;
         self.gpu_tex_uploads += 1;
         self.mark(|| "texture detiling (GPU)".into());
         let cpu_epoch = mem!(self).cpu_epoch;
-        let img = self.images.get_mut(&key).unwrap();
+        let img = img!(self).images.get_mut(&key).unwrap();
         img.upload_batch = batch;
         img.validated = Some(stamp);
         img.cpu_checked = cpu_epoch;
@@ -5372,13 +5433,13 @@ impl Renderer {
             if t.width != src.width || t.height != src.height {
                 DEPTH_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            let img = self.images.get_mut(&src).unwrap();
+            let img = img!(self).images.get_mut(&src).unwrap();
             return img.view(src.format, 0, view_type, false, 0, 1);
         }
-        let wgen = self.write_gen.get(&src).copied().unwrap_or(0);
+        let wgen = img!(self).write_gen.get(&src).copied().unwrap_or(0);
         let skey = (src, t.width, t.height, vfmt);
         let dst_key = ImageKey { base: t.base ^ 0x4000_0000_0000_0000, width: t.width, height: t.height, layers: 1, levels: 1, format: vfmt, depth: false, ty3d: false };
-        let fresh = self.shadows.get(&skey).is_some_and(|&(_, g)| g == wgen);
+        let fresh = img!(self).shadows.get(&skey).is_some_and(|&(_, g)| g == wgen);
         if !fresh {
             self.init_image(dst_key)?;
             self.begin();
@@ -5388,10 +5449,11 @@ impl Renderer {
                 self.mark(|| "depth copy for sampling (compute)".into());
                 DEPTH_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 DEPTH_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                self.shadows.insert(skey, (dst_key, wgen));
-                let d = self.images.get_mut(&dst_key).unwrap();
-                set_gpu_written!(self, d, dst_key.base);
-                let img = self.images.get_mut(&dst_key).unwrap();
+                img!(self).shadows.insert(skey, (dst_key, wgen));
+                let im = img!(self);
+                let d = im.images.get_mut(&dst_key).unwrap();
+                set_gpu_written!(im, d, dst_key.base);
+                let img = img!(self).images.get_mut(&dst_key).unwrap();
                 return img.view(vfmt, t.dst_sel, view_type, false, 0, 1);
             }
             let bpp = if vfmt == vk::Format::R16_UNORM { 2 } else { 4 };
@@ -5410,18 +5472,19 @@ impl Renderer {
             };
             let to_img = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, ..to_buf };
             unsafe {
-                REC.cmd_copy_image_to_buffer(self.cx.cmd, self.images[&src].image, vk::ImageLayout::GENERAL, scratch, &[to_buf]);
+                REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&src].image, vk::ImageLayout::GENERAL, scratch, &[to_buf]);
                 global_barrier(self.cx.cmd);
-                REC.cmd_copy_buffer_to_image(self.cx.cmd, scratch, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[to_img]);
+                REC.cmd_copy_buffer_to_image(self.cx.cmd, scratch, img!(self).images[&dst_key].image, vk::ImageLayout::GENERAL, &[to_img]);
             }
             unordered!(self);
             self.mark(|| "depth copy for sampling".into());
             DEPTH_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            self.shadows.insert(skey, (dst_key, wgen));
-            let d = self.images.get_mut(&dst_key).unwrap();
-            set_gpu_written!(self, d, dst_key.base);
+            img!(self).shadows.insert(skey, (dst_key, wgen));
+            let im = img!(self);
+            let d = im.images.get_mut(&dst_key).unwrap();
+            set_gpu_written!(im, d, dst_key.base);
         }
-        let img = self.images.get_mut(&dst_key).unwrap();
+        let img = img!(self).images.get_mut(&dst_key).unwrap();
         img.view(vfmt, t.dst_sel, view_type, false, 0, 1)
     }
 
@@ -5463,8 +5526,8 @@ impl Renderer {
         let ai = vk::DescriptorSetAllocateInfo::default().descriptor_pool(self.cx.desc_pool).set_layouts(&layouts);
         let Ok(sets) = (unsafe { c.device.allocate_descriptor_sets(&ai) }) else { return Ok(false) };
         let set = sets[0];
-        let sv = self.images.get_mut(&src).unwrap().view(src.format, 0, vk::ImageViewType::TYPE_2D, false, 0, 1)?;
-        let dv = self.images.get_mut(&dst).unwrap().view(dst.format, 0, vk::ImageViewType::TYPE_2D, true, 0, 1)?;
+        let sv = img!(self).images.get_mut(&src).unwrap().view(src.format, 0, vk::ImageViewType::TYPE_2D, false, 0, 1)?;
+        let dv = img!(self).images.get_mut(&dst).unwrap().view(dst.format, 0, vk::ImageViewType::TYPE_2D, true, 0, 1)?;
         let si = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: sv, image_layout: vk::ImageLayout::GENERAL }];
         let di = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: dv, image_layout: vk::ImageLayout::GENERAL }];
         let writes = [
@@ -5492,7 +5555,7 @@ impl Renderer {
             SHADOW_VIEWS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if crate::tune::get(crate::tune::SHADOW_LOAD_VIEW) != 0 {
                 SHADOW_VIEWS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let img = self.images.get_mut(&src).unwrap();
+                let img = img!(self).images.get_mut(&src).unwrap();
                 return img.view(vfmt, t.dst_sel, view_type, false, 0, 1);
             }
         }
@@ -5502,23 +5565,24 @@ impl Renderer {
         let want = if matches!(t.ty, desc::T_CUBE | desc::T_1D_ARRAY | desc::T_2D_ARRAY) { t.total_layers().max(src.layers) } else { src.layers };
         let mut parts: smallvec::SmallVec<[(ImageKey, u32); 4]> = smallvec::smallvec![(src, 0u32)];
         let mut covered = src.layers;
-        let mut next = self.images.get(&src).and_then(|i| Self::image_guest_layout(&src, i)).map(|g| src.base + g.3);
+        let mut next = img!(self).images.get(&src).and_then(|i| Self::image_guest_layout(&src, i)).map(|g| src.base + g.3);
         while covered < want {
             let Some(addr) = next else { break };
-            let Some(k) = self.by_base.get(&addr).and_then(|ks| {
-                ks.iter().copied().find(|k| self.images[k].gpu_written && !k.depth && k.width == src.width && k.height == src.height && format_class(k.format) == format_class(src.format))
+            let im = img!(self);
+            let Some(k) = im.by_base.get(&addr).and_then(|ks| {
+                ks.iter().copied().find(|k| im.images[k].gpu_written && !k.depth && k.width == src.width && k.height == src.height && format_class(k.format) == format_class(src.format))
             }) else {
                 break;
             };
             parts.push((k, covered));
             covered += k.layers;
-            next = Self::image_guest_layout(&k, &self.images[&k]).map(|g| k.base + g.3);
+            next = Self::image_guest_layout(&k, &img!(self).images[&k]).map(|g| k.base + g.3);
         }
         let layers = covered.min(want).max(1);
-        let wgen: u64 = parts.iter().map(|(k, _)| self.write_gen.get(k).copied().unwrap_or(0)).sum();
+        let wgen: u64 = parts.iter().map(|(k, _)| img!(self).write_gen.get(k).copied().unwrap_or(0)).sum();
         let skey = (src, t.width, t.height, store_fmt);
         let dst_key = ImageKey { base: t.base ^ 0x8000_0000_0000_0000, width: t.width, height: t.height, layers, levels: 1, format: store_fmt, depth: false, ty3d: false };
-        let fresh = self.shadows.get(&skey).is_some_and(|&(k, g)| g == wgen && k == dst_key);
+        let fresh = img!(self).shadows.get(&skey).is_some_and(|&(k, g)| g == wgen && k == dst_key);
         if !fresh {
             self.init_image(dst_key)?;
             self.begin();
@@ -5540,17 +5604,18 @@ impl Renderer {
                     extent: vk::Extent3D { width: t.width, height: t.height, depth: 1 },
                 };
                 unsafe {
-                    REC.cmd_copy_image(self.cx.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.images[&dst_key].image, vk::ImageLayout::GENERAL, &[region]);
+                    REC.cmd_copy_image(self.cx.cmd, img!(self).images[&k].image, vk::ImageLayout::GENERAL, img!(self).images[&dst_key].image, vk::ImageLayout::GENERAL, &[region]);
                 }
             }
             unordered!(self);
             SHADOW_VIEWS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.mark(|| "shadow copy for sampling".into());
-            self.shadows.insert(skey, (dst_key, wgen));
-            let d = self.images.get_mut(&dst_key).unwrap();
-            set_gpu_written!(self, d, dst_key.base);
+            img!(self).shadows.insert(skey, (dst_key, wgen));
+            let im = img!(self);
+            let d = im.images.get_mut(&dst_key).unwrap();
+            set_gpu_written!(im, d, dst_key.base);
         }
-        let img = self.images.get_mut(&dst_key).unwrap();
+        let img = img!(self).images.get_mut(&dst_key).unwrap();
         img.view(vfmt, t.dst_sel, view_type, false, t.view_base_layer(), t.layers().max(1))
     }
 
@@ -5595,7 +5660,7 @@ impl Renderer {
             pos += lv.width as u64 * lv.height as u64 * (bpp / 8) as u64 * layers as u64;
         }
         unsafe {
-            REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions);
+            REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.ring.buffer, img!(self).images[&key].image, vk::ImageLayout::GENERAL, &regions);
         }
         // TLG_MIP_CHECK=<n>: level-to-level correlations of the first n chains
         // per tile mode (chains whose level 1 correlates poorly are dumped).
@@ -6095,8 +6160,8 @@ impl Renderer {
         // free for the texture's GPU detiling -- without that, a 64 MiB
         // shadow map sampled from guest memory every frame fell back to the
         // CPU detiler, ~150 ms per frame.)
-        if self.ready_bases.len() > 1 << 14 {
-            self.ready_bases.clear();
+        if img!(self).ready_bases.len() > 1 << 14 {
+            img!(self).ready_bases.clear();
         }
         let mut n = 0u64;
         for p in stages {
@@ -6106,17 +6171,19 @@ impl Renderer {
                         // Images that are GPU-produced or already validated this epoch need no upload.
                         // (A base found ready counts as ready for the rest of
                         // the CPU epoch: an estimate, a short one is retried.)
-                        if self.ready_bases.get(&t.base) == Some(&mem!(self).cpu_epoch) {
+                        if img!(self).ready_bases.get(&t.base) == Some(&mem!(self).cpu_epoch) {
                             continue;
                         }
-                        let ready = self.by_base.get(&t.base).is_some_and(|ks| {
+                        let im = img!(self);
+                        let epoch = mem!(self).epoch;
+                        let ready = im.by_base.get(&t.base).is_some_and(|ks| {
                             ks.iter().any(|k| {
-                                let img = &self.images[k];
-                                (img.gpu_written && !img.guest_newer) || (!img.gpu_written && img.upload_batch == mem!(self).epoch)
+                                let img = &im.images[k];
+                                (img.gpu_written && !img.guest_newer) || (!img.gpu_written && img.upload_batch == epoch)
                             })
                         });
                         if ready {
-                            self.ready_bases.insert(t.base, mem!(self).cpu_epoch);
+                            img!(self).ready_bases.insert(t.base, mem!(self).cpu_epoch);
                         } else {
                             let layers = if t.ty == desc::T_3D { t.depth } else { t.total_layers() }.max(1);
                             n += resources::texture_bytes(t, layers).min(64 << 20);
@@ -6189,7 +6256,7 @@ impl Renderer {
             self.cx.attach_marked = false;
             let mut stale = std::mem::take(&mut mem!(self).stale);
             for ks in stale.values_mut() {
-                ks.retain(|k| match self.images.get_mut(k) {
+                ks.retain(|k| match img!(self).images.get_mut(k) {
                     Some(i) => {
                         if i.guest_stale && i.last_write_frame + 2 < frame {
                             i.guest_stale = false;
@@ -6200,7 +6267,7 @@ impl Renderer {
                 });
             }
             stale.retain(|_, ks| !ks.is_empty());
-            mem!(self).stale_ivals = stale.values().flatten().map(|k| Self::stale_ival(k, self.images.get(k).and_then(|i| Self::image_guest_layout(k, i)).map(|g| g.3))).collect();
+            mem!(self).stale_ivals = stale.values().flatten().map(|k| Self::stale_ival(k, img!(self).images.get(k).and_then(|i| Self::image_guest_layout(k, i)).map(|g| g.3))).collect();
             mem!(self).stale_sorted = false;
             mem!(self).stale = stale;
         }
@@ -6212,6 +6279,7 @@ impl Renderer {
             mem!(self).stale_unbounded_lo = mem!(self).stale_ivals.iter().filter(|e| e.1 == u64::MAX).map(|e| e.0).min().unwrap_or(u64::MAX);
             mem!(self).stale_sorted = true;
         }
+        let im = img!(self);
         let m = mem!(self);
         let near = || {
             let i0 = m.stale_ivals.partition_point(|e| e.0 < base.saturating_sub(m.stale_span_max));
@@ -6227,7 +6295,7 @@ impl Renderer {
         let mut keys: Vec<ImageKey> = Vec::new();
         for ks in m.stale.range(base.saturating_sub(m.stale_max)..base + size).map(|(_, ks)| ks) {
             for &k in ks {
-                let Some(i) = self.images.get(&k) else { continue };
+                let Some(i) = im.images.get(&k) else { continue };
                 if i.guest_stale && !i.guest_newer && !k.ty3d && Self::image_guest_layout(&k, i).is_some_and(|g| base < k.base + g.3) {
                     keys.push(k);
                 }
@@ -6237,14 +6305,14 @@ impl Renderer {
             self.cx.attach_marked = false;
         }
         for key in keys {
-            let Some((bpp, mode, ph, total)) = Self::image_guest_layout(&key, &self.images[&key]) else { continue };
+            let Some((bpp, mode, ph, total)) = Self::image_guest_layout(&key, &img!(self).images[&key]) else { continue };
             // The title wrote this memory since the image was rendered: it
             // freed the surface and reused the memory (e.g. heap blocks), so
             // the contents are dead. (Our own CPU-path write-backs complete
             // before the image can become stale again, whose baseline
             // harvest then consumes them.)
             {
-                let since = self.images[&key].stale_stamp;
+                let since = img!(self).images[&key].stale_stamp;
                 if mem!(self).writes.cpu_written_since(key.base, total, since).0 {
                     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
                     if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
@@ -6253,10 +6321,10 @@ impl Renderer {
                     self.reused_skips += 1;
                     // Guest memory is now the newer copy: reloaded into the
                     // image should the title use a surface here again.
-                    if let Some(i) = self.images.get_mut(&key) {
+                    if let Some(i) = img!(self).images.get_mut(&key) {
                         i.guest_stale = false;
                         i.guest_newer = true;
-                        self.newer_gen += 1;
+                        img!(self).newer_gen += 1;
                     }
                     continue;
                 }
@@ -6294,7 +6362,7 @@ impl Renderer {
                     image_offset: vk::Offset3D::default(),
                     image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
                 };
-                unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, self.cx.dring.buffer, &[region]) };
+                unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, self.cx.dring.buffer, &[region]) };
                 match self.gpu_remap(&key, true, lin_off) {
                     Ok(true) => {
                         // (Mirror tiling registered its write-back itself.)
@@ -6303,7 +6371,7 @@ impl Renderer {
                             mem!(self).writes.note_gpu_write(key.base, total);
                             self.note_pending_gpu_write(key.base, total);
                         }
-                        self.images.get_mut(&key).unwrap().guest_stale = false;
+                        img!(self).images.get_mut(&key).unwrap().guest_stale = false;
                         mem!(self).epoch += 1;
                         self.gpu_remaps[1] += 1;
                         continue;
@@ -6335,7 +6403,7 @@ impl Renderer {
                 image_offset: vk::Offset3D::default(),
                 image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
             };
-            unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, self.images[&key].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
+            unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
             self.flush_for(1);
             let t0 = std::time::Instant::now();
             let lin = unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(off as usize), (lin_slice * key.layers as u64) as usize) };
@@ -6351,11 +6419,11 @@ impl Renderer {
             mem!(self).writes.note_gpu_write(key.base, total);
             // (A new baseline: these CPU writes are ours, not the title's.)
             let (_, stamp) = mem!(self).writes.cpu_written_since(key.base, total, u64::MAX);
-            if let Some(i) = self.images.get_mut(&key) {
+            if let Some(i) = img!(self).images.get_mut(&key) {
                 i.stale_stamp = stamp;
             }
             self.prof[1] += t0.elapsed();
-            self.images.get_mut(&key).unwrap().guest_stale = false;
+            img!(self).images.get_mut(&key).unwrap().guest_stale = false;
             mem!(self).epoch += 1;
             if crate::log::enabled(crate::log::Level::Debug) {
                 crate::debug!("render target {:#x} {}x{} {:?} written back to guest memory", key.base, key.width, key.height, key.format);
@@ -6430,9 +6498,10 @@ impl Renderer {
                                 // writes landed first (`sync_guest` checks them
                                 // again); a GPU-written image here is read on the
                                 // GPU, reloads included (ordered by barriers).
-                                let (gpu_image, mut any_newer) = self.by_base.get(&t.base).map_or((false, false), |ks| {
+                                let im = img!(self);
+                                let (gpu_image, mut any_newer) = im.by_base.get(&t.base).map_or((false, false), |ks| {
                                     ks.iter().fold((false, false), |(g, n), k| {
-                                        let i = &self.images[k];
+                                        let i = &im.images[k];
                                         (g || i.gpu_written, n || i.guest_newer)
                                     })
                                 });
@@ -6465,7 +6534,12 @@ impl Renderer {
                                     }
                                 }
                                 // Render targets here made stale by buffer stores.
-                                let newer: Vec<ImageKey> = if any_newer { self.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| self.images[k].guest_newer).collect()).unwrap_or_default() } else { Vec::new() };
+                                let newer: Vec<ImageKey> = if any_newer {
+                                    let im = img!(self);
+                                    im.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| im.images[k].guest_newer).collect()).unwrap_or_default()
+                                } else {
+                                    Vec::new()
+                                };
                                 for k in newer {
                                     if let Err(e) = self.refresh_from_guest(k, true) {
                                         self.report(format!("render target reload failed: {e}"));
@@ -7383,23 +7457,25 @@ impl Renderer {
             let tick = self.draws + self.dispatches + 1;
             for a in colors.iter().flatten() {
                 self.mark_stale(a.key);
-                if let Some(img) = self.images.get_mut(&a.key) {
-                    set_gpu_written!(self, img, a.key.base);
+                let im = img!(self);
+                if let Some(img) = im.images.get_mut(&a.key) {
+                    set_gpu_written!(im, img, a.key.base);
                     img.guest_stale = true;
                     img.last_write = tick;
                     img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
                 }
-                *self.write_gen.entry(a.key).or_default() += 1;
+                *img!(self).write_gen.entry(a.key).or_default() += 1;
             }
             if let Some(d) = depth {
                 self.mark_stale(d.key);
-                if let Some(img) = self.images.get_mut(&d.key) {
-                    set_gpu_written!(self, img, d.key.base);
+                let im = img!(self);
+                if let Some(img) = im.images.get_mut(&d.key) {
+                    set_gpu_written!(im, img, d.key.base);
                     img.guest_stale = true;
                     img.last_write = tick;
                     img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
                 }
-                *self.write_gen.entry(d.key).or_default() += 1;
+                *img!(self).write_gen.entry(d.key).or_default() += 1;
             }
             self.cx.attach_marked = self.cx.rendering.is_some();
         }
@@ -7677,7 +7753,7 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: k.width, height: k.height, depth: 1 },
         };
-        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&k].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
         self.flush();
         let raw = unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(off as usize) as *const f32, (size / 4) as usize) };
         static T: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
@@ -7707,7 +7783,7 @@ impl Renderer {
         for a in colors {
             match a {
                 Some(a) => {
-                    let img = self.images.get_mut(&a.key).ok_or("attachment image missing")?;
+                    let img = img!(self).images.get_mut(&a.key).ok_or("attachment image missing")?;
                     let view = img.view(a.view_format, 0, vk::ImageViewType::TYPE_2D, false, a.layer, 1)?;
                     color_infos.push(
                         vk::RenderingAttachmentInfo::default()
@@ -7722,7 +7798,7 @@ impl Renderer {
         }
         let depth_info = match depth {
             Some(d) => {
-                let img = self.images.get_mut(&d.key).ok_or("depth image missing")?;
+                let img = img!(self).images.get_mut(&d.key).ok_or("depth image missing")?;
                 let view = img.view(d.view_format, 0, vk::ImageViewType::TYPE_2D, false, 0, 1)?;
                 Some(vk::RenderingAttachmentInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL).load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE))
             }
@@ -8473,11 +8549,12 @@ impl Renderer {
     fn note_buffer_write(&mut self, base: u64, size: u64) {
         // (Images starting up to IMG_NEAR_BYTES below the write, and the
         // large ones further below; one found twice is marked twice.)
+        let im = img!(self);
         let m = mem!(self);
         let near = m.img_bases.range(base.saturating_sub(m.img_max_bytes.min(IMG_NEAR_BYTES))..base + size);
         let far = m.img_bases_large.range(base.saturating_sub(m.img_max_bytes)..base + size);
         for (k, _) in near.chain(far).flat_map(|(_, ks)| ks.iter()).filter(|(k, bound)| k.base + bound > base) {
-            let Some(img) = self.images.get_mut(k) else { continue };
+            let Some(img) = im.images.get_mut(k) else { continue };
             if !img.gpu_written || k.ty3d {
                 continue;
             }
@@ -8492,7 +8569,7 @@ impl Renderer {
                 }
                 img.guest_newer = true;
                 img.guest_stale = false;
-                self.newer_gen += 1;
+                im.newer_gen += 1;
                 self.cx.attach_marked = false;
             }
         }
@@ -8524,11 +8601,11 @@ impl Renderer {
         }
         let layers = key.layers.max(1);
         let bytes = resources::texture_bytes(t, layers);
-        let since = self.images[&key].validated;
+        let since = img!(self).images[&key].validated;
         let (written, stamp) = mem!(self).writes.changed_since(t.base, bytes, since.unwrap_or(0));
         if !written && since.is_some() {
             let cpu_epoch = mem!(self).cpu_epoch;
-            let img = self.images.get_mut(&key).unwrap();
+            let img = img!(self).images.get_mut(&key).unwrap();
             img.upload_batch = batch;
             img.validated = Some(stamp);
             img.cpu_checked = cpu_epoch;
@@ -8631,14 +8708,14 @@ impl Renderer {
             });
             pos += lin_sizes[i];
         }
-        unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &regions) };
+        unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.dring.buffer, img!(self).images[&key].image, vk::ImageLayout::GENERAL, &regions) };
         unordered!(self);
         self.uploads += 1;
         self.gpu_tex_uploads += 1;
         self.mark(|| "texture detiling, mip chain (GPU)".into());
         mip_stat(0);
         let cpu_epoch = mem!(self).cpu_epoch;
-        let img = self.images.get_mut(&key).unwrap();
+        let img = img!(self).images.get_mut(&key).unwrap();
         img.upload_batch = batch;
         img.validated = Some(stamp);
         img.cpu_checked = cpu_epoch;
@@ -8652,7 +8729,7 @@ impl Renderer {
     pub fn verify_gpu_textures(&mut self) {
         let pending: Vec<(ImageKey, Tsharp, u32)> = std::mem::take(&mut *VERIFY_QUEUE.lock());
         for (key, t, layers) in pending {
-            let Some(image) = self.images.get(&key).map(|i| i.image) else { continue };
+            let Some(image) = img!(self).images.get(&key).map(|i| i.image) else { continue };
             let (bpp, block) = resources::element_bits(t.dfmt);
             let eb = (bpp / 8) as u64;
             let levels: Vec<tiling::MipLevel> = resources::texture_layout(&t, layers).into_iter().take(key.levels.max(1) as usize).collect();
@@ -9124,7 +9201,7 @@ impl Renderer {
     fn tile_map(&mut self, key: &ImageKey, bpp: u32, mode: tiling::TileMode, idx: u8, slice: u64) -> Result<Option<(vk::Buffer, u64)>, String> {
         // Padded pitch of the guest surface (textures may have one wider
         // than the image).
-        let pitch = tiling::padded(self.images.get(key).map_or(0, |i| i.pitch).max(key.width), key.height, bpp, mode).0;
+        let pitch = tiling::padded(img!(self).images.get(key).map_or(0, |i| i.pitch).max(key.width), key.height, bpp, mode).0;
         self.tile_map_raw(key.width, key.height, pitch, bpp, mode, idx, slice)
     }
 
@@ -9182,7 +9259,7 @@ impl Renderer {
     /// device ring. Returns false when it cannot be done on the GPU (the
     /// caller then uses the CPU path).
     fn gpu_remap(&mut self, key: &ImageKey, tile: bool, lin_off: u64) -> Result<bool, String> {
-        let Some(img) = self.images.get(key) else { return Ok(false) };
+        let Some(img) = img!(self).images.get(key) else { return Ok(false) };
         let Some((bpp, mode, _ph, total)) = Self::image_guest_layout(key, img) else { return Ok(false) };
         let idx = img.tile_index.unwrap_or(0);
         if !Self::gpu_remap_eligible(bpp) {
@@ -9288,7 +9365,7 @@ impl Renderer {
             let s = format!("{:#x} {}x{}x{} {:?} (at {:#x})", key.base, key.width, key.height, key.layers, key.format, self.cx.cur_shader);
             *RELOAD_SITES.lock().get_or_insert_with(HashMap::new).entry(s).or_default() += 1;
         }
-        let Some(img) = self.images.get_mut(&key) else { return Ok(()) };
+        let Some(img) = img!(self).images.get_mut(&key) else { return Ok(()) };
         img.guest_newer = false;
         let Some((bpp, mode, ph, total)) = Self::image_guest_layout(&key, img) else { return Ok(()) };
         if trace_frame() {
@@ -9338,10 +9415,10 @@ impl Renderer {
                         image_offset: vk::Offset3D::default(),
                         image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
                     };
-                    unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.dring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
+                    unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.dring.buffer, img!(self).images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
                     unordered!(self);
-                    *self.write_gen.entry(key).or_default() += 1;
-                    self.images.get_mut(&key).unwrap().last_write = self.draws + self.dispatches + 1;
+                    *img!(self).write_gen.entry(key).or_default() += 1;
+                    img!(self).images.get_mut(&key).unwrap().last_write = self.draws + self.dispatches + 1;
                     self.gpu_remaps[0] += 1;
                     return Ok(());
                 }
@@ -9380,11 +9457,11 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
         };
-        unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.ring.buffer, self.images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
+        unsafe { REC.cmd_copy_buffer_to_image(self.cx.cmd, self.cx.ring.buffer, img!(self).images[&key].image, vk::ImageLayout::GENERAL, &[region]) };
         unordered!(self);
         // Shadow copies of the old contents are out of date.
-        *self.write_gen.entry(key).or_default() += 1;
-        self.images.get_mut(&key).unwrap().last_write = self.draws + self.dispatches + 1;
+        *img!(self).write_gen.entry(key).or_default() += 1;
+        img!(self).images.get_mut(&key).unwrap().last_write = self.draws + self.dispatches + 1;
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
             crate::info!("render target {:#x} {}x{} {:?} reloaded from guest memory (written by buffer stores)", key.base, key.width, key.height, key.format);
@@ -9396,7 +9473,7 @@ impl Renderer {
     /// HTILE/CMASK surface: examined when the target is next bound.
     fn note_meta_write(&mut self, base: u64, size: u64) {
         for k in self.meta_overlapping(base, size, false) {
-            if let Some(img) = self.images.get_mut(&k) {
+            if let Some(img) = img!(self).images.get_mut(&k) {
                 img.meta_dirty = true;
                 img.meta_fill = None;
             }
@@ -9407,7 +9484,9 @@ impl Renderer {
     /// (`inside`: lie entirely inside it), from `meta_cache`.
     fn meta_overlapping(&mut self, base: u64, size: u64, inside: bool) -> smallvec::SmallVec<[ImageKey; 4]> {
         if mem!(self).meta_cache.0 != mem!(self).meta_gen {
-            let mut v: Vec<(u64, u64, ImageKey)> = mem!(self).meta_images.iter().filter_map(|k| self.images.get(k).and_then(|i| i.meta).map(|(m, n)| (m, m + n, *k))).collect();
+            let im = img!(self);
+            let m = mem!(self);
+            let mut v: Vec<(u64, u64, ImageKey)> = m.meta_images.iter().filter_map(|k| im.images.get(k).and_then(|i| i.meta).map(|(m, n)| (m, m + n, *k))).collect();
             v.sort_unstable_by_key(|e| e.0);
             let max = v.iter().map(|e| e.1 - e.0).max().unwrap_or(0);
             mem!(self).meta_cache = (mem!(self).meta_gen, v, max);
@@ -9422,7 +9501,7 @@ impl Renderer {
     /// surfaces it covers entirely hold that pattern (see `apply_meta_clears`).
     fn note_meta_fill(&mut self, base: u64, size: u64, pattern: u32) {
         for k in self.meta_overlapping(base, size, true) {
-            if let Some(img) = self.images.get_mut(&k) {
+            if let Some(img) = img!(self).images.get_mut(&k) {
                 img.meta_fill = Some(pattern);
             }
         }
@@ -9438,18 +9517,18 @@ impl Renderer {
         let mut todo: Vec<(ImageKey, Option<u32>)> = Vec::new();
         for (n, a) in colors.iter().enumerate() {
             if let Some(a) = a {
-                if self.images.get(&a.key).is_some_and(|i| i.meta_dirty) {
+                if img!(self).images.get(&a.key).is_some_and(|i| i.meta_dirty) {
                     todo.push((a.key, Some(n as u32)));
                 }
             }
         }
         if let Some(d) = depth {
-            if self.images.get(&d.key).is_some_and(|i| i.meta_dirty) {
+            if img!(self).images.get(&d.key).is_some_and(|i| i.meta_dirty) {
                 todo.push((d.key, None));
             }
         }
         for (key, slot) in todo {
-            let Some(((mbase, msize), fill)) = self.images.get_mut(&key).and_then(|i| {
+            let Some(((mbase, msize), fill)) = img!(self).images.get_mut(&key).and_then(|i| {
                 i.meta_dirty = false;
                 i.meta.map(|m| (m, i.meta_fill))
             }) else {
@@ -9484,7 +9563,7 @@ impl Renderer {
             if SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 12 {
                 crate::info!("metadata of {:#x} ({}) written: {:#x}+{:#x} sample {:08x?}", key.base, if slot.is_some() { "CMASK" } else { "HTILE" }, mbase, msize, &words[..4.min(words.len())]);
             }
-            let img = self.images[&key].image;
+            let img = img!(self).images[&key].image;
             match slot {
                 None => {
                     // HTILE: ZMask [3:0] == 0 -> depth cleared; with stencil
@@ -9539,8 +9618,9 @@ impl Renderer {
                 }
             }
             self.mark_stale(key);
-            if let Some(i) = self.images.get_mut(&key) {
-                set_gpu_written!(self, i, key.base);
+            let im = img!(self);
+            if let Some(i) = im.images.get_mut(&key) {
+                set_gpu_written!(im, i, key.base);
                 i.guest_stale = true;
             }
             // The hardware marks tiles expanded as it renders them (and an
@@ -9724,8 +9804,9 @@ impl Renderer {
         }
         // (As the CPU path's clear does; the draw that follows renders to it.)
         self.mark_stale(key);
-        if let Some(i) = self.images.get_mut(&key) {
-            set_gpu_written!(self, i, key.base);
+        let im = img!(self);
+        if let Some(i) = im.images.get_mut(&key) {
+            set_gpu_written!(im, i, key.base);
             i.guest_stale = true;
         }
         self.meta_gpu += 1;
@@ -9811,8 +9892,9 @@ impl Renderer {
         v
     }
 
-    pub fn image_count(&self) -> usize {
-        self.images.len()
+    pub fn image_count(&mut self) -> usize {
+        let im = img!(self);
+        im.images.len()
     }
     pub fn pipeline_count(&self) -> usize {
         self.gfx_pipes.len() + self.cs_pipes.len()
@@ -9869,9 +9951,9 @@ impl Renderer {
                 p.give(blocks);
             }
             for (k, p) in pooled {
-                if self.image_pool_n < IMAGE_POOL_MAX && self.pressure < 2 {
-                    self.image_pool.entry(k).or_default().push(p);
-                    self.image_pool_n += 1;
+                if img!(self).image_pool_n < IMAGE_POOL_MAX && self.pressure < 2 {
+                    img!(self).image_pool.entry(k).or_default().push(p);
+                    img!(self).image_pool_n += 1;
                 } else {
                     p.destroy();
                 }
@@ -9884,12 +9966,12 @@ impl Renderer {
         self.next_trim = frame + 30;
         let (usage, budget) = ctx().vram().unwrap_or((0, 0));
         self.pressure = vram_pressure(usage, budget);
-        if self.pressure >= 2 && self.image_pool_n > 0 {
+        if self.pressure >= 2 && img!(self).image_pool_n > 0 {
             // (Pooled images are idle: the GPU finished with them.)
-            for (_, v) in self.image_pool.drain() {
+            for (_, v) in img!(self).image_pool.drain() {
                 v.into_iter().for_each(resources::PooledImage::destroy);
             }
-            self.image_pool_n = 0;
+            img!(self).image_pool_n = 0;
         }
         let age = EVICT_AGE[self.pressure as usize];
         // (Not recording: every command using these has been submitted.)
@@ -9909,7 +9991,7 @@ impl Renderer {
         static SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let evict_shadows = *SHADOWS.get_or_init(|| std::env::var("TLG_EVICT_SHADOWS").map(|v| v != "0").unwrap_or(true));
         let small = crate::tune::get(crate::tune::EVICT_SMALL) != 0;
-        let mut candidates: Vec<(u64, u64, ImageKey)> = self
+        let mut candidates: Vec<(u64, u64, ImageKey)> = img!(self)
             .images
             .iter()
             .filter(|(k, i)| {
@@ -9940,16 +10022,16 @@ impl Renderer {
         let victims: Vec<ImageKey> = candidates.into_iter().map(|c| c.2).collect();
         let mut freed = 0;
         for k in &victims {
-            let Some(img) = self.images.remove(k) else { continue };
-            self.newer_gen += 1;
+            let Some(img) = img!(self).images.remove(k) else { continue };
+            img!(self).newer_gen += 1;
             if img.meta_listed {
                 mem!(self).meta_images.retain(|x| x != k);
                 mem!(self).meta_gen += 1;
             }
-            if let Some(v) = self.by_base.get_mut(&k.base) {
+            if let Some(v) = img!(self).by_base.get_mut(&k.base) {
                 v.retain(|x| x != k);
                 if v.is_empty() {
-                    self.by_base.remove(&k.base);
+                    img!(self).by_base.remove(&k.base);
                 }
             }
             if let Some(v) = mem!(self).img_bases.get_mut(&k.base) {
@@ -9964,13 +10046,13 @@ impl Renderer {
                     mem!(self).img_bases_large.remove(&k.base);
                 }
             }
-            self.write_gen.remove(k);
-            if self.evicted_keys.len() >= 1 << 16 {
-                self.evicted_keys.clear();
+            img!(self).write_gen.remove(k);
+            if img!(self).evicted_keys.len() >= 1 << 16 {
+                img!(self).evicted_keys.clear();
             }
-            self.evicted_keys.insert(*k, frame);
+            img!(self).evicted_keys.insert(*k, frame);
             freed += img.bytes;
-            self.image_bytes -= img.bytes;
+            img!(self).image_bytes -= img.bytes;
             if img.bytes <= SMALL_IMAGE_BYTES && crate::tune::get(crate::tune::IMAGE_POOL) != 0 {
                 self.retired.push((seq, Retired::Pooled(ImageKey { base: 0, ..*k }, resources::PooledImage::of(img))));
             } else {
@@ -9979,7 +10061,7 @@ impl Renderer {
         }
         if !victims.is_empty() {
             let gone: std::collections::HashSet<ImageKey> = victims.iter().copied().collect();
-            self.shadows.retain(|sk, (dk, _)| !gone.contains(&sk.0) && !gone.contains(dk));
+            img!(self).shadows.retain(|sk, (dk, _)| !gone.contains(&sk.0) && !gone.contains(dk));
             self.evicted.0 += victims.len() as u64;
             self.evicted.1 += freed;
             if any_big {
@@ -10018,7 +10100,7 @@ impl Renderer {
                 self.pressure,
                 usage >> 20,
                 budget >> 20,
-                self.image_bytes >> 20,
+                img!(self).image_bytes >> 20,
                 mem!(self).vcache.as_ref().map_or(0, |v| v.bytes) >> 20,
                 if released > 0 { format!(", released {} MiB of mirrors", released >> 20) } else { String::new() }
             );
@@ -10028,17 +10110,18 @@ impl Renderer {
     /// One line of VRAM accounting for the periodic statistics.
     /// Images per guest base (`by_base`, walked by texture bindings): bases,
     /// the most at one base, bases with 4 or more, and the bases with most.
-    pub fn base_report(&self) -> String {
-        let mut counts: Vec<(usize, u64)> = self.by_base.iter().map(|(b, ks)| (ks.len(), *b)).collect();
+    pub fn base_report(&mut self) -> String {
+        let im = img!(self);
+        let mut counts: Vec<(usize, u64)> = im.by_base.iter().map(|(b, ks)| (ks.len(), *b)).collect();
         counts.sort_unstable_by(|a, b| b.cmp(a));
         let many = counts.iter().filter(|c| c.0 >= 4).count();
         let top: Vec<String> = counts.iter().take(5).map(|(n, b)| format!("{b:#x} {n}")).collect();
-        format!("images by guest base: {} bases, {} images, at most {} at one base, {} bases with 4 or more (most: {})", counts.len(), self.images.len(), counts.first().map_or(0, |c| c.0), many, top.join(", "))
+        format!("images by guest base: {} bases, {} images, at most {} at one base, {} bases with 4 or more (most: {})", counts.len(), im.images.len(), counts.first().map_or(0, |c| c.0), many, top.join(", "))
     }
 
     pub fn vram_report(&mut self) -> String {
         let (mut tex, mut gpu, mut shadow) = (0u64, 0u64, 0u64);
-        for (k, i) in &self.images {
+        for (k, i) in &img!(self).images {
             if is_shadow(k) {
                 shadow += i.bytes;
             } else if i.gpu_written {
@@ -10060,8 +10143,8 @@ impl Renderer {
         let wins: Vec<String> = wins.iter().map(|w| format!("{:#x} {}/{}/{}", w.0, w.1 >> 20, w.2 >> 20, w.3 >> 20)).collect();
         format!(
             "VRAM: {} images {} MiB (textures {} MiB, GPU-written {} MiB, shadow copies {} MiB), mirrors {} MiB ({} MiB ever bound; per window MiB bound/valid/allocated: {}), element maps {} MiB; evicted {} images ({} MiB) so far, {} needed again (after {} frames on average){budget}",
-            self.images.len(),
-            self.image_bytes >> 20,
+            img!(self).images.len(),
+            img!(self).image_bytes >> 20,
             tex >> 20,
             gpu >> 20,
             shadow >> 20,
@@ -10079,12 +10162,13 @@ impl Renderer {
     /// Image to present for a display buffer (after a flush).
     pub fn display_image(&mut self, base: u64, w: u32, h: u32) -> Option<(vk::Image, u32, u32, vk::Format)> {
         let k = self.display_key(base, w, h)?;
-        Some((self.images[&k].image, w, h, k.format))
+        Some((img!(self).images[&k].image, w, h, k.format))
     }
 
-    fn display_key(&self, base: u64, w: u32, h: u32) -> Option<ImageKey> {
-        let ks = self.by_base.get(&base)?;
-        ks.iter().copied().find(|k| !k.depth && k.width >= w && k.height >= h && self.images[k].gpu_written)
+    fn display_key(&mut self, base: u64, w: u32, h: u32) -> Option<ImageKey> {
+        let im = img!(self);
+        let ks = im.by_base.get(&base)?;
+        ks.iter().copied().find(|k| !k.depth && k.width >= w && k.height >= h && im.images[k].gpu_written)
     }
 
     /// Reads back a display image as RGBA8 (for screenshots).
@@ -10105,7 +10189,7 @@ impl Renderer {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
         };
-        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&k].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
         self.flush();
         let mut px = unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(off as usize), (w * h * 4) as usize) }.to_vec();
         if matches!(k.format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB) {
@@ -10144,7 +10228,7 @@ impl Renderer {
         let bases = BASES.get_or_init(|| {
             std::env::var("TLG_DUMP_BASES").map(|v| v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).unwrap_or_default()
         });
-        let mut keys: Vec<ImageKey> = self
+        let mut keys: Vec<ImageKey> = img!(self)
             .images
             .iter()
             .filter(|(k, i)| i.gpu_written && (bases.is_empty() || bases.contains(&(k.base & 0x0FFF_FFFF_FFFF_FFFF))))
@@ -10188,7 +10272,7 @@ impl Renderer {
             image_offset: vk::Offset3D { x: 0, y: 0, z: if k.ty3d { layer as i32 } else { 0 } },
             image_extent: vk::Extent3D { width: k.width, height: k.height, depth: 1 },
         };
-        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, self.images[&k].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&k].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
         self.flush();
         let raw = unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(off as usize), size as usize) }.to_vec();
         let (rgba, stats) = to_viewable(view_fmt, &raw, k.width, k.height);
@@ -10232,7 +10316,8 @@ impl Renderer {
         // the names).
         for r in &p.resources {
             let ResolvedRes::Image(t) = r else { continue };
-            let keys: Vec<ImageKey> = self.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| self.images[k].gpu_written).collect()).unwrap_or_default();
+            let im = img!(self);
+            let keys: Vec<ImageKey> = im.by_base.get(&t.base).map(|ks| ks.iter().copied().filter(|k| im.images[k].gpu_written).collect()).unwrap_or_default();
             for k in keys {
                 if !done.contains(&k) {
                     done.push(k);

@@ -555,7 +555,8 @@ fn gfx_thread() {
         if n <= 3 || n % 600 == 0 || REPORT_REQUEST.swap(false, Ordering::Relaxed) {
             crate::info!("gfx: submission {} done; busy {:.1}s of {:.1}s; queued {}; stats {:?}", n, busy.as_secs_f64(), started.elapsed().as_secs_f64(), q.pending.lock().len(), cp.stats);
             if let Some(r) = render::RENDERER.lock().as_mut() {
-                crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}; color shadows: copies {}, texel-load lookups {} ({} served by the target)", r.draws, r.dispatches, r.skipped, r.image_count(), r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed));
+                let images = r.image_count();
+                crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}; color shadows: copies {}, texel-load lookups {} ({} served by the target)", r.draws, r.dispatches, r.skipped, images, r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed));
                 let ub = r.upload_bytes;
                 crate::info!("buffer copies: written {} MiB, misaligned {} MiB, pending writes {} MiB, indices {} MiB; read-only copies reused {} times ({} MiB); read-only copies into the BAR ring {} ({} MiB; {} to the host ring for want of room); index data from the mirror {} draws ({} MiB)", ub[0] >> 20, ub[1] >> 20, ub[2] >> 20, ub[3] >> 20, r.upload_reused.0, r.upload_reused.1 >> 20, r.bar_uploads.0, r.bar_uploads.1 >> 20, r.bar_uploads.2, r.index_mirrored.0, r.index_mirrored.1 >> 20);
                 crate::info!("render targets (de)tiled on the GPU: reloads {}, write-backs {}; textures detiled on the GPU {}; ring-full retries {}", r.gpu_remaps[0], r.gpu_remaps[1], r.gpu_tex_uploads, r.ring_retries);
@@ -658,6 +659,7 @@ fn gfx_thread() {
                         ("render-target reloads (target, at shader)", &render::RELOAD_SITES),
                         ("shader preparations that waited for pending GPU writes (reader, address, write)", &render::GUARD_SITES),
                         ("upload copies with forwards of pending GPU writes (read range, reader, write)", &render::FORWARD_SITES),
+                        ("image state taken while the memory model was held (site)", &render::IMG_AFTER_MEM),
                     ] {
                         let mut v: Vec<(String, u64)> = m.lock().take().unwrap_or_default().into_iter().collect();
                         v.sort_by(|x, y| y.1.cmp(&x.1));
@@ -1130,6 +1132,11 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                     recorder.push_str(&format!("; decoded submissions: prepare-thread waits for CP writes {}, graphics-CP waits for decoding {} ({:.2} ms; at a submission's start {}, {:.2} ms)", pa[7], pa[8], pa[9] as f64 / 1e6, pa[10], pa[11] as f64 / 1e6));
                 }
                 recorder.push_str(&format!("; prepare thread on submissions {} ms, preparations over 200 us {} ({:.2} ms)", pa[14] / 1_000_000, pa[12], pa[13] as f64 / 1e6));
+            }
+            // (Renderer-lock holds that took the image state, by queue class.)
+            let ih: [u64; 4] = std::array::from_fn(|i| render::IMG_HOLDS[i].swap(0, Ordering::Relaxed));
+            if ih.iter().any(|&n| n != 0) {
+                recorder.push_str(&format!("; lock holds with the image state: graphics {} of {}, compute queues {} of {}", ih[1], ih[0] + ih[1], ih[3], ih[2] + ih[3]));
             }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
             let ts: [u64; 5] = std::array::from_fn(|i| TAIL_STATS[i].swap(0, Ordering::Relaxed));
