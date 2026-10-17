@@ -717,8 +717,12 @@ pub const POOL_CAP: usize = 120;
 /// around the caches (`TLG_STREAM_COPIES`, 0; measured alike at the 31%
 /// clamp, full clock not measured yet).
 pub const STREAM_COPIES: usize = 121;
+/// A draw with the previous draw's context registers (`Regs::ctx_gen`)
+/// reuses its render targets' lookup without reading their registers and
+/// its dynamic state without computing it (`TLG_SAME_STATE`, 1).
+pub const SAME_STATE: usize = 122;
 
-const TABLE: [(&str, &str, i64); 122] = [
+const TABLE: [(&str, &str, i64); 123] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -841,6 +845,7 @@ const TABLE: [(&str, &str, i64); 122] = [
     ("dry_words", "TLG_DRY_WORDS", 1),
     ("pool_cap", "TLG_POOL_CAP", 8192),
     ("stream_copies", "TLG_STREAM_COPIES", 0),
+    ("same_state", "TLG_SAME_STATE", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

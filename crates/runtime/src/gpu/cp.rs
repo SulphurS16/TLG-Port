@@ -13,11 +13,15 @@ pub struct Regs {
     pub sh: Vec<u32>,
     pub uconfig: Vec<u32>,
     pub config: Vec<u32>,
+    /// Changes whenever a context register's value changes (writes of the
+    /// value it has leave it): state derived from the context registers
+    /// alone is still current while it is unchanged.
+    pub ctx_gen: u64,
 }
 
 impl Regs {
     pub fn new() -> Regs {
-        Regs { ctx: vec![0; 0x400], sh: vec![0; 0x400], uconfig: vec![0; 0x400], config: vec![0; 0xC00] }
+        Regs { ctx: vec![0; 0x400], sh: vec![0; 0x400], uconfig: vec![0; 0x400], config: vec![0; 0xC00], ctx_gen: 0 }
     }
     pub fn ctx(&self, reg: u32) -> u32 {
         self.ctx[(reg - pm4::CONTEXT_REG_BASE) as usize]
@@ -1425,8 +1429,15 @@ impl CommandProcessor {
         // Bulk copy into one register file unless writes are being watched.
         if !reg_watching() {
             let (s, e) = (start as usize, start as usize + vals.len());
+            if (0xA000..0xA400).contains(&s) && e <= 0xA400 {
+                let f = &mut self.regs.ctx[s - 0xA000..e - 0xA000];
+                if f != vals {
+                    f.copy_from_slice(vals);
+                    self.regs.ctx_gen += 1;
+                }
+                return;
+            }
             let file = match s {
-                0xA000..0xA400 if e <= 0xA400 => Some(&mut self.regs.ctx[s - 0xA000..e - 0xA000]),
                 0x2C00..0x3000 if e <= 0x3000 => Some(&mut self.regs.sh[s - 0x2C00..e - 0x2C00]),
                 0xC000..0xC400 if e <= 0xC400 => Some(&mut self.regs.uconfig[s - 0xC000..e - 0xC000]),
                 0x2000..0x2C00 if e <= 0x2C00 => Some(&mut self.regs.config[s - 0x2000..e - 0x2000]),
@@ -1450,7 +1461,12 @@ impl CommandProcessor {
         }
         let r = reg as usize;
         match r {
-            0xA000..0xA400 => self.regs.ctx[r - 0xA000] = v,
+            0xA000..0xA400 => {
+                if self.regs.ctx[r - 0xA000] != v {
+                    self.regs.ctx[r - 0xA000] = v;
+                    self.regs.ctx_gen += 1;
+                }
+            }
             0x2C00..0x3000 => self.regs.sh[r - 0x2C00] = v,
             0xC000..0xC400 => self.regs.uconfig[r - 0xC000] = v,
             0x2000..0x2C00 => self.regs.config[r - 0x2000] = v,
@@ -1473,6 +1489,9 @@ impl CommandProcessor {
         }
         let r = reg as usize;
         if (0xA000..0xA400).contains(&r) {
+            if self.regs.ctx[r - 0xA000] != v {
+                self.regs.ctx_gen += 1;
+            }
             self.regs.ctx[r - 0xA000] = v;
         } else if (0x2C00..0x3000).contains(&r) {
             self.regs.sh[r - 0x2C00] = v;

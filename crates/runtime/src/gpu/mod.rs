@@ -1195,6 +1195,10 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
         if wi[0] != 0 {
             crate::info!("render-target write-back checks/s: {} (stale intervals {:.1} each)", wi[0], wi[1] as f64 / wi[0] as f64);
         }
+        let ss: [u64; 3] = std::array::from_fn(|i| render::STATE_REUSE[i].swap(0, Ordering::Relaxed));
+        if ss[0] != 0 {
+            crate::info!("draws/s: {} on the graphics queue; {} with the previous draw's context registers, {} also with its shaders and primitive type", ss[0], ss[1], ss[2]);
+        }
         crate::info!(
             "perf/s: flips {} draws {} dispatches {} passes {} barriers {} batches {} cpu epochs {} write-watch queries {} ({} pages, {} ms; {} checks answered by this epoch's) uploads {} hashed {} MB | gpu busy {}ms (executing {}ms), cp sync waits {}ms, GPU thread CPU {}ms | flushes [{}] | {}{}",
             now.frames - p.frames,

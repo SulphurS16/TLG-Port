@@ -759,6 +759,11 @@ type Colors = smallvec::SmallVec<[Option<Attachment>; 8]>;
 /// selected them, the draw's `Renderer::work_seq`, and the result.
 struct TargetCache {
     regs: smallvec::SmallVec<[u32; 96]>,
+    /// `Regs::ctx_gen` of the draw's queue (`queue`) and the pixel shader's
+    /// outputs (`mrt_mask`) last found with these registers.
+    ctx_gen: u64,
+    mrt_mask: u32,
+    queue: usize,
     seq: u64,
     colors: Colors,
     blends: smallvec::SmallVec<[u32; 8]>,
@@ -2259,6 +2264,10 @@ pub(super) struct BatchCtx {
     unordered_line: u32,
     /// See `DynState` (None at the start of a command buffer).
     dyn_state: Option<DynState>,
+    /// What `dyn_state` was made from: the context registers' generation
+    /// and queue, the extent, the primitive type, a depth target
+    /// (`tune same_state`).
+    dyn_key: (u64, usize, (u32, u32), u32, bool),
     /// Graphics pipeline bound in the current command buffer (consecutive
     /// draws mostly share one; the bind is skipped then).
     bound_gfx: vk::Pipeline,
@@ -2291,6 +2300,12 @@ pub(super) struct BatchCtx {
     /// draw's targets.
     work_seq: u64,
     target_cache: Option<TargetCache>,
+    /// The current draw's render targets came from `target_cache` by its
+    /// context registers' generation (`draw_attachments`); the last draw's
+    /// ready pipeline: (vertex and pixel shader keys, primitive type, push
+    /// descriptors, its command's `work_seq`) -> (pipeline, layouts).
+    targets_same: bool,
+    last_pipe: Option<((u64, Option<u64>, u32, bool, u64), (vk::Pipeline, vk::PipelineLayout, vk::DescriptorSetLayout))>,
     /// Distinct buffers of `hz` and whether any access to each writes.
     hz_bufs: smallvec::SmallVec<[(vk::Buffer, bool); 8]>,
     /// `hz` entries' accesses, each kept once (`tune hz_dedupe`): the
@@ -3065,6 +3080,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 bits_arena: (u64::MAX, 0, 0, 0),
                 unordered_line: 0,
                 dyn_state: None,
+                dyn_key: (u64::MAX, 0, (0, 0), 0, false),
                 bound_gfx: vk::Pipeline::null(),
                 bound_cs: vk::Pipeline::null(),
                 dring,
@@ -3078,6 +3094,8 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 vc_why: "other",
                 work_seq: 0,
                 target_cache: None,
+                targets_same: false,
+                last_pipe: None,
                 hz_bufs: smallvec::SmallVec::new(),
                 hz_seen: FastSet::default(),
                 req_class: 0,
@@ -3401,6 +3419,13 @@ impl Descriptors {
 /// TLG_PERF: `writeback_images` calls and the stale intervals they had to
 /// consider in all (`Renderer::stale_ivals`).
 pub static WB_IMAGES: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+/// TLG_PERF: graphics-queue draws, those with the previous draw's context
+/// registers (`Regs::ctx_gen`), those also with its shaders and primitive
+/// type.
+pub static STATE_REUSE: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+thread_local! {
+    static LAST_STATE: std::cell::Cell<(u64, u64, u64, u32)> = const { std::cell::Cell::new((u64::MAX, 0, 0, 0)) };
+}
 
 /// TLG_PERF: dispatches by queue class (graphics, compute) and the
 /// synchronizing packets before them since the previous dispatch
@@ -4853,7 +4878,31 @@ impl Renderer {
         // draw, and the blend controls.)
         let caching = crate::tune::get(crate::tune::TARGET_CACHE) != 0;
         let mut tregs: smallvec::SmallVec<[u32; 96]> = smallvec::SmallVec::new();
+        self.cx.targets_same = false;
         if caching {
+            // (The context registers unchanged since the cached draw on this
+            // queue - `Regs::ctx_gen` - with the same pixel shader outputs:
+            // the registers below are the cache's, not read and compared;
+            // `tune same_state`.)
+            let queue = self.cx.cmd_queue;
+            let same = crate::tune::get(crate::tune::SAME_STATE) != 0
+                && self.cx.target_cache.as_ref().is_some_and(|c| {
+                    c.seq + 1 == self.cx.work_seq
+                        && c.ctx_gen == regs.ctx_gen
+                        && c.mrt_mask == mrt_mask
+                        && c.queue == queue
+                        && (c.newer == img!(self).newer_gen || c.colors.iter().flatten().map(|a| a.key).chain(c.depth.map(|d| d.key)).all(|k| img!(self).images.get(&k).is_some_and(|i| !i.guest_newer)))
+                });
+            if same {
+                if perf_on() {
+                    self.target_hits.0 += 1;
+                    self.target_hits.1 += 1;
+                }
+                self.cx.targets_same = true;
+                let c = self.cx.target_cache.as_mut().unwrap();
+                c.seq = self.cx.work_seq;
+                return Ok((c.colors.clone(), c.blends.clone(), c.masks.clone(), c.depth));
+            }
             tregs.extend_from_slice(&[target_mask, regs.ctx(0xA202), mrt_mask, dctl, regs.ctx(0xA000)]);
             if color_mode != 0 {
                 for n in 0..8u32 {
@@ -4879,7 +4928,9 @@ impl Renderer {
             }
             if let Some(c) = hit {
                 let r = (c.colors.clone(), c.blends.clone(), c.masks.clone(), c.depth);
-                self.cx.target_cache.as_mut().unwrap().seq = self.cx.work_seq;
+                let c = self.cx.target_cache.as_mut().unwrap();
+                c.seq = self.cx.work_seq;
+                (c.ctx_gen, c.mrt_mask, c.queue) = (regs.ctx_gen, mrt_mask, queue);
                 return Ok(r);
             }
         }
@@ -4911,7 +4962,7 @@ impl Renderer {
         if caching && only_targets {
             let current = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).all(|k| img!(self).images.get(&k).is_some_and(|i| !i.guest_newer));
             let newer = if current { img!(self).newer_gen } else { 0 };
-            self.cx.target_cache = Some(TargetCache { regs: tregs, seq: self.cx.work_seq, colors: colors.clone(), blends: blends.clone(), masks: masks.clone(), depth, newer });
+            self.cx.target_cache = Some(TargetCache { regs: tregs, ctx_gen: regs.ctx_gen, mrt_mask, queue: self.cx.cmd_queue, seq: self.cx.work_seq, colors: colors.clone(), blends: blends.clone(), masks: masks.clone(), depth, newer });
         }
         Ok((colors, blends, masks, depth))
     }
@@ -9123,60 +9174,76 @@ impl Renderer {
             extent = (extent.0.min(a.key.width), extent.1.min(a.key.height));
         }
         // Pipeline.
-        let vs_params = vs.translated.out.params;
-        let key = GfxKey {
-            vs: vs.translated.key_hash ^ vs.addr,
-            ps: ps.as_ref().map(|p| p.translated.key_hash ^ p.addr),
-            rect,
-            gs_params: if rect { vs_params } else { 0 },
-            colors: colors.iter().map(|c| c.map(|a| a.view_format).unwrap_or(vk::Format::UNDEFINED)).collect(),
-            blend: blends.clone(),
-            masks: masks.clone(),
-            depth: depth.map(|d| d.key.format).unwrap_or(vk::Format::UNDEFINED),
-            stencil: depth.is_some_and(|d| d.key.format == vk::Format::D32_SFLOAT_S8_UINT),
-            topology_class: match prim {
-                _ if tess.is_some() => 3,
-                1 => 0,
-                2 | 3 => 1,
-                _ => 2,
-            },
-            polygon: ((regs.ctx(0xA205) >> 3) & 3) as u8,
-            depth_clamp: regs.ctx(0xA204) & (3 << 26) != 0,
-            tess: tess.as_ref().map(|t| (t.tf_param, t.min.to_bits(), t.max.to_bits())),
-            push: crate::tune::get(crate::tune::PUSH_DESC) != 0,
-        };
-        phase!(2);
-        // (One lookup for a known pipeline - nearly every draw: the key is
-        // hashed and compared once, `tune pipe_lookup1`.)
-        let known = if crate::tune::get(crate::tune::PIPE_LOOKUP1) != 0 { self.gfx_pipes.get_mut(&key).map(|p| p.take()) } else { None };
-        let (pipeline, layout, set_layout, pslot) = match known {
-            Some(r) => r?,
+        let (vs_k, ps_k) = (vs.translated.key_hash ^ vs.addr, ps.as_ref().map(|p| p.translated.key_hash ^ p.addr));
+        let push = crate::tune::get(crate::tune::PUSH_DESC) != 0;
+        let stencil = depth.is_some_and(|d| d.key.format == vk::Format::D32_SFLOAT_S8_UINT);
+        // (The previous draw's pipeline, ready: its targets and context
+        // registers unchanged since - the rest of the key comes from the
+        // shaders and the primitive type; `tune same_state`.)
+        let reuse = if self.cx.targets_same && tess.is_none() { self.cx.last_pipe.filter(|l| l.0 == (vs_k, ps_k, prim, push, self.cx.work_seq - 1)).map(|l| l.1) } else { None };
+        let (pipeline, layout, set_layout, pslot) = match reuse {
+            Some((p, l, sl)) => {
+                phase!(2);
+                (p, l, sl, None)
+            }
             None => {
-                if !self.gfx_pipes.contains_key(&key) && key.tess.is_none() && super::manifest::on() {
-                    // (The stages by their translations: the key's stage fields
-                    // hold their addresses, which differ between sessions.)
-                    let state = GfxKey { vs: 0, ps: key.ps.map(|_| 0), ..key.clone() };
-                    super::manifest::note_gfx(&state.encode(), (vs.code_hash, vs.translated.key_hash), ps.as_ref().map(|p| (p.code_hash, p.translated.key_hash)));
-                }
-                if !self.gfx_pipes.contains_key(&key) {
-                    if let Some(p) = self.ahead_gfx(&key, regs, &vs, ps.as_ref(), tess.is_some()) {
-                        self.gfx_pipes.insert(key.clone(), p);
+                let vs_params = vs.translated.out.params;
+                let key = GfxKey {
+                    vs: vs.translated.key_hash ^ vs.addr,
+                    ps: ps.as_ref().map(|p| p.translated.key_hash ^ p.addr),
+                    rect,
+                    gs_params: if rect { vs_params } else { 0 },
+                    colors: colors.iter().map(|c| c.map(|a| a.view_format).unwrap_or(vk::Format::UNDEFINED)).collect(),
+                    blend: blends.clone(),
+                    masks: masks.clone(),
+                    depth: depth.map(|d| d.key.format).unwrap_or(vk::Format::UNDEFINED),
+                    stencil,
+                    topology_class: match prim {
+                        _ if tess.is_some() => 3,
+                        1 => 0,
+                        2 | 3 => 1,
+                        _ => 2,
+                    },
+                    polygon: ((regs.ctx(0xA205) >> 3) & 3) as u8,
+                    depth_clamp: regs.ctx(0xA204) & (3 << 26) != 0,
+                    tess: tess.as_ref().map(|t| (t.tf_param, t.min.to_bits(), t.max.to_bits())),
+                    push,
+                };
+                phase!(2);
+                // (One lookup for a known pipeline - nearly every draw: the key is
+                // hashed and compared once, `tune pipe_lookup1`.)
+                let known = if crate::tune::get(crate::tune::PIPE_LOOKUP1) != 0 { self.gfx_pipes.get_mut(&key).map(|p| p.take()) } else { None };
+                match known {
+                    Some(r) => r?,
+                    None => {
+                        if !self.gfx_pipes.contains_key(&key) && key.tess.is_none() && super::manifest::on() {
+                            // (The stages by their translations: the key's stage fields
+                            // hold their addresses, which differ between sessions.)
+                            let state = GfxKey { vs: 0, ps: key.ps.map(|_| 0), ..key.clone() };
+                            super::manifest::note_gfx(&state.encode(), (vs.code_hash, vs.translated.key_hash), ps.as_ref().map(|p| (p.code_hash, p.translated.key_hash)));
+                        }
+                        if !self.gfx_pipes.contains_key(&key) {
+                            if let Some(p) = self.ahead_gfx(&key, regs, &vs, ps.as_ref(), tess.is_some()) {
+                                self.gfx_pipes.insert(key.clone(), p);
+                            }
+                        }
+                        if !self.gfx_pipes.contains_key(&key) {
+                            let t0 = std::time::Instant::now();
+                            let p = self.create_gfx_pipeline(&key, &vs, ps.as_ref())?;
+                            PIPE_CREATES[0].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            PIPE_CREATES[0].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                            let ms = t0.elapsed().as_millis();
+                            if ms >= 100 {
+                                crate::info!("graphics pipeline for vs {:#x} ps {:#x} took {ms} ms to create", vs.addr, ps.as_ref().map(|p| p.addr).unwrap_or(0));
+                            }
+                            self.gfx_pipes.insert(key.clone(), p);
+                        }
+                        self.gfx_pipes.get_mut(&key).unwrap().take()?
                     }
                 }
-                if !self.gfx_pipes.contains_key(&key) {
-                    let t0 = std::time::Instant::now();
-                    let p = self.create_gfx_pipeline(&key, &vs, ps.as_ref())?;
-                    PIPE_CREATES[0].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    PIPE_CREATES[0].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-                    let ms = t0.elapsed().as_millis();
-                    if ms >= 100 {
-                        crate::info!("graphics pipeline for vs {:#x} ps {:#x} took {ms} ms to create", vs.addr, ps.as_ref().map(|p| p.addr).unwrap_or(0));
-                    }
-                    self.gfx_pipes.insert(key.clone(), p);
-                }
-                self.gfx_pipes.get_mut(&key).unwrap().take()?
             }
         };
+        self.cx.last_pipe = (pslot.is_none() && tess.is_none()).then_some(((vs_k, ps_k, prim, push, self.cx.work_seq), (pipeline, layout, set_layout)));
         // (`new_shaders` skip: a draw whose pipeline is still compiling is
         // left out of this frame - unless the game reads its results:
         // buffer stores, occlusion counts.)
@@ -9354,7 +9421,7 @@ impl Renderer {
                 if rc & 1 != 0 {
                     aspect |= vk::ImageAspectFlags::DEPTH;
                 }
-                if rc & 2 != 0 && key.stencil {
+                if rc & 2 != 0 && stencil {
                     aspect |= vk::ImageAspectFlags::STENCIL;
                 }
                 if !aspect.is_empty() {
@@ -9680,6 +9747,11 @@ impl Renderer {
     }
 
     unsafe fn set_dynamic_state(&mut self, regs: &Regs, extent: (u32, u32), prim: u32, has_depth: bool) {
+        // (Made from the same inputs and still in effect: nothing to do.)
+        let key = (regs.ctx_gen, self.cx.cmd_queue, extent, prim, has_depth);
+        if self.cx.dyn_state.is_some() && self.cx.dyn_key == key && crate::tune::get(crate::tune::SAME_STATE) != 0 {
+            return;
+        }
         let vte = regs.ctx(0xA206);
         let (xs, xo, ys, yo, zs, zo) = (f32r(regs.ctx(0xA10F)), f32r(regs.ctx(0xA110)), f32r(regs.ctx(0xA111)), f32r(regs.ctx(0xA112)), f32r(regs.ctx(0xA113)), f32r(regs.ctx(0xA114)));
         let vp = if vte & 0x3F == 0x3F && xs != 0.0 {
@@ -9777,6 +9849,7 @@ impl Renderer {
             blend_constants: [regs.ctx(0xA105), regs.ctx(0xA106), regs.ctx(0xA107), regs.ctx(0xA108)],
         };
         let o = self.cx.dyn_state;
+        self.cx.dyn_key = key;
         if o == Some(n) {
             return;
         }
@@ -12748,6 +12821,15 @@ impl Hooks for VkHooks {
         // Shader preparation reads registers and guest memory only: before
         // the lock (its reads are checked under it). Not for patches.
         let prim = cp.regs.uconfig[(0xC242 - 0xC000) as usize];
+        if perf_on() && cp.queue == 0 {
+            use std::sync::atomic::Ordering::Relaxed;
+            let pgm = |lo: u32| (cp.regs.sh(lo) as u64) | ((cp.regs.sh(lo + 1) as u64) << 32);
+            let now = (cp.regs.ctx_gen, pgm(0x2C48), pgm(0x2C08), prim);
+            let last = LAST_STATE.replace(now);
+            STATE_REUSE[0].fetch_add(1, Relaxed);
+            STATE_REUSE[1].fetch_add((now.0 == last.0) as u64, Relaxed);
+            STATE_REUSE[2].fetch_add((now == last) as u64, Relaxed);
+        }
         let tp = tsc();
         let ahead = (crate::tune::get(crate::tune::PREP_AHEAD) != 0 && cp.queue == 0 && prim != 9).then(|| super::prepahead::take_draw(&cp.regs)).flatten();
         let tp = if crate::tune::get(crate::tune::PREP_AHEAD) != 0 { bpart(17, tp) } else { tp };
