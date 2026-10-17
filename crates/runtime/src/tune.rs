@@ -698,8 +698,23 @@ pub const NGS2_VEC: usize = 115;
 /// (decoding, envelope, filters, peak) while the rendering thread does the
 /// rest; the routing stays in the voices' order (the same mix bit for bit).
 pub const NGS2_THREADS: usize = 116;
+/// A draw finds its known graphics pipeline with one lookup of its key
+/// (`TLG_PIPE_LOOKUP1`, 1; 0: the checks for a new pipeline first, four
+/// hashes of the key per draw).
+pub const PIPE_LOOKUP1: usize = 117;
+/// Shader preparation's vector pool: each thread keeps a stash and trades
+/// with the shared pool a batch at a time (`TLG_POOL_LOCAL`, 1; 0: the
+/// shared pool's lock for every vector).
+pub const POOL_LOCAL: usize = 118;
+/// Dry preparation logs the words it reads (contiguous reads merged) and
+/// the graphics CP compares guest memory with them (`TLG_DRY_WORDS`, 1; 0:
+/// a hash of each read, hashed again to compare).
+pub const DRY_WORDS: usize = 119;
+/// Vectors of each kind the shared pool of shader preparation keeps
+/// (`TLG_POOL_CAP`, 8192; more are freed).
+pub const POOL_CAP: usize = 120;
 
-const TABLE: [(&str, &str, i64); 117] = [
+const TABLE: [(&str, &str, i64); 121] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -817,6 +832,10 @@ const TABLE: [(&str, &str, i64); 117] = [
     ("new_shaders", "TLG_NEW_SHADERS", -1),
     ("ngs2_vec", "TLG_NGS2_VEC", 1),
     ("ngs2_threads", "TLG_NGS2_THREADS", 1),
+    ("pipe_lookup1", "TLG_PIPE_LOOKUP1", 1),
+    ("pool_local", "TLG_POOL_LOCAL", 1),
+    ("dry_words", "TLG_DRY_WORDS", 1),
+    ("pool_cap", "TLG_POOL_CAP", 8192),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

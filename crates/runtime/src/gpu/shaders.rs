@@ -113,6 +113,10 @@ fn hash_words(w: &[u32]) -> u64 {
 /// ~4% of the graphics CP). One pool for all threads: the prepare thread
 /// makes most `Prepared`s and the CP threads drop them (a pool per thread
 /// freed ~2.7% of the graphics CP's time while the prepare thread allocated).
+/// Each thread keeps a stash of each kind and trades with the shared pool
+/// `POOL_BATCH` vectors at a time (`tune pool_local`): taking the shared
+/// pool's lock for every vector - ~8 times per draw between the prepare
+/// thread and the graphics CP - had them contend for it.
 struct VecPool {
     res: Vec<Vec<ResolvedRes>>,
     specs: Vec<Vec<ResSpec>>,
@@ -122,28 +126,81 @@ struct VecPool {
     logs: Vec<Vec<(u64, u32, u64)>>,
 }
 
-static POOL: parking_lot::Mutex<VecPool> = parking_lot::Mutex::new(VecPool { res: Vec::new(), specs: Vec::new(), u32s: Vec::new(), u64s: Vec::new(), inputs: Vec::new(), logs: Vec::new() });
-
-fn pool_take<T>(v: &mut Vec<Vec<T>>) -> Vec<T> {
-    v.pop().unwrap_or_default()
+impl VecPool {
+    const fn new() -> VecPool {
+        VecPool { res: Vec::new(), specs: Vec::new(), u32s: Vec::new(), u64s: Vec::new(), inputs: Vec::new(), logs: Vec::new() }
+    }
 }
 
-fn pool_give<T>(v: &mut Vec<Vec<T>>, mut x: Vec<T>) {
-    // (The prepare thread runs up to a submission ahead: hundreds of stages
-    // in flight, returned in bursts. A pool of 32 freed most of them.)
-    if v.len() < 2048 && x.capacity() != 0 && x.capacity() <= 4096 {
-        x.clear();
-        v.push(x);
+static POOL: parking_lot::Mutex<VecPool> = parking_lot::Mutex::new(VecPool::new());
+
+thread_local! {
+    /// This thread's stash (`VecPool`).
+    static LOCAL_POOL: std::cell::RefCell<VecPool> = const { std::cell::RefCell::new(VecPool::new()) };
+}
+
+/// Vectors a thread's stash trades with the shared pool at a time.
+const POOL_BATCH: usize = 32;
+
+/// A pooled vector of the kind `kind` picks (empty, maybe with capacity).
+fn pool_take<T>(kind: fn(&mut VecPool) -> &mut Vec<Vec<T>>) -> Vec<T> {
+    if crate::tune::get(crate::tune::POOL_LOCAL) == 0 {
+        return kind(&mut POOL.lock()).pop().unwrap_or_default();
     }
+    LOCAL_POOL
+        .try_with(|l| {
+            let mut l = l.borrow_mut();
+            let local = kind(&mut l);
+            if local.is_empty() {
+                let mut g = POOL.lock();
+                let shared = kind(&mut g);
+                let n = shared.len().min(POOL_BATCH);
+                local.extend(shared.drain(shared.len() - n..));
+            }
+            local.pop().unwrap_or_default()
+        })
+        .unwrap_or_default()
+}
+
+/// A vector back to the pool of its kind.
+fn pool_give<T>(kind: fn(&mut VecPool) -> &mut Vec<Vec<T>>, mut x: Vec<T>) {
+    // (The prepare thread runs up to a submission ahead: hundreds of stages
+    // in flight, returned in bursts. A pool of 32 freed most of them; 2048
+    // freed some in the later areas - ~2,500 draws per frame with three
+    // word vectors each - which the prepare thread then allocated again.)
+    let cap = crate::tune::get(crate::tune::POOL_CAP).max(0) as usize;
+    if x.capacity() == 0 || x.capacity() > 4096 {
+        return;
+    }
+    x.clear();
+    if crate::tune::get(crate::tune::POOL_LOCAL) == 0 {
+        let mut g = POOL.lock();
+        let shared = kind(&mut g);
+        if shared.len() < cap {
+            shared.push(x);
+        }
+        return;
+    }
+    let _ = LOCAL_POOL.try_with(|l| {
+        let mut l = l.borrow_mut();
+        let local = kind(&mut l);
+        local.push(x);
+        if local.len() >= 2 * POOL_BATCH {
+            let mut g = POOL.lock();
+            let shared = kind(&mut g);
+            let n = POOL_BATCH.min(cap.saturating_sub(shared.len()));
+            shared.extend(local.drain(local.len() - n..));
+            // (The shared pool full: freed.)
+            local.truncate(POOL_BATCH);
+        }
+    });
 }
 
 impl Drop for Prepared {
     fn drop(&mut self) {
-        let (res, sgpr, reads) = (std::mem::take(&mut self.resources), std::mem::take(&mut self.sgpr_data), std::mem::take(&mut self.mem_reads));
-        let mut p = POOL.lock();
-        pool_give(&mut p.res, res);
-        pool_give(&mut p.u32s, sgpr);
-        pool_give(&mut p.u64s, reads);
+        pool_give(|p| &mut p.res, std::mem::take(&mut self.resources));
+        pool_give(|p| &mut p.u32s, std::mem::take(&mut self.sgpr_data));
+        pool_give(|p| &mut p.u64s, std::mem::take(&mut self.mem_reads));
     }
 }
 
@@ -156,11 +213,16 @@ thread_local! {
 
 // Dry preparation (`prepahead`): on the prepare thread, guest reads see the
 // overlay of the dry-run CP's memory writes and are logged (address, dwords,
-// hash) for the graphics CP to validate the result against memory.
+// and the words read - or their hash, `tune dry_words 0`) for the graphics
+// CP to validate the result against memory.
 thread_local! {
     static DRY_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static DRY_OVERLAY: std::cell::RefCell<Overlay> = std::cell::RefCell::new(Overlay::default());
     static DRY_LOG: std::cell::RefCell<Vec<(u64, u32, u64)>> = const { std::cell::RefCell::new(Vec::new()) };
+    /// The words of this preparation's reads (`tune dry_words`), and whether
+    /// it logs them.
+    static DRY_WORDS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static DRY_WORDS_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The dry-run CP's memory writes (dword-aligned ones; others are never read
@@ -271,35 +333,41 @@ fn hash_dwords(w: &[u32]) -> u64 {
 /// Starts logging this thread's guest reads (one preparation).
 pub fn dry_begin() {
     DRY_LOG.with(|l| l.borrow_mut().clear());
+    DRY_WORDS.with(|w| w.borrow_mut().clear());
+    DRY_WORDS_ON.set(crate::tune::get(crate::tune::DRY_WORDS) != 0);
     DRY_ON.set(true);
 }
 
-/// A dry preparation's reads (`dry_end`), checked by `dry_valid`; the
-/// vector goes back to the pool when dropped (on the CP thread that took the
-/// result).
-pub struct DryLog(Vec<(u64, u32, u64)>);
-
-impl std::ops::Deref for DryLog {
-    type Target = [(u64, u32, u64)];
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+/// A dry preparation's reads (`dry_end`), checked by `dry_valid`: (address,
+/// dwords, the words' offset in `words`) - without `words`, (address,
+/// dwords, hash). The vectors go back to the pool when dropped (on the CP
+/// thread that took the result).
+pub struct DryLog {
+    reads: Vec<(u64, u32, u64)>,
+    words: Option<Vec<u32>>,
 }
 
 impl Drop for DryLog {
     fn drop(&mut self) {
-        let v = std::mem::take(&mut self.0);
-        pool_give(&mut POOL.lock().logs, v);
+        pool_give(|p| &mut p.logs, std::mem::take(&mut self.reads));
+        if let Some(w) = self.words.take() {
+            pool_give(|p| &mut p.u32s, w);
+        }
     }
 }
 
 /// Ends the log started by `dry_begin` and returns it.
 pub fn dry_end() -> DryLog {
     DRY_ON.set(false);
-    // (Copied into a pooled vector: the thread's log keeps its capacity.)
-    let mut v = pool_take(&mut POOL.lock().logs);
-    DRY_LOG.with(|l| v.extend_from_slice(&l.borrow()));
-    DryLog(v)
+    // (Copied into pooled vectors: the thread's log keeps its capacity.)
+    let mut reads = pool_take(|p| &mut p.logs);
+    DRY_LOG.with(|l| reads.extend_from_slice(&l.borrow()));
+    let words = DRY_WORDS_ON.get().then(|| {
+        let mut v = pool_take(|p| &mut p.u32s);
+        DRY_WORDS.with(|w| v.extend_from_slice(&w.borrow()));
+        v
+    });
+    DryLog { reads, words }
 }
 
 /// The dry-run CP wrote guest [addr, addr+4*len): later reads see it.
@@ -327,13 +395,36 @@ fn dry_overlay(addr: u64, words: &mut [u32]) {
 /// A dry preparation read `words` at `addr` (after `dry_overlay`): logged.
 fn dry_seen(addr: u64, words: &mut [u32]) {
     dry_overlay(addr, words);
-    DRY_LOG.with(|l| l.borrow_mut().push((addr, words.len() as u32, hash_dwords(words))));
+    if !DRY_WORDS_ON.get() {
+        DRY_LOG.with(|l| l.borrow_mut().push((addr, words.len() as u32, hash_dwords(words))));
+        return;
+    }
+    // (A read continuing the previous one in the same mapping - the one the
+    // read was just checked against - extends it: one check for both.)
+    let vlo = LAST_VMA.get().0;
+    DRY_WORDS.with(|w| {
+        let mut w = w.borrow_mut();
+        DRY_LOG.with(|l| {
+            let mut l = l.borrow_mut();
+            match l.last_mut() {
+                Some(e) if e.0 + 4 * e.1 as u64 == addr && e.0 >= vlo => e.1 += words.len() as u32,
+                _ => l.push((addr, words.len() as u32, w.len() as u64)),
+            }
+        });
+        w.extend_from_slice(words);
+    });
 }
 
 /// Whether guest memory still holds what a dry preparation read.
-pub fn dry_valid(log: &[(u64, u32, u64)]) -> bool {
+pub fn dry_valid(log: &DryLog) -> bool {
+    if let Some(words) = &log.words {
+        return log.reads.iter().all(|&(addr, n, off)| {
+            let (n, off) = (n as usize, off as usize);
+            mapped(addr, addr + 4 * n as u64) && words.get(off..off + n).is_some_and(|w| unsafe { std::slice::from_raw_parts(addr as *const u32, n) } == w)
+        });
+    }
     let mut buf = [0u32; 64];
-    for &(addr, n, h) in log {
+    for &(addr, n, h) in &log.reads {
         let end = addr + 4 * n as u64;
         if !mapped(addr, end) {
             return false;
@@ -932,10 +1023,8 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
     }
     // Resolve descriptors.
     let mut memo = PtrMemo::new();
-    let (mut resources, mut specs, mut strides, mut ps_inputs, mut sgpr_data, mut mem_reads) = {
-        let mut p = POOL.lock();
-        (pool_take(&mut p.res), pool_take(&mut p.specs), pool_take(&mut p.u32s), pool_take(&mut p.inputs), pool_take(&mut p.u32s), pool_take(&mut p.u64s))
-    };
+    let (mut resources, mut specs, mut strides, mut ps_inputs, mut sgpr_data, mut mem_reads) =
+        (pool_take(|p| &mut p.res), pool_take(|p| &mut p.specs), pool_take(|p| &mut p.u32s), pool_take(|p| &mut p.inputs), pool_take(|p| &mut p.u32s), pool_take(|p| &mut p.u64s));
     resources.reserve(plan.resources.len());
     specs.reserve(plan.resources.len());
     strides.reserve(plan.resources.len());
@@ -1162,12 +1251,9 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
     let utility = analyzed.utility;
     // (A pooled vector takes the reads' place in READS.)
     READS.with(|r| std::mem::swap(&mut *r.borrow_mut(), &mut mem_reads));
-    {
-        let mut p = POOL.lock();
-        pool_give(&mut p.specs, std::mem::take(&mut spec.resources));
-        pool_give(&mut p.u32s, std::mem::take(&mut spec.buffer_strides));
-        pool_give(&mut p.inputs, std::mem::take(&mut spec.ps_inputs));
-    }
+    pool_give(|p| &mut p.specs, std::mem::take(&mut spec.resources));
+    pool_give(|p| &mut p.u32s, std::mem::take(&mut spec.buffer_strides));
+    pool_give(|p| &mut p.inputs, std::mem::take(&mut spec.ps_inputs));
     let mut ring_bytes = (0u64, 0u64);
     for b in &translated.out.bindings {
         if let translate::BindingKind::Buffer(i) = b.kind {

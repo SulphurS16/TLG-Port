@@ -1128,6 +1128,19 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 .collect();
             crate::info!("descriptors by shader (of {:.1} ms): {}", us(all) / 1e3, top.join("; "));
         }
+        // (`shader_stats`: buffer bindings over 20 us, the costliest sites.)
+        if let Some(m) = render::SLOW_BINDINGS.lock().take() {
+            let mut v: Vec<((u8, u64, usize, u64, u64, usize), (u64, u64))> = m.into_iter().collect();
+            let all: u64 = v.iter().map(|e| e.1 .1).sum();
+            v.sort_by(|a, b| b.1 .1.cmp(&a.1 .1));
+            let us = |c: u64| c as f64 / hz * 1e6;
+            let top: Vec<String> = v
+                .iter()
+                .take(10)
+                .map(|((st, a, i, base, size, path), (n, c))| format!("{} {a:#x} #{i} {base:#x}+{size:#x} {}: {n} x {:.1} us", ["vs", "ps", "cs"][*st as usize], render::BUFFER_PATHS[*path], us(*c) / *n as f64))
+                .collect();
+            crate::info!("slow buffer bindings/s (over 20 us; {:.1} ms in all): {}", us(all) / 1e3, top.join("; "));
+        }
         if render::shader_stats() {
             let tp: Vec<String> = render::TEX_PATH
                 .iter()
@@ -1154,7 +1167,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let v = [render::VBIND_STATS[0].swap(0, Ordering::Relaxed), render::VBIND_STATS[1].swap(0, Ordering::Relaxed), render::VBIND_STATS[2].swap(0, Ordering::Relaxed)];
             let h: [u64; 5] = std::array::from_fn(|i| writes::HV_STATS[i].swap(0, Ordering::Relaxed));
             let b: [u64; 4] = std::array::from_fn(|i| writes::BULK_STATS[i].swap(0, Ordering::Relaxed));
-            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served (TLG_PERF=2): {} same CPU epoch (1..6+ batches back: {}), {} same required epoch; mirror binding cache {} of {} ({} after a recheck); validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none); bulk rounds {} ({} runs, {} pages, {} written pages found)", parts.join("; "), x[0], xb.join("/"), x[1], v[0], v[1], v[2], h[0], h[1], h[2], h[3], h[4], b[0], b[1], b[2], b[3]);
+            let wt: [u64; 3] = std::array::from_fn(|i| writes::WW_TIMES[i].swap(0, Ordering::Relaxed));
+            crate::info!("buffer binding steps/s: {}; read-only copies an earlier batch could have served (TLG_PERF=2): {} same CPU epoch (1..6+ batches back: {}), {} same required epoch; mirror binding cache {} of {} ({} after a recheck); validation harvests {} ({} block runs, {} pages, {} written pages found, {} found none); bulk rounds {} ({} runs, {} pages, {} written pages found); write tracker wall ms: bulk rounds {:.1} (arming inside: see last), validation harvests {:.1}, cold-block arming {:.1}", parts.join("; "), x[0], xb.join("/"), x[1], v[0], v[1], v[2], h[0], h[1], h[2], h[3], h[4], b[0], b[1], b[2], b[3], wt[0] as f64 / 1e6, wt[1] as f64 / 1e6, wt[2] as f64 / 1e6);
             let miss: Vec<String> = (0..2)
                 .map(|c| {
                     let m: Vec<String> = render::VBIND_MISS_NAMES.iter().enumerate().map(|(i, n)| format!("{n} {}", render::VBIND_MISS[c][i].swap(0, Ordering::Relaxed))).collect();

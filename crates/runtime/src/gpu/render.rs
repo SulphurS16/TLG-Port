@@ -3538,6 +3538,101 @@ pub static BARRIER_SITES: parking_lot::Mutex<Option<HashMap<u32, u64>>> = parkin
 /// per (base, bytes) (TLG_PERF report).
 pub static VCACHE_FILL_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, &'static str), (u64, u64)>>> = parking_lot::Mutex::new(None);
 
+/// Phase times of one `vcache_fill` (`shader_stats`): TSC at the start, after
+/// residency, the CPU-write check, the runs, the forwards, the waits, the
+/// staging copy and the recording; fills of 1 ms or more from frame 3000 on
+/// are logged (the first 100).
+struct FillTimes {
+    t: [u64; 8],
+    on: bool,
+    runs: usize,
+    fwd: usize,
+    bytes: u64,
+    staged: bool,
+    hoist: bool,
+    /// The wait after failed forwards: 1 this batch's write-back (submitted
+    /// and waited for), 2 CPU write-backs in flight.
+    wait: u8,
+}
+
+thread_local! {
+    /// Why `mirror_forwards_keep` last returned None (`FillTimes`): 1 import
+    /// or no spans, 2 in-place writes in flight, 3 end-of-pipe actions in
+    /// flight, 4 a batch without a fence, 5 a batch whose slot may be
+    /// reused, 6 from a released window, 7 overlapping the window's own.
+    static FWD_FAIL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+
+impl FillTimes {
+    fn start() -> FillTimes {
+        let on = shader_stats();
+        let mut t = [0u64; 8];
+        if on {
+            t[0] = unsafe { core::arch::x86_64::_rdtsc() };
+        }
+        FillTimes { t, on, runs: 0, fwd: 0, bytes: 0, staged: false, hoist: false, wait: 0 }
+    }
+    fn at(&mut self, i: usize) {
+        if self.on {
+            self.t[i] = unsafe { core::arch::x86_64::_rdtsc() };
+        }
+    }
+    fn report(&self, base: u64, size: u64) {
+        let per_us = TSC_PER_US.load(std::sync::atomic::Ordering::Relaxed);
+        if !self.on || per_us == 0 || self.t[7].wrapping_sub(self.t[0]) < 1000 * per_us || super::FRAMES.load(std::sync::atomic::Ordering::Relaxed) < 3000 {
+            return;
+        }
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 100 {
+            return;
+        }
+        // (Phases not reached keep 0: shown as 0.)
+        let mut prev = self.t[0];
+        let ph: Vec<String> = (1..8)
+            .map(|i| {
+                if self.t[i] == 0 {
+                    return "-".into();
+                }
+                let d = self.t[i].wrapping_sub(prev);
+                prev = self.t[i];
+                format!("{:.0}", d as f64 / per_us as f64)
+            })
+            .collect();
+        crate::info!(
+            "slow mirror fill {base:#x}+{size:#x}: {:.0} us (resident/check/runs/forwards/waits/staging/record: {}); runs {}, forwards {}, wait {}, {} bytes copied{}{}",
+            self.t[7].wrapping_sub(self.t[0]) as f64 / per_us as f64,
+            ph.join("/"),
+            self.runs,
+            if self.fwd == usize::MAX { format!("none (reason {})", FWD_FAIL.get()) } else { self.fwd.to_string() },
+            ["none", "this batch's write-back", "CPU write-backs in flight"][self.wait as usize],
+            self.bytes,
+            if self.staged { ", staged in a buffer of its own" } else { "" },
+            if self.hoist { ", hoisted" } else { "" }
+        );
+    }
+}
+
+/// Buffer bindings that took over `SLOW_BINDING_US` (`shader_stats`): by
+/// (stage: 0 vertex, 1 pixel, 2 compute; shader; binding's resource index;
+/// base; size; path, `BUFFER_PATHS`) -> (count, TSC cycles); reported and
+/// cleared every second.
+pub static SLOW_BINDINGS: parking_lot::Mutex<Option<HashMap<(u8, u64, usize, u64, u64, usize), (u64, u64)>>> = parking_lot::Mutex::new(None);
+const SLOW_BINDING_US: u64 = 20;
+
+/// One buffer binding's time for `SLOW_BINDINGS`: `b` is (stage, shader,
+/// resource index, base, size).
+fn note_slow_binding(b: (u8, u64, usize, u64, u64), path: usize, cycles: u64) {
+    // (Known after the first statistics second.)
+    let per_us = TSC_PER_US.load(std::sync::atomic::Ordering::Relaxed);
+    if per_us == 0 || cycles < SLOW_BINDING_US * per_us {
+        return;
+    }
+    let mut g = SLOW_BINDINGS.lock();
+    let e = g.get_or_insert_with(HashMap::new).entry((b.0, b.1, b.2, b.3, b.4, path)).or_insert((0, 0));
+    e.0 += 1;
+    e.1 += cycles;
+}
+
 /// Write-backs by (base, bytes, from the mirror) (TLG_PERF report).
 pub static WRITEBACK_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, bool), u64>>> = parking_lot::Mutex::new(None);
 
@@ -5087,14 +5182,20 @@ impl Renderer {
     /// pages read. Returns whether it synchronized (the shader must then be
     /// prepared again).
     fn guard_reads(&mut self, reads: &[u64]) -> bool {
-        if reads.is_empty() {
+        self.guard_reads_parts(&[reads])
+    }
+
+    /// `guard_reads` over several lists (the stages' reads, without
+    /// collecting them into one per command).
+    fn guard_reads_parts(&mut self, parts: &[&[u64]]) -> bool {
+        if parts.iter().all(|r| r.is_empty()) {
             return false;
         }
         let done = *DONE.lock();
         let mut need = if mem!(self).gpu_pending_all > done { mem!(self).gpu_pending_all } else { 0 };
         let open = self.open_seq;
         let (mut own, mut other) = (need == open, need >= OPEN_MIN && need != open);
-        for &a in reads {
+        for &a in parts.iter().flat_map(|r| r.iter()) {
             if let Some(s) = mem!(self).gpu_pending_pages.get(a >> 12) {
                 if s > done {
                     own |= s == open;
@@ -5134,7 +5235,7 @@ impl Renderer {
             // covers it (this batch's write-backs, else in flight).
             let mut g = GUARD_SITES.lock();
             let m = g.get_or_insert_with(HashMap::new);
-            for &a in reads {
+            for &a in parts.iter().flat_map(|r| r.iter()) {
                 if !mem!(self).gpu_pending_pages.get(a >> 12).is_some_and(|s| s > done) && mem!(self).gpu_pending_all <= done {
                     continue;
                 }
@@ -6619,10 +6720,14 @@ impl Renderer {
     }
 
     fn vcache_fill(&mut self, k: u64, base: u64, size: u64, epoch: u64, required: u64, overwrite: bool) -> Option<(vk::Buffer, u64)> {
+        // (`shader_stats`: phase times of slow fills, `FillTimes`.)
+        let mut ft = FillTimes::start();
         if !self.vcache_resident(k, base, size) {
             return None;
         }
+        ft.at(1);
         self.vcache_check(k, base, size, epoch, required)?;
+        ft.at(2);
         let m = mem!(self);
         let vc = m.vcache.as_mut().unwrap();
         let w = vc.windows.get_mut(&k)?;
@@ -6652,6 +6757,8 @@ impl Renderer {
         let (wlo, whi, vbuf) = (w.lo, w.hi, w.buf);
         if !runs.is_empty() {
             let (lo, hi) = (wlo + ((runs[0].0 as u64) << 12), (wlo + ((runs[runs.len() - 1].1 as u64) << 12)).min(whi));
+            ft.at(3);
+            ft.runs = runs.len();
             // Shader writes not in guest memory yet (this batch's write-backs,
             // submitted batches' not yet landed): copied over the pages on the
             // GPU after them, from where the writes are (as `upload_guest`
@@ -6663,6 +6770,8 @@ impl Renderer {
             // (The window's own pending writes are left out of the copy-in:
             // the window holds their data already.)
             let fwd = self.mirror_forwards_keep(&abs, vbuf);
+            ft.at(4);
+            ft.fwd = fwd.as_ref().map_or(usize::MAX, |f| f.0.len());
             if fwd.is_none() {
                 if let Some(wb) = self.cx.writebacks.iter().find(|wb| wb.base < hi && lo < wb.base + wb.size) {
                     if perf_on() {
@@ -6670,11 +6779,14 @@ impl Renderer {
                         *GUARD_SITES.lock().get_or_insert_with(HashMap::new).entry(k).or_default() += 1;
                     }
                     self.flush_for(1);
+                    ft.wait = 1;
                 } else if cpu_writeback_in_flight(lo, hi - lo) {
                     self.flushes[1] += 1;
                     wait_cpu_writebacks(lo, hi - lo);
+                    ft.wait = 2;
                 }
             }
+            ft.at(5);
             let keep: Vec<(u64, u64)> = fwd.as_ref().map_or(Vec::new(), |f| f.1.iter().map(|&(a, b)| (a.saturating_sub(wlo), b.saturating_sub(wlo))).collect());
             if !keep.is_empty() {
                 self.copyin_kept += 1;
@@ -6719,6 +6831,9 @@ impl Renderer {
             };
             // Forwards land after the copy-in and earlier forwards they
             // overlap (a barrier then), in program order.
+            ft.at(6);
+            ft.bytes = regions.iter().map(|r| r.size).sum();
+            ft.staged = src != self.cx.ring.buffer && src != vbuf;
             let fwd_copies: Vec<(vk::Buffer, Vec<vk::BufferCopy>)> = fwd
                 .iter()
                 .flat_map(|f| f.0.iter())
@@ -6812,7 +6927,10 @@ impl Renderer {
             if !hoist {
                 self.mark(|| "vertex/index data to VRAM".into());
             }
+            ft.hoist = hoist;
         }
+        ft.at(7);
+        ft.report(base, size);
         let m = mem!(self);
         let vc = m.vcache.as_mut().unwrap();
         vc.hits += 1;
@@ -6845,7 +6963,9 @@ impl Renderer {
     /// returned as guest ranges to leave out of the copy-in instead of
     /// failing, unless a forward overlaps one (their order is not known).
     fn mirror_forwards_keep(&mut self, spans: &[(u64, u64)], exclude: vk::Buffer) -> Option<(Vec<(u64, vk::Buffer, u64, u64)>, Vec<(u64, u64)>)> {
+        FWD_FAIL.set(0);
         if ctx().ext_host.is_some() || spans.is_empty() {
+            FWD_FAIL.set(1);
             return None;
         }
         let (lo, hi) = (spans[0].0, spans[spans.len() - 1].1);
@@ -6854,10 +6974,16 @@ impl Renderer {
         if cpu_writeback_in_flight(lo, hi - lo) || writeback_in_flight(lo, hi - lo) {
             let oldest = (self.last_seq + 2).saturating_sub(SLOTS as u64);
             for c in COMPLETIONS.lock().iter() {
-                if c.zc_writes.iter().any(|&(w, n)| overlaps(w, n)) || c.actions.iter().any(|a| spans.iter().any(|&(x, y)| a.overlaps(x, y - x))) {
+                if c.zc_writes.iter().any(|&(w, n)| overlaps(w, n)) {
+                    FWD_FAIL.set(2);
+                    return None;
+                }
+                if c.actions.iter().any(|a| spans.iter().any(|&(x, y)| a.overlaps(x, y - x))) {
+                    FWD_FAIL.set(3);
                     return None;
                 }
                 if c.writebacks.iter().any(|&(w, _, n)| overlaps(w, n)) && (c.seq < oldest || c.fence == vk::Fence::null()) {
+                    FWD_FAIL.set(if c.fence == vk::Fence::null() { 4 } else { 5 });
                     return None;
                 }
                 out.extend(c.dev_writes.iter().filter(|&&(w, _, _, n)| overlaps(w, n)).copied());
@@ -6868,10 +6994,12 @@ impl Renderer {
         let live = |b: vk::Buffer| b == dring || vc.is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
         let (keep, out): (Vec<_>, Vec<_>) = out.into_iter().partition(|e| exclude != vk::Buffer::null() && e.1 == exclude);
         if out.iter().any(|e| !live(e.1)) {
+            FWD_FAIL.set(6);
             return None;
         }
         let keep: Vec<(u64, u64)> = keep.iter().map(|e| (e.0, e.0 + e.3)).collect();
         if out.iter().any(|e| keep.iter().any(|&(a, b)| e.0 < b && a < e.0 + e.3)) {
+            FWD_FAIL.set(7);
             return None;
         }
         Some((out, keep))
@@ -8171,6 +8299,10 @@ impl Renderer {
         let mut tb = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         let mut part = 4usize;
         let mut bpath = 0usize;
+        // (`shader_stats`: the buffer binding being timed - stage, shader,
+        // binding index, base, size - for `SLOW_BINDINGS`.)
+        let slow = perf && shader_stats();
+        let mut last_buf = (0u8, 0u64, 0usize, 0u64, 0u64);
         for p in prepared {
             // Per resource: page bitmap of its writes (`BindingKind::DirtyInfo`);
             // writes not tracked mark the sink.
@@ -8190,8 +8322,18 @@ impl Renderer {
                     if part == 2 {
                         self.bsub[bpath] += t.wrapping_sub(tb);
                         self.bcnt[bpath] += 1;
+                        if slow {
+                            note_slow_binding(last_buf, bpath, t.wrapping_sub(tb));
+                        }
                     }
                     tb = t;
+                }
+                if slow {
+                    if let BindingKind::Buffer(i) = b.kind {
+                        if let ResolvedRes::Buffer(v) = &p.resources[i] {
+                            last_buf = (p.stage as u8, p.addr, i, v.base, v.size());
+                        }
+                    }
                 }
                 part = match b.kind {
                     BindingKind::SgprData => 1,
@@ -8514,6 +8656,9 @@ impl Renderer {
             if part == 2 {
                 self.bsub[bpath] += t.wrapping_sub(tb);
                 self.bcnt[bpath] += 1;
+                if slow {
+                    note_slow_binding(last_buf, bpath, t.wrapping_sub(tb));
+                }
             }
             tb = t;
         }
@@ -8819,8 +8964,8 @@ impl Renderer {
         self.cx.prep_shader = ps.as_ref().map(|p| p.addr).unwrap_or(vs.addr);
         self.cx.prep_vs = vs.addr;
         for _ in 0..3 {
-            let reads: smallvec::SmallVec<[u64; 64]> = vs.mem_reads.iter().chain(ps.iter().flat_map(|p| p.mem_reads.iter())).copied().collect();
-            if !self.guard_reads(&reads) {
+            let ps_reads: &[u64] = ps.as_ref().map_or(&[], |p| &p.mem_reads[..]);
+            if !self.guard_reads_parts(&[&vs.mem_reads[..], ps_reads]) {
                 break;
             }
             self.begin();
@@ -8943,29 +9088,37 @@ impl Renderer {
             push: crate::tune::get(crate::tune::PUSH_DESC) != 0,
         };
         phase!(2);
-        if !self.gfx_pipes.contains_key(&key) && key.tess.is_none() && super::manifest::on() {
-            // (The stages by their translations: the key's stage fields hold
-            // their addresses, which differ between sessions.)
-            let state = GfxKey { vs: 0, ps: key.ps.map(|_| 0), ..key.clone() };
-            super::manifest::note_gfx(&state.encode(), (vs.code_hash, vs.translated.key_hash), ps.as_ref().map(|p| (p.code_hash, p.translated.key_hash)));
-        }
-        if !self.gfx_pipes.contains_key(&key) {
-            if let Some(p) = self.ahead_gfx(&key, regs, &vs, ps.as_ref(), tess.is_some()) {
-                self.gfx_pipes.insert(key.clone(), p);
+        // (One lookup for a known pipeline - nearly every draw: the key is
+        // hashed and compared once, `tune pipe_lookup1`.)
+        let known = if crate::tune::get(crate::tune::PIPE_LOOKUP1) != 0 { self.gfx_pipes.get_mut(&key).map(|p| p.take()) } else { None };
+        let (pipeline, layout, set_layout, pslot) = match known {
+            Some(r) => r?,
+            None => {
+                if !self.gfx_pipes.contains_key(&key) && key.tess.is_none() && super::manifest::on() {
+                    // (The stages by their translations: the key's stage fields
+                    // hold their addresses, which differ between sessions.)
+                    let state = GfxKey { vs: 0, ps: key.ps.map(|_| 0), ..key.clone() };
+                    super::manifest::note_gfx(&state.encode(), (vs.code_hash, vs.translated.key_hash), ps.as_ref().map(|p| (p.code_hash, p.translated.key_hash)));
+                }
+                if !self.gfx_pipes.contains_key(&key) {
+                    if let Some(p) = self.ahead_gfx(&key, regs, &vs, ps.as_ref(), tess.is_some()) {
+                        self.gfx_pipes.insert(key.clone(), p);
+                    }
+                }
+                if !self.gfx_pipes.contains_key(&key) {
+                    let t0 = std::time::Instant::now();
+                    let p = self.create_gfx_pipeline(&key, &vs, ps.as_ref())?;
+                    PIPE_CREATES[0].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    PIPE_CREATES[0].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                    let ms = t0.elapsed().as_millis();
+                    if ms >= 100 {
+                        crate::info!("graphics pipeline for vs {:#x} ps {:#x} took {ms} ms to create", vs.addr, ps.as_ref().map(|p| p.addr).unwrap_or(0));
+                    }
+                    self.gfx_pipes.insert(key.clone(), p);
+                }
+                self.gfx_pipes.get_mut(&key).unwrap().take()?
             }
-        }
-        if !self.gfx_pipes.contains_key(&key) {
-            let t0 = std::time::Instant::now();
-            let p = self.create_gfx_pipeline(&key, &vs, ps.as_ref())?;
-            PIPE_CREATES[0].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            PIPE_CREATES[0].1.fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
-            let ms = t0.elapsed().as_millis();
-            if ms >= 100 {
-                crate::info!("graphics pipeline for vs {:#x} ps {:#x} took {ms} ms to create", vs.addr, ps.as_ref().map(|p| p.addr).unwrap_or(0));
-            }
-            self.gfx_pipes.insert(key.clone(), p);
-        }
-        let (pipeline, layout, set_layout, pslot) = self.gfx_pipes.get_mut(&key).unwrap().take()?;
+        };
         // (`new_shaders` skip: a draw whose pipeline is still compiling is
         // left out of this frame - unless the game reads its results:
         // buffer stores, occlusion counts.)
@@ -9907,8 +10060,7 @@ impl Renderer {
         self.cx.prep_shader = hs.addr;
         self.cx.prep_vs = ls.addr;
         for _ in 0..3 {
-            let reads: smallvec::SmallVec<[u64; 64]> = ls.mem_reads.iter().chain(hs.mem_reads.iter()).copied().collect();
-            if !self.guard_reads(&reads) {
+            if !self.guard_reads_parts(&[&ls.mem_reads[..], &hs.mem_reads[..]]) {
                 break;
             }
             self.begin();

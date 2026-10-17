@@ -69,6 +69,26 @@ pub static HV_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::ato
 /// TLG_PERF: bulk queries at round starts (`tune ww_bulk`): rounds, runs,
 /// pages queried, written pages found.
 pub static BULK_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// TLG_PERF: wall time (ns) of bulk rounds, validation harvests (their
+/// queries) and cold-block arming, lock waits and kernel calls included.
+pub static WW_TIMES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// TLG_PERF timing of a write-tracker phase into `WW_TIMES[i]`.
+struct Timed(usize, Option<std::time::Instant>);
+
+impl Timed {
+    fn new(i: usize) -> Timed {
+        Timed(i, super::render::perf_on().then(std::time::Instant::now))
+    }
+}
+
+impl Drop for Timed {
+    fn drop(&mut self) {
+        if let Some(t0) = self.1 {
+            WW_TIMES[self.0].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
 
 /// A queue class's validations since its required epoch last changed
 /// (`WriteTracker::bulk_round`): the block ranges they asked for.
@@ -144,6 +164,7 @@ impl WriteTracker {
             return true;
         }
         self.pages.clear();
+        let _t = Timed::new(1);
         let perf = super::render::perf_on();
         let log = crate::tune::get(crate::tune::WW_LOG) > 0;
         for (i, &(lo, hi)) in runs.iter().enumerate() {
@@ -198,6 +219,7 @@ impl WriteTracker {
         if self.rounds[c].required == self.required {
             return;
         }
+        let _t = Timed::new(0);
         self.rounds[c].required = self.required;
         let mut asked = std::mem::take(&mut self.rounds[c].asked);
         asked.sort_unstable();
@@ -256,6 +278,7 @@ impl WriteTracker {
     /// writes since these queries are collected once more after the
     /// protection (later ones fault).
     fn arm_cold(&mut self, runs: &[(u64, u64)]) {
+        let _t = Timed::new(2);
         let mut dirty: smallvec::SmallVec<[u64; 16]> = self.pages.iter().map(|&p| p >> BLOCK_SHIFT).collect();
         dirty.sort_unstable();
         dirty.dedup();
