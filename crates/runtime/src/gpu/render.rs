@@ -3359,6 +3359,9 @@ pub static TEX_SLOW: (std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64
 struct MemoEntry {
     epoch: u64,
     g: u64,
+    /// `ImgState::gen_seq` when it was made: while that is unchanged no
+    /// base's generation changed, and `g` is current without a lookup.
+    seq: u64,
     n: u64,
     view: vk::ImageView,
     cpu: u64,
@@ -6034,7 +6037,8 @@ impl Renderer {
     /// the entry was made.
     fn tex_memo_current(&mut self, t: &Tsharp, e: MemoEntry) -> bool {
         let whole = crate::tune::get(crate::tune::MEMO_BASE) == 0;
-        if (whole && e.n != img!(self).newer_gen) || e.g != base_gen!(img!(self), t.base) {
+        let im = img!(self);
+        if (whole && e.n != im.newer_gen) || (e.seq != im.gen_seq && e.g != base_gen!(im, t.base)) {
             return false;
         }
         if self.tex_memo_mode == 2 {
@@ -6335,7 +6339,8 @@ impl Renderer {
             let (g, n) = (base_gen!(img!(self), t.base), img!(self).newer_gen);
             let cpu = img!(self).images.get(&key).map_or(u64::MAX, |i| i.cpu_checked);
             let (stamp, bytes) = (mem!(self).writes.stamp(), resources::texture_bytes(t, depth_layers.max(1)));
-            self.tex_memo.insert((*t, load_only), MemoEntry { epoch: batch, g, n, view, cpu, stamp, bytes });
+            let seq = img!(self).gen_seq;
+            self.tex_memo.insert((*t, load_only), MemoEntry { epoch: batch, g, seq, n, view, cpu, stamp, bytes });
         }
         Ok(view)
     }
