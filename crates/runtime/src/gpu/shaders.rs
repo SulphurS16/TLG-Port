@@ -45,7 +45,14 @@ pub struct Translated {
 /// `TLG_SPIRV_NONCE`, so both compile afresh.
 pub fn compile_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TLG_COMPILE_PROBE").is_ok_and(|v| v == "1" || v == "map"))
+    *ON.get_or_init(|| std::env::var("TLG_COMPILE_PROBE").is_ok_and(|v| v == "1" || v == "map" || v == "regcache"))
+}
+
+/// `TLG_COMPILE_PROBE=regcache`: every shader's probe variant is its
+/// translation without block-local register values (`translate::REG_CACHE`).
+pub fn compile_probe_regcache() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_COMPILE_PROBE").is_ok_and(|v| v == "regcache"))
 }
 
 /// `TLG_COMPILE_PROBE=map`: the probe variants are the shader with page
@@ -57,7 +64,9 @@ pub fn compile_probe_map() -> bool {
 
 /// What the two probe variants are, for the reports.
 pub fn probe_labels() -> (&'static str, &'static str) {
-    if compile_probe_map() {
+    if compile_probe_regcache() {
+        ("without block-local register values", "-")
+    } else if compile_probe_map() {
         ("with word-map marks", "without page marks")
     } else {
         ("without page marks", "with plain atomics")
@@ -1102,7 +1111,12 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
                 }
                 // (`TLG_COMPILE_PROBE`: also without page marks, for the
                 // pipeline compile-time comparison - never used.)
-                let probe = if compile_probe() && out.bindings.iter().any(|b| b.kind == translate::BindingKind::DirtyBits) {
+                let probe = if compile_probe_regcache() {
+                    translate::REG_CACHE.with(|s| s.set(false));
+                    let p = translate::translate(code, plan, &spec);
+                    translate::REG_CACHE.with(|s| s.set(true));
+                    [p.ok().map(Arc::new), None]
+                } else if compile_probe() && out.bindings.iter().any(|b| b.kind == translate::BindingKind::DirtyBits) {
                     let variant = |mode: u8| {
                         translate::PROBE_MARKS.with(|s| s.set(mode));
                         let p = translate::translate(code, plan, &spec);

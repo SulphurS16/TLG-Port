@@ -31,6 +31,11 @@ thread_local! {
     /// word map), so the driver's compile time can be compared. Such
     /// shaders are never used.
     pub static PROBE_MARKS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+    /// Measurements only (`TLG_COMPILE_PROBE=regcache`): false = every
+    /// register read loads its variable again, every cast is made again and
+    /// VALU writes select on the lane's EXEC bit even when nothing writes
+    /// EXEC (the translation before the block-local values, `T::cached`).
+    pub static REG_CACHE: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -404,6 +409,19 @@ pub(crate) struct T<'a> {
     /// `active()` computed in the current block (block index, value):
     /// reused until EXEC is written or another block is selected.
     active_cache: Option<(usize, Word)>,
+    /// Block-local values (`cached`): what each register variable holds in
+    /// the block being emitted, the casts made there (by value and type) and
+    /// the types known of values (register loads, casts) - a cast back is
+    /// the value itself. Cleared when emission moves to another block
+    /// (`sync_cache`): a value is known only where it was loaded or made.
+    reg_cache: HashMap<Word, Word>,
+    cast_cache: HashMap<(Word, Word), Word>,
+    known_ty: HashMap<Word, Word>,
+    cache_blk: Option<usize>,
+    /// The block-local values are used (`REG_CACHE`). They cut the SPIR-V's
+    /// loads, casts and selects, which the driver's compile time follows in
+    /// part.
+    cached: bool,
     /// Per buffer resource: byte bias of its binding (see `bias_offset`).
     pub buf_bias: HashMap<usize, Word>,
     pub warnings: Vec<String>,
@@ -470,10 +488,77 @@ impl<'a> T<'a> {
         *self.consts.entry((ty, v as u32)).or_insert_with(|| if v { self.b.constant_true(ty) } else { self.b.constant_false(ty) })
     }
 
+    /// Clears the block-local values when emission has moved to another
+    /// block.
+    fn sync_cache(&mut self) {
+        let blk = self.b.selected_block();
+        if blk != self.cache_blk {
+            self.reg_cache.clear();
+            self.cast_cache.clear();
+            self.known_ty.clear();
+            self.cache_blk = blk;
+        }
+    }
+
+    /// A register variable's value: what this block stored or loaded there
+    /// last, else a load.
+    fn load_reg(&mut self, p: Word, ty: Word) -> R<Word> {
+        if !self.cached {
+            return e(self.b.load(ty, None, p, None, []));
+        }
+        self.sync_cache();
+        if let Some(&v) = self.reg_cache.get(&p) {
+            return Ok(v);
+        }
+        let v = e(self.b.load(ty, None, p, None, []))?;
+        self.reg_cache.insert(p, v);
+        self.known_ty.insert(v, ty);
+        Ok(v)
+    }
+
+    /// Stores a register variable (the block's later reads take `v`).
+    fn store_reg(&mut self, p: Word, v: Word) -> R<()> {
+        self.b.store(p, v, None, []).map_err(|x| format!("{x:?}"))?;
+        if self.cached {
+            self.sync_cache();
+            self.reg_cache.insert(p, v);
+        }
+        Ok(())
+    }
+
+    /// `v` cast to type `ty`: once per block, and a cast back is the value
+    /// that was cast.
+    fn cast(&mut self, ty: Word, v: Word) -> R<Word> {
+        if !self.cached {
+            return e(self.b.bitcast(ty, None, v));
+        }
+        self.sync_cache();
+        if self.known_ty.get(&v) == Some(&ty) {
+            return Ok(v);
+        }
+        if let Some(&r) = self.cast_cache.get(&(v, ty)) {
+            return Ok(r);
+        }
+        let r = e(self.b.bitcast(ty, None, v))?;
+        self.cast_cache.insert((v, ty), r);
+        if let Some(&from) = self.known_ty.get(&v) {
+            self.cast_cache.insert((r, from), v);
+        }
+        self.known_ty.insert(r, ty);
+        Ok(r)
+    }
+
+    /// Every lane stays active: no instruction writes EXEC and no stage
+    /// input sets it (tessellation's LS and HS do), so EXEC keeps its
+    /// initial 1.
+    fn all_active(&self) -> bool {
+        self.cached && !self.exec_written && self.spec.tess.role == TessRole::None
+    }
+
     /// Raw 32-bit value of a scalar register slot (0..127).
     pub fn sreg(&mut self, idx: u32) -> R<Word> {
         let p = self.sgpr[(idx & 127) as usize];
-        e(self.b.load(self.t.u32, None, p, None, []))
+        self.load_reg(p, self.t.u32)
     }
     pub fn set_sreg(&mut self, idx: u32, v: Word) -> R<()> {
         if idx >= 128 {
@@ -483,19 +568,22 @@ impl<'a> T<'a> {
             self.active_cache = None;
         }
         let p = self.sgpr[idx as usize];
-        self.b.store(p, v, None, []).map_err(|x| format!("{x:?}"))
+        self.store_reg(p, v)
     }
     pub fn vreg(&mut self, idx: u32) -> R<Word> {
         let p = self.vgpr[(idx & 255) as usize];
-        e(self.b.load(self.t.u32, None, p, None, []))
+        self.load_reg(p, self.t.u32)
     }
     /// Unconditional VGPR write (used for initialization).
     pub fn set_vreg_raw(&mut self, idx: u32, v: Word) -> R<()> {
         let p = self.vgpr[(idx & 255) as usize];
-        self.b.store(p, v, None, []).map_err(|x| format!("{x:?}"))
+        self.store_reg(p, v)
     }
     /// VGPR write predicated on this lane being active.
     pub fn set_vreg(&mut self, idx: u32, v: Word) -> R<()> {
+        if self.all_active() {
+            return self.set_vreg_raw(idx, v);
+        }
         let act = self.active()?;
         let old = self.vreg(idx)?;
         let nv = e(self.b.select(self.t.u32, None, act, v, old))?;
@@ -506,6 +594,9 @@ impl<'a> T<'a> {
     /// (thousands of recomputations made the largest shaders take ~35 s to
     /// compile).
     pub fn active(&mut self) -> R<Word> {
+        if self.all_active() {
+            return Ok(self.bool_c(true));
+        }
         let blk = self.b.selected_block();
         if let (Some((cb, w)), Some(b)) = (self.active_cache, blk) {
             if cb == b {
@@ -577,10 +668,10 @@ impl<'a> T<'a> {
         e(self.b.i_not_equal(bt, None, r, zero))
     }
     pub fn get_scc(&mut self) -> R<Word> {
-        e(self.b.load(self.t.bool_, None, self.scc, None, []))
+        self.load_reg(self.scc, self.t.bool_)
     }
     pub fn set_scc(&mut self, v: Word) -> R<()> {
-        self.b.store(self.scc, v, None, []).map_err(|x| format!("{x:?}"))
+        self.store_reg(self.scc, v)
     }
 
     /// 32-bit value of an operand (SGPR, VGPR, inline constant, literal, special).
@@ -631,13 +722,13 @@ impl<'a> T<'a> {
     }
 
     pub fn to_f(&mut self, v: Word) -> R<Word> {
-        e(self.b.bitcast(self.t.f32, None, v))
+        self.cast(self.t.f32, v)
     }
     pub fn to_u(&mut self, v: Word) -> R<Word> {
-        e(self.b.bitcast(self.t.u32, None, v))
+        self.cast(self.t.u32, v)
     }
     pub fn to_i(&mut self, v: Word) -> R<Word> {
-        e(self.b.bitcast(self.t.i32, None, v))
+        self.cast(self.t.i32, v)
     }
     pub fn glsl1(&mut self, ty: Word, op: spirv::GlslStd450Op, a: Word) -> R<Word> {
         e(self.b.ext_inst(ty, None, self.glsl, op as u32, [Operand::IdRef(a)]))
@@ -988,6 +1079,11 @@ fn translate_mode(code: &[Inst], plan: &Plan, spec: &Spec, wave_sync: bool) -> R
         sg_lane_var: None,
         lane_slots: HashMap::default(),
         active_cache: None,
+        reg_cache: HashMap::default(),
+        cast_cache: HashMap::default(),
+        known_ty: HashMap::default(),
+        cache_blk: None,
+        cached: REG_CACHE.with(|c| c.get()),
         buf_bias: HashMap::default(),
         warnings: Vec::new(),
         params: 0,

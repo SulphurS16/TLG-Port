@@ -9652,6 +9652,10 @@ impl Renderer {
             let module = |spirv: &[u32]| unsafe { c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(spirv), None) }.map_err(|e| format!("vkCreateShaderModule: {e}"));
             let mut pns = [0u64; 2];
             for (v, t) in pns.iter_mut().enumerate() {
+                // (A variant neither stage has: not made.)
+                if vs.translated.probe[v].is_none() && ps.is_none_or(|p| p.translated.probe[v].is_none()) {
+                    continue;
+                }
                 let pv = module(vs.translated.probe[v].as_ref().map_or(&vs.translated.out.spirv, |p| &p.spirv))?;
                 let pp = match ps {
                     Some(p) => Some(module(p.translated.probe[v].as_ref().map_or(&p.translated.out.spirv, |o| &o.spirv))?),
