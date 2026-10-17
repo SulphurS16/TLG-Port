@@ -2529,9 +2529,10 @@ struct PendingWrite {
     dev_buf: vk::Buffer,
     mirror: bool,
     /// Page bitmap of the range's writes (mirror writes): (device-ring
-    /// offset, host-ring offset of its copy, dwords). Only marked pages are
-    /// copied out and written back.
-    bits: Option<(u64, u64, u32)>,
+    /// offset, host-ring offset of its copy, dwords, device-ring offset of
+    /// the word map the shaders mark instead - `Spec::page_marks` 3 - or
+    /// u64::MAX). Only marked pages are copied out and written back.
+    bits: Option<(u64, u64, u32, u64)>,
 }
 
 static RENDERER_CELL: Mutex<Option<Renderer>> = Mutex::new(None);
@@ -3232,8 +3233,9 @@ fn note_compile_probe(kind: usize, ns: u64, probe_ns: [u64; 2], a: u64, b: u64) 
     COMPILE_PROBE[kind][3].fetch_add(probe_ns[1], Relaxed);
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     if ns >= 100_000_000 && N.fetch_add(1, Relaxed) < 40 {
+        let (l0, l1) = shaders::probe_labels();
         crate::info!(
-            "compile probe: {} {a:#x}{}: {} ms, without page marks {} ms, with plain atomics {} ms",
+            "compile probe: {} {a:#x}{}: {} ms, {l0} {} ms, {l1} {} ms",
             ["graphics pipeline for vs", "compute pipeline for cs"][kind],
             if b != 0 { format!(" ps {b:#x}") } else { String::new() },
             ns / 1_000_000,
@@ -4286,7 +4288,7 @@ impl Renderer {
         let mut wb_cs: Vec<bool> = Vec::new();
         for (k, part) in parts.iter().enumerate() {
             writebacks.extend(part.pending.iter().map(|p| (p.base, p.host_off, p.size)));
-            wb_bits.extend(part.pending.iter().map(|p| p.bits.map(|(_, host, words)| (host, words))));
+            wb_bits.extend(part.pending.iter().map(|p| p.bits.map(|(_, host, words, _)| (host, words))));
             mirror_writes.extend(part.pending.iter().filter(|p| p.mirror && p.bits.is_none()).map(|p| (p.base, p.size)));
             wb_mirror.extend(part.pending.iter().map(|p| p.mirror));
             wb_cs.extend(part.pending.iter().map(|_| k == 1));
@@ -5212,42 +5214,55 @@ impl Renderer {
 
     /// Registers the write-back of mirror-resident GPU writes to guest
     /// [base, base+size) at the end of this batch: once per range and batch
-    /// (the copy-out then holds the last write). Returns the range's page
-    /// bitmap (device-ring offset, dwords, the range's offset in its first
-    /// page): writers mark the pages they write, and only those are copied
-    /// out and written back.
-    fn mirror_write_back(&mut self, base: u64, size: u64, buf: vk::Buffer, off: u64) -> Result<(u64, u32, u32), String> {
+    /// (the copy-out then holds the last write). Returns where the writers
+    /// mark the pages they write (device-ring offset, dwords, the range's
+    /// offset in its first page): the page bitmap, or with `map` (the
+    /// shader's `Spec::page_marks` 3) a word per page, which the copy-out
+    /// turns into the bitmap. Only marked pages are copied out and written
+    /// back.
+    fn mirror_write_back(&mut self, base: u64, size: u64, buf: vk::Buffer, off: u64, map: bool) -> Result<(u64, u32, u32), String> {
         let head = (base & 0xFFF) as u32;
-        // (Only when no later write-back overlaps it: write-backs land in order.)
-        if let Some(w) = bloom_maybe(&self.cx.wb_bloom, base, size).then(|| self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size)).flatten().filter(|w| w.mirror && w.base == base && w.size == size && w.dev_buf == buf) {
-            if let Some((bits, _, words)) = w.bits {
-                return Ok((bits, words, head));
-            }
-        }
         let pages = (head as u64 + size).div_ceil(4096);
         let words = pages.div_ceil(32) as u32;
+        // (Only when no later write-back overlaps it: write-backs land in
+        // order; and when its writers mark the same way.)
+        if let Some(w) = bloom_maybe(&self.cx.wb_bloom, base, size).then(|| self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size)).flatten().filter(|w| w.mirror && w.base == base && w.size == size && w.dev_buf == buf) {
+            match w.bits {
+                Some((_, _, _, m)) if map && m != u64::MAX => return Ok((m, pages as u32, head)),
+                Some((bits, _, words, m)) if !map && m == u64::MAX => return Ok((bits, words, head)),
+                _ => {}
+            }
+        }
         let host_off = self.cx.ring.alloc(size).ok_or_else(|| format!("ring full: {size:#x}-byte write-back of {base:#x} (segment {:#x})", self.cx.ring.segment_size()))?;
         let bits_host = self.cx.ring.alloc(words as u64 * 4).ok_or("ring full: page bitmap")?;
         self.begin();
+        // (The word map right after the bitmap: zeroed together.)
+        let bits = self.zeroed_words(words as u64 + if map { pages } else { 0 })?;
+        let m = if map { bits + 4 * words as u64 } else { u64::MAX };
+        self.push_writeback(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: Some((bits, bits_host, words, m)) });
+        Ok(if map { (m, pages as u32, head) } else { (bits, words, head) })
+    }
+
+    /// `n` device-ring dwords that are zero when this batch's commands run:
+    /// from the batch's pre-zeroed arena (`tune bits_arena`), else filled in
+    /// the batch's prologue (or here, behind a barrier).
+    fn zeroed_words(&mut self, n: u64) -> Result<u64, String> {
         let (arena_batch, arena_off, used, cap) = self.cx.bits_arena;
-        let bits = if arena_batch == self.cx.batch && used + words as u64 <= cap && crate::tune::get(crate::tune::BITS_ARENA) != 0 {
+        if arena_batch == self.cx.batch && used + n <= cap && crate::tune::get(crate::tune::BITS_ARENA) != 0 {
             // (Pre-zeroed words of this batch: see `begin`.)
-            self.cx.bits_arena.2 += words as u64;
-            arena_off + 4 * used
+            self.cx.bits_arena.2 += n;
+            return Ok(arena_off + 4 * used);
+        }
+        let off = self.cx.dring.alloc(n * 4).ok_or("device ring full: page bitmap")?;
+        if crate::tune::get(crate::tune::PROLOGUE) != 0 {
+            let pro = self.prologue_cmd();
+            unsafe { REC.cmd_fill_buffer(pro, self.cx.dring.buffer, off, n * 4, 0) };
         } else {
-            let bits = self.cx.dring.alloc(words as u64 * 4).ok_or("device ring full: page bitmap")?;
-            if crate::tune::get(crate::tune::PROLOGUE) != 0 {
-                let pro = self.prologue_cmd();
-                unsafe { REC.cmd_fill_buffer(pro, self.cx.dring.buffer, bits, words as u64 * 4, 0) };
-            } else {
-                self.end_rendering();
-                unsafe { REC.cmd_fill_buffer(self.cx.cmd, self.cx.dring.buffer, bits, words as u64 * 4, 0) };
-                full_barrier!(self);
-            }
-            bits
-        };
-        self.push_writeback(PendingWrite { base, size, host_off, dev_off: off, dev_buf: buf, mirror: true, bits: Some((bits, bits_host, words)) });
-        Ok((bits, words, head))
+            self.end_rendering();
+            unsafe { REC.cmd_fill_buffer(self.cx.cmd, self.cx.dring.buffer, off, n * 4, 0) };
+            full_barrier!(self);
+        }
+        Ok(off)
     }
 
     /// `mirror_write_back` for GPU work that writes every byte of [base,
@@ -8127,7 +8142,7 @@ impl Renderer {
                             if let Some((vb, voff)) = self.vcache_bind_ex(base, extent, false, extent < VCACHE_MIN) {
                                 let t1 = bpart(0, t0);
                                 bpath = 4;
-                                let (bits, words, head) = self.mirror_write_back(base, extent, vb, voff)?;
+                                let (bits, words, head) = self.mirror_write_back(base, extent, vb, voff, p.translated.page_marks == 3)?;
                                 if let Some(d) = dinfo.get_mut(3 * i..3 * i + 3) {
                                     d.copy_from_slice(&[(bits / 4) as u32, head, words - 1]);
                                 }
@@ -10443,7 +10458,7 @@ impl Renderer {
             .map(|i| vk::DescriptorSetLayoutBinding::default().binding(i).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE))
             .collect();
         let set_layout = unsafe { c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None) }.map_err(|e| e.to_string())?;
-        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 24 }];
+        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 28 }];
         let sls = [set_layout];
         let layout = unsafe { c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sls).push_constant_ranges(&pcr), None) }.map_err(|e| e.to_string())?;
         let m = self.module(0x4449_5254_5900_0000, &gcn::translate::kernels::dirty_copy_cs())?;
@@ -10515,12 +10530,15 @@ impl Renderer {
         let mut bitmaps = Vec::new();
         unsafe { REC.cmd_bind_pipeline(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, pipeline) };
         self.cx.bound_cs = vk::Pipeline::null();
+        let mut mapped = false;
         for p in pending {
-            let Some((bits, bits_host, words)) = p.bits else { continue };
+            let Some((bits, bits_host, words, map)) = p.bits else { continue };
             let set = self.dirty_set(p.dev_buf)?;
             let head = p.base & 0xFFF;
             let pages = (head + p.size).div_ceil(4096) as u32;
-            let pc = [pages, head as u32, p.size as u32, (p.dev_off / 4) as u32, (p.host_off / 4) as u32, (bits / 4) as u32];
+            mapped |= map != u64::MAX;
+            let map_dw = if map == u64::MAX { u32::MAX } else { (map / 4) as u32 };
+            let pc = [pages, head as u32, p.size as u32, (p.dev_off / 4) as u32, (p.host_off / 4) as u32, (bits / 4) as u32, map_dw];
             let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
             unsafe {
                 REC.cmd_bind_descriptor_sets(self.cx.cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
@@ -10530,6 +10548,11 @@ impl Renderer {
             bitmaps.push(vk::BufferCopy { src_offset: bits, dst_offset: bits_host, size: words as u64 * 4 });
         }
         if !bitmaps.is_empty() {
+            // (Bits the copies set from word maps first.)
+            if mapped {
+                let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+                unsafe { REC.cmd_pipeline_barrier(self.cx.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[mb], &[], &[]) };
+            }
             unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.dring.buffer, self.cx.ring.buffer, &bitmaps) };
         }
         self.cx.bound_gfx = vk::Pipeline::null();

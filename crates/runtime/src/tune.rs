@@ -608,12 +608,14 @@ pub const SHADER_STATS: usize = 100;
 /// 20261016-070734, memo hits 24,300 vs 24,400 per second.)
 pub const MEMO_BASE: usize = 101;
 
-/// Shaders' page marks of buffer stores kept per invocation and flushed when
-/// a store moves on to another bitmap word and at the end (`TLG_PAGE_MARKS`,
-/// 1; 0: one subgroup-coalesced mark per store - its subgroup operations made
-/// shaders with buffer stores compile ~1.8x slower, cold runs 20261016-074024
-/// .. -082408; 2: a plain atomic per lane and store). Part of the translation
-/// key: switching translates again.
+/// How shaders mark the pages of their buffer stores (`TLG_PAGE_MARKS`, 3: a
+/// word per page set by a plain store, which the write-back's page copy
+/// turns into the bitmap - no atomic and no branch of its own: shaders with
+/// buffer stores compile ~1.2x as long as without marks; 1: bitmap bits kept
+/// per invocation and flushed when a store moves on to another bitmap word
+/// and at the end, ~2x; 0: one subgroup-coalesced mark per store, ~3.5x; 2: a
+/// plain atomic per lane and store, ~1.5x). Part of the translation key:
+/// switching translates again.
 pub const PAGE_MARKS: usize = 102;
 /// Forwards of GPU writes that only batches in flight made (their device
 /// copies, not in guest memory yet) are recorded in the batch prologue,
@@ -778,7 +780,7 @@ const TABLE: [(&str, &str, i64); 113] = [
     ("tex_memo", "TLG_TEX_MEMO", 1),
     ("shader_stats", "TLG_SHADER_STATS", 0),
     ("memo_base", "TLG_MEMO_BASE", 1),
-    ("page_marks", "TLG_PAGE_MARKS", 1),
+    ("page_marks", "TLG_PAGE_MARKS", 3),
     ("hoist_fwd", "TLG_HOIST_FWD", 1),
     ("guest_prio", "TLG_GUEST_PRIO", 256),
     ("rev_db", "TLG_REV_DB", 0),

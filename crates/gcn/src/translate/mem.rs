@@ -744,7 +744,7 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
 /// store stays in the first byte's page), in the store's own branch of the
 /// active lanes. When a subgroup's lanes all hit one bitmap dword, one lane
 /// sets their bits together (stores of a wave usually share pages) - or as
-/// `Spec::page_marks` says.
+/// `Spec::page_marks` says (3: the pages' words of a word map instead).
 fn mark_dirty(tr: &mut T, r: usize, first: Word, last: Option<Word>) -> R<()> {
     let probe = super::PROBE_MARKS.with(|s| s.get());
     if probe == 1 {
@@ -753,6 +753,22 @@ fn mark_dirty(tr: &mut T, r: usize, first: Word, last: Option<Word>) -> R<()> {
     let Some((_, bits)) = tr.dirty else { return Ok(()) };
     let Some(&(base, head, limit)) = tr.dirty_res.get(&r) else { return Ok(()) };
     let u = tr.t.u32;
+    if probe == 3 || (probe == 0 && tr.spec.page_marks == 3) {
+        // A word per page, set by a plain store (`Spec::page_marks` 3): no
+        // atomic and no branch of its own - every writer stores the same
+        // value. The binding's `DirtyInfo` names the word map (the limit is
+        // its last page).
+        let (k12, z, one) = (tr.u(12), tr.u(0), tr.u(1));
+        for at in std::iter::once(first).chain(last) {
+            let a = e(tr.b.i_add(u, None, at, head))?;
+            let page = e(tr.b.shift_right_logical(u, None, a, k12))?;
+            let page = tr.glsl2(u, GLOp::UMin, page, limit)?;
+            let idx = e(tr.b.i_add(u, None, page, base))?;
+            let p = e(tr.b.access_chain(tr.t.sb_u32, None, bits, [z, idx]))?;
+            tr.b.store(p, one, None, []).map_err(|x| format!("{x:?}"))?;
+        }
+        return Ok(());
+    }
     let bt = tr.t.bool_;
     let sg = tr.u(spirv::Scope::Subgroup as u32);
     let dev = tr.u(spirv::Scope::Device as u32);

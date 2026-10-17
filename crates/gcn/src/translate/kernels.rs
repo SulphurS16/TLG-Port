@@ -126,13 +126,17 @@ pub fn remap_cs(tile: bool) -> Vec<u32> {
 }
 
 /// Copies the pages of a written range whose bit is set in its page bitmap
-/// (see `BindingKind::DirtyBits`) from the device to the host ring.
+/// (see `BindingKind::DirtyBits`) from the device to the host ring. With a
+/// word map (`Spec::page_marks` 3: a word per page, nonzero = written): the
+/// pages whose word is set, and their bits are set in the bitmap (zeroed
+/// before) for the host's write-back.
 ///
 /// Bindings (set 0): 0 = source dwords, 1 = destination dwords, 2 = bitmap
-/// dwords (whole buffers). Push constants (6 x u32): page count, byte
-/// offset of the range within its first page, range bytes, source,
-/// destination and bitmap base (dwords). One workgroup of 64 per page; the
-/// range's bytes [p*4096 - head, (p+1)*4096 - head) ∩ [0, bytes) of page p.
+/// and word-map dwords (whole buffers). Push constants (7 x u32): page
+/// count, byte offset of the range within its first page, range bytes,
+/// source, destination, bitmap and word-map base (dwords; u32::MAX: no word
+/// map). One workgroup of 64 per page; the range's bytes [p*4096 - head,
+/// (p+1)*4096 - head) ∩ [0, bytes) of page p.
 pub fn dirty_copy_cs() -> Vec<u32> {
     let mut b = Builder::new();
     b.set_version(1, 3);
@@ -159,9 +163,9 @@ pub fn dirty_copy_cs() -> Vec<u32> {
         })
         .collect();
     let (src, dst, bits) = (bufs[0], bufs[1], bufs[2]);
-    let pcs = b.type_struct([u32t, u32t, u32t, u32t, u32t, u32t]);
+    let pcs = b.type_struct([u32t, u32t, u32t, u32t, u32t, u32t, u32t]);
     b.decorate(pcs, Decoration::Block, []);
-    for m in 0..6 {
+    for m in 0..7 {
         b.member_decorate(pcs, m, Decoration::Offset, [Operand::LiteralBit32(m * 4)]);
     }
     let p_pcs = b.type_pointer(None, StorageClass::PushConstant, pcs);
@@ -190,6 +194,7 @@ pub fn dirty_copy_cs() -> Vec<u32> {
     };
     let (npages, head, bytes) = (pc_field(&mut b, 0), pc_field(&mut b, 1), pc_field(&mut b, 2));
     let (src_dw, dst_dw, bits_dw) = (pc_field(&mut b, 3), pc_field(&mut b, 4), pc_field(&mut b, 5));
+    let map_dw = pc_field(&mut b, 6);
     let g = b.load(v3u, None, wg, None, []).unwrap();
     let page = b.composite_extract(u32t, None, g, [0]).unwrap();
     let l = b.load(v3u, None, lid, None, []).unwrap();
@@ -202,7 +207,17 @@ pub fn dirty_copy_cs() -> Vec<u32> {
     let bi = b.bitwise_and(u32t, None, page, c31).unwrap();
     let bit = b.shift_right_logical(u32t, None, w, bi).unwrap();
     let bit = b.bitwise_and(u32t, None, bit, c1).unwrap();
-    let set = b.i_not_equal(boolt, None, bit, c0).unwrap();
+    let bit_set = b.i_not_equal(boolt, None, bit, c0).unwrap();
+    // (With a word map: the page's word; without, the bitmap's first word
+    // is read in its place and not used.)
+    let cmax = b.constant_bit32(u32t, u32::MAX);
+    let has_map = b.i_not_equal(boolt, None, map_dw, cmax).unwrap();
+    let mi = b.i_add(u32t, None, page, map_dw).unwrap();
+    let mi = b.select(u32t, None, has_map, mi, bits_dw).unwrap();
+    let pm = b.access_chain(p_sb_u, None, bits, [c0, mi]).unwrap();
+    let mw = b.load(u32t, None, pm, None, []).unwrap();
+    let map_set = b.i_not_equal(boolt, None, mw, c0).unwrap();
+    let set = b.select(boolt, None, has_map, map_set, bit_set).unwrap();
     let in_range = b.u_less_than(boolt, None, page, npages).unwrap();
     let go = b.logical_and(boolt, None, set, in_range).unwrap();
     let body = b.id();
@@ -210,6 +225,19 @@ pub fn dirty_copy_cs() -> Vec<u32> {
     b.selection_merge(merge, spirv::SelectionControl::NONE).unwrap();
     b.branch_conditional(go, body, merge, []).unwrap();
     b.begin_block(Some(body)).unwrap();
+    // A word-mapped page's bit for the host (one lane).
+    let lane0 = b.i_equal(boolt, None, lane, c0).unwrap();
+    let set_bit = b.logical_and(boolt, None, has_map, lane0).unwrap();
+    let sb = b.id();
+    let sm = b.id();
+    b.selection_merge(sm, spirv::SelectionControl::NONE).unwrap();
+    b.branch_conditional(set_bit, sb, sm, []).unwrap();
+    b.begin_block(Some(sb)).unwrap();
+    let one_bit = b.shift_left_logical(u32t, None, c1, bi).unwrap();
+    let dev = b.constant_bit32(u32t, spirv::Scope::Device as u32);
+    b.atomic_or(u32t, None, pw, dev, c0, one_bit).unwrap();
+    b.branch(sm).unwrap();
+    b.begin_block(Some(sm)).unwrap();
     // [start, end) in range bytes.
     let pstart = b.shift_left_logical(u32t, None, page, c12).unwrap();
     let past = b.u_greater_than(boolt, None, pstart, head).unwrap();
@@ -776,6 +804,16 @@ mod tests {
                 let last = b.instructions.last().map(|i| i.class.opcode);
                 assert!(matches!(last, Some(rspirv::spirv::Op::Return | rspirv::spirv::Op::Branch | rspirv::spirv::Op::BranchConditional)), "{name}: block without terminator");
             }
+        }
+    }
+
+    #[test]
+    fn dirty_copy_kernel_assembles() {
+        let w = super::dirty_copy_cs();
+        check_module(&w, "dirty_copy");
+        if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/dirty_copy.spv"), bytes).unwrap();
         }
     }
 

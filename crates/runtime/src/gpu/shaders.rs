@@ -33,6 +33,9 @@ pub struct Translated {
     /// `TLG_COMPILE_PROBE`: the same translation without page marks, and
     /// with plain per-lane atomics as the marks.
     pub probe: [Option<Arc<Output>>; 2],
+    /// How its buffer stores mark their pages (`Spec::page_marks`; 3: a word
+    /// map, see `Renderer::mirror_write_back`).
+    pub page_marks: u8,
 }
 
 /// Pipeline compile-time measurements (`TLG_COMPILE_PROBE=1`): each shader
@@ -42,7 +45,23 @@ pub struct Translated {
 /// `TLG_SPIRV_NONCE`, so both compile afresh.
 pub fn compile_probe() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TLG_COMPILE_PROBE").is_ok_and(|v| v == "1"))
+    *ON.get_or_init(|| std::env::var("TLG_COMPILE_PROBE").is_ok_and(|v| v == "1" || v == "map"))
+}
+
+/// `TLG_COMPILE_PROBE=map`: the probe variants are the shader with page
+/// marks as a word per page set by plain stores, and without page marks.
+pub fn compile_probe_map() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_COMPILE_PROBE").is_ok_and(|v| v == "map"))
+}
+
+/// What the two probe variants are, for the reports.
+pub fn probe_labels() -> (&'static str, &'static str) {
+    if compile_probe_map() {
+        ("with word-map marks", "without page marks")
+    } else {
+        ("without page marks", "with plain atomics")
+    }
 }
 
 static CACHE: Mutex<Option<FastMap<(u64, u64), Translated>>> = Mutex::new(None);
@@ -960,7 +979,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         binding_base: if sr.stage == Stage::Fragment { PS_BINDING_BASE } else { 0 },
         // (Set below, once the rest of the key is known.)
         debug_capture: Vec::new(),
-        page_marks: crate::tune::get(crate::tune::PAGE_MARKS).clamp(0, 2) as u8,
+        page_marks: crate::tune::get(crate::tune::PAGE_MARKS).clamp(0, 3) as u8,
     };
     match sr.stage {
         Stage::Fragment => {
@@ -1055,11 +1074,11 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
                         translate::PROBE_MARKS.with(|s| s.set(0));
                         p.ok().map(Arc::new)
                     };
-                    [variant(1), variant(2)]
+                    if compile_probe_map() { [variant(3), variant(1)] } else { [variant(1), variant(2)] }
                 } else {
                     [None, None]
                 };
-                let t = Translated { out: Arc::new(out), key_hash, probe };
+                let t = Translated { out: Arc::new(out), key_hash, probe, page_marks: spec.page_marks };
                 map.insert((code_hash, key_hash), t.clone());
                 t
             }

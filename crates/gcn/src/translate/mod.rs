@@ -26,7 +26,8 @@ thread_local! {
     /// Measurements only (the runtime's `TLG_COMPILE_PROBE`): 1 = buffer
     /// stores leave out their page marks (`mem::mark_dirty`; the bindings
     /// stay); 2 = they mark with a plain atomic per active lane (no subgroup
-    /// operations), so the driver's compile time can be compared. Such
+    /// operations); 3 = they set a word per page with a plain store (a page
+    /// word map), so the driver's compile time can be compared. Such
     /// shaders are never used.
     pub static PROBE_MARKS: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
@@ -164,7 +165,11 @@ pub struct Spec {
     /// invocation and flushed when a store moves on to another bitmap word
     /// and before the program ends; 0 = one subgroup-coalesced mark per store
     /// (its subgroup operations made such shaders compile ~1.8x slower);
-    /// 2 = a plain atomic per lane and store.
+    /// 2 = a plain atomic per lane and store; 3 = a word per page set by a
+    /// plain store (the binding's `DirtyInfo` names a word map; the
+    /// write-back's copy turns it into the bitmap): no atomic and no branch
+    /// of its own, ~1.2x the unmarked shaders' compile time against ~2x
+    /// with 1.
     pub page_marks: u8,
 }
 
@@ -1610,6 +1615,15 @@ mod tests {
         let plain = ops_of(2);
         assert_eq!(count(&plain, spirv::Op::GroupNonUniformAllEqual), 0);
         assert_eq!(count(&plain, spirv::Op::AtomicOr), 3);
+        // A word per page (3): a plain store per page (1 + 2), no atomic,
+        // no subgroup operation, nothing pending to flush.
+        let map = ops_of(3);
+        assert_eq!(count(&map, spirv::Op::AtomicOr), 0);
+        assert_eq!(count(&map, spirv::Op::GroupNonUniformAllEqual), 0);
+        PROBE_MARKS.with(|s| s.set(1));
+        let none = ops_of(1);
+        PROBE_MARKS.with(|s| s.set(0));
+        assert_eq!(count(&map, spirv::Op::Store), count(&none, spirv::Op::Store) + 3);
     }
 
     #[test]

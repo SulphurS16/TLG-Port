@@ -751,10 +751,11 @@ fn gfx_thread() {
                     a[11] as f64 / 1e3 / (a[2] + a[3]).max(1) as f64
                 );
                 if shaders::compile_probe() {
+                    let (l0, l1) = shaders::probe_labels();
                     let p: Vec<String> = (0..2)
                         .map(|k| {
                             let v: [u64; 4] = std::array::from_fn(|i| render::COMPILE_PROBE[k][i].load(Ordering::Relaxed));
-                            format!("{} {} pipelines {:.2} s as used, {:.2} s without page marks, {:.2} s with plain atomics", ["graphics", "compute"][k], v[0], v[1] as f64 / 1e9, v[2] as f64 / 1e9, v[3] as f64 / 1e9)
+                            format!("{} {} pipelines {:.2} s as used, {:.2} s {l0}, {:.2} s {l1}", ["graphics", "compute"][k], v[0], v[1] as f64 / 1e9, v[2] as f64 / 1e9, v[3] as f64 / 1e9)
                         })
                         .collect();
                     crate::info!("compile probe: {}", p.join("; "));
