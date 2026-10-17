@@ -572,6 +572,7 @@ fn gfx_thread() {
                 if let Some((mib, n, copied, hits)) = r.vcache_stats() {
                     crate::info!("VRAM mirrors: {mib} MiB in {n} windows; {copied} MiB copied in; {hits} bindings served");
                 }
+                crate::info!("{}", r.map_sizes());
                 crate::info!("{}", r.vram_report());
                 crate::info!("{}", r.base_report());
                 crate::info!("EVENT_WRITE types: {}", cp::event_type_counts());

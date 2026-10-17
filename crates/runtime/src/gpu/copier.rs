@@ -67,7 +67,7 @@ pub fn copy(dst: *mut u8, src: u64, len: usize) -> u64 {
     // writes ring bytes only this copy owns.)
     if len <= INLINE_MAX && SLEEPING.load(Ordering::SeqCst) && crate::tune::get(crate::tune::COPY_INLINE) != 0 {
         let d = unsafe { std::slice::from_raw_parts_mut(dst, len) };
-        super::resources::copy_from_guest(d, src);
+        super::resources::copy_from_guest_with(d, src, true);
         INLINE.fetch_add(1, Ordering::Relaxed);
         return 0;
     }
@@ -158,7 +158,7 @@ fn run() {
             j
         };
         let dst = unsafe { std::slice::from_raw_parts_mut(job.dst, job.len) };
-        super::resources::copy_from_guest(dst, job.src);
+        super::resources::copy_from_guest_with(dst, job.src, true);
         *CUR.lock() = (0, 0, 0);
         COPIES.fetch_add(1, Ordering::Relaxed);
         DONE.store(job.seq, Ordering::Release);

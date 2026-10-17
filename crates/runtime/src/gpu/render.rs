@@ -23,8 +23,27 @@ macro_rules! set_gpu_written {
     ($s:expr, $img:expr, $base:expr) => {{
         if !$img.gpu_written {
             $img.gpu_written = true;
-            *$s.base_gen.entry($base).or_default() += 1;
+            bump_base!($s, $base);
         }
+    }};
+}
+
+/// Images at guest `$base` changed (`ImgState::base_gen`, `$s` the image
+/// state): a generation no state of any base had before.
+macro_rules! bump_base {
+    ($s:expr, $base:expr) => {{
+        $s.gen_seq += 1;
+        let g = $s.gen_seq;
+        $s.base_gen.insert($base, g);
+    }};
+}
+
+/// The generation of guest `$base` (`ImgState::base_gen`, `$s` the image
+/// state).
+macro_rules! base_gen {
+    ($s:expr, $base:expr) => {{
+        let s = &*$s;
+        s.base_gen.get(&$base).copied().unwrap_or(s.gen_floor)
     }};
 }
 
@@ -1031,6 +1050,10 @@ const VCACHE_MIN: u64 = 64 << 10;
 const VCACHE_MAX: u64 = 64 << 20;
 const VWIN_SIZE: u64 = (1 << VWIN_SHIFT) + VCACHE_MAX;
 const VCACHE_BUDGET: u64 = 4 << 30;
+/// Entries of the mirror binding cache (`MemModel::vbind`) and of
+/// `ImgState::tex_paths` before they start afresh.
+const VBIND_MAX: usize = 16 << 10;
+const TEX_PATHS_MAX: usize = 16 << 10;
 /// Largest read-only copy `upload_guest_ro` puts in the BAR ring (bigger
 /// ones would take a segment's room from many small ones).
 const BAR_UPLOAD_MAX: u64 = 64 << 10;
@@ -2459,10 +2482,16 @@ struct ImgState {
     /// the CPU epoch then.
     ready_bases: FastMap<u64, u64>,
     /// Sampled textures that took the guest-memory path (`tune tex_cache`),
-    /// with their base's `base_gen` then; per guest base, a count bumped when
-    /// an image there becomes GPU-written (or is replaced).
+    /// with their base's `base_gen` then; per guest base, a generation that
+    /// changes when an image there becomes GPU-written (or is replaced):
+    /// `gen_seq`'s next value, unique over all bases. Bases with no image
+    /// are dropped now and then (`Renderer::housekeeping`; a few hundred new
+    /// bases per second in busy areas) and read as `gen_floor`, a value
+    /// newer than any recorded before they were dropped.
     tex_paths: FastMap<(Tsharp, bool), u64>,
     base_gen: FastMap<u64, u64>,
+    gen_seq: u64,
+    gen_floor: u64,
     /// Bumped when an image becomes newer in guest memory, is created or is
     /// removed: a target cache entry with this value needs no per-image check.
     newer_gen: u64,
@@ -3161,6 +3190,8 @@ pub fn init() -> Result<(), String> {
             ready_bases: FastMap::default(),
             tex_paths: FastMap::default(),
             base_gen: FastMap::default(),
+            gen_seq: 0,
+            gen_floor: 0,
             newer_gen: 1,
             meta_dirty_gen: 0,
             write_gen: FastMap::default(),
@@ -4732,7 +4763,7 @@ impl Renderer {
         img!(self).images.insert(k, img);
         img!(self).newer_gen += 1;
         mem!(self).meta_gen += 1;
-        *img!(self).base_gen.entry(k.base).or_default() += 1;
+        bump_base!(img!(self), k.base);
     }
 
     fn init_image(&mut self, key: ImageKey) -> Result<(), String> {
@@ -5017,8 +5048,8 @@ impl Renderer {
         // The new image takes over the old one's state and index entries.
         let o = img!(self).images.remove(&old).unwrap();
         img!(self).newer_gen += 1;
-        *img!(self).base_gen.entry(old.base).or_default() += 1;
-        *img!(self).base_gen.entry(new.base).or_default() += 1;
+        bump_base!(img!(self), old.base);
+        bump_base!(img!(self), new.base);
         let n = img!(self).images.get_mut(&new).unwrap();
         n.gpu_written = o.gpu_written;
         n.uploaded_hash = o.uploaded_hash;
@@ -5952,7 +5983,7 @@ impl Renderer {
     /// the entry was made.
     fn tex_memo_current(&mut self, t: &Tsharp, e: MemoEntry) -> bool {
         let whole = crate::tune::get(crate::tune::MEMO_BASE) == 0;
-        if (whole && e.n != img!(self).newer_gen) || e.g != img!(self).base_gen.get(&t.base).copied().unwrap_or(0) {
+        if (whole && e.n != img!(self).newer_gen) || e.g != base_gen!(img!(self), t.base) {
             return false;
         }
         if self.tex_memo_mode == 2 {
@@ -6086,7 +6117,7 @@ impl Renderer {
         // before and no image at its base became GPU-written since.)
         let caching = !storage && crate::tune::get(crate::tune::TEX_CACHE) != 0 && !trace_frame();
         let hit = caching && {
-            let g = img!(self).base_gen.get(&t.base).copied().unwrap_or(0);
+            let g = base_gen!(img!(self), t.base);
             img!(self).tex_paths.get(&(*t, load_only)) == Some(&g)
         };
         if perf_on() && caching {
@@ -6170,10 +6201,12 @@ impl Renderer {
                 crate::info!("FRAME texture {:#x} {}x{} {:?}: guest memory (images here: [{}])", t.base, t.width, t.height, vfmt, others.join(", "));
             }
             if caching {
-                if img!(self).tex_paths.len() > 1 << 16 {
-                    img!(self).tex_paths.clear();
+                // (A fresh table once large: one cleared in place keeps its
+                // size, and lookups spread over all of it.)
+                if img!(self).tex_paths.len() >= TEX_PATHS_MAX {
+                    img!(self).tex_paths = FastMap::default();
                 }
-                let g = img!(self).base_gen.get(&t.base).copied().unwrap_or(0);
+                let g = base_gen!(img!(self), t.base);
                 img!(self).tex_paths.insert((*t, load_only), g);
             }
         }
@@ -6248,7 +6281,7 @@ impl Renderer {
             if self.tex_memo.len() > 1 << 14 {
                 self.tex_memo.clear();
             }
-            let (g, n) = (img!(self).base_gen.get(&t.base).copied().unwrap_or(0), img!(self).newer_gen);
+            let (g, n) = (base_gen!(img!(self), t.base), img!(self).newer_gen);
             let cpu = img!(self).images.get(&key).map_or(u64::MAX, |i| i.cpu_checked);
             let (stamp, bytes) = (mem!(self).writes.stamp(), resources::texture_bytes(t, depth_layers.max(1)));
             self.tex_memo.insert((*t, load_only), MemoEntry { epoch: batch, g, n, view, cpu, stamp, bytes });
@@ -6291,7 +6324,7 @@ impl Renderer {
             );
         }
         img.gpu_written = false;
-        *im.base_gen.entry(k.base).or_default() += 1;
+        bump_base!(im, k.base);
         img.guest_stale = false;
         img.guest_newer = false;
         img.validated = None;
@@ -6938,8 +6971,10 @@ impl Renderer {
             if let Some(w) = vc.windows.get(&k) {
                 let (b0, b1) = (((base - w.lo) >> 16) as usize, ((base + size - 1 - w.lo) >> 16) as usize);
                 let checked = w.checked[b0..=b1].iter().copied().min().unwrap_or(u64::MAX);
-                if m.vbind.len() >= 1 << 16 {
-                    m.vbind.clear();
+                // (A fresh table once large, as `tex_paths`: the bindings of a
+                // frame are a few thousand; ~700 new ranges per second.)
+                if m.vbind.len() >= VBIND_MAX {
+                    m.vbind = FastMap::default();
                 }
                 m.vbind.insert((base, size), (k, w.part_gen(base, size), checked, vbuf, base - wlo));
             }
@@ -7007,6 +7042,29 @@ impl Renderer {
 
     /// VRAM buffer cache statistics: (MiB allocated, windows, MiB copied in,
     /// bindings served).
+    /// The large lookup maps per-command work probes: entries / capacity
+    /// (hash tables keep their capacity after `clear`; a sparse large table
+    /// spreads lookups over more cache lines).
+    pub fn map_sizes(&mut self) -> String {
+        let n = |len: usize, cap: usize| format!("{len}/{cap}");
+        let m = mem!(self);
+        let (vbind, chunks) = (n(m.vbind.len(), m.vbind.capacity()), n(m.writes.chunk_count(), m.writes.chunk_capacity()));
+        let im = img!(self);
+        let (images, by_base, base_gen, ready, paths) = (
+            n(im.images.len(), im.images.capacity()),
+            n(im.by_base.len(), im.by_base.capacity()),
+            n(im.base_gen.len(), im.base_gen.capacity()),
+            n(im.ready_bases.len(), im.ready_bases.capacity()),
+            n(im.tex_paths.len(), im.tex_paths.capacity()),
+        );
+        format!(
+            "lookup maps (entries/capacity): mirror bindings {vbind}, write-tracker chunks {chunks}, images {images}, images by base {by_base}, base generations {base_gen}, ready bases {ready}, texture paths {paths}, texture memo {}, upload reuse {}, graphics pipelines {}",
+            n(self.tex_memo.len(), self.tex_memo.capacity()),
+            n(self.cx.upload_reuse.len(), self.cx.upload_reuse.capacity()),
+            n(self.gfx_pipes.len(), self.gfx_pipes.capacity())
+        )
+    }
+
     pub fn vcache_stats(&mut self) -> Option<(u64, usize, u64, u64)> {
         mem!(self).vcache.as_ref().map(|v| (v.bytes >> 20, v.windows.len(), v.copied >> 20, v.hits))
     }
@@ -8040,7 +8098,7 @@ impl Renderer {
                         i.guest_stale = false;
                         i.guest_newer = true;
                         img!(self).newer_gen += 1;
-                        *img!(self).base_gen.entry(key.base).or_default() += 1;
+                        bump_base!(img!(self), key.base);
                     }
                     continue;
                 }
@@ -10500,7 +10558,7 @@ impl Renderer {
                 img.guest_newer = true;
                 img.guest_stale = false;
                 im.newer_gen += 1;
-                *im.base_gen.entry(k.base).or_default() += 1;
+                bump_base!(im, k.base);
                 self.cx.attach_marked = false;
             }
         }
@@ -11878,6 +11936,18 @@ impl Renderer {
             return;
         }
         self.next_trim = frame + 30;
+        // Generations of bases with no image left go (`ImgState::base_gen`;
+        // rarely: texture paths recorded at dropped bases are checked again).
+        {
+            let im = img!(self);
+            if im.base_gen.len() > 4 * im.by_base.len() + (16 << 10) {
+                let ImgState { base_gen, by_base, .. } = &mut *im;
+                base_gen.retain(|b, _| by_base.contains_key(b));
+                base_gen.shrink_to_fit();
+                im.gen_seq += 1;
+                im.gen_floor = im.gen_seq;
+            }
+        }
         let (usage, budget) = ctx().vram().unwrap_or((0, 0));
         self.pressure = vram_pressure(usage, budget);
         if self.pressure >= 2 && img!(self).image_pool_n > 0 {
@@ -11958,7 +12028,7 @@ impl Renderer {
         for k in &victims {
             let Some(img) = img!(self).images.remove(k) else { continue };
             img!(self).newer_gen += 1;
-            *img!(self).base_gen.entry(k.base).or_default() += 1;
+            bump_base!(img!(self), k.base);
             if img.meta_listed {
                 mem!(self).meta_images.retain(|x| x != k);
                 mem!(self).meta_gen += 1;

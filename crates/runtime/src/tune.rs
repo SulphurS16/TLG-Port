@@ -713,8 +713,12 @@ pub const DRY_WORDS: usize = 119;
 /// Vectors of each kind the shared pool of shader preparation keeps
 /// (`TLG_POOL_CAP`, 8192; more are freed).
 pub const POOL_CAP: usize = 120;
+/// Upload-ring writes (scalar data, guest copies) with non-temporal stores
+/// around the caches (`TLG_STREAM_COPIES`, 0; measured alike at the 31%
+/// clamp, full clock not measured yet).
+pub const STREAM_COPIES: usize = 121;
 
-const TABLE: [(&str, &str, i64); 121] = [
+const TABLE: [(&str, &str, i64); 122] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -836,6 +840,7 @@ const TABLE: [(&str, &str, i64); 121] = [
     ("pool_local", "TLG_POOL_LOCAL", 1),
     ("dry_words", "TLG_DRY_WORDS", 1),
     ("pool_cap", "TLG_POOL_CAP", 8192),
+    ("stream_copies", "TLG_STREAM_COPIES", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

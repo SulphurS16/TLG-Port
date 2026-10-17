@@ -1251,10 +1251,7 @@ impl CommandProcessor {
                 if w0 & (1 << 31) != 0 {
                     // Registers [reg, reg+n).
                     let n = (w0 & 0x7FFF_FFFF) as usize;
-                    let reg = chunk[i + 1];
-                    for (k, &v) in chunk[i + 2..i + 2 + n].iter().enumerate() {
-                        self.write_reg(reg + k as u32, v);
-                    }
+                    self.write_regs(chunk[i + 1], &chunk[i + 2..i + 2 + n]);
                     self.stats.packets += 1;
                     i += 2 + n;
                 } else {
@@ -1420,8 +1417,11 @@ impl CommandProcessor {
     }
 
     fn set_regs(&mut self, base: u32, body: &[u32]) {
-        let start = base + (body[0] & 0xFFFF);
-        let vals = &body[1..];
+        self.write_regs(base + (body[0] & 0xFFFF), &body[1..]);
+    }
+
+    /// Registers [start, start + vals.len()).
+    fn write_regs(&mut self, start: u32, vals: &[u32]) {
         // Bulk copy into one register file unless writes are being watched.
         if !reg_watching() {
             let (s, e) = (start as usize, start as usize + vals.len());

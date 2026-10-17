@@ -106,17 +106,61 @@ impl Ring {
         self.seg_hi - self.seg_lo
     }
     pub fn write(&mut self, off: u64, data: &[u8]) {
-        unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), self.ptr.add(off as usize), data.len()) };
+        unsafe { stream_copy(self.ptr.add(off as usize), data.as_ptr(), data.len()) };
     }
     /// Copies guest memory into the ring (unmapped bytes read as zero).
     pub fn write_guest(&mut self, off: u64, addr: u64, n: u64) {
         let dst = unsafe { std::slice::from_raw_parts_mut(self.ptr.add(off as usize), n as usize) };
-        copy_from_guest(dst, addr);
+        copy_from_guest_with(dst, addr, true);
+    }
+}
+
+/// Copies `len` bytes to `dst` for the GPU alone (the upload rings): the
+/// whole 64-byte lines with non-temporal stores, which go around the
+/// caches (`tune stream_copies`) - the rings take more bytes per frame in
+/// the later areas than the processor's last-level cache holds, and regular
+/// stores fill it with lines the CPU does not read again, evicting the CPs'
+/// working set; the ends and small copies as usual. An `sfence` orders the
+/// streamed stores (weakly ordered) before what follows.
+///
+/// # Safety
+/// `dst` and `src` valid for `len` bytes, not overlapping.
+pub unsafe fn stream_copy(dst: *mut u8, src: *const u8, len: usize) {
+    use core::arch::x86_64::{__m128i, _mm_loadu_si128, _mm_sfence, _mm_stream_si128};
+    let head = dst.align_offset(64);
+    unsafe {
+        if len < head + 64 || crate::tune::get(crate::tune::STREAM_COPIES) == 0 {
+            std::ptr::copy_nonoverlapping(src, dst, len);
+            return;
+        }
+        std::ptr::copy_nonoverlapping(src, dst, head);
+        let (mut d, mut s) = (dst.add(head), src.add(head));
+        let lines = (len - head) / 64;
+        for _ in 0..lines {
+            let a = _mm_loadu_si128(s as *const __m128i);
+            let b = _mm_loadu_si128(s.add(16) as *const __m128i);
+            let c = _mm_loadu_si128(s.add(32) as *const __m128i);
+            let e = _mm_loadu_si128(s.add(48) as *const __m128i);
+            _mm_stream_si128(d as *mut __m128i, a);
+            _mm_stream_si128(d.add(16) as *mut __m128i, b);
+            _mm_stream_si128(d.add(32) as *mut __m128i, c);
+            _mm_stream_si128(d.add(48) as *mut __m128i, e);
+            d = d.add(64);
+            s = s.add(64);
+        }
+        std::ptr::copy_nonoverlapping(s, d, len - head - lines * 64);
+        _mm_sfence();
     }
 }
 
 /// Copies from guest memory, zero-filling bytes that are not mapped.
 pub fn copy_from_guest(dst: &mut [u8], addr: u64) {
+    copy_from_guest_with(dst, addr, false);
+}
+
+/// `copy_from_guest`; `ring`: `dst` is upload-ring memory only the GPU
+/// reads (`stream_copy`).
+pub fn copy_from_guest_with(dst: &mut [u8], addr: u64, ring: bool) {
     let n = dst.len() as u64;
     if !crate::mem::is_guest(addr, n) {
         dst.fill(0);
@@ -130,7 +174,11 @@ pub fn copy_from_guest(dst: &mut [u8], addr: u64) {
             Some(v) if v.kind != crate::mem::VmaKind::Reserved => {
                 let end = v.end().min(addr + n);
                 let len = (end - a) as usize;
-                unsafe { std::ptr::copy_nonoverlapping(a as *const u8, dst[i..].as_mut_ptr(), len) };
+                if ring {
+                    unsafe { stream_copy(dst[i..].as_mut_ptr(), a as *const u8, len) };
+                } else {
+                    unsafe { std::ptr::copy_nonoverlapping(a as *const u8, dst[i..].as_mut_ptr(), len) };
+                }
                 a = end;
             }
             _ => {

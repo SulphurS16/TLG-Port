@@ -379,6 +379,14 @@ impl WriteTracker {
     /// Records a GPU write to guest memory [lo, lo+len) (recorded before it
     /// executes; readers synchronize with in-flight GPU writes before they
     /// validate, so the stamp is never older than the data they see).
+    /// Chunks with page stamps (`map_sizes`), and their map's capacity.
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+    pub fn chunk_capacity(&self) -> usize {
+        self.chunks.capacity()
+    }
+
     pub fn note_gpu_write(&mut self, lo: u64, len: u64) {
         self.seq += 1;
         let s = self.seq;
