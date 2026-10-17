@@ -721,8 +721,11 @@ pub const STREAM_COPIES: usize = 121;
 /// reuses its render targets' lookup without reading their registers and
 /// its dynamic state without computing it (`TLG_SAME_STATE`, 1).
 pub const SAME_STATE: usize = 122;
+/// Registered GPU writes stamp the whole 64 KiB blocks they cover once each
+/// instead of each page (`TLG_BLOCK_STAMPS`, 1).
+pub const BLOCK_STAMPS: usize = 123;
 
-const TABLE: [(&str, &str, i64); 123] = [
+const TABLE: [(&str, &str, i64); 124] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -846,6 +849,7 @@ const TABLE: [(&str, &str, i64); 123] = [
     ("pool_cap", "TLG_POOL_CAP", 8192),
     ("stream_copies", "TLG_STREAM_COPIES", 0),
     ("same_state", "TLG_SAME_STATE", 1),
+    ("block_stamps", "TLG_BLOCK_STAMPS", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

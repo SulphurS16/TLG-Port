@@ -28,6 +28,7 @@ const CHUNK_PAGES: usize = 1 << (CHUNK_SHIFT - PAGE_SHIFT);
 /// Write-watch queries cover 64 KiB blocks (64 per chunk).
 const BLOCK_SHIFT: u32 = 16;
 const CHUNK_BLOCKS: usize = 1 << (CHUNK_SHIFT - BLOCK_SHIFT);
+const BLOCK_PAGES: usize = 1 << (BLOCK_SHIFT - PAGE_SHIFT);
 /// Consecutive unwritten queries after which a block is armed (made
 /// read-only, cpuwatch.rs), doubled for each time it was written while armed
 /// (`tune arm_after`).
@@ -48,6 +49,10 @@ struct Chunk {
     max: u64,
     /// Stamp of the last write covering the whole chunk.
     whole: u64,
+    /// Stamp of the last registered GPU write covering each whole 64 KiB
+    /// block (`tune block_stamps`): a page's stamp is the newer of its own
+    /// and its block's (and `whole`).
+    blocks: [u64; CHUNK_BLOCKS],
     /// Stamp of the last harvest that found each page written, or of the last
     /// GPU write to it (0 = never).
     pages: Box<[u64; CHUNK_PAGES]>,
@@ -59,7 +64,7 @@ struct Chunk {
 
 impl Chunk {
     fn new() -> Chunk {
-        Chunk { max: 0, whole: 0, pages: Box::new([0; CHUNK_PAGES]), cpu: Box::new([0; CHUNK_PAGES]), cpu_max: 0 }
+        Chunk { max: 0, whole: 0, blocks: [0; CHUNK_BLOCKS], pages: Box::new([0; CHUNK_PAGES]), cpu: Box::new([0; CHUNK_PAGES]), cpu_max: 0 }
     }
 }
 
@@ -376,9 +381,6 @@ impl WriteTracker {
         runs
     }
 
-    /// Records a GPU write to guest memory [lo, lo+len) (recorded before it
-    /// executes; readers synchronize with in-flight GPU writes before they
-    /// validate, so the stamp is never older than the data they see).
     /// Chunks with page stamps (`map_sizes`), and their map's capacity.
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
@@ -387,6 +389,9 @@ impl WriteTracker {
         self.chunks.capacity()
     }
 
+    /// Records a GPU write to guest memory [lo, lo+len) (recorded before it
+    /// executes; readers synchronize with in-flight GPU writes before they
+    /// validate, so the stamp is never older than the data they see).
     pub fn note_gpu_write(&mut self, lo: u64, len: u64) {
         self.seq += 1;
         let s = self.seq;
@@ -400,9 +405,16 @@ impl WriteTracker {
                 ch.whole = s;
             } else {
                 let first = ((lo.max(base) - base) >> PAGE_SHIFT) as usize;
-                let last = ((hi.min(end) - base + (1 << PAGE_SHIFT) - 1) >> PAGE_SHIFT) as usize;
-                for p in &mut ch.pages[first..last.min(CHUNK_PAGES)] {
-                    *p = s;
+                let last = (((hi.min(end) - base + (1 << PAGE_SHIFT) - 1) >> PAGE_SHIFT) as usize).min(CHUNK_PAGES);
+                // (Whole blocks once each: a 6 MiB binding's ~1,500 page
+                // stamps were most of a written binding's notes.)
+                let (fb, lb) = (first.div_ceil(BLOCK_PAGES), last / BLOCK_PAGES);
+                if fb < lb && crate::tune::get(crate::tune::BLOCK_STAMPS) != 0 {
+                    ch.pages[first..fb * BLOCK_PAGES].fill(s);
+                    ch.blocks[fb..lb].fill(s);
+                    ch.pages[lb * BLOCK_PAGES..last].fill(s);
+                } else {
+                    ch.pages[first..last].fill(s);
                 }
             }
             ch.max = s;
@@ -526,7 +538,7 @@ impl WriteTracker {
                 let first = ((lo.max(base) - base) >> PAGE_SHIFT) as usize;
                 let last = (((hi.min(base + (1 << CHUNK_SHIFT)) - base) + (1 << PAGE_SHIFT) - 1) >> PAGE_SHIFT) as usize;
                 for p in first..last.min(CHUNK_PAGES) {
-                    if stamps[p] > since {
+                    if stamps[p] > since || (!cpu_only && ch.blocks[p / BLOCK_PAGES] > since) {
                         let a = base + ((p as u64) << PAGE_SHIFT);
                         runs.push((a.max(lo), (a + (1 << PAGE_SHIFT)).min(hi)));
                     }
@@ -573,8 +585,8 @@ impl WriteTracker {
                 if ch.max > since {
                     let base = c << CHUNK_SHIFT;
                     let first = ((lo.max(base) - base) >> PAGE_SHIFT) as usize;
-                    let last = ((hi.min(base + (1 << CHUNK_SHIFT)) - base + (1 << PAGE_SHIFT) - 1) >> PAGE_SHIFT) as usize;
-                    if ch.pages[first..last.min(CHUNK_PAGES)].iter().any(|&s| s > since) {
+                    let last = (((hi.min(base + (1 << CHUNK_SHIFT)) - base + (1 << PAGE_SHIFT) - 1) >> PAGE_SHIFT) as usize).min(CHUNK_PAGES);
+                    if ch.pages[first..last].iter().any(|&s| s > since) || (first < last && ch.blocks[first / BLOCK_PAGES..=(last - 1) / BLOCK_PAGES].iter().any(|&s| s > since)) {
                         return true;
                     }
                 }
@@ -668,5 +680,32 @@ mod tests {
         assert!(t.cpu_pages_after(mid, mid + 0x3000, s3 - 1));
         assert!(!t.cpu_pages_after(mid, mid + 0x3000, s3));
         assert_eq!(t.dirty_runs(mid, mid + 0x3000, s3 - 1), vec![(mid + 0x1000, mid + 0x2000)]);
+    }
+
+    #[test]
+    fn gpu_writes_of_whole_blocks() {
+        let mut t = WriteTracker::new();
+        let base = 0x2000_0000_0000u64;
+        // Pages 3..40 of a chunk: only block 1 (pages 16..32) is whole, so
+        // pages 3..16 and 32..40 are stamped by page, block 1 by its block
+        // stamp.
+        t.note_gpu_write(base + 0x3000, 0x25000);
+        let s = t.seq;
+        for (page, written) in [(2u64, false), (3, true), (15, true), (16, true), (31, true), (32, true), (39, true), (40, false), (48, false)] {
+            assert_eq!(t.gpu_written_since(base + (page << 12) + 0x10, 4, s - 1), written, "page {page}");
+            assert!(!t.gpu_written_since(base + (page << 12), 0x1000, s), "page {page} after the write");
+        }
+        // A range that ends inside the block-stamped block.
+        assert!(t.gpu_written_since(base + 0x14000, 0x2000, s - 1));
+        // Runs page by page, merged.
+        assert_eq!(t.dirty_runs(base, base + 0x40000, s - 1), vec![(base + 0x3000, base + 0x28000)]);
+        // A newer page write inside the block keeps the block's pages written.
+        t.note_gpu_write(base + 0x11000, 0x10);
+        let s2 = t.seq;
+        assert!(t.gpu_written_since(base + 0x11000, 0x10, s2 - 1));
+        assert!(!t.gpu_written_since(base + 0x12000, 0x10, s2 - 1));
+        assert!(t.gpu_written_since(base + 0x12000, 0x10, s - 1));
+        // CPU-only views ignore registered GPU writes.
+        assert!(t.cpu_dirty_runs(base, base + 0x40000, 0).is_empty());
     }
 }
