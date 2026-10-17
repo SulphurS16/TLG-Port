@@ -231,6 +231,13 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let hold = parts.next().and_then(|h| h.parse().ok()).unwrap_or(6);
                 input::press_now(names, hold)
             }
+            "mash" => {
+                // mash <buttons,...> <count> [every flips, 4] [hold flips, 2]
+                let names = parts.next().unwrap_or("");
+                let mut n = |d: u64| parts.next().and_then(|v| v.parse().ok()).unwrap_or(d);
+                let (count, every, hold) = (n(0), n(4), n(2));
+                input::mash(names, count, every, hold)
+            }
             "shot" => {
                 let name: String = parts.next().unwrap_or("x").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
                 *hle::libs::videoout::SHOT_REQUEST.lock() = Some(name);

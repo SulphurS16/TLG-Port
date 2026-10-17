@@ -181,6 +181,27 @@ pub fn press_now(names: &str, hold: u64) -> Result<(), String> {
     Ok(())
 }
 
+/// Schedules `count` presses of the buttons in `names` (comma-separated, in
+/// turn), one every `every` flips from the next flip, each held `hold` flips:
+/// the title's "spells" (the opening's, the glyph screen after a game over)
+/// end after many alternating face-button presses.
+pub fn mash(names: &str, count: u64, every: u64, hold: u64) -> Result<(), String> {
+    let list: Vec<&str> = names.split(',').filter(|n| !n.is_empty()).collect();
+    if list.is_empty() || count == 0 {
+        return Err("mash: expected <buttons,...> <count> [every flips] [hold flips]".into());
+    }
+    let flip = crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed) + 1;
+    let (every, hold) = (every.max(1), hold.max(1).min(every.max(1)));
+    let mut steps = Vec::new();
+    for k in 0..count.min(10_000) {
+        steps.append(&mut parse_script(&format!("{}:{}:{hold}", flip + k * every, list[k as usize % list.len()]))?);
+    }
+    let mut live = LIVE.lock();
+    live.retain(|s| s.flip + s.hold > flip);
+    live.append(&mut steps);
+    Ok(())
+}
+
 fn scripted(st: &mut PadState, flip: u64) {
     for step in LIVE.lock().iter() {
         if flip >= step.flip && flip < step.flip + step.hold {
