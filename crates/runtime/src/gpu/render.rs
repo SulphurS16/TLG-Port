@@ -885,6 +885,13 @@ impl std::hash::Hasher for FxHasher {
 pub type FastMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<FxHasher>>;
 pub type FastSet<K> = std::collections::HashSet<K, std::hash::BuildHasherDefault<FxHasher>>;
 
+/// Numbers the batch contexts' mirror-use sets (`BatchCtx::mirror_used_id`).
+static MIRROR_USED_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn next_mirror_used_id() -> u64 {
+    MIRROR_USED_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
 /// VRAM mirrors of guest memory for read-only vertex/index data: draws fetch
 /// from device memory instead of over PCIe from imported guest memory.
 /// Windows start at 256 MiB boundaries and span 320 MiB, so a binding of up
@@ -1637,6 +1644,16 @@ fn bloom_maybe<const N: usize>(f: &[u64; N], base: u64, size: u64) -> bool {
         f[i >> 6] >> (i & 63) & 1 != 0
     })
 }
+
+/// Whether the write-backs of `cx`'s batch may overlap [base, base+size):
+/// from their merged ranges (`tune wb_ranges`), else their bloom filter -
+/// which a single write-back of 4 MiB or more fills.
+fn wb_maybe(cx: &BatchCtx, base: u64, size: u64) -> bool {
+    if crate::tune::get(crate::tune::WB_RANGES) == 0 || crate::tune::get(crate::tune::SCAN_INDEX) == 0 {
+        return bloom_maybe(&cx.wb_bloom, base, size);
+    }
+    cx.wb_ranges.overlaps(base, base.saturating_add(size.max(1)))
+}
 static DONE: parking_lot::Mutex<u64> = parking_lot::Mutex::new(0);
 
 /// TLG_PERF frame tail: the batch that ends a frame (`tail_mark`) and when
@@ -2289,6 +2306,10 @@ pub(super) struct BatchCtx {
     /// commands so far (`vcache_bind_ex`): a copy-in of pages outside them
     /// can go ahead of the batch (`tune hoist_copyins`).
     batch_mirror_used: Ranges,
+    /// Names `batch_mirror_used`'s contents (a new number whenever it starts
+    /// empty): mirror bindings entered in it already are not entered again
+    /// (`tune vbind_fast`).
+    mirror_used_id: u64,
     /// Device-ring copies of shader-written buffers to copy back to guest
     /// memory after the current command: (ring offset, guest buffer, offset, size).
     gpu_wb: Vec<(u64, vk::Buffer, u64, u64)>,
@@ -2350,6 +2371,9 @@ pub(super) struct BatchCtx {
     upload_reuse_epoch: u64,
     /// `writebacks` by 64 KiB block (`bloom_add`), for overlap checks.
     wb_bloom: [u64; 4],
+    /// `writebacks`' guest ranges, merged: exact overlap checks
+    /// (`wb_maybe`, `tune wb_ranges`).
+    wb_ranges: Ranges,
     /// `upload_reuse`'s ranges by 64 KiB block: CP writes elsewhere need no
     /// look at the entries (`forget_uploads`). Rebuilt when entries go.
     reuse_bloom: [u64; 16],
@@ -2429,9 +2453,12 @@ pub struct MemModel {
     /// Sparse mirror windows' block memory (their binds: `BatchCtx`).
     sparse_pool: Option<BlockPool>,
     /// VRAM-mirror bindings served (`tune vbind_cache`): (base, size) ->
-    /// (window, its generation then, the oldest CPU-check epoch of the
-    /// blocks, buffer, offset); and the generation counter of the windows.
-    vbind: FastMap<(u64, u64), (u64, u64, u64, vk::Buffer, u64)>,
+    /// (window, the generation of the parts it touches then, the oldest
+    /// CPU-check epoch of the blocks, buffer, offset, the window's
+    /// generation when the binding was last found current, the mirror-use
+    /// set it was last entered in: `vbind_fast`); and the generation counter
+    /// of the windows.
+    vbind: FastMap<(u64, u64), (u64, u64, u64, vk::Buffer, u64, u64, u64)>,
     vgen: u64,
     /// Texture validation epoch: CPU-sourced textures are re-hashed at most
     /// once per epoch. It advances per title submission and whenever guest
@@ -2448,6 +2475,9 @@ pub struct MemModel {
     /// visiting every image with metadata.
     meta_gen: u64,
     meta_cache: (u64, Vec<(u64, u64, ImageKey)>, u64),
+    /// Ranges GPU writes covered without meeting a metadata surface or an
+    /// image (`note_surface_writes`), with the `meta_gen` then.
+    surface_none: FastMap<(u64, u64), u64>,
     /// All images by guest base (range queries) with an upper bound of each
     /// one's guest surface size, and the largest bound.
     img_bases: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
@@ -3088,6 +3118,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 writebacks: Vec::new(),
                 zc_writes: Vec::new(),
                 batch_mirror_used: Ranges::new(),
+                mirror_used_id: next_mirror_used_id(),
                 zc_reads: Ranges::default(),
                 gpu_wb: Vec::new(),
                 dirty_sink: (u64::MAX, 0),
@@ -3113,6 +3144,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 upload_reuse: FastMap::default(),
                 upload_reuse_epoch: 0,
                 wb_bloom: [0; 4],
+                wb_ranges: Ranges::new(),
                 reuse_bloom: [0; 16],
                 eop_spans: Vec::new(),
                 ring_segs,
@@ -3188,6 +3220,7 @@ pub fn init() -> Result<(), String> {
             meta_images: Vec::new(),
             meta_gen: 1,
             meta_cache: (0, Vec::new(), 0),
+            surface_none: FastMap::default(),
             img_bases: std::collections::BTreeMap::new(),
             img_max_bytes: 0,
             img_bases_large: std::collections::BTreeMap::new(),
@@ -3471,6 +3504,9 @@ fn note_compile_probe(kind: usize, ns: u64, probe_ns: [u64; 2], a: u64, b: u64) 
         );
     }
 }
+
+/// Entries of `MemModel::surface_none` before it starts afresh.
+const SURFACE_NONE_MAX: usize = 4096;
 
 /// TLG_PERF: mirror bindings served by the binding cache, and all.
 pub static VBIND_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
@@ -3857,6 +3893,7 @@ impl Renderer {
             }
         }
         self.cx.batch_mirror_used = Ranges::new();
+        self.cx.mirror_used_id = next_mirror_used_id();
         self.cx.recording = true;
         OPEN_WORK[self.inst as usize].store(true, std::sync::atomic::Ordering::Release);
         self.cx.dyn_state = None;
@@ -4367,6 +4404,7 @@ impl Renderer {
         self.cx.batch_cmds = 0;
         let mut pending = std::mem::take(&mut self.cx.writebacks);
         self.cx.wb_bloom = [0; 4];
+        self.cx.wb_ranges = Ranges::new();
         // (In-flight forwards see the whole written ranges, lazy ones too.)
         let dev_writes: Vec<(u64, vk::Buffer, u64, u64)> = pending.iter().map(|p| (p.base, p.dev_buf, p.dev_off, p.size)).collect();
         // (Numbers of the skips, for `lazywb::submitted`.)
@@ -5253,13 +5291,12 @@ impl Renderer {
 
     /// GPU work of this batch writes guest [base, base+len) in the mirror
     /// window `buf` itself: copies elsewhere are stale (`note_pending_gpu_write`),
-    /// `buf` holds the newest data, and bindings it served stay current (its
-    /// generation is kept, `vbind`).
+    /// `buf` holds the newest data (its pages there current), and bindings it
+    /// served stay current (its generation is kept, `vbind`).
     fn note_mirror_write(&mut self, buf: vk::Buffer, base: u64, len: u64) {
         self.cx.vgen_keep = buf;
         self.note_pending_gpu_write(base, len);
         self.cx.vgen_keep = vk::Buffer::null();
-        self.vcache_validate(buf, base, len);
     }
 
     /// Before record-time reads of guest memory by shader preparation
@@ -5559,8 +5596,7 @@ impl Renderer {
         mem!(self).writes.note_gpu_write(base, bytes);
         self.note_mirror_write(vb, base, bytes);
         if bytes <= SURFACE_WRITE_MAX {
-            self.note_meta_write(base, bytes);
-            self.note_buffer_write(base, bytes);
+            self.note_surface_writes(base, bytes);
         }
         mem!(self).epoch += 1;
         Ok(Some((vb, voff)))
@@ -5580,7 +5616,7 @@ impl Renderer {
         let words = pages.div_ceil(32) as u32;
         // (Only when no later write-back overlaps it: write-backs land in
         // order; and when its writers mark the same way.)
-        if let Some(w) = bloom_maybe(&self.cx.wb_bloom, base, size).then(|| self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size)).flatten().filter(|w| w.mirror && w.base == base && w.size == size && w.dev_buf == buf) {
+        if let Some(w) = wb_maybe(&self.cx, base, size).then(|| self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size)).flatten().filter(|w| w.mirror && w.base == base && w.size == size && w.dev_buf == buf) {
             match w.bits {
                 Some((_, _, _, m)) if map && m != u64::MAX => return Ok((m, pages as u32, head)),
                 Some((bits, _, words, m)) if !map && m == u64::MAX => return Ok((bits, words, head)),
@@ -5628,7 +5664,7 @@ impl Renderer {
     fn mirror_write_back_full(&mut self, base: u64, size: u64, buf: vk::Buffer, off: u64) -> Result<(), String> {
         // (Already registered and not overtaken by a later overlapping
         // write-back: lands with that one.)
-        if bloom_maybe(&self.cx.wb_bloom, base, size) && self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size).is_some_and(|w| w.mirror && w.bits.is_none() && w.base == base && w.size == size && w.dev_buf == buf && w.dev_off == off) {
+        if wb_maybe(&self.cx, base, size) && self.cx.writebacks.iter().rev().find(|w| w.base < base + size && base < w.base + w.size).is_some_and(|w| w.mirror && w.bits.is_none() && w.base == base && w.size == size && w.dev_buf == buf && w.dev_off == off) {
             return Ok(());
         }
         let host_off = self.cx.ring.alloc(size).ok_or_else(|| format!("ring full: {size:#x}-byte write-back of {base:#x} (segment {:#x})", self.cx.ring.segment_size()))?;
@@ -5883,8 +5919,7 @@ impl Renderer {
         mem!(self).writes.note_gpu_write(dst, bytes);
         self.note_mirror_write(dbuf, dst, bytes);
         if bytes <= SURFACE_WRITE_MAX {
-            self.note_meta_write(dst, bytes);
-            self.note_buffer_write(dst, bytes);
+            self.note_surface_writes(dst, bytes);
         }
         mem!(self).epoch += 1;
         self.dma_mirror += 1;
@@ -5944,8 +5979,7 @@ impl Renderer {
         mem!(self).writes.note_gpu_write(base, len);
         self.note_pending_gpu_write(base, len);
         if len <= SURFACE_WRITE_MAX {
-            self.note_meta_write(base, len);
-            self.note_buffer_write(base, len);
+            self.note_surface_writes(base, len);
         }
         mem!(self).epoch += 1;
     }
@@ -6452,7 +6486,7 @@ impl Renderer {
         // counts the pages they write as changed and reloads them from guest
         // memory before the write-back: detiling the title screen's tiled
         // render targets from the mirror gave a black background.)
-        if self.cx.writebacks.iter().any(|w| w.base < t.base + bytes && t.base < w.base + w.size) {
+        if wb_maybe(&self.cx, t.base, bytes) && self.cx.writebacks.iter().any(|w| w.base < t.base + bytes && t.base < w.base + w.size) {
             self.report(format!("texture {:#x} {}x{}: GPU detiling declined (pending write-back)", t.base, t.width, t.height));
             return Ok(false);
         }
@@ -6530,7 +6564,39 @@ impl Renderer {
             VBIND_STATS[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         if !overwrite && crate::tune::get(crate::tune::VBIND_CACHE) != 0 {
-            if let Some(&(k, wgen, checked, buf, off)) = mem!(self).vbind.get(&(base, size)) {
+            // (`tune vbind_fast`: a window still at the generation it had when
+            // the binding was last found current had none of its parts
+            // invalidated since - no part scan; a binding this batch's
+            // mirror-use set holds already is not entered again. Rechecks
+            // after a new epoch take the general path below.)
+            if crate::tune::get(crate::tune::VBIND_FAST) != 0 {
+                let (required, used_id) = (self.cx.required_epoch, self.cx.mirror_used_id);
+                let m = mem!(self);
+                let hit = match (m.vbind.get_mut(&(base, size)), m.vcache.as_mut()) {
+                    (Some(e), Some(vc)) if e.2 != u64::MAX && e.2 >= required => match vc.windows.get_mut(&e.0) {
+                        Some(w) if w.buf == e.3 && (w.wgen == e.5 || w.part_gen(base, size) == e.1) => {
+                            e.5 = w.wgen;
+                            w.last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+                            vc.hits += 1;
+                            let enter = e.6 != used_id;
+                            e.6 = used_id;
+                            Some((e.3, e.4, enter))
+                        }
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some((buf, off, enter)) = hit {
+                    if perf_on() {
+                        VBIND_STATS[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    if enter {
+                        self.cx.batch_mirror_used.insert(base, base + size);
+                    }
+                    return Some((buf, off));
+                }
+            }
+            if let Some(&(k, wgen, checked, buf, off, _, _)) = mem!(self).vbind.get(&(base, size)) {
                 let required = self.cx.required_epoch;
                 // (Stale only by a newer epoch: its blocks' CPU-write checks
                 // again, as the fill would make them; still current when they
@@ -6570,7 +6636,7 @@ impl Renderer {
             } else {
                 match mem!(self).vbind.get(&(base, size)) {
                     None => 1,
-                    Some(&(k, wgen, _, buf, _)) => match mem!(self).vcache.as_ref().and_then(|vc| vc.windows.get(&k)) {
+                    Some(&(k, wgen, _, buf, _, _, _)) => match mem!(self).vcache.as_ref().and_then(|vc| vc.windows.get(&k)) {
                         Some(w) if w.buf == buf => {
                             if w.part_gen(base, size) != wgen {
                                 VBIND_MISS_SRC[BPART_CS.get() as usize][w.bump_src(base, size, wgen)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -7032,7 +7098,7 @@ impl Renderer {
                 if m.vbind.len() >= VBIND_MAX {
                     m.vbind = FastMap::default();
                 }
-                m.vbind.insert((base, size), (k, w.part_gen(base, size), checked, vbuf, base - wlo));
+                m.vbind.insert((base, size), (k, w.part_gen(base, size), checked, vbuf, base - wlo, w.wgen, 0));
             }
         }
         Some((vbuf, base - wlo))
@@ -7126,21 +7192,9 @@ impl Renderer {
     }
 
     /// GPU or CP writes to guest [lo, lo+len): mirrored pages there must be
-    /// copied in again before their next use.
-    /// The pages of [lo, lo+len) in the mirror window `buf` hold the newest
-    /// data (the GPU wrote them there); other windows overlapping the range
-    /// (neighbouring slots) were invalidated with the write.
-    fn vcache_validate(&mut self, buf: vk::Buffer, lo: u64, len: u64) {
-        let Some(vc) = mem!(self).vcache.as_mut() else { return };
-        let hi = lo.saturating_add(len.max(1));
-        for w in vc.windows.values_mut().filter(|w| w.buf == buf) {
-            let (a, b) = (lo.max(w.lo), hi.min(w.hi));
-            if a < b {
-                bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, true);
-            }
-        }
-    }
-
+    /// copied in again before their next use - except in the window a GPU
+    /// write lands in (`vgen_keep`, `note_mirror_write`), whose pages there
+    /// hold the newest data.
     fn vcache_invalidate(&mut self, lo: u64, len: u64) {
         self.vcache_invalidate_src(lo, len, 0);
     }
@@ -7154,9 +7208,11 @@ impl Renderer {
         for w in vc.windows.values_mut() {
             let (a, b) = (lo.max(w.lo), hi.min(w.hi));
             if a < b {
-                bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, false);
-                // (Not the window a GPU write lands in: `note_mirror_write`.)
-                if w.buf != self.cx.vgen_keep {
+                // (The window a GPU write lands in: current there, its
+                // generation kept - `note_mirror_write`.)
+                let keep = w.buf == self.cx.vgen_keep;
+                bits_set(&mut w.valid, ((a - w.lo) >> 12) as usize, ((b - w.lo + 0xFFF) >> 12) as usize, keep);
+                if !keep {
                     m.vgen += 1;
                     w.wgen = m.vgen;
                     // (A mirror write landing in another window.)
@@ -7493,6 +7549,7 @@ impl Renderer {
     fn push_writeback(&mut self, w: PendingWrite) {
         cp_view(self.inst as usize).lock().pending.insert(w.base, w.base + w.size.max(1));
         bloom_add(&mut self.cx.wb_bloom, w.base, w.size);
+        self.cx.wb_ranges.insert(w.base, w.base.saturating_add(w.size.max(1)));
         self.cx.writebacks.push(w);
     }
 
@@ -7528,7 +7585,7 @@ impl Renderer {
 
     /// Whether either context's open batch writes [base, base+size).
     fn pending_write_overlaps(&self, base: u64, size: u64) -> bool {
-        let over = |cx: &BatchCtx| (bloom_maybe(&cx.wb_bloom, base, size) && cx.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size)) || cx.zc_writes.iter().any(|&(w, n)| w < base + size && base < w + n);
+        let over = |cx: &BatchCtx| (wb_maybe(cx, base, size) && cx.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size)) || cx.zc_writes.iter().any(|&(w, n)| w < base + size && base < w + n);
         over(&self.cx) || over(&self.cx_park)
     }
 
@@ -7744,7 +7801,7 @@ impl Renderer {
         if let Some(t0) = t0 {
             self.prof[2] += t0.elapsed();
         }
-        let regions: Vec<(vk::Buffer, vk::BufferCopy)> = if inflight.is_empty() && !bloom_maybe(&self.cx.wb_bloom, base, size) {
+        let regions: Vec<(vk::Buffer, vk::BufferCopy)> = if inflight.is_empty() && !wb_maybe(&self.cx, base, size) {
             Vec::new()
         } else {
             inflight
@@ -7765,7 +7822,7 @@ impl Renderer {
         let hoist = !regions.is_empty()
             && crate::tune::get(crate::tune::HOIST_FWD) != 0
             && crate::tune::get(crate::tune::PROLOGUE) != 0
-            && !(bloom_maybe(&self.cx.wb_bloom, base, size) && self.cx.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size));
+            && !(wb_maybe(&self.cx, base, size) && self.cx.writebacks.iter().any(|p| p.base < base + size && base < p.base + p.size));
         self.cx.upload_forwarded = !regions.is_empty() && !hoist;
         self.cx.upload_hoisted = hoist;
         if perf_detail() && !regions.is_empty() {
@@ -8288,7 +8345,7 @@ impl Renderer {
                                 // Accessed in place at execution time: device-ring
                                 // writes must have reached guest memory.
                                 let range = full.min(ctx().limits.max_storage_buffer_range as u64);
-                                if self.cx.writebacks.iter().any(|w| w.base < v.base + range && v.base < w.base + w.size) {
+                                if wb_maybe(&self.cx, v.base, range) && self.cx.writebacks.iter().any(|w| w.base < v.base + range && v.base < w.base + w.size) {
                                     self.flush_for(1);
                                 } else if cpu_writeback_in_flight(v.base, range) {
                                     wait_cpu_writebacks(v.base, range);
@@ -8316,7 +8373,7 @@ impl Renderer {
                                 // (Mirror-resident writes keep the mirror current.)
                                 if ctx().ext_host.is_none()
                                     && size >= VCACHE_MIN
-                                    && bloom_maybe(&self.cx.wb_bloom, v.base, size)
+                                    && wb_maybe(&self.cx, v.base, size)
                                     && self.cx.writebacks.iter().any(|w| !w.mirror && w.base < v.base + size && v.base < w.base + w.size)
                                     && self.mirror_forwards(&[(v.base, v.base + size)], vk::Buffer::null()).is_none()
                                 {
@@ -8515,8 +8572,7 @@ impl Renderer {
                                         // Other huge bindings are sparse writers
                                         // too: not a surface write.
                                         if n <= SURFACE_WRITE_MAX {
-                                            self.note_meta_write(b, n);
-                                            self.note_buffer_write(b, n);
+                                            self.note_surface_writes(b, n);
                                         }
                                     }
                                 }
@@ -8572,8 +8628,7 @@ impl Renderer {
                                 }
                                 let t2 = bpart(1, t1);
                                 if extent <= SURFACE_WRITE_MAX {
-                                    self.note_meta_write(base, extent);
-                                    self.note_buffer_write(base, extent);
+                                    self.note_surface_writes(base, extent);
                                 }
                                 let t3 = bpart(2, t2);
                                 mem!(self).writes.note_gpu_write(base, extent);
@@ -8616,8 +8671,7 @@ impl Renderer {
                             *m.entry((base, size, cause == 0)).or_default() += 1;
                         }
                         if written && v.size() <= SURFACE_WRITE_MAX {
-                            self.note_meta_write(base, size);
-                            self.note_buffer_write(base, size);
+                            self.note_surface_writes(base, size);
                         }
                         if written {
                             if let Some((zbuf, zoff, _)) = self.zc_binding(base, size).filter(|z| z.2 >= size) {
@@ -9325,7 +9379,7 @@ impl Renderer {
             let n = count as u64 * isz;
             let ty = if isz == 4 { vk::IndexType::UINT32 } else { vk::IndexType::UINT16 };
             // Indices in place when guest memory is current (as for read-only buffers).
-            let current = !(bloom_maybe(&self.cx.wb_bloom, index_addr, n) && self.cx.writebacks.iter().any(|w| w.base < index_addr + n && index_addr < w.base + w.size)) && !cpu_writeback_in_flight(index_addr, n);
+            let current = !(wb_maybe(&self.cx, index_addr, n) && self.cx.writebacks.iter().any(|w| w.base < index_addr + n && index_addr < w.base + w.size)) && !cpu_writeback_in_flight(index_addr, n);
             let zc = if current && index_addr % isz == 0 && ctx().ext_host.is_some() { self.zc_binding(index_addr & !15, n + (index_addr & 15)) } else { None };
             if zc.is_some() {
                 self.zc_read(index_addr, index_addr + n);
@@ -10607,8 +10661,9 @@ impl Renderer {
 
     /// GPU buffer writes to [base, base+size) overlapping the guest surface
     /// of a rendered image: guest memory is now newer than the image.
-    /// (Callers skip bindings larger than SURFACE_WRITE_MAX.)
-    fn note_buffer_write(&mut self, base: u64, size: u64) {
+    /// (Callers skip bindings larger than SURFACE_WRITE_MAX.) Returns whether
+    /// no image lies near the range.
+    fn note_buffer_write(&mut self, base: u64, size: u64) -> bool {
         // (Images starting up to IMG_NEAR_BYTES below the write, and the
         // large ones further below; one found twice is marked twice.)
         let m = mem!(self);
@@ -10616,7 +10671,7 @@ impl Renderer {
         let far = m.img_bases_large.range(base.saturating_sub(m.img_max_bytes)..base + size);
         let keys: smallvec::SmallVec<[ImageKey; 8]> = near.chain(far).flat_map(|(_, ks)| ks.iter()).filter(|(k, bound)| k.base + bound > base).map(|(k, _)| *k).collect();
         if keys.is_empty() {
-            return;
+            return true;
         }
         let im = img!(self);
         for k in &keys {
@@ -10639,6 +10694,28 @@ impl Renderer {
                 bump_base!(im, k.base);
                 self.cx.attach_marked = false;
             }
+        }
+        false
+    }
+
+    /// `note_meta_write` and `note_buffer_write` for a GPU write of guest
+    /// [base, base+size): nothing to do for a range where both found
+    /// nothing while `meta_gen` is unchanged (`tune surface_memo`).
+    fn note_surface_writes(&mut self, base: u64, size: u64) {
+        let on = crate::tune::get(crate::tune::SURFACE_MEMO) != 0;
+        let mg = mem!(self).meta_gen;
+        if on && mem!(self).surface_none.get(&(base, size)) == Some(&mg) {
+            return;
+        }
+        let none = self.note_meta_write(base, size);
+        let none = self.note_buffer_write(base, size) && none;
+        if on && none {
+            let m = mem!(self);
+            // (A fresh table once large, as `vbind`.)
+            if m.surface_none.len() >= SURFACE_NONE_MAX {
+                m.surface_none = FastMap::default();
+            }
+            m.surface_none.insert((base, size), mg);
         }
     }
 
@@ -10678,7 +10755,7 @@ impl Renderer {
             img.cpu_checked = cpu_epoch;
             return Ok(true);
         }
-        if self.cx.writebacks.iter().any(|w| w.base < t.base + bytes && t.base < w.base + w.size) {
+        if wb_maybe(&self.cx, t.base, bytes) && self.cx.writebacks.iter().any(|w| w.base < t.base + bytes && t.base < w.base + w.size) {
             mip_stat(2);
             return Ok(false);
         }
@@ -11561,15 +11638,18 @@ impl Renderer {
 
     /// GPU buffer writes to [base, base+size) that touch a render target's
     /// HTILE/CMASK surface: examined when the target is next bound.
-    fn note_meta_write(&mut self, base: u64, size: u64) {
-        for k in self.meta_overlapping(base, size, false) {
+    /// Returns whether none overlapped.
+    fn note_meta_write(&mut self, base: u64, size: u64) -> bool {
+        let keys = self.meta_overlapping(base, size, false);
+        for k in &keys {
             let im = img!(self);
-            if let Some(img) = im.images.get_mut(&k) {
+            if let Some(img) = im.images.get_mut(k) {
                 img.meta_dirty = true;
                 img.meta_fill = None;
                 im.meta_dirty_gen += 1;
             }
         }
+        keys.is_empty()
     }
 
     /// The images whose metadata surfaces overlap [base, base+size)

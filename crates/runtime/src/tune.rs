@@ -724,8 +724,19 @@ pub const SAME_STATE: usize = 122;
 /// Registered GPU writes stamp the whole 64 KiB blocks they cover once each
 /// instead of each page (`TLG_BLOCK_STAMPS`, 1).
 pub const BLOCK_STAMPS: usize = 123;
+/// Mirror binding cache hits check the window's generation before its
+/// parts' and enter a binding in the batch's mirror-use set once
+/// (`TLG_VBIND_FAST`, 1).
+pub const VBIND_FAST: usize = 124;
+/// Overlap checks against the batch's write-backs from their merged ranges
+/// instead of a bloom filter that fills up (`TLG_WB_RANGES`, 1).
+pub const WB_RANGES: usize = 125;
+/// GPU buffer writes over ranges where no image or metadata surface was
+/// found skip those lookups while the image indexes are unchanged
+/// (`TLG_SURFACE_MEMO`, 1).
+pub const SURFACE_MEMO: usize = 126;
 
-const TABLE: [(&str, &str, i64); 124] = [
+const TABLE: [(&str, &str, i64); 127] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -850,6 +861,9 @@ const TABLE: [(&str, &str, i64); 124] = [
     ("stream_copies", "TLG_STREAM_COPIES", 0),
     ("same_state", "TLG_SAME_STATE", 1),
     ("block_stamps", "TLG_BLOCK_STAMPS", 1),
+    ("vbind_fast", "TLG_VBIND_FAST", 1),
+    ("wb_ranges", "TLG_WB_RANGES", 1),
+    ("surface_memo", "TLG_SURFACE_MEMO", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
