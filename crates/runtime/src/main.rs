@@ -492,6 +492,7 @@ pub fn shutdown(code: i32) -> ! {
         // (Pipelines compiling on workers go into the cache too.)
         gpu::pcompile::idle(Duration::from_secs(3));
         gpu::render::save_pipeline_cache(Duration::ZERO);
+        gpu::manifest::flush();
         if let Some(p) = config::try_paths() {
             let _ = std::fs::remove_file(p.running_marker());
         }
@@ -642,6 +643,8 @@ fn main() {
         // measure compile times.)
         if std::env::var("TLG_PIPELINE_CACHE").map_or(true, |v| v != "0") {
             gpu::render::set_pipeline_cache_path(paths.pipeline_cache());
+            // (Earlier sessions' pipelines compiled again into it.)
+            gpu::manifest::init(paths.pipeline_cache().with_file_name("pipeline-manifest.bin"));
         }
         gpu::render::init()
     }) {

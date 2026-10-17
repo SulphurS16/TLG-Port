@@ -11,6 +11,7 @@ mod cfg;
 pub mod gs;
 pub mod kernels;
 mod mem;
+pub mod spec_io;
 pub mod tess;
 mod wave;
 

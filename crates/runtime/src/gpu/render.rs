@@ -73,6 +73,144 @@ struct GfxKey {
     push: bool,
 }
 
+impl GfxKey {
+    /// The key as bytes (the pipeline manifest's render state).
+    fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(64);
+        let mut w = gcn::translate::spec_io::Writer(&mut b);
+        w.u64(self.vs);
+        w.bool(self.ps.is_some());
+        w.u64(self.ps.unwrap_or(0));
+        w.bool(self.rect);
+        w.u32(self.gs_params);
+        w.u8(self.colors.len() as u8);
+        for f in &self.colors {
+            w.u32(f.as_raw() as u32);
+        }
+        w.u8(self.blend.len() as u8);
+        for &x in &self.blend {
+            w.u32(x);
+        }
+        w.u8(self.masks.len() as u8);
+        for &x in &self.masks {
+            w.u32(x);
+        }
+        w.u32(self.depth.as_raw() as u32);
+        w.bool(self.stencil);
+        w.u8(self.topology_class);
+        w.u8(self.polygon);
+        w.bool(self.depth_clamp);
+        w.bool(self.tess.is_some());
+        let t = self.tess.unwrap_or((0, 0, 0));
+        w.u32(t.0);
+        w.u32(t.1);
+        w.u32(t.2);
+        w.bool(self.push);
+        b
+    }
+
+    fn decode(b: &[u8]) -> Option<GfxKey> {
+        let mut r = gcn::translate::spec_io::Reader(b);
+        let vs = r.u64()?;
+        let has_ps = r.bool()?;
+        let ps = r.u64()?;
+        let rect = r.bool()?;
+        let gs_params = r.u32()?;
+        let n = r.u8()?;
+        let colors = (0..n).map(|_| r.u32().map(|f| vk::Format::from_raw(f as i32))).collect::<Option<_>>()?;
+        let n = r.u8()?;
+        let blend = (0..n).map(|_| r.u32()).collect::<Option<_>>()?;
+        let n = r.u8()?;
+        let masks = (0..n).map(|_| r.u32()).collect::<Option<_>>()?;
+        let depth = vk::Format::from_raw(r.u32()? as i32);
+        let stencil = r.bool()?;
+        let (topology_class, polygon, depth_clamp) = (r.u8()?, r.u8()?, r.bool()?);
+        let has_tess = r.bool()?;
+        let t = (r.u32()?, r.u32()?, r.u32()?);
+        let push = r.bool()?;
+        r.0.is_empty().then_some(GfxKey { vs, ps: has_ps.then_some(ps), rect, gs_params, colors, blend, masks, depth, stencil, topology_class, polygon, depth_clamp, tess: has_tess.then_some(t), push })
+    }
+}
+
+/// The pipeline manifest's graphics pipeline (`manifest`): made from the
+/// stages' translations and the recorded render state on a compile worker,
+/// into the pipeline cache, and dropped. Tessellation (stages of the
+/// renderer's own) is not made: false.
+pub fn replay_gfx(key: &[u8], vs: &gcn::translate::Output, vs_tess: TessRole, ps: Option<&gcn::translate::Output>) -> Result<bool, String> {
+    let key = GfxKey::decode(key).ok_or("unreadable render state")?;
+    if key.tess.is_some() || vs_tess != TessRole::None {
+        return Ok(false);
+    }
+    let mut st: smallvec::SmallVec<[(Stage, TessRole, &[gcn::translate::Binding]); 2]> = smallvec::smallvec![(Stage::Vertex, TessRole::None, vs.bindings.as_slice())];
+    if let Some(p) = ps {
+        st.push((Stage::Fragment, TessRole::None, p.bindings.as_slice()));
+    }
+    let (layout, set_layout) = replay_layouts(&st)?;
+    let c = ctx();
+    let mut mods: smallvec::SmallVec<[(vk::ShaderStageFlags, vk::ShaderModule); 2]> = smallvec::SmallVec::new();
+    let mut r = ahead_module(&vs.spirv).map(|m| mods.push((vk::ShaderStageFlags::VERTEX, m)));
+    // (Rect lists: the generated geometry stage, as `ahead_draw` makes it.)
+    if let (Ok(()), true) = (&r, key.rect) {
+        r = ahead_module(&gcn::translate::gs::rect_list_gs(key.gs_params)).map(|m| mods.push((vk::ShaderStageFlags::GEOMETRY, m)));
+    }
+    if let (Ok(()), Some(p)) = (&r, ps) {
+        r = ahead_module(&p.spirv).map(|m| mods.push((vk::ShaderStageFlags::FRAGMENT, m)));
+    }
+    let made = r.and_then(|()| Renderer::gfx_pipeline_from(&key, &mods, layout));
+    unsafe {
+        if let Ok(p) = made {
+            c.device.destroy_pipeline(p, None);
+        }
+        for &(_, m) in &mods {
+            c.device.destroy_shader_module(m, None);
+        }
+        c.device.destroy_pipeline_layout(layout, None);
+        c.device.destroy_descriptor_set_layout(set_layout, None);
+    }
+    made.map(|_| {
+        pipeline_cache_dirty();
+        true
+    })
+}
+
+/// The pipeline manifest's compute pipeline (as `replay_gfx`).
+pub fn replay_cs(cs: &gcn::translate::Output, tess: TessRole) -> Result<bool, String> {
+    if tess != TessRole::None {
+        return Ok(false);
+    }
+    let (layout, set_layout) = replay_layouts(&[(Stage::Compute, TessRole::None, cs.bindings.as_slice())])?;
+    let c = ctx();
+    let m = ahead_module(&cs.spirv);
+    let made = m.as_ref().map_err(|e| e.clone()).and_then(|&m| compute_pipeline(m, layout, vk::PipelineCreateFlags::DISPATCH_BASE));
+    unsafe {
+        if let Ok(p) = made {
+            c.device.destroy_pipeline(p, None);
+        }
+        if let Ok(m) = m {
+            c.device.destroy_shader_module(m, None);
+        }
+        c.device.destroy_pipeline_layout(layout, None);
+        c.device.destroy_descriptor_set_layout(set_layout, None);
+    }
+    made.map(|_| {
+        pipeline_cache_dirty();
+        true
+    })
+}
+
+/// The set and pipeline layouts the renderer makes for these stages.
+fn replay_layouts(stages: &[(Stage, TessRole, &[gcn::translate::Binding])]) -> Result<(vk::PipelineLayout, vk::DescriptorSetLayout), String> {
+    let (set_layout, _) = set_layout_of(stages)?;
+    let layouts = [set_layout];
+    match unsafe { ctx().device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&layouts), None) } {
+        Ok(l) => Ok((l, set_layout)),
+        Err(e) => {
+            unsafe { ctx().device.destroy_descriptor_set_layout(set_layout, None) };
+            Err(e.to_string())
+        }
+    }
+}
+
 /// A tessellated draw whose LS and HS stages have been dispatched (see
 /// `Renderer::tess_stages`).
 struct TessDraw {
@@ -421,19 +559,25 @@ pub fn ahead_dispatch(cs: &Prepared) {
 /// set to allocate and write on the CP thread; up to the device's limit of
 /// push descriptors).
 fn make_set_layout(stages: &[&Prepared]) -> Result<(vk::DescriptorSetLayout, bool), String> {
+    let st: smallvec::SmallVec<[(Stage, TessRole, &[gcn::translate::Binding]); 2]> = stages.iter().map(|p| (p.stage, p.tess, p.translated.out.bindings.as_slice())).collect();
+    set_layout_of(&st)
+}
+
+/// `make_set_layout` from the stages' kinds and bindings.
+fn set_layout_of(stages: &[(Stage, TessRole, &[gcn::translate::Binding])]) -> Result<(vk::DescriptorSetLayout, bool), String> {
     let mut bindings = Vec::new();
-    for p in stages {
-        let flags = match (p.stage, p.tess) {
+    for &(stage, tess, stage_bindings) in stages {
+        let flags = match (stage, tess) {
             (Stage::Vertex, TessRole::Ds) => vk::ShaderStageFlags::TESSELLATION_EVALUATION,
             (Stage::Vertex, _) => vk::ShaderStageFlags::VERTEX,
             (Stage::Fragment, _) => vk::ShaderStageFlags::FRAGMENT,
             (Stage::Compute, _) => vk::ShaderStageFlags::COMPUTE,
         };
-        if p.tess == TessRole::Ds {
+        if tess == TessRole::Ds {
             // The generated control stage's factor buffer.
             bindings.push(vk::DescriptorSetLayoutBinding::default().binding(TESS_TF_BINDING).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::TESSELLATION_CONTROL));
         }
-        for b in &p.translated.out.bindings {
+        for b in stage_bindings {
             let ty = match b.kind {
                 BindingKind::SgprData | BindingKind::Buffer(_) | BindingKind::Gds | BindingKind::DebugOut | BindingKind::Lds | BindingKind::DirtyInfo | BindingKind::DirtyBits => vk::DescriptorType::STORAGE_BUFFER,
                 BindingKind::Image(_) => vk::DescriptorType::SAMPLED_IMAGE,
@@ -462,6 +606,14 @@ struct PipelineCacheFile {
 
 static PIPELINE_CACHE: parking_lot::Mutex<Option<PipelineCacheFile>> = parking_lot::Mutex::new(None);
 static PIPELINE_CACHE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+/// The pipeline cache started without pipelines (no file or a refused one).
+static PIPELINE_CACHE_EMPTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Whether the persistent pipeline cache started without pipelines (it is
+/// created now if not yet).
+pub fn pipeline_cache_started_empty() -> bool {
+    pipeline_cache() == vk::PipelineCache::null() || PIPELINE_CACHE_EMPTY.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 /// Where the pipeline cache lives (set before `init`).
 pub fn set_pipeline_cache_path(p: std::path::PathBuf) {
@@ -478,13 +630,15 @@ fn pipeline_cache() -> vk::PipelineCache {
     let data = std::fs::read(&path).unwrap_or_default();
     let c = ctx();
     let create = |d: &[u8]| unsafe { c.device.create_pipeline_cache(&vk::PipelineCacheCreateInfo::default().initial_data(d), None) };
-    let cache = match create(&data).or_else(|_| create(&[])) {
-        Ok(cache) => cache,
+    let (cache, loaded) = match create(&data).map(|c| (c, data.len())).or_else(|_| create(&[]).map(|c| (c, 0))) {
+        Ok(c) => c,
         Err(e) => {
             crate::warn!("pipeline cache unavailable: {e}");
             return vk::PipelineCache::null();
         }
     };
+    // (A header alone holds no pipeline.)
+    PIPELINE_CACHE_EMPTY.store(loaded < 4096, std::sync::atomic::Ordering::Relaxed);
     crate::info!("pipeline cache {} ({} KiB loaded)", path.display(), data.len() >> 10);
     *LAST_SAVED.lock() = Some((data.len(), resources::hash_slice(0, &data)));
     *g = Some(PipelineCacheFile { cache, path, dirty: false, saved: std::time::Instant::now() });
@@ -8775,6 +8929,12 @@ impl Renderer {
             push: crate::tune::get(crate::tune::PUSH_DESC) != 0,
         };
         phase!(2);
+        if !self.gfx_pipes.contains_key(&key) && key.tess.is_none() && super::manifest::on() {
+            // (The stages by their translations: the key's stage fields hold
+            // their addresses, which differ between sessions.)
+            let state = GfxKey { vs: 0, ps: key.ps.map(|_| 0), ..key.clone() };
+            super::manifest::note_gfx(&state.encode(), (vs.code_hash, vs.translated.key_hash), ps.as_ref().map(|p| (p.code_hash, p.translated.key_hash)));
+        }
         if !self.gfx_pipes.contains_key(&key) {
             if let Some(p) = self.ahead_gfx(&key, regs, &vs, ps.as_ref(), tess.is_some()) {
                 self.gfx_pipes.insert(key.clone(), p);
@@ -9907,6 +10067,9 @@ impl Renderer {
         }
         phase!(0);
         let key = cs.translated.key_hash ^ cs.addr ^ push_mode_key();
+        if !self.cs_pipes.contains_key(&key) && super::manifest::on() {
+            super::manifest::note_cs((cs.code_hash, cs.translated.key_hash));
+        }
         if !self.cs_pipes.contains_key(&key) && ahead_on() {
             if let Some(a) = ahead_take(cs_map, &key) {
                 ahead_count(3);

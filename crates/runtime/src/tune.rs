@@ -676,8 +676,15 @@ pub const PS4_FPU: usize = 111;
 /// for bit), and reverbs and delays on silent input once their state has
 /// died away under -180 dB (it is then cleared).
 pub const NGS2_IDLE: usize = 112;
+/// The pipeline manifest (`gpu::manifest`, `TLG_PIPE_MANIFEST`, 1): the
+/// session's translations and pipelines are recorded beside the pipeline
+/// cache, and earlier sessions' are compiled again at the start, behind the
+/// session's own compiles - after an update that changes the translator,
+/// places the player has been do not stall on first sight again. Read at
+/// start.
+pub const PIPE_MANIFEST: usize = 113;
 
-const TABLE: [(&str, &str, i64); 113] = [
+const TABLE: [(&str, &str, i64); 114] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -791,6 +798,7 @@ const TABLE: [(&str, &str, i64); 113] = [
     ("ngs2_ftz", "TLG_NGS2_FTZ", 1),
     ("ps4_fpu", "TLG_PS4_FPU", 1),
     ("ngs2_idle", "TLG_NGS2_IDLE", 1),
+    ("pipe_manifest", "TLG_PIPE_MANIFEST", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

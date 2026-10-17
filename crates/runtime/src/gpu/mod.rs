@@ -5,6 +5,7 @@ pub mod cp;
 pub mod cpuwatch;
 pub mod desc;
 pub mod lazywb;
+pub mod manifest;
 pub mod pcompile;
 pub mod pm4;
 pub mod prepahead;
@@ -525,6 +526,7 @@ fn gfx_thread() {
             }
             // New pipelines reach the on-disk cache within half a minute.
             render::save_pipeline_cache(std::time::Duration::from_secs(30));
+            manifest::flush();
             if let Some(r) = render::RENDERER.lock().as_mut() {
                 // Submit (no wait): presentation is ordered after it on the queue.
                 r.submit_batch(Vec::new());

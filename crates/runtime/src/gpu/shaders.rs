@@ -66,6 +66,33 @@ pub fn probe_labels() -> (&'static str, &'static str) {
 
 static CACHE: Mutex<Option<FastMap<(u64, u64), Translated>>> = Mutex::new(None);
 
+/// The translation key of a specialization (`prepare`).
+pub fn spec_key(spec: &Spec) -> u64 {
+    let mut h = super::render::FxHasher::default();
+    spec.hash(&mut h);
+    h.finish()
+}
+
+/// This session's translation of program `code_hash` with key `key_hash`.
+pub fn cached_translation(code_hash: u64, key_hash: u64) -> Option<Arc<Output>> {
+    CACHE.lock().as_ref()?.get(&(code_hash, key_hash)).map(|t| t.out.clone())
+}
+
+/// Keeps a translation made outside `prepare` (the pipeline manifest's) for
+/// it; returns the one kept (an earlier one made meanwhile wins).
+pub fn insert_translation(code_hash: u64, key_hash: u64, out: Output, page_marks: u8) -> Arc<Output> {
+    let mut g = CACHE.lock();
+    let map = g.get_or_insert_with(FastMap::default);
+    map.entry((code_hash, key_hash)).or_insert_with(|| Translated { out: Arc::new(out), key_hash, probe: [None, None], page_marks }).out.clone()
+}
+
+/// The dwords of the decoded program at `addr` (`program`), for the
+/// pipeline manifest.
+fn program_words(addr: u64) -> Option<Vec<u32>> {
+    let len = PROGRAMS.lock().as_ref()?.get(&addr)?.len_words;
+    Some(super::shader_dump::code_slice(addr)?.get(..len)?.to_vec())
+}
+
 /// Content hash of shader code (checked on every use of a cached program).
 fn hash_words(w: &[u32]) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) };
@@ -811,12 +838,12 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
             let s = s as usize;
             let faddr = (*user.get(s).ok_or("fetch pointer outside user data")? as u64) | ((*user.get(s + 1).ok_or("fetch pointer outside user data")? as u64) << 32);
             let (f, fh, _) = program(faddr)?;
-            Some((f, fh))
+            Some((f, fh, faddr))
         }
         _ => None,
     };
     let code_hash = match &fetch {
-        Some((_, fh)) => main_hash ^ fh.rotate_left(17),
+        Some((_, fh, _)) => main_hash ^ fh.rotate_left(17),
         None => main_hash,
     };
     let akey = (code_hash, addr, user_sgprs);
@@ -832,7 +859,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
                 crate::info!("shader float mode: {:?} FLOAT_MODE {:#04x} DX10_CLAMP {} IEEE_MODE {} (first at {addr:#x})", sr.stage, mode & 0xFF, (rsrc1 >> 21) & 1, (rsrc1 >> 23) & 1);
             }
             let code = match &fetch {
-                Some((f, _)) => Arc::new(translate::inline_fetch(&main, f)),
+                Some((f, _, _)) => Arc::new(translate::inline_fetch(&main, f)),
                 None => main.clone(),
             };
             let plan = analysis::analyze(&code, user_sgprs, addr);
@@ -1029,11 +1056,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
             }
         }
     }
-    let hash_spec = |spec: &Spec| {
-        let mut h = super::render::FxHasher::default();
-        spec.hash(&mut h);
-        h.finish()
-    };
+    let hash_spec = spec_key;
     // The key without debug captures names the translation in shader dumps
     // (`<stage>_<addr>_<key>.spv`): the same in every run, while the address
     // may differ, so captures can name a shader by it.
@@ -1048,6 +1071,18 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
             None => {
                 super::shader_dump::dump(stage_name, addr, &user);
                 let out = translate::translate(code, plan, &spec).map_err(|e| format!("{:?} shader {addr:#x}: {e}", sr.stage))?;
+                // (Its inputs, for the pipeline manifest.)
+                if super::manifest::on() {
+                    if let Some(main_words) = program_words(addr) {
+                        let fetch_words = match &fetch {
+                            Some((_, _, fa)) => program_words(*fa),
+                            None => Some(Vec::new()),
+                        };
+                        if let Some(fw) = fetch_words {
+                            super::manifest::note_stage(code_hash, key_hash, addr, user_sgprs, main_words, fw, &spec);
+                        }
+                    }
+                }
                 if !spec.debug_capture.is_empty() {
                     crate::info!("{:?} shader {addr:#x} (key {base_key:016x}): translated with debug captures {:x?}", sr.stage, spec.debug_capture);
                 }
