@@ -693,8 +693,13 @@ pub const NEW_SHADERS: usize = 114;
 /// bands in one pass (0: the lane loops and band-by-band passes before;
 /// the same output bit for bit).
 pub const NGS2_VEC: usize = 115;
+/// The NGS2 mixer's helper thread (`TLG_NGS2_THREADS`, 1): with 8 or more
+/// sampler voices playing, a second thread renders every other one
+/// (decoding, envelope, filters, peak) while the rendering thread does the
+/// rest; the routing stays in the voices' order (the same mix bit for bit).
+pub const NGS2_THREADS: usize = 116;
 
-const TABLE: [(&str, &str, i64); 116] = [
+const TABLE: [(&str, &str, i64); 117] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -811,6 +816,7 @@ const TABLE: [(&str, &str, i64); 116] = [
     ("pipe_manifest", "TLG_PIPE_MANIFEST", 1),
     ("new_shaders", "TLG_NEW_SHADERS", -1),
     ("ngs2_vec", "TLG_NGS2_VEC", 1),
+    ("ngs2_threads", "TLG_NGS2_THREADS", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

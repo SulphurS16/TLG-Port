@@ -288,6 +288,11 @@ struct Voice {
     /// reverb's or delay's state has died away and was cleared (`render`).
     quiet: u32,
     fx_idle: bool,
+    /// Sampler voices: the current grain before routing (`sampler_grain`),
+    /// its channels and whether it is silent.
+    out: Vec<[f32; MAX_CH]>,
+    out_ch: usize,
+    out_silent: bool,
 }
 
 impl Voice {
@@ -327,6 +332,9 @@ impl Voice {
             limiter: None,
             quiet: 0,
             fx_idle: false,
+            out: Vec::new(),
+            out_ch: 1,
+            out_silent: false,
         }
     }
 }
@@ -1339,6 +1347,105 @@ const IDLE_EQ_RUN: usize = 3;
 const IDLE_UNMIXED: usize = 4;
 const IDLE_MIXED: usize = 5;
 
+/// One sampler voice's grain before routing (`Voice::out`): its samples, its
+/// filters and compressor, its peak; then its channels and whether the
+/// output is silent (`out_ch`, `out_silent`). Touches the voice alone.
+fn sampler_grain(v: &mut Voice, grain: usize, rate: u32, idle: bool) {
+    let mut out = std::mem::take(&mut v.out);
+    render_sampler(v, grain, rate, &mut out);
+    let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
+    if trace_voices() {
+        note_dc(v, &out, ch);
+    }
+    run_eq(v, &mut out, ch, rate);
+    v.peak = peak_of(&out, ch);
+    v.peak_win = v.peak_win.max(v.peak);
+    v.out = out;
+    v.out_ch = ch;
+    v.out_silent = idle && v.peak == 0.0;
+}
+
+/// Fewer playing sampler voices than this are rendered without the helper
+/// (handing a share over costs two thread wake-ups per grain).
+const HELPER_MIN: usize = 8;
+
+/// The mixer's helper thread (`tune ngs2_threads`): it renders a share of
+/// each grain's sampler voices (`sampler_grain`) while the rendering thread
+/// does the rest; the rendering thread waits for it before routing. It runs
+/// only while the rendering thread holds the NGS2 lock and waits, so nothing
+/// else touches those voices (ATRAC9 decoders are made only under the lock,
+/// as the library's shared tables are written then).
+struct Helper {
+    /// Job number, voices (`*mut Voice` as usize), grain, rate, idle.
+    job: Mutex<(u64, Vec<usize>, usize, u32, bool)>,
+    job_cv: parking_lot::Condvar,
+    done: Mutex<u64>,
+    done_cv: parking_lot::Condvar,
+}
+
+impl Helper {
+    /// Hands `voices` over; returns the job's number.
+    fn give(&self, voices: Vec<usize>, grain: usize, rate: u32, idle: bool) -> u64 {
+        let seq = {
+            let mut j = self.job.lock();
+            *j = (j.0 + 1, voices, grain, rate, idle);
+            j.0
+        };
+        self.job_cv.notify_one();
+        seq
+    }
+
+    /// Waits until job `seq` is done.
+    fn wait(&self, seq: u64) {
+        let mut d = self.done.lock();
+        while *d < seq {
+            self.done_cv.wait(&mut d);
+        }
+    }
+
+    fn run(&'static self) {
+        crate::log::set_thread_name("NGS2-helper");
+        // (The title's sound thread runs raised: SceKernel priority 256.)
+        crate::thread::raise_priority();
+        let mut last = 0;
+        loop {
+            let (seq, voices, grain, rate, idle) = {
+                let mut j = self.job.lock();
+                while j.0 == last {
+                    self.job_cv.wait(&mut j);
+                }
+                (j.0, std::mem::take(&mut j.1), j.2, j.3, j.4)
+            };
+            last = seq;
+            {
+                // (The same floating-point state as the rendering thread's.)
+                let _ftz = FtzGuard::new();
+                for v in voices {
+                    // SAFETY: `render` hands over distinct voices and waits.
+                    sampler_grain(unsafe { &mut *(v as *mut Voice) }, grain, rate, idle);
+                }
+            }
+            *self.done.lock() = seq;
+            self.done_cv.notify_one();
+        }
+    }
+}
+
+/// The helper thread, started at first use.
+fn helper() -> &'static Helper {
+    static H: std::sync::OnceLock<&'static Helper> = std::sync::OnceLock::new();
+    H.get_or_init(|| {
+        let h: &'static Helper = Box::leak(Box::new(Helper {
+            job: Mutex::new((0, Vec::new(), 0, 0, false)),
+            job_cv: parking_lot::Condvar::new(),
+            done: Mutex::new(0),
+            done_cv: parking_lot::Condvar::new(),
+        }));
+        crate::thread::spawn_host("NGS2-helper", 1 << 20, Box::new(move || h.run())).expect("NGS2 helper thread");
+        h
+    })
+}
+
 /// A voice's filters and compressor have no state left: on silent input
 /// they give silence, bit for bit (flat ones are not run at all).
 fn eq_at_rest(v: &Voice) -> bool {
@@ -1350,7 +1457,7 @@ fn eq_at_rest(v: &Voice) -> bool {
 /// ngs2_idle`), what silence passes through unchanged is skipped: the mixing
 /// of silent outputs, a submixer's filters on silent input while they are at
 /// rest, reverbs and delays on silent input once they have died away.
-fn render(s: &mut State, system: u64, grain: usize, rate: u32, idle: bool) -> Vec<[f32; MAX_CH]> {
+fn render(s: &mut State, system: u64, grain: usize, rate: u32, idle: bool, threads: bool) -> Vec<[f32; MAX_CH]> {
     let _ftz = FtzGuard::new();
     let at = s.systems.get(&system).map_or(0, |y| y.renders.saturating_sub(1)) * grain as u64;
     let rev_gain = reverb_ab_gain(s, at, rate);
@@ -1367,33 +1474,53 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32, idle: bool) -> Ve
             }
         }
     }
-    let mut buf = Vec::with_capacity(grain);
+    // The playing sampler voices' grains (each voice's own state alone: its
+    // decoding, envelope, filters, peak), with a share on the helper thread
+    // (`tune ngs2_threads`), then their routing in the voices' order - the
+    // same mix as voice by voice.
+    let mut playing: Vec<(u64, *mut Voice)> = Vec::new();
     for vh in &all {
-        let play = s.voices.get(vh).is_some_and(|v| v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0 && v.flags & STATE_PAUSED == 0);
-        if !play {
-            if let Some(v) = s.voices.get_mut(vh) {
-                v.peak = 0.0;
-            }
-            continue;
+        let Some(v) = s.voices.get_mut(vh) else { continue };
+        if v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0 && v.flags & STATE_PAUSED == 0 {
+            playing.push((*vh, v as *mut Voice));
+        } else {
+            v.peak = 0.0;
         }
-        let (ch, silent) = {
-            let v = s.voices.get_mut(vh).unwrap();
-            render_sampler(v, grain, rate, &mut buf);
-            let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
-            if trace_voices() {
-                note_dc(v, &buf, ch);
-            }
-            run_eq(v, &mut buf, ch, rate);
-            v.peak = peak_of(&buf, ch);
-            v.peak_win = v.peak_win.max(v.peak);
-            (ch, idle && v.peak == 0.0)
+    }
+    // (A voice listed twice - never seen - keeps the helper out.)
+    let distinct = {
+        let mut p: Vec<usize> = playing.iter().map(|&(_, v)| v as usize).collect();
+        p.sort_unstable();
+        p.windows(2).all(|w| w[0] != w[1])
+    };
+    let helper = (distinct && threads && playing.len() >= HELPER_MIN).then(helper);
+    if let Some(h) = helper {
+        // (Every other voice: the formats' costs spread evenly.)
+        let theirs: Vec<usize> = playing.iter().skip(1).step_by(2).map(|&(_, v)| v as usize).collect();
+        let seq = h.give(theirs, grain, rate, idle);
+        for &(_, v) in playing.iter().step_by(2) {
+            // SAFETY: the voices are distinct entries of `s.voices`, which
+            // nothing changes until the helper is done with its share.
+            sampler_grain(unsafe { &mut *v }, grain, rate, idle);
+        }
+        h.wait(seq);
+    } else {
+        for &(_, v) in &playing {
+            sampler_grain(unsafe { &mut *v }, grain, rate, idle);
+        }
+    }
+    for &(vh, _) in &playing {
+        let (ch, silent, out) = {
+            let v = s.voices.get_mut(&vh).unwrap();
+            (v.out_ch, v.out_silent, std::mem::take(&mut v.out))
         };
         if silent {
             s.idle[IDLE_UNMIXED] += 1;
-            continue;
+        } else {
+            s.idle[IDLE_MIXED] += 1;
+            route(s, vh, &out, ch);
         }
-        s.idle[IDLE_MIXED] += 1;
-        route(s, *vh, &buf, ch);
+        s.voices.get_mut(&vh).unwrap().out = out;
     }
     // Mixing voices: deepest upstream first (a voice runs after everything that
     // patches into it; cycles are cut).
@@ -1681,7 +1808,7 @@ sysv! {
         let mut g = NGS2.lock();
         let s = g.get_or_insert_with(State::default);
         let Some((grain, rate)) = s.systems.get_mut(&system).map(|y| { y.renders += 1; (y.grain as usize, y.sample_rate) }) else { return ERR_INVALID_HANDLE };
-        let mix = render(s, system, grain, rate, crate::tune::get(crate::tune::NGS2_IDLE) != 0);
+        let mix = render(s, system, grain, rate, crate::tune::get(crate::tune::NGS2_IDLE) != 0, crate::tune::get(crate::tune::NGS2_THREADS) != 0);
         // Every ~10 s: what the mixer is doing.
         let renders = s.systems[&system].renders;
         let peak = mix.iter().flat_map(|f| f.iter()).fold(0f32, |m, &x| m.max(x.abs()));
@@ -1954,8 +2081,8 @@ mod tests {
         let (mut on, mut off) = (build(), build());
         let (mut first_diff, mut worst, mut peak) = (None, 0f32, 0f32);
         for g in 0..1600 {
-            let a = render(&mut on, 1, 256, 48000, true);
-            let b = render(&mut off, 1, 256, 48000, false);
+            let a = render(&mut on, 1, 256, 48000, true, false);
+            let b = render(&mut off, 1, 256, 48000, false, false);
             for (x, y) in a.iter().zip(&b) {
                 for c in 0..MAX_CH {
                     peak = peak.max(y[c].abs());
@@ -1971,5 +2098,66 @@ mod tests {
         assert!(first_diff.is_none_or(|g| g >= 200), "{first_diff:?}");
         assert!(on.idle[IDLE_FX_SKIPPED] > 0 && on.idle[IDLE_EQ_SKIPPED] > 0 && on.idle[IDLE_UNMIXED] > 0, "{:?}", on.idle);
         assert_eq!(off.idle[IDLE_FX_SKIPPED] + off.idle[IDLE_EQ_SKIPPED] + off.idle[IDLE_UNMIXED], 0);
+    }
+
+    #[test]
+    fn helper_thread_changes_nothing() {
+        // Twelve sampler voices (pitches, filters, envelopes, mono and
+        // stereo, some ending) into a bus and the mastering voice: the same
+        // output bit for bit with the helper thread rendering every other
+        // voice as without it, and the same voice states.
+        fn build() -> State {
+            let mut s = State::default();
+            let (bus, mst) = (0x20u64, 0x50u64);
+            let patch = |port: u32, dest: u64| Patch { port, dest, dest_input: 0 };
+            s.racks.insert(0x100, Rack { system: 1, rack_id: 0, buf: BufferInfo::default(), voices: (0..12).map(|i| 0x1000 + i).collect() });
+            for (rack, vh, kind) in [(0x200u64, bus, Kind::Submixer), (0x500, mst, Kind::Mastering)] {
+                s.racks.insert(rack, Rack { system: 1, rack_id: 0, buf: BufferInfo::default(), voices: vec![vh] });
+                s.voices.insert(vh, Voice::new(rack, kind, 0));
+            }
+            s.voices.get_mut(&bus).unwrap().patches = vec![patch(0, mst)];
+            let mut x = 0x2468_ace0u32;
+            for i in 0..12u64 {
+                let mut v = Voice::new(0x100, Kind::Sampler, i as u32);
+                v.flags = STATE_IN_USE | STATE_PLAYING;
+                let ch = 1 + (i % 2) as usize;
+                v.sampler.channels = ch as u32;
+                v.channels = ch as u32;
+                v.sampler.pitch = 0.75 + 0.1 * i as f32;
+                // (Some voices run out within the test: their end and silence.)
+                v.sampler.pcm = (0..(3000 + 4000 * (i % 3)))
+                    .map(|_| {
+                        let mut fr = [0f32; MAX_CH];
+                        for c in fr.iter_mut().take(ch) {
+                            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                            *c = (x as i32) as f32 / 4e9;
+                        }
+                        fr
+                    })
+                    .collect();
+                if i % 3 != 0 {
+                    v.eq_params[0] = Some((FilterKind::LowPass, 2000.0 + 500.0 * i as f32, 0.7, 1.0));
+                }
+                if i % 4 == 1 {
+                    v.eq_params[1] = Some((FilterKind::HighPass, 80.0, 0.7, 1.0));
+                }
+                if i % 5 == 2 {
+                    v.env = Envelope::new(vec![(0, 300, 1.0), (0, 2000, 0.0)], 1);
+                }
+                v.patches = vec![patch(0, bus)];
+                s.voices.insert(0x1000 + i, v);
+            }
+            s
+        }
+        let (mut with, mut without) = (build(), build());
+        for g in 0..120 {
+            let a = render(&mut with, 1, 256, 48000, true, true);
+            let b = render(&mut without, 1, 256, 48000, true, false);
+            assert!(a.iter().zip(&b).all(|(x, y)| x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())), "grain {g}");
+        }
+        for i in 0..12u64 {
+            let (p, q) = (&with.voices[&(0x1000 + i)], &without.voices[&(0x1000 + i)]);
+            assert_eq!((p.flags, p.peak.to_bits(), p.sampler.pcm.len()), (q.flags, q.peak.to_bits(), q.sampler.pcm.len()), "voice {i}");
+        }
     }
 }
