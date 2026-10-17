@@ -597,8 +597,8 @@ fn main() {
     {
         let s = config::settings();
         info!(
-            "settings: {:?} on {} (window {}x{}, fullscreen {:?} @ {} Hz), vsync {:?}, scaling {:?} {:?}, frame cap {:?}, gpu {}, volume {}",
-            s.display_mode, s.monitor, s.window_width, s.window_height, s.resolution, s.refresh_rate, s.vsync, s.scaling, s.filter, s.frame_cap, s.gpu, s.volume
+            "settings: {:?} on {} (window {}x{}, fullscreen {:?} @ {} Hz), vsync {:?}, scaling {:?} {:?}, frame cap {:?}, new shaders {:?}, gpu {}, volume {}",
+            s.display_mode, s.monitor, s.window_width, s.window_height, s.resolution, s.refresh_rate, s.vsync, s.scaling, s.filter, s.frame_cap, s.new_shaders, s.gpu, s.volume
         );
     }
     exception::install();

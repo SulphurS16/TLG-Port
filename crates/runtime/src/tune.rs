@@ -683,8 +683,13 @@ pub const NGS2_IDLE: usize = 112;
 /// places the player has been do not stall on first sight again. Read at
 /// start.
 pub const PIPE_MANIFEST: usize = 113;
+/// Draws whose graphics pipeline is still compiling (`TLG_NEW_SHADERS`, -1:
+/// settings.txt `new_shaders`; 0 wait for it, 1 leave the draw out of the
+/// frame - not draws that write buffers or are counted by an occlusion
+/// query, whose results the game reads; `render::skip_compiling`).
+pub const NEW_SHADERS: usize = 114;
 
-const TABLE: [(&str, &str, i64); 114] = [
+const TABLE: [(&str, &str, i64); 115] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -799,6 +804,7 @@ const TABLE: [(&str, &str, i64); 114] = [
     ("ps4_fpu", "TLG_PS4_FPU", 1),
     ("ngs2_idle", "TLG_NGS2_IDLE", 1),
     ("pipe_manifest", "TLG_PIPE_MANIFEST", 1),
+    ("new_shaders", "TLG_NEW_SHADERS", -1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -4,7 +4,7 @@
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 pub use tlg_config::paths::{Layout, Paths};
-pub use tlg_config::settings::{DisplayMode, Filter, FrameCap, Scaling, Settings, VSync};
+pub use tlg_config::settings::{DisplayMode, Filter, FrameCap, NewShaders, Scaling, Settings, VSync};
 
 static PATHS: OnceLock<Paths> = OnceLock::new();
 static SETTINGS: OnceLock<Settings> = OnceLock::new();

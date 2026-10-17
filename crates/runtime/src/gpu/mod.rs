@@ -728,13 +728,14 @@ fn gfx_thread() {
                 let pc = |i: usize| (render::PIPE_CREATES[i].0.load(Ordering::Relaxed), render::PIPE_CREATES[i].1.load(Ordering::Relaxed) as f64 / 1e9);
                 let (g, c) = (pc(0), pc(1));
                 crate::info!(
-                    "pipelines created so far: graphics {} ({:.2} s), compute {} ({:.2} s); by compile workers {} ({:.2} s)",
+                    "pipelines created so far: graphics {} ({:.2} s), compute {} ({:.2} s); by compile workers {} ({:.2} s); draws left out while their pipeline compiled (new_shaders skip) {}",
                     g.0,
                     g.1,
                     c.0,
                     c.1,
                     pcompile::DONE.load(Ordering::Relaxed),
-                    pcompile::BUSY_NS.load(Ordering::Relaxed) as f64 / 1e9
+                    pcompile::BUSY_NS.load(Ordering::Relaxed) as f64 / 1e9,
+                    render::SKIPPED_DRAWS.load(Ordering::Relaxed)
                 );
                 let a: [u64; 12] = std::array::from_fn(|i| render::AHEAD_STATS[i].load(Ordering::Relaxed));
                 crate::info!(

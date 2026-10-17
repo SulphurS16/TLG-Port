@@ -132,6 +132,20 @@ impl GfxKey {
     }
 }
 
+/// Draws left out of their frame while their pipeline compiled
+/// (`skip_compiling`).
+pub static SKIPPED_DRAWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether a draw whose graphics pipeline is still compiling is left out of
+/// the frame instead of waited for (`tune new_shaders`, settings.txt
+/// `new_shaders`).
+fn skip_compiling() -> bool {
+    match crate::tune::get(crate::tune::NEW_SHADERS) {
+        -1 => crate::config::settings().new_shaders == crate::config::NewShaders::Skip,
+        v => v != 0,
+    }
+}
+
 /// The pipeline manifest's graphics pipeline (`manifest`): made from the
 /// stages' translations and the recorded render state on a compile worker,
 /// into the pipeline cache, and dropped. Tessellation (stages of the
@@ -8952,6 +8966,18 @@ impl Renderer {
             self.gfx_pipes.insert(key.clone(), p);
         }
         let (pipeline, layout, set_layout, pslot) = self.gfx_pipes.get_mut(&key).unwrap().take()?;
+        // (`new_shaders` skip: a draw whose pipeline is still compiling is
+        // left out of this frame - unless the game reads its results:
+        // buffer stores, occlusion counts.)
+        if pslot.as_ref().is_some_and(|s| s.get().is_none())
+            && skip_compiling()
+            && vs.written_buffers.is_empty()
+            && ps.as_ref().is_none_or(|p| p.written_buffers.is_empty())
+            && self.cx.occl_active.is_none()
+        {
+            SKIPPED_DRAWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(());
+        }
         phase!(3);
         // Descriptors (may record uploads: must happen before rendering starts).
         let mut stages = smallvec::SmallVec::<[&shaders::Prepared; 2]>::new();

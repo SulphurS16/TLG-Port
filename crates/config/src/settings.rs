@@ -53,6 +53,18 @@ pub enum FrameCap {
 /// Frame caps the launcher offers, in its order.
 pub const OFFERED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game, FrameCap::Fps60];
 
+/// What a frame does with an effect whose shader is still being compiled
+/// (the first time the game shows it).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NewShaders {
+    /// Waits for the compile: the game pauses for a moment.
+    Wait,
+    /// Draws the frame without that effect until its shader is ready: no
+    /// pause, the effect may be missing for a moment. (Only effects that
+    /// change nothing the game reads back: the rest are waited for.)
+    Skip,
+}
+
 /// Render resolutions accepted (the tested range).
 pub const RENDER_MIN: (u32, u32) = (640, 360);
 pub const RENDER_MAX: (u32, u32) = (3840, 2160);
@@ -102,6 +114,7 @@ pub struct Settings {
     pub scaling: Scaling,
     pub filter: Filter,
     pub frame_cap: FrameCap,
+    pub new_shaders: NewShaders,
     /// "auto" or part of a GPU's name (or its index in the device list).
     pub gpu: String,
     /// Master volume 0-100.
@@ -126,6 +139,7 @@ impl Default for Settings {
             scaling: Scaling::Fit,
             filter: Filter::Smooth,
             frame_cap: FrameCap::Game,
+            new_shaders: NewShaders::Wait,
             gpu: "auto".into(),
             volume: 100,
             game_dir: None,
@@ -171,6 +185,11 @@ filter = smooth
 # to 60 fps (experimental, needs a fast PC: the game's time step follows the
 # frame rate, so its speed stays the same; not yet played at 60 fps).
 frame_cap = game
+# The first time the game shows an effect, its shader is compiled: wait =
+# the game pauses for a moment until it is ready; skip = the frame is drawn
+# without that effect meanwhile (no pause, the effect may be missing for a
+# moment; effects whose results the game reads are always waited for).
+new_shaders = wait
 # auto (a discrete GPU first) or part of the graphics card's name.
 gpu = auto
 # Master volume, 0-100.
@@ -281,6 +300,11 @@ impl Settings {
                     "off" | "uncapped" | "0" => s.frame_cap = FrameCap::Off,
                     _ => errs.push(bad("game or 60 (other limits are not tested yet)")),
                 },
+                "new_shaders" => match lv.as_str() {
+                    "wait" => s.new_shaders = NewShaders::Wait,
+                    "skip" => s.new_shaders = NewShaders::Skip,
+                    _ => errs.push(bad("wait or skip")),
+                },
                 "gpu" => s.gpu = if v.is_empty() { "auto".into() } else { v.to_string() },
                 "volume" => match num(v).filter(|&n| n <= 100) {
                     Some(n) => s.volume = n,
@@ -337,6 +361,10 @@ impl Settings {
             FrameCap::Game => "game",
             FrameCap::Fps60 => "60",
             FrameCap::Off => "off",
+        });
+        f.set("new_shaders", match self.new_shaders {
+            NewShaders::Wait => "wait",
+            NewShaders::Skip => "skip",
         });
         f.set("gpu", &self.gpu);
         f.set("volume", &self.volume.to_string());
@@ -422,6 +450,7 @@ mod tests {
             vsync: VSync::Off,
             filter: Filter::Sharp,
             frame_cap: FrameCap::Fps60,
+            new_shaders: NewShaders::Skip,
             game_dir: Some(PathBuf::from(r"E:\TLG\CUSA03627")),
             close_launcher: true,
             ..Settings::default()
