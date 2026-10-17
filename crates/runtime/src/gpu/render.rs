@@ -3519,8 +3519,9 @@ pub static VBIND_MISS_SRC: [[std::sync::atomic::AtomicU64; 6]; 2] = [const { [co
 pub const VBIND_MISS_SRC_NAMES: [&str; 6] = ["GPU writes", "CPU writes found", "CP writes", "remapped memory", "GPU writes in an overlapping window", "none found"];
 
 /// TLG_PERF: TSC cycles and counts of buffer-binding steps (`BPART_NAMES`).
-pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 25] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 25];
-pub const BPART_NAMES: [&str; 25] = [
+pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); BPART_COUNT] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; BPART_COUNT];
+pub const BPART_COUNT: usize = 27;
+pub const BPART_NAMES: [&str; BPART_COUNT] = [
     "mirror written: bind",
     "write-back",
     "meta+surface",
@@ -3546,6 +3547,8 @@ pub const BPART_NAMES: [&str; 25] = [
     "buffers (prepare_guest_reads)",
     "images (prepare_guest_reads)",
     "draw targets",
+    "written copy: checks",
+    "written copy: notes",
 ];
 
 /// The time-stamp counter for `bpart` and other per-command timers; 0 while
@@ -3599,7 +3602,7 @@ thread_local! {
     static BPART_CS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 /// TLG_PERF: `BPARTS` of the compute queues' commands alone.
-pub static BPARTS_CS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 25] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 25];
+pub static BPARTS_CS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); BPART_COUNT] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; BPART_COUNT];
 
 pub fn perf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -8746,7 +8749,8 @@ impl Renderer {
                         // the ring copy: host writes are visible at
                         // submission, the device range is fresh.)
                         bpath = 8;
-                        let t0 = tsc();
+                        // (From the binding's start: the checks before the copy.)
+                        let t0 = bpart(25, tb);
                         let off = self.upload_guest(base, size)?;
                         let t0 = bpart(9, t0);
                         let forwarded = self.cx.upload_forwarded;
@@ -8772,10 +8776,11 @@ impl Renderer {
                             unordered!(self);
                         }
                         self.push_writeback(PendingWrite { base, size, host_off: off, dev_off, dev_buf: self.cx.dring.buffer, mirror: false, bits: None });
-                        bpart(10, t0);
+                        let tn = bpart(10, t0);
                         mem!(self).writes.note_gpu_write(base, size);
                         self.note_pending_gpu_write(base, size);
                         self.mark(|| "written buffer setup copy".into());
+                        bpart(26, tn);
                         infos.push((b.binding, vk::DescriptorType::STORAGE_BUFFER, Info::Buf(vk::DescriptorBufferInfo { buffer: self.cx.dring.buffer, offset: dev_off, range: size.next_multiple_of(4) })));
                     }
                     BindingKind::Image(i) | BindingKind::StorageImage(i) => {

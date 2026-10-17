@@ -1155,10 +1155,10 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             crate::info!("texture lookups by path/s: {}; over 100 us: {} ({:.1} ms)", tp.join(", "), slow.1, slow.0 as f64 / hz * 1e3);
         }
         // (Their steps: us each, count.)
-        static LAST_BP: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);
-        let cur: [(u64, u64); 25] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
+        static LAST_BP: Mutex<[(u64, u64); render::BPART_COUNT]> = Mutex::new([(0, 0); render::BPART_COUNT]);
+        let cur: [(u64, u64); render::BPART_COUNT] = std::array::from_fn(|i| (render::BPARTS[i].0.load(Ordering::Relaxed), render::BPARTS[i].1.load(Ordering::Relaxed)));
         let prev = std::mem::replace(&mut *LAST_BP.lock(), cur);
-        let parts: Vec<String> = (0..25)
+        let parts: Vec<String> = (0..render::BPART_COUNT)
             .filter(|&i| cur[i].1 > prev[i].1)
             .map(|i| format!("{} {:.2} us x {}", render::BPART_NAMES[i], (cur[i].0 - prev[i].0) as f64 / hz * 1e6 / (cur[i].1 - prev[i].1) as f64, cur[i].1 - prev[i].1))
             .collect();
@@ -1180,10 +1180,10 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             crate::info!("mirror binding cache misses/s by queue and reason: {}", miss.join("; "));
         }
         // (The compute queues' share of them.)
-        static LAST_CS: Mutex<[(u64, u64); 25]> = Mutex::new([(0, 0); 25]);
-        let cur: [(u64, u64); 25] = std::array::from_fn(|i| (render::BPARTS_CS[i].0.load(Ordering::Relaxed), render::BPARTS_CS[i].1.load(Ordering::Relaxed)));
+        static LAST_CS: Mutex<[(u64, u64); render::BPART_COUNT]> = Mutex::new([(0, 0); render::BPART_COUNT]);
+        let cur: [(u64, u64); render::BPART_COUNT] = std::array::from_fn(|i| (render::BPARTS_CS[i].0.load(Ordering::Relaxed), render::BPARTS_CS[i].1.load(Ordering::Relaxed)));
         let prev = std::mem::replace(&mut *LAST_CS.lock(), cur);
-        let parts: Vec<String> = (0..25)
+        let parts: Vec<String> = (0..render::BPART_COUNT)
             .filter(|&i| cur[i].1 > prev[i].1)
             .map(|i| format!("{} {:.2} us x {}", render::BPART_NAMES[i], (cur[i].0 - prev[i].0) as f64 / hz * 1e6 / (cur[i].1 - prev[i].1) as f64, cur[i].1 - prev[i].1))
             .collect();
