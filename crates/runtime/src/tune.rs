@@ -688,8 +688,13 @@ pub const PIPE_MANIFEST: usize = 113;
 /// frame - not draws that write buffers or are counted by an occlusion
 /// query, whose results the game reads; `render::skip_compiling`).
 pub const NEW_SHADERS: usize = 114;
+/// The NGS2 mixer's lanes in vector form (`TLG_NGS2_VEC`, 1): the matrix
+/// and direct mixes over all eight lanes with a mask, a voice's filter
+/// bands in one pass (0: the lane loops and band-by-band passes before;
+/// the same output bit for bit).
+pub const NGS2_VEC: usize = 115;
 
-const TABLE: [(&str, &str, i64); 115] = [
+const TABLE: [(&str, &str, i64); 116] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -805,6 +810,7 @@ const TABLE: [(&str, &str, i64); 115] = [
     ("ngs2_idle", "TLG_NGS2_IDLE", 1),
     ("pipe_manifest", "TLG_PIPE_MANIFEST", 1),
     ("new_shaders", "TLG_NEW_SHADERS", -1),
+    ("ngs2_vec", "TLG_NGS2_VEC", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

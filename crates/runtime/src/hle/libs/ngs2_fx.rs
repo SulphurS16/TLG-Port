@@ -405,6 +405,8 @@ pub struct Taps {
     /// (gain, delay in samples).
     pub taps: Vec<(f32, usize)>,
     buf: Vec<[f32; 8]>,
+    /// The delay line's length these taps need.
+    need: usize,
     pos: usize,
     lp: [f32; 8],
     coef: f32,
@@ -420,6 +422,15 @@ impl Taps {
     /// [3] feedback, [4] low-pass cutoff (Hz), [5] number of taps, then
     /// (gain, milliseconds) pairs.
     pub fn from_words(w: &[u32], rate: u32) -> Option<Taps> {
+        let mut t = Taps::params_from_words(w, rate)?;
+        t.buf = vec![[0.0; 8]; t.need];
+        Some(t)
+    }
+
+    /// The parameters of `from_words` without the delay line (empty), for
+    /// `update`: the title sets them often, and a new line was up to half
+    /// a megabyte allocated and zeroed each time.
+    pub fn params_from_words(w: &[u32], rate: u32) -> Option<Taps> {
         let f = |i: usize| w.get(i).map(|&x| f32::from_bits(x)).unwrap_or(0.0);
         let n = (*w.get(5)? as usize).min(8);
         let rate = rate.max(8000) as f32;
@@ -436,14 +447,15 @@ impl Taps {
         let len = taps.iter().map(|t| t.1).max().unwrap_or(0) + 2;
         let coef = if cutoff >= rate / 2.0 { 0.0 } else { (-2.0 * std::f32::consts::PI * cutoff / rate).exp() };
         let fb = loop_feedback(&taps, feedback);
-        Some(Taps { level, feedback, cutoff, taps, buf: vec![[0.0; 8]; len], pos: 0, lp: [0.0; 8], coef, fb })
+        Some(Taps { level, feedback, cutoff, taps, buf: Vec::new(), need: len, pos: 0, lp: [0.0; 8], coef, fb })
     }
 
-    /// New parameters, keeping the delay line (the title glides between
-    /// environments by small steps).
+    /// New parameters (`params_from_words`), keeping the delay line (the
+    /// title glides between environments by small steps); a longer line
+    /// keeps the delayed samples in order.
     pub fn update(&mut self, new: Taps) {
-        if new.buf.len() > self.buf.len() {
-            let mut b = vec![[0.0; 8]; new.buf.len()];
+        if new.need > self.buf.len() {
+            let mut b = vec![[0.0; 8]; new.need];
             let n = self.buf.len();
             for i in 0..n {
                 b[i] = self.buf[(self.pos + i) % n];
@@ -609,8 +621,16 @@ impl Biquad {
     /// Filters channels 0..ch of every frame in place (transposed direct
     /// form II). All eight lanes run together (vector operations: one
     /// recurrence chain per frame instead of one per channel); lanes from
-    /// `ch` on keep their samples and their state.
+    /// `ch` on keep their samples and their state. (The mixer runs a
+    /// voice's bands together: `process_bands`.)
+    #[cfg(test)]
     pub fn process(&mut self, frames: &mut [[f32; 8]], ch: usize) {
+        Biquad::process_bands(&mut [self], frames, ch);
+    }
+
+    /// `process` as before `process_bands` (`tune ngs2_vec` 0): the first
+    /// `ch` lanes copied in and out of each frame, one band per pass.
+    pub fn process_one(&mut self, frames: &mut [[f32; 8]], ch: usize) {
         let ch = ch.min(8);
         if ch == 0 {
             return;
@@ -622,8 +642,6 @@ impl Biquad {
             (z1[c], z2[c]) = (self.z[c][0], self.z[c][1]);
         }
         for fr in frames.iter_mut() {
-            // (Unused lanes as zeros: no denormal or NaN arithmetic there.
-            // Plain copies: lanes picked by closures went through calls.)
             let mut x = [0f32; 8];
             x[..ch].copy_from_slice(&fr[..ch]);
             let mut y = [0f32; 8];
@@ -635,8 +653,83 @@ impl Biquad {
             fr[..ch].copy_from_slice(&y[..ch]);
         }
         for c in 0..ch {
-            // (Denormals after silence.)
             self.z[c] = [if z1[c].abs() < 1e-20 { 0.0 } else { z1[c] }, if z2[c].abs() < 1e-20 { 0.0 } else { z2[c] }];
+        }
+    }
+
+    /// Filters channels 0..ch of every frame in place through `bands` in
+    /// turn, bit for bit as `process` band after band, in one pass over the
+    /// frames for up to four bands: each band's recurrence is a chain of
+    /// dependent operations per frame (latency-bound), and the chains of
+    /// bands run together overlap.
+    pub fn process_bands(bands: &mut [&mut Biquad], frames: &mut [[f32; 8]], ch: usize) {
+        let ch = ch.min(8);
+        if ch == 0 {
+            return;
+        }
+        for group in bands.chunks_mut(4) {
+            match group.len() {
+                1 => run_bands::<1>(group, frames, ch),
+                2 => run_bands::<2>(group, frames, ch),
+                3 => run_bands::<3>(group, frames, ch),
+                _ => run_bands::<4>(group, frames, ch),
+            }
+        }
+    }
+}
+
+/// Bit masks of the lanes below `n` of an eight-lane frame (all ones there,
+/// zero above): lanes picked by masks keep vector form (a copy of the first
+/// `n` lanes was a library call per frame, a loop over them ran lane by
+/// lane).
+pub fn lane_mask(n: usize) -> [u32; 8] {
+    let mut m = [0u32; 8];
+    for (c, x) in m.iter_mut().enumerate() {
+        if c < n {
+            *x = !0;
+        }
+    }
+    m
+}
+
+/// `N` biquads (`group`, in order) over channels 0..ch of `frames`.
+fn run_bands<const N: usize>(group: &mut [&mut Biquad], frames: &mut [[f32; 8]], ch: usize) {
+    let mut coef = [([0f32; 3], [0f32; 2]); N];
+    // (Per band: z1 and z2 by lane; unused lanes start at zero, as in a
+    // band's own pass.)
+    let mut z = [[[0f32; 8]; 2]; N];
+    for k in 0..N {
+        coef[k] = (group[k].b, group[k].a);
+        for c in 0..ch {
+            (z[k][0][c], z[k][1][c]) = (group[k].z[c][0], group[k].z[c][1]);
+        }
+    }
+    let m = lane_mask(ch);
+    for fr in frames.iter_mut() {
+        // (Unused lanes as zeros: no denormal or NaN arithmetic there.)
+        let mut x = [0f32; 8];
+        for c in 0..8 {
+            x[c] = f32::from_bits(fr[c].to_bits() & m[c]);
+        }
+        for k in 0..N {
+            let ([b0, b1, b2], [a1, a2]) = coef[k];
+            let mut y = [0f32; 8];
+            for c in 0..8 {
+                y[c] = b0 * x[c] + z[k][0][c];
+                z[k][0][c] = b1 * x[c] - a1 * y[c] + z[k][1][c];
+                z[k][1][c] = b2 * x[c] - a2 * y[c];
+            }
+            x = y;
+        }
+        for c in 0..8 {
+            fr[c] = f32::from_bits((x[c].to_bits() & m[c]) | (fr[c].to_bits() & !m[c]));
+        }
+    }
+    for k in 0..N {
+        for c in 0..ch {
+            // (Denormals after silence.)
+            let (z1, z2) = (z[k][0][c], z[k][1][c]);
+            group[k].z[c] = [if z1.abs() < 1e-20 { 0.0 } else { z1 }, if z2.abs() < 1e-20 { 0.0 } else { z2 }];
         }
     }
 }
@@ -814,6 +907,61 @@ mod tests {
                 for (g, w) in got.iter().zip(&want) {
                     for c in 0..8 {
                         assert_eq!(g[c].to_bits(), w[c].to_bits(), "ch {ch} lane {c}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bands_in_one_pass_match_band_by_band() {
+        // Up to eight bands in one pass (groups of four) give the
+        // per-channel recurrences band after band bit for bit, keep each
+        // band's state across grains and leave the lanes past `ch` alone.
+        let mut seed = 0x8765_4321u32;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            (seed as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        let kinds = [FilterKind::HighPass, FilterKind::Peaking, FilterKind::LowShelf, FilterKind::LowPass, FilterKind::HighShelf];
+        for n in 1..=8 {
+            for ch in 1..=8 {
+                let mut bands: Vec<Biquad> = (0..n).map(|k| Biquad::new(kinds[k % kinds.len()], 150.0 + 900.0 * k as f32, 0.8, 1.4, 48000)).collect();
+                let mut one_by_one = bands.clone();
+                let coef: Vec<([f32; 3], [f32; 2])> = bands.iter().map(|f| (f.b, f.a)).collect();
+                let mut z = vec![[[0f32; 2]; 8]; n];
+                for _grain in 0..3 {
+                    let input: Vec<[f32; 8]> = (0..61).map(|_| std::array::from_fn(|_| rnd())).collect();
+                    let mut want = input.clone();
+                    for k in 0..n {
+                        let (b, a) = coef[k];
+                        for c in 0..ch {
+                            let [mut z1, mut z2] = z[k][c];
+                            for fr in want.iter_mut() {
+                                let x = fr[c];
+                                let y = b[0] * x + z1;
+                                z1 = b[1] * x - a[0] * y + z2;
+                                z2 = b[2] * x - a[1] * y;
+                                fr[c] = y;
+                            }
+                            z[k][c] = [z1, z2];
+                        }
+                    }
+                    let mut got = input.clone();
+                    let mut refs: Vec<&mut Biquad> = bands.iter_mut().collect();
+                    Biquad::process_bands(&mut refs, &mut got, ch);
+                    // (And the band-by-band passes `tune ngs2_vec` 0 keeps.)
+                    let mut old = input.clone();
+                    for f in one_by_one.iter_mut() {
+                        f.process_one(&mut old, ch);
+                    }
+                    for ((g, o), w) in got.iter().zip(&old).zip(&want) {
+                        for c in 0..8 {
+                            assert_eq!(g[c].to_bits(), w[c].to_bits(), "{n} bands, ch {ch}, lane {c}");
+                            assert_eq!(o[c].to_bits(), w[c].to_bits(), "{n} bands one by one, ch {ch}, lane {c}");
+                        }
                     }
                 }
             }

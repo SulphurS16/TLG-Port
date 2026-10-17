@@ -18,7 +18,7 @@
 //! delays, peak meters. Unknown parameter ids are logged with their payload.
 
 use super::atrac9;
-use super::ngs2_fx::{Biquad, Compressor, Envelope, FilterKind, I3dl2, Limiter, Reverb, Taps};
+use super::ngs2_fx::{lane_mask, Biquad, Compressor, Envelope, FilterKind, I3dl2, Limiter, Reverb, Taps};
 use crate::gpu::render::FastMap;
 use crate::hle::Registry;
 use crate::{reg, sysv};
@@ -706,7 +706,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                 }
                 CUSTOM_DELAY if v.kind == Kind::Custom => {
                     let words: Vec<u32> = (0..((size as usize).saturating_sub(8) / 4).min(40)).map(|k| u32_at(8 + k * 4)).collect();
-                    match (Taps::from_words(&words, 48000), v.taps.as_mut()) {
+                    // (A delay line only for a new delay: updates keep theirs.)
+                    let parsed = if v.taps.is_some() { Taps::params_from_words(&words, 48000) } else { Taps::from_words(&words, 48000) };
+                    match (parsed, v.taps.as_mut()) {
                         (Some(t), Some(cur)) => cur.update(t),
                         (Some(t), None) => {
                             static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
@@ -782,9 +784,13 @@ fn run_eq(v: &mut Voice, frames: &mut [[f32; MAX_CH]], ch: usize, rate: u32) {
         };
         v.eq_rate = rate;
     }
-    for f in v.eq.iter_mut().flatten() {
-        if !f.is_flat() {
-            f.process(frames, ch);
+    // (The bands in one pass: `Biquad::process_bands`.)
+    let mut bands: smallvec::SmallVec<[&mut Biquad; 8]> = v.eq.iter_mut().flatten().filter(|f| !f.is_flat()).collect();
+    if crate::tune::get(crate::tune::NGS2_VEC) != 0 {
+        Biquad::process_bands(&mut bands, frames, ch);
+    } else {
+        for f in bands {
+            f.process_one(frames, ch);
         }
     }
     if let Some(c) = v.comp.as_mut().filter(|c| !c.is_flat()) {
@@ -1105,7 +1111,7 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
     // Each patch's destination, its channels, the port's gain and level
     // matrix (rows per destination channel), before the destinations are
     // borrowed for mixing.
-    let mut jobs: Vec<(u64, usize, f32, Option<[[f32; MAX_CH]; MAX_CH]>)> = Vec::with_capacity(v.patches.len());
+    let mut jobs: smallvec::SmallVec<[(u64, usize, f32, Option<[[f32; MAX_CH]; MAX_CH]>); 8]> = smallvec::SmallVec::new();
     let fold = s.port_fold || crate::tune::get(crate::tune::NGS2_COMPAT) & 2 != 0;
     for p in &v.patches {
         // The title patches to rack handles of one-voice racks (mastering,
@@ -1130,13 +1136,15 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
         });
         jobs.push((dest, dch, v.port_volume[port], rows));
     }
+    let vec = crate::tune::get(crate::tune::NGS2_VEC) != 0;
     for (dest, dch, g, rows) in jobs {
         let Some(d) = s.voices.get_mut(&dest) else { continue };
         if d.input.len() < src.len() {
             d.input.resize(src.len(), [0.0; MAX_CH]);
         }
         match &rows {
-            Some(rows) => mix_rows(&mut d.input, src, rows, src_ch, dch, g),
+            Some(rows) if vec => mix_rows(&mut d.input, src, rows, src_ch, dch, g),
+            Some(rows) => mix_rows_lanes(&mut d.input, src, rows, src_ch, dch, g),
             // No matrix: channel to channel; mono feeds the front pair.
             None if src_ch == 1 && dch >= 2 => {
                 for (o, fr) in d.input.iter_mut().zip(src) {
@@ -1144,7 +1152,8 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
                     o[1] += fr[0] * g;
                 }
             }
-            None => mix_direct(&mut d.input, src, src_ch.min(dch), g),
+            None if vec => mix_direct(&mut d.input, src, src_ch.min(dch), g),
+            None => mix_direct_lanes(&mut d.input, src, src_ch.min(dch), g),
         }
     }
 }
@@ -1155,6 +1164,49 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
 /// channel at once (vector operations), each destination's sum in the same
 /// order as row by row.
 fn mix_rows(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], rows: &[[f32; MAX_CH]; MAX_CH], src_ch: usize, dch: usize, g: f32) {
+    let (src_ch, dch) = (src_ch.min(MAX_CH), dch.min(MAX_CH));
+    let mut cols = [[0f32; MAX_CH]; MAX_CH];
+    for (oc, row) in rows.iter().enumerate().take(dch) {
+        for ic in 0..src_ch {
+            cols[ic][oc] = row[ic];
+        }
+    }
+    let m = lane_mask(dch);
+    for (o, fr) in dst.iter_mut().zip(src) {
+        let mut acc = [0f32; MAX_CH];
+        for ic in 0..src_ch {
+            let x = fr[ic];
+            for oc in 0..MAX_CH {
+                acc[oc] += x * cols[ic][oc];
+            }
+        }
+        // (Every lane in vector form, those from dch on kept by the mask: a
+        // loop over the first dch ran lane by lane, ~14% of the sound thread
+        // in busy areas.)
+        for c in 0..MAX_CH {
+            let v = o[c] + acc[c] * g;
+            o[c] = f32::from_bits((v.to_bits() & m[c]) | (o[c].to_bits() & !m[c]));
+        }
+    }
+}
+
+/// dst[c] += src[c] * g for the channels c < n (the rest untouched), every
+/// lane in vector form and the lanes from n on kept by a mask. (The masked
+/// lanes of a per-lane form went through closures the compiler kept: ~8% of
+/// the sound thread.)
+fn mix_direct(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], n: usize, g: f32) {
+    let m = lane_mask(n.min(MAX_CH));
+    for (o, fr) in dst.iter_mut().zip(src) {
+        for c in 0..MAX_CH {
+            let v = o[c] + fr[c] * g;
+            o[c] = f32::from_bits((v.to_bits() & m[c]) | (o[c].to_bits() & !m[c]));
+        }
+    }
+}
+
+/// `mix_rows` as before the masks (`tune ngs2_vec` 0): the destination's
+/// first dch lanes in a loop.
+fn mix_rows_lanes(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], rows: &[[f32; MAX_CH]; MAX_CH], src_ch: usize, dch: usize, g: f32) {
     let (src_ch, dch) = (src_ch.min(MAX_CH), dch.min(MAX_CH));
     let mut cols = [[0f32; MAX_CH]; MAX_CH];
     for (oc, row) in rows.iter().enumerate().take(dch) {
@@ -1176,10 +1228,8 @@ fn mix_rows(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], rows: &[[f32; MAX_
     }
 }
 
-/// dst[c] += src[c] * g for the channels c < n (the rest untouched). (The
-/// masked lanes of a per-lane form went through closures the compiler kept:
-/// ~8% of the sound thread.)
-fn mix_direct(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], n: usize, g: f32) {
+/// `mix_direct` as before the masks (`tune ngs2_vec` 0).
+fn mix_direct_lanes(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], n: usize, g: f32) {
     let n = n.min(MAX_CH);
     if n == MAX_CH {
         for (o, fr) in dst.iter_mut().zip(src) {
@@ -1387,7 +1437,7 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32, idle: bool) -> Ve
                     let out = reverb_grain(v, &input, ch, och, rate, rev_gain);
                     v.fx_idle = scan && v.reverb.as_mut().is_some_and(|r| r.settle(IDLE_EPS));
                     s.idle[IDLE_FX_RUN] += 1;
-                    (input.clone(), Some(out), och, false)
+                    (input, Some(out), och, false)
                 }
                 Kind::Custom if v.taps.is_some() => {
                     let och = (v.out_channels as usize).clamp(1, MAX_CH);
@@ -1841,10 +1891,12 @@ mod tests {
                         o[oc] += acc * 0.7;
                     }
                 }
-                let mut got = dst0.clone();
-                mix_rows(&mut got, &src, &rows, src_ch, dch, 0.7);
-                for (g, w) in got.iter().zip(&want) {
-                    assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "rows {src_ch}->{dch}");
+                for (form, f) in [("masked", mix_rows as fn(&mut [[f32; MAX_CH]], &[[f32; MAX_CH]], &[[f32; MAX_CH]; MAX_CH], usize, usize, f32)), ("lanes", mix_rows_lanes)] {
+                    let mut got = dst0.clone();
+                    f(&mut got, &src, &rows, src_ch, dch, 0.7);
+                    for (g, w) in got.iter().zip(&want) {
+                        assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "rows {src_ch}->{dch} ({form})");
+                    }
                 }
             }
             let mut want = dst0.clone();
@@ -1853,10 +1905,12 @@ mod tests {
                     o[c] += fr[c] * 0.7;
                 }
             }
-            let mut got = dst0.clone();
-            mix_direct(&mut got, &src, src_ch, 0.7);
-            for (g, w) in got.iter().zip(&want) {
-                assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "direct {src_ch}");
+            for (form, f) in [("masked", mix_direct as fn(&mut [[f32; MAX_CH]], &[[f32; MAX_CH]], usize, f32)), ("lanes", mix_direct_lanes)] {
+                let mut got = dst0.clone();
+                f(&mut got, &src, src_ch, 0.7);
+                for (g, w) in got.iter().zip(&want) {
+                    assert!(g.iter().zip(w).all(|(a, b)| a.to_bits() == b.to_bits()), "direct {src_ch} ({form})");
+                }
             }
         }
     }
