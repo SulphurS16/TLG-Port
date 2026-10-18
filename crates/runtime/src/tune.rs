@@ -738,8 +738,13 @@ pub const SURFACE_MEMO: usize = 126;
 /// The texture upload estimate asks the texture memo first, and the guest-read
 /// checks take its entries (`TLG_TEX_MEMO_FIRST`, 1).
 pub const TEX_MEMO_FIRST: usize = 127;
+/// NGS2 click guards (`TLG_NGS2_FADES`, 3): bit 0, sampler voices fade in
+/// over 64 samples at PLAY and a voice stopped or killed while playing ends
+/// with its next 64 samples faded out; bit 1, changes of a port's levels
+/// (volume x matrix) ramp across the next grain.
+pub const NGS2_FADES: usize = 128;
 
-const TABLE: [(&str, &str, i64); 128] = [
+const TABLE: [(&str, &str, i64); 129] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -868,6 +873,7 @@ const TABLE: [(&str, &str, i64); 128] = [
     ("wb_ranges", "TLG_WB_RANGES", 1),
     ("surface_memo", "TLG_SURFACE_MEMO", 1),
     ("tex_memo_first", "TLG_TEX_MEMO_FIRST", 1),
+    ("ngs2_fades", "TLG_NGS2_FADES", 3),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

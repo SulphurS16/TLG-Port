@@ -275,7 +275,28 @@ struct Voice {
     out: Vec<[f32; MAX_CH]>,
     out_ch: usize,
     out_silent: bool,
+    /// Sampler voices: frames of the fade-in left after a PLAY, and the
+    /// system rate they last rendered at (`tune ngs2_fades` bit 0).
+    fade_in: u32,
+    rate: u32,
+    /// The effective levels (port volume x matrix) each patch (port,
+    /// destination) was last mixed with: a change ramps across the next grain
+    /// (`tune ngs2_fades` bit 1). A patch without an entry (a new one, or
+    /// the first grain after a PLAY) mixes at its levels at once.
+    port_last: Vec<(usize, u64, Levels)>,
+    /// Bumped by every change of the voice's port volumes, matrices, levels
+    /// and patches; `port_last` is as of `port_last_gen` (u64::MAX: to be
+    /// made).
+    levels_gen: u64,
+    port_last_gen: u64,
 }
+
+/// Levels from source channels to destination channels: `[dst][src]`.
+type Levels = [[f32; MAX_CH]; MAX_CH];
+
+/// Frames of a voice's fade-in and of its tail when it is stopped or killed
+/// while playing.
+const FADE_FRAMES: usize = 64;
 
 impl Voice {
     fn new(rack: u64, kind: Kind, index: u32) -> Voice {
@@ -317,8 +338,23 @@ impl Voice {
             out: Vec::new(),
             out_ch: 1,
             out_silent: false,
+            fade_in: 0,
+            rate: 0,
+            port_last: Vec::new(),
+            levels_gen: 0,
+            port_last_gen: u64::MAX,
         }
     }
+}
+
+/// The last frames of a sampler voice stopped or killed while playing,
+/// faded out, with the routing it had then (destination, its channels, the
+/// effective levels): mixed into the next grain. (The voice itself stops at
+/// once, as the title expects of its state.)
+struct Tail {
+    frames: Vec<[f32; MAX_CH]>,
+    src_ch: usize,
+    jobs: Vec<(u64, usize, Levels)>,
 }
 
 #[derive(Default)]
@@ -338,6 +374,11 @@ struct State {
     /// Grains skipped as idle and run since the last statistics line
     /// (`IDLE_FX_SKIPPED` ...).
     idle: [u64; 6],
+    /// Stop tails waiting for the next grain, and those made and level ramps
+    /// mixed since the last statistics line.
+    tails: Vec<Tail>,
+    tails_made: u64,
+    ramps: u64,
 }
 
 static NGS2: Mutex<Option<State>> = Mutex::new(None);
@@ -438,6 +479,19 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
         let u64_at = |off: usize| unsafe { *(p.add(off) as *const u64) };
         let f32_at = |off: usize| f32::from_bits(u32_at(off));
         let mut unimpl: Option<&'static str> = None;
+        // A sampler voice stopped or killed while playing ends with a faded
+        // tail (`Tail`) along the routing it has now (`tune ngs2_fades` bit 0).
+        let fades = crate::tune::get(crate::tune::NGS2_FADES);
+        let mut tail_jobs = if id == PARAM_EVENT && fades & 1 != 0 && matches!(u32_at(8), EVENT_STOP | EVENT_STOP_IMMEDIATELY | EVENT_KILL) {
+            s.voices.get(&vh).filter(|v| v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0 && v.flags & STATE_PAUSED == 0 && v.rate != 0).map(|v| {
+                let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
+                let jobs: Vec<(u64, usize, Levels)> = route_jobs(s, v, ch).into_iter().map(|(d, dch, _, g, rows)| (d, dch, effective(g, rows.as_ref(), ch, dch))).collect();
+                (jobs, ch)
+            })
+        } else {
+            None
+        };
+        let mut tail: Option<Tail> = None;
         {
             let Some(v) = s.voices.get_mut(&vh) else { return ERR_INVALID_HANDLE };
             if id == PARAM_EVENT && trace_voices() && v.kind == Kind::Sampler {
@@ -448,6 +502,11 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     EVENT_PLAY => {
                         if v.flags & STATE_PLAYING == 0 {
                             v.env.restart();
+                            // (A new sound: faded in, at its levels from the
+                            // start.)
+                            v.fade_in = if fades & 1 != 0 && v.kind == Kind::Sampler { FADE_FRAMES as u32 } else { 0 };
+                            v.port_last.clear();
+                            v.port_last_gen = u64::MAX;
                         }
                         v.flags = (v.flags | STATE_IN_USE | STATE_PLAYING) & !(STATE_STOPPED | STATE_PAUSED | STATE_EMPTY);
                     }
@@ -455,6 +514,22 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     // through them (the voice ends with the envelope).
                     EVENT_STOP if v.kind == Kind::Sampler && v.flags & STATE_PLAYING != 0 && v.env.release() => {}
                     e @ (EVENT_STOP | EVENT_STOP_IMMEDIATELY | EVENT_KILL) => {
+                        // Its next frames, faded out: the stop's tail. (Read
+                        // before the stop drops the voice's data; through the
+                        // voice's filters, whose state continues.)
+                        if let Some((jobs, ch)) = tail_jobs.take().filter(|(j, _)| !j.is_empty()) {
+                            let rate = v.rate;
+                            let mut frames = Vec::with_capacity(FADE_FRAMES);
+                            render_sampler(v, FADE_FRAMES, rate, &mut frames);
+                            run_eq(v, &mut frames, ch, rate);
+                            for (i, fr) in frames.iter_mut().enumerate() {
+                                let g = (FADE_FRAMES - 1 - i.min(FADE_FRAMES - 1)) as f32 / FADE_FRAMES as f32;
+                                for x in fr.iter_mut() {
+                                    *x *= g;
+                                }
+                            }
+                            tail = Some(Tail { frames, src_ch: ch, jobs });
+                        }
                         v.flags = (v.flags & !(STATE_PLAYING | STATE_PAUSED)) | STATE_STOPPED;
                         if e != EVENT_STOP || v.kind == Kind::Sampler {
                             v.flags &= !STATE_IN_USE;
@@ -473,6 +548,8 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                         // which the PS4 recording does not have.
                         if e == EVENT_KILL && v.kind == Kind::Sampler && crate::tune::get(crate::tune::NGS2_COMPAT) & 1 == 0 {
                             v.patches.clear();
+                            v.port_last.clear();
+                            v.port_last_gen = u64::MAX;
                         }
                     }
                     EVENT_PAUSE => v.flags |= STATE_PAUSED,
@@ -487,6 +564,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                         if trace_voices() && v.port_volume[port] != f32_at(12) {
                             crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): port {port} volume {:.4}", v.kind, v.channels, f32_at(12));
                         }
+                        if v.port_volume[port] != f32_at(12) {
+                            v.levels_gen += 1;
+                        }
                         v.port_volume[port] = f32_at(12);
                     }
                 }
@@ -497,6 +577,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     } else {
                         if trace_voices() && v.port_matrix[port] != u32_at(12) as i32 {
                             crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): port {port} matrix {}", v.kind, v.channels, u32_at(12) as i32);
+                        }
+                        if v.port_matrix[port] != u32_at(12) as i32 {
+                            v.levels_gen += 1;
                         }
                         v.port_matrix[port] = u32_at(12) as i32;
                     }
@@ -516,6 +599,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                             let nz: Vec<String> = l.iter().enumerate().filter(|(_, x)| **x != 0.0).map(|(i, x)| format!("{i}:{x:.3}")).collect();
                             crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): matrix {mid}, {n} levels, nonzero [{}]", v.kind, v.channels, nz.join(" "));
                         }
+                        if v.matrices.get(&mid) != Some(&l) {
+                            v.levels_gen += 1;
+                        }
                         v.matrices.insert(mid, l);
                         v.matrix_src.insert(mid, (levels as u64, n));
                     }
@@ -525,6 +611,9 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                     let port = u32_at(8);
                     let dest_input = u32_at(12);
                     let dest = u64_at(16);
+                    if !v.patches.iter().any(|pa| pa.port == port && pa.dest_input == dest_input && pa.dest == dest) {
+                        v.levels_gen += 1;
+                    }
                     v.patches.retain(|pa| pa.port != port || pa.dest_input != dest_input);
                     if dest != 0 {
                         v.patches.push(Patch { port, dest, dest_input });
@@ -734,6 +823,10 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                 }
                 _ => unimpl = Some("unknown voice parameters"),
             }
+        }
+        if let Some(t) = tail {
+            s.tails.push(t);
+            s.tails_made += 1;
         }
         if let Some(what) = unimpl {
             note(s, what);
@@ -1094,15 +1187,37 @@ fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MA
     }
 }
 
-/// Mixes `src` (`src_ch` channels) of voice `vh` along its patches into the
-/// destination voices' input buses.
-fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
-    let src_ch = src_ch.min(MAX_CH);
-    let Some(v) = s.voices.get(&vh) else { return };
-    // Each patch's destination, its channels, the port's gain and level
-    // matrix (rows per destination channel), before the destinations are
-    // borrowed for mixing.
-    let mut jobs: smallvec::SmallVec<[(u64, usize, f32, Option<[[f32; MAX_CH]; MAX_CH]>); 8]> = smallvec::SmallVec::new();
+/// A patch's effective levels: the port volume times its matrix, or the
+/// default routing without a matrix (mono into the front pair, else channel
+/// to channel).
+fn effective(g: f32, rows: Option<&Levels>, src_ch: usize, dch: usize) -> Levels {
+    let mut lv = [[0f32; MAX_CH]; MAX_CH];
+    match rows {
+        Some(r) => {
+            for oc in 0..dch.min(MAX_CH) {
+                for ic in 0..src_ch.min(MAX_CH) {
+                    lv[oc][ic] = r[oc][ic] * g;
+                }
+            }
+        }
+        None if src_ch == 1 && dch >= 2 => {
+            lv[0][0] = g;
+            lv[1][0] = g;
+        }
+        None => {
+            for c in 0..src_ch.min(dch).min(MAX_CH) {
+                lv[c][c] = g;
+            }
+        }
+    }
+    lv
+}
+
+/// A voice's patches as mixing jobs: destination voice, its channels, the
+/// port, the port's gain and level matrix (rows per destination channel,
+/// for `src_ch` source channels).
+fn route_jobs(s: &State, v: &Voice, src_ch: usize) -> smallvec::SmallVec<[(u64, usize, usize, f32, Option<Levels>); 8]> {
+    let mut jobs = smallvec::SmallVec::new();
     let fold = s.port_fold || crate::tune::get(crate::tune::NGS2_COMPAT) & 2 != 0;
     for p in &v.patches {
         // The title patches to rack handles of one-voice racks (mastering,
@@ -1125,13 +1240,45 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
             }
             rows
         });
-        jobs.push((dest, dch, v.port_volume[port], rows));
+        jobs.push((dest, dch, port, v.port_volume[port], rows));
+    }
+    jobs
+}
+
+/// Mixes `src` (`src_ch` channels) of voice `vh` along its patches into the
+/// destination voices' input buses. A patch whose effective levels changed
+/// since the voice's last grain ramps to them across this one (`tune
+/// ngs2_fades` bit 1); otherwise it mixes at them throughout.
+fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
+    let src_ch = src_ch.min(MAX_CH);
+    let Some(v) = s.voices.get(&vh) else { return };
+    // (The jobs before the destinations are borrowed for mixing.)
+    let jobs = route_jobs(s, v, src_ch);
+    let ramps = crate::tune::get(crate::tune::NGS2_FADES) & 2 != 0;
+    // Levels the title has not touched since the last grain (the usual case)
+    // need no ramp and no new entries.
+    let changed = ramps && v.port_last_gen != v.levels_gen;
+    let mut now: smallvec::SmallVec<[(usize, u64, Levels); 8]> = smallvec::SmallVec::new();
+    let mut from: smallvec::SmallVec<[Option<Levels>; 8]> = smallvec::SmallVec::new();
+    if changed {
+        for &(dest, dch, port, g, ref rows) in &jobs {
+            let lv = effective(g, rows.as_ref(), src_ch, dch);
+            let before = v.port_last.iter().find(|(p, d, _)| *p == port && *d == dest).map(|e| e.2);
+            from.push(before.filter(|b| *b != lv));
+            now.push((port, dest, lv));
+        }
     }
     let vec = crate::tune::get(crate::tune::NGS2_VEC) != 0;
-    for (dest, dch, g, rows) in jobs {
+    let mut ramped = 0;
+    for (k, (dest, dch, _, g, rows)) in jobs.into_iter().enumerate() {
         let Some(d) = s.voices.get_mut(&dest) else { continue };
         if d.input.len() < src.len() {
             d.input.resize(src.len(), [0.0; MAX_CH]);
+        }
+        if let Some(Some(f)) = from.get(k) {
+            mix_ramp(&mut d.input, src, f, &now[k].2, src_ch, dch);
+            ramped += 1;
+            continue;
         }
         match &rows {
             Some(rows) if vec => mix_rows(&mut d.input, src, rows, src_ch, dch, g),
@@ -1145,6 +1292,37 @@ fn route(s: &mut State, vh: u64, src: &[[f32; MAX_CH]], src_ch: usize) {
             }
             None if vec => mix_direct(&mut d.input, src, src_ch.min(dch), g),
             None => mix_direct_lanes(&mut d.input, src, src_ch.min(dch), g),
+        }
+    }
+    s.ramps += ramped;
+    if let Some(v) = s.voices.get_mut(&vh) {
+        if changed {
+            v.port_last.clear();
+            v.port_last.extend(now);
+            v.port_last_gen = v.levels_gen;
+        } else if !ramps && v.port_last_gen != u64::MAX {
+            v.port_last.clear();
+            v.port_last_gen = u64::MAX;
+        }
+    }
+}
+
+/// dst[oc] += sum over ic < src_ch of src[ic] * level[oc][ic] for oc < dch,
+/// the levels moving linearly from `from` (as before the grain) to `to`
+/// (reached at its last frame); with `from` = `to`, mixing at `to`.
+fn mix_ramp(dst: &mut [[f32; MAX_CH]], src: &[[f32; MAX_CH]], from: &Levels, to: &Levels, src_ch: usize, dch: usize) {
+    let n = src.len().min(dst.len());
+    let (src_ch, dch) = (src_ch.min(MAX_CH), dch.min(MAX_CH));
+    for i in 0..n {
+        let t = (i + 1) as f32 / n as f32;
+        let fr = &src[i];
+        let o = &mut dst[i];
+        for oc in 0..dch {
+            let mut acc = 0.0;
+            for ic in 0..src_ch {
+                acc += fr[ic] * (from[oc][ic] + (to[oc][ic] - from[oc][ic]) * t);
+            }
+            o[oc] += acc;
         }
     }
 }
@@ -1336,11 +1514,23 @@ const IDLE_MIXED: usize = 5;
 fn sampler_grain(v: &mut Voice, grain: usize, rate: u32, idle: bool) {
     let mut out = std::mem::take(&mut v.out);
     render_sampler(v, grain, rate, &mut out);
+    v.rate = rate;
     let ch = (v.sampler.channels as usize).clamp(1, MAX_CH);
     if trace_voices() {
         note_dc(v, &out, ch);
     }
     run_eq(v, &mut out, ch, rate);
+    // The fade-in of a new sound (`tune ngs2_fades` bit 0).
+    if v.fade_in > 0 {
+        let done = FADE_FRAMES - (v.fade_in as usize).min(FADE_FRAMES);
+        for (i, fr) in out.iter_mut().take(v.fade_in as usize).enumerate() {
+            let g = (done + i + 1) as f32 / FADE_FRAMES as f32;
+            for x in fr.iter_mut() {
+                *x *= g;
+            }
+        }
+        v.fade_in = v.fade_in.saturating_sub(out.len() as u32);
+    }
     v.peak = peak_of(&out, ch);
     v.peak_win = v.peak_win.max(v.peak);
     v.out = out;
@@ -1504,6 +1694,17 @@ fn render(s: &mut State, system: u64, grain: usize, rate: u32, idle: bool, threa
             route(s, vh, &out, ch);
         }
         s.voices.get_mut(&vh).unwrap().out = out;
+    }
+    // The tails of voices stopped or killed since the last grain, along the
+    // routing they had.
+    for t in std::mem::take(&mut s.tails) {
+        for (dest, dch, lv) in &t.jobs {
+            let Some(d) = s.voices.get_mut(dest) else { continue };
+            if d.input.len() < t.frames.len() {
+                d.input.resize(t.frames.len(), [0.0; MAX_CH]);
+            }
+            mix_ramp(&mut d.input, &t.frames, lv, lv, t.src_ch, *dch);
+        }
     }
     // Mixing voices: deepest upstream first (a voice runs after everything that
     // patches into it; cycles are cut).
@@ -1809,7 +2010,7 @@ sysv! {
             }
             let st = std::mem::take(&mut s.idle);
             crate::info!(
-                "NGS2: {} sampler voices playing (by waveform type {:x?}), {starved} without data; output peak {:.4} over the last 10 s; grains skipped as idle: reverbs and delays {} of {}, submixer filters {} of {}, voice outputs {} of {} (silent, not mixed)",
+                "NGS2: {} sampler voices playing (by waveform type {:x?}), {starved} without data; output peak {:.4} over the last 10 s; grains skipped as idle: reverbs and delays {} of {}, submixer filters {} of {}, voice outputs {} of {} (silent, not mixed); stop tails {}, level ramps {}",
                 by_type.values().sum::<u32>(),
                 by_type,
                 s.peak,
@@ -1818,8 +2019,11 @@ sysv! {
                 st[IDLE_EQ_SKIPPED],
                 st[IDLE_EQ_SKIPPED] + st[IDLE_EQ_RUN],
                 st[IDLE_UNMIXED],
-                st[IDLE_UNMIXED] + st[IDLE_MIXED]
+                st[IDLE_UNMIXED] + st[IDLE_MIXED],
+                s.tails_made,
+                s.ramps
             );
+            (s.tails_made, s.ramps) = (0, 0);
             s.peak = 0.0;
             if trace_voices() {
                 // The mix path's levels: each voice that carried sound, with
@@ -2142,5 +2346,71 @@ mod tests {
             let (p, q) = (&with.voices[&(0x1000 + i)], &without.voices[&(0x1000 + i)]);
             assert_eq!((p.flags, p.peak.to_bits(), p.sampler.pcm.len()), (q.flags, q.peak.to_bits(), q.sampler.pcm.len()), "voice {i}");
         }
+    }
+
+    /// A sampler voice (mono, a constant 0.5 queued) patched on port 0 into
+    /// a stereo submixer, in one system's racks.
+    fn constant_voice() -> (State, u64, u64) {
+        let mut s = State::default();
+        let (sam, bus) = (0x10u64, 0x20u64);
+        for (rack, vh, kind) in [(0x100u64, sam, Kind::Sampler), (0x200, bus, Kind::Submixer)] {
+            s.racks.insert(rack, Rack { system: 1, rack_id: 0, buf: BufferInfo::default(), voices: vec![vh] });
+            s.voices.insert(vh, Voice::new(rack, kind, 0));
+        }
+        let v = s.voices.get_mut(&sam).unwrap();
+        v.sampler.pcm = (0..4800).map(|_| { let mut f = [0f32; MAX_CH]; f[0] = 0.5; f }).collect();
+        v.patches = vec![Patch { port: 0, dest: bus, dest_input: 0 }];
+        (s, sam, bus)
+    }
+
+    #[test]
+    fn play_fades_in_and_kill_ends_with_a_faded_tail() {
+        let (mut s, sam, bus) = constant_voice();
+        let set = |s: &mut State, b: Vec<u64>| assert_eq!(unsafe { control(s, sam, b.as_ptr() as *const u8) }, 0);
+        set(&mut s, param(PARAM_EVENT, &[EVENT_PLAY]));
+        render(&mut s, 1, 256, 48000, false, false);
+        // (The linear resampler's first frame is the voice's start value 0,
+        // then the data.)
+        let first = &s.voices[&bus].input;
+        for i in 1..FADE_FRAMES {
+            let want = 0.5 * (i + 1) as f32 / FADE_FRAMES as f32;
+            assert!((first[i][0] - want).abs() < 1e-6 && first[i][1] == first[i][0], "fade-in frame {i}: {}", first[i][0]);
+        }
+        assert!(first[FADE_FRAMES..].iter().all(|f| f[0] == 0.5));
+        // KILL while playing: the voice stops at once (as the title sees
+        // it), and the next grain carries its next 64 frames, faded out.
+        set(&mut s, param(PARAM_EVENT, &[EVENT_KILL]));
+        assert_eq!(s.voices[&sam].flags & STATE_PLAYING, 0);
+        assert!(s.voices[&sam].patches.is_empty());
+        render(&mut s, 1, 256, 48000, false, false);
+        let next = &s.voices[&bus].input;
+        for i in 0..FADE_FRAMES {
+            let want = 0.5 * (FADE_FRAMES - 1 - i) as f32 / FADE_FRAMES as f32;
+            assert!((next[i][0] - want).abs() < 1e-6, "tail frame {i}: {}", next[i][0]);
+        }
+        assert!(next[FADE_FRAMES..].iter().all(|f| f[0] == 0.0 && f[1] == 0.0));
+        // Nothing more after that.
+        render(&mut s, 1, 256, 48000, false, false);
+        assert!(s.voices[&bus].input.iter().all(|f| f[0] == 0.0));
+    }
+
+    #[test]
+    fn level_changes_ramp_across_a_grain() {
+        let (mut s, sam, bus) = constant_voice();
+        s.voices.get_mut(&sam).unwrap().flags = STATE_IN_USE | STATE_PLAYING;
+        render(&mut s, 1, 256, 48000, false, false);
+        assert!(s.voices[&bus].input[8..].iter().all(|f| f[0] == 0.5));
+        let b = param(PARAM_PORT_VOLUME, &[0, 0.5f32.to_bits()]);
+        assert_eq!(unsafe { control(&mut s, sam, b.as_ptr() as *const u8) }, 0);
+        render(&mut s, 1, 256, 48000, false, false);
+        // From 0.5 x 1.0 to 0.5 x 0.5, reached at the grain's last frame.
+        let got = &s.voices[&bus].input;
+        for (i, f) in got.iter().enumerate() {
+            let want = 0.5 * (1.0 - 0.5 * (i + 1) as f32 / 256.0);
+            assert!((f[0] - want).abs() < 1e-6 && f[1] == f[0], "frame {i}: {} vs {want}", f[0]);
+        }
+        // Unchanged levels after that: constant.
+        render(&mut s, 1, 256, 48000, false, false);
+        assert!(s.voices[&bus].input.iter().all(|f| f[0] == 0.25));
     }
 }
