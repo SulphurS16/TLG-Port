@@ -6053,6 +6053,19 @@ impl Renderer {
         ok
     }
 
+    /// `tex_memo_valid` from the entry this command's upload estimate found
+    /// (`memo_seen`), its generations checked again; else the memo itself.
+    fn tex_memo_valid_seen(&mut self, t: &Tsharp, load_only: bool) -> bool {
+        let addr = t as *const Tsharp as usize;
+        if let Some(e) = self.memo_seen.iter().find(|s| s.0 == addr && s.1 == load_only && s.3 == *t).map(|s| s.2) {
+            self.tex_memo_sync();
+            if self.tex_memo_current(t, e) {
+                return true;
+            }
+        }
+        self.tex_memo_valid(t, load_only)
+    }
+
     /// `tex_memo` holds entries of the current validation epoch only (`tex_memo
     /// 2`: of the current CPU epoch).
     fn tex_memo_sync(&mut self) {
@@ -8045,10 +8058,20 @@ impl Renderer {
         // shadow map sampled from guest memory every frame fell back to the
         // CPU detiler, ~150 ms per frame.)
         let mut n = 0u64;
+        // (`tune tex_memo_first`: sampled textures the memo answers for were
+        // validated in this epoch - no upload; the entries go into
+        // `memo_seen` for `prepare_guest_reads` and the descriptors.)
+        let memo_first = crate::tune::get(crate::tune::TEX_MEMO_FIRST) != 0;
+        if memo_first {
+            self.memo_seen.clear();
+        }
         for p in stages {
             for b in &p.translated.out.bindings {
                 if let BindingKind::Image(i) | BindingKind::StorageImage(i) = b.kind {
                     if let ResolvedRes::Image(t) = &p.resources[i] {
+                        if memo_first && b.kind == BindingKind::Image(i) && self.tex_memo_valid(t, p.load_only.get(i).copied().unwrap_or(false)) {
+                            continue;
+                        }
                         // Images that are GPU-produced or already validated this epoch need no upload.
                         // (A base found ready counts as ready for the rest of
                         // the CPU epoch: an estimate, a short one is retried.)
@@ -8326,7 +8349,10 @@ impl Renderer {
     /// buffer writes that its CPU-sourced textures may read (both may submit
     /// and wait, which is not allowed once preparation has started).
     fn prepare_guest_reads(&mut self, stages: &[&Prepared]) {
-        self.memo_seen.clear();
+        // (`tex_memo_first`: the estimate cleared it and found the entries.)
+        if crate::tune::get(crate::tune::TEX_MEMO_FIRST) == 0 {
+            self.memo_seen.clear();
+        }
         self.zc_revalidate();
         // Buffers first: their render target write-backs may write guest
         // memory that CPU-sourced textures read.
@@ -8389,7 +8415,7 @@ impl Renderer {
                                 // (Sampled through the memo: validated in this
                                 // epoch with nothing changed at its base since -
                                 // the checks below would find it so again.)
-                                if b.kind == BindingKind::Image(i) && self.tex_memo_valid(t, p.load_only.get(i).copied().unwrap_or(false)) {
+                                if b.kind == BindingKind::Image(i) && self.tex_memo_valid_seen(t, p.load_only.get(i).copied().unwrap_or(false)) {
                                     continue;
                                 }
                                 // Only guest-memory reads need this batch's

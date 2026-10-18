@@ -735,8 +735,11 @@ pub const WB_RANGES: usize = 125;
 /// found skip those lookups while the image indexes are unchanged
 /// (`TLG_SURFACE_MEMO`, 1).
 pub const SURFACE_MEMO: usize = 126;
+/// The texture upload estimate asks the texture memo first, and the guest-read
+/// checks take its entries (`TLG_TEX_MEMO_FIRST`, 1).
+pub const TEX_MEMO_FIRST: usize = 127;
 
-const TABLE: [(&str, &str, i64); 127] = [
+const TABLE: [(&str, &str, i64); 128] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -864,6 +867,7 @@ const TABLE: [(&str, &str, i64); 127] = [
     ("vbind_fast", "TLG_VBIND_FAST", 1),
     ("wb_ranges", "TLG_WB_RANGES", 1),
     ("surface_memo", "TLG_SURFACE_MEMO", 1),
+    ("tex_memo_first", "TLG_TEX_MEMO_FIRST", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
