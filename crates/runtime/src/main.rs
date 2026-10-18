@@ -442,7 +442,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
             _ => Err(format!("unknown command '{cmd}'")),
         };
         match result {
-            Ok(()) => info!("control: '{line}' at flip {flip}"),
+            Ok(()) => info!("control: '{line}' at flip {flip}, audio dump frame {}", audio::dumped_frames(0)),
             Err(e) => warn!("control: '{line}': {e}"),
         }
     }

@@ -1854,20 +1854,28 @@ fn note_dc(v: &Voice, buf: &[[f32; MAX_CH]], ch: usize) {
 /// pair; no centre or LFE) times wet, plus the input times dry.
 fn reverb_grain(v: &mut Voice, input: &[[f32; MAX_CH]], ich: usize, och: usize, rate: u32, wet_gain: f32) -> Vec<[f32; MAX_CH]> {
     let p = v.i3dl2;
-    if !v.reverb.as_ref().is_some_and(|r| r.matches(&p, rate)) {
-        v.reverb = Some(Reverb::new(p, rate));
+    let mode = crate::tune::get(crate::tune::NGS2_REV8);
+    // (Every channel its own late reverb with four or more outputs.)
+    let multi = mode & 1 != 0 && och >= 4;
+    if !v.reverb.as_ref().is_some_and(|r| r.matches(&p, rate, multi)) {
+        v.reverb = Some(Reverb::new(p, rate, multi));
     }
     let r = v.reverb.as_mut().unwrap();
     let dry = p.dry;
+    // The input: the mean of the channels, or the non-LFE channels' sum /
+    // sqrt(2 x their number) (`tune ngs2_rev8` bit 1).
+    let no_lfe = mode & 2 != 0 && ich >= 4;
+    let in_gain = if no_lfe { 1.0 / ((2 * (ich - 1)) as f32).sqrt() } else { 1.0 / ich as f32 };
+    let mono: Vec<f32> = input.iter().map(|fr| (fr[..ich].iter().sum::<f32>() - if no_lfe { fr[3] } else { 0.0 }) * in_gain).collect();
+    let mut wet = Vec::with_capacity(input.len());
+    r.process_block(&mono, &mut wet);
     input
         .iter()
-        .map(|fr| {
-            let mono = fr[..ich].iter().sum::<f32>() / ich as f32;
-            let [l, rr] = r.process(mono);
+        .zip(&wet)
+        .map(|(fr, w)| {
             let mut o = [0f32; MAX_CH];
-            o[0] = l * wet_gain;
-            if och > 1 {
-                o[1] = rr * wet_gain;
+            for c in 0..och.min(MAX_CH) {
+                o[c] = w[c] * wet_gain;
             }
             if dry != 0.0 {
                 for c in 0..och.min(ich) {

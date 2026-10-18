@@ -136,12 +136,42 @@ struct Allpass {
 }
 
 impl Allpass {
-    fn process(&mut self, x: f32) -> f32 {
-        let b = self.buf[self.pos];
-        self.buf[self.pos] = x + b * 0.5;
-        self.pos = wrap_inc(self.pos, self.buf.len());
-        b - x * 0.5
+    /// `process` frame by frame over a block no longer than the delay, in
+    /// place: every value read was written before the block, so the ring's
+    /// contiguous runs go in vector form (the same results).
+    fn process_block(&mut self, x: &mut [f32]) {
+        let n = self.buf.len();
+        debug_assert!(x.len() <= n);
+        let mut i = 0;
+        while i < x.len() {
+            let run = (n - self.pos).min(x.len() - i);
+            for (b, v) in self.buf[self.pos..self.pos + run].iter_mut().zip(&mut x[i..i + run]) {
+                let bv = *b;
+                *b = *v + bv * 0.5;
+                *v = bv - *v * 0.5;
+            }
+            self.pos += run;
+            if self.pos == n {
+                self.pos = 0;
+            }
+            i += run;
+        }
     }
+}
+
+/// The Walsh-Hadamard transform of eight values: h[k] = sum over j of
+/// (-1)^popcount(k & j) x[j] (Sylvester's rows; row 0 the plain sum).
+fn fwht8(mut h: [f32; 8]) -> [f32; 8] {
+    for len in [1, 2, 4] {
+        for i in (0..8).step_by(2 * len) {
+            for j in i..i + len {
+                let (a, b) = (h[j], h[j + len]);
+                h[j] = a + b;
+                h[j + len] = a - b;
+            }
+        }
+    }
+    h
 }
 
 /// `(i + 1) % n` without a division (`i < n`).
@@ -190,8 +220,14 @@ fn max_abs_frames(v: &[[f32; 8]]) -> f32 {
 pub struct Reverb {
     p: I3dl2,
     rate: u32,
+    /// Output channels with their own late reverb (`multi`): every channel
+    /// but the LFE, each a different sign mix of the combs (Sylvester-Hadamard
+    /// rows 1-7: mutually uncorrelated, each at the plain sum's energy) through
+    /// its own allpass pair. Otherwise FL and FR only, both the plain sum.
+    multi: bool,
     combs: Vec<Comb>,
-    ap: [Vec<Allpass>; 2],
+    /// Allpass pairs per output slot: FL, FR (then C, SL, SR, BL, BR).
+    ap: Vec<[Allpass; 2]>,
     /// Pre-delay line (mono) and its read offsets for the reflections tap and
     /// the late reverb.
     pre: Vec<f32>,
@@ -210,14 +246,25 @@ pub struct Reverb {
     /// Output scale: energy normalization x Room x Reverb x wet.
     late_gain: f32,
     refl_gain: f32,
+    /// Scratch of `process_block`: per frame the combs' mix (the plain sum,
+    /// or the Hadamard rows) and the reflections; one slot's samples.
+    mix: Vec<[f32; 8]>,
+    refl: Vec<f32>,
+    slot: Vec<f32>,
 }
 
+/// The output channels of a multichannel reverb's slots (the LFE, channel 3,
+/// has none).
+const REVERB_SLOTS: [usize; 7] = [0, 1, 2, 4, 5, 6, 7];
+
 impl Reverb {
-    pub fn new(p: I3dl2, rate: u32) -> Reverb {
+    pub fn new(p: I3dl2, rate: u32, multi: bool) -> Reverb {
         let rate = rate.max(8000);
         let scale = rate as f32 / 48000.0;
         let decay = p.decay.clamp(0.1, 20.0);
-        let combs: Vec<Comb> = [1557usize, 1617, 1491, 1422, 1277, 1356]
+        // (Freeverb's comb lengths; the two-channel form keeps its six.)
+        let lens: &[usize] = if multi { &[1557, 1617, 1491, 1422, 1277, 1356, 1188, 1116] } else { &[1557, 1617, 1491, 1422, 1277, 1356] };
+        let combs: Vec<Comb> = lens
             .iter()
             .map(|&d| {
                 let len = ((d as f32 * scale) as usize).max(1);
@@ -225,9 +272,12 @@ impl Reverb {
                 Comb { buf: vec![0.0; len], pos: 0, fb: 10f32.powf(-3.0 * t / decay), lp: 0.0 }
             })
             .collect();
-        let ap = |ds: &[usize]| ds.iter().map(|&d| Allpass { buf: vec![0.0; ((d as f32 * scale) as usize).max(1)], pos: 0 }).collect::<Vec<_>>();
+        let ap = |d: usize| Allpass { buf: vec![0.0; ((d as f32 * scale) as usize).max(1)], pos: 0 };
+        let slots = if multi { REVERB_SLOTS.len() } else { 2 };
+        let aps = (0..slots).map(|k| [ap(556 + 23 * k), ap(441 + 23 * k)]).collect();
         // Energy of the summed combs' impulse responses (unit input):
-        // sum over combs of 1 / (1 - fb^2); normalized to 1.
+        // sum over combs of 1 / (1 - fb^2); normalized to 1 (signs in the
+        // sums change nothing: the combs' outputs are uncorrelated).
         let energy: f32 = combs.iter().map(|c| 1.0 / (1.0 - c.fb * c.fb).max(1e-4)).sum();
         let norm = 1.0 / energy.sqrt();
         // High frequencies decay faster by DecayHFRatio (1 = as fast as lows).
@@ -241,8 +291,9 @@ impl Reverb {
         Reverb {
             p,
             rate,
+            multi,
             combs,
-            ap: [ap(&[556, 441]), ap(&[579, 464])],
+            ap: aps,
             pre: vec![0.0; late_delay.max(refl_delay) + 2],
             pre_pos: 0,
             refl_delay,
@@ -255,12 +306,15 @@ impl Reverb {
             hp_r: one_pole_r(REVERB_HP_HZ, rate),
             late_gain: norm * room * mb(p.reverb) * p.wet,
             refl_gain: room * mb(p.reflections) * p.wet,
+            mix: Vec::new(),
+            refl: Vec::new(),
+            slot: Vec::new(),
         }
     }
 
-    /// Whether the parameters or rate changed enough to rebuild.
-    pub fn matches(&self, p: &I3dl2, rate: u32) -> bool {
-        self.p == *p && self.rate == rate.max(8000)
+    /// Whether the parameters, rate or form changed enough to rebuild.
+    pub fn matches(&self, p: &I3dl2, rate: u32, multi: bool) -> bool {
+        self.p == *p && self.rate == rate.max(8000) && self.multi == multi
     }
 
     /// Whether the reverb has died away: every value of its state under
@@ -289,42 +343,82 @@ impl Reverb {
         true
     }
 
-    /// One frame: mono input (the channels' mean), a stereo pair out.
-    pub fn process(&mut self, x: f32) -> [f32; 2] {
-        // (DC and the lowest rumble kept out: at DC every comb's gain is
-        // 1 / (1 - fb), ~13 times the reverb's broadband level for a 3 s
-        // decay, so a low thump came back as a DC swell of the decay's
-        // length.)
-        let hp = x - self.hp_x + self.hp_r * self.hp_y;
-        self.hp_x = x;
-        self.hp_y = if hp.abs() < 1e-20 { 0.0 } else { hp };
-        self.in_lp = hp * (1.0 - self.in_coef) + self.in_lp * self.in_coef;
-        let n = self.pre.len();
-        self.pre[self.pre_pos] = self.in_lp;
-        let at = |d: usize| {
-            let d = d.min(n - 1);
-            if self.pre_pos >= d { self.pre_pos - d } else { self.pre_pos + n - d }
-        };
-        let late_in = self.pre[at(self.late_delay)];
-        let refl = self.pre[at(self.refl_delay)] * self.refl_gain;
-        self.pre_pos = wrap_inc(self.pre_pos, n);
-        let mut sum = 0.0;
-        for c in &mut self.combs {
-            let y = c.buf[c.pos];
-            c.lp = y * (1.0 - self.damp) + c.lp * self.damp;
-            c.buf[c.pos] = late_in + c.lp * c.fb;
-            c.pos = wrap_inc(c.pos, c.buf.len());
-            sum += y;
+    /// One frame: mono input, the output channels out (multichannel: all but
+    /// the LFE; otherwise FL and FR).
+    pub fn process(&mut self, x: f32) -> [f32; 8] {
+        let mut out = Vec::with_capacity(1);
+        self.process_block(&[x], &mut out);
+        out[0]
+    }
+
+    /// `process` over a block of frames (into `out`, cleared first): the
+    /// input stage and the combs frame by frame (the combs' damping
+    /// recursions interleaved), then each output slot's mix and allpasses in
+    /// runs no longer than the shortest allpass, in vector form.
+    pub fn process_block(&mut self, x: &[f32], out: &mut Vec<[f32; 8]>) {
+        out.clear();
+        let run = self.ap.iter().flatten().map(|a| a.buf.len()).min().unwrap_or(1).max(1);
+        for xs in x.chunks(run) {
+            self.run(xs, out);
         }
-        let mut out = [0.0; 2];
-        for (k, aps) in self.ap.iter_mut().enumerate() {
-            let mut s = sum;
-            for a in aps.iter_mut() {
-                s = a.process(s);
+    }
+
+    fn run(&mut self, xs: &[f32], out: &mut Vec<[f32; 8]>) {
+        let (mut mix, mut refl, mut slot) = (std::mem::take(&mut self.mix), std::mem::take(&mut self.refl), std::mem::take(&mut self.slot));
+        mix.clear();
+        refl.clear();
+        for &x in xs {
+            // (DC and the lowest rumble kept out: at DC every comb's gain is
+            // 1 / (1 - fb), ~13 times the reverb's broadband level for a 3 s
+            // decay, so a low thump came back as a DC swell of the decay's
+            // length.)
+            let hp = x - self.hp_x + self.hp_r * self.hp_y;
+            self.hp_x = x;
+            self.hp_y = if hp.abs() < 1e-20 { 0.0 } else { hp };
+            self.in_lp = hp * (1.0 - self.in_coef) + self.in_lp * self.in_coef;
+            let n = self.pre.len();
+            self.pre[self.pre_pos] = self.in_lp;
+            let at = |d: usize| {
+                let d = d.min(n - 1);
+                if self.pre_pos >= d { self.pre_pos - d } else { self.pre_pos + n - d }
+            };
+            let late_in = self.pre[at(self.late_delay)];
+            refl.push(self.pre[at(self.refl_delay)] * self.refl_gain);
+            self.pre_pos = wrap_inc(self.pre_pos, n);
+            let mut y = [0f32; 8];
+            for (c, yo) in self.combs.iter_mut().zip(y.iter_mut()) {
+                let v = c.buf[c.pos];
+                c.lp = v * (1.0 - self.damp) + c.lp * self.damp;
+                c.buf[c.pos] = late_in + c.lp * c.fb;
+                c.pos = wrap_inc(c.pos, c.buf.len());
+                *yo = v;
             }
-            out[k] = s * self.late_gain + refl;
+            // Multichannel: the Hadamard rows (slot k takes row k + 1);
+            // otherwise the plain sum (both slots).
+            mix.push(if self.multi {
+                fwht8(y)
+            } else {
+                let mut m = [0f32; 8];
+                m[0] = y.iter().sum();
+                m
+            });
         }
-        out
+        let base = out.len();
+        out.resize(base + xs.len(), [0.0; 8]);
+        slot.resize(xs.len(), 0.0);
+        for (k, aps) in self.ap.iter_mut().enumerate() {
+            let (row, ch) = if self.multi { (k + 1, REVERB_SLOTS[k]) } else { (0, k) };
+            for (s, m) in slot.iter_mut().zip(&mix) {
+                *s = m[row];
+            }
+            for a in aps.iter_mut() {
+                a.process_block(&mut slot);
+            }
+            for ((o, &s), &r) in out[base..].iter_mut().zip(&slot).zip(&refl) {
+                o[ch] = s * self.late_gain + if ch < 2 { r } else { 0.0 };
+            }
+        }
+        (self.mix, self.refl, self.slot) = (mix, refl, slot);
     }
 }
 
@@ -986,7 +1080,7 @@ mod tests {
     #[test]
     fn reverb_is_wet_only_and_decays() {
         let p = I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 1.0, decay_hf: 1.0, reflections: -10000, reflections_delay: 0.01, reverb: 0, reverb_delay: 0.0 };
-        let mut r = Reverb::new(p, 48000);
+        let mut r = Reverb::new(p, 48000, false);
         // An impulse: no output at once (wet only), energy near 1, and the
         // last 0.5 s far below the first.
         let first = r.process(1.0);
@@ -1010,24 +1104,88 @@ mod tests {
     }
 
     #[test]
+    fn reverb_blocks_match_frame_by_frame() {
+        // Grains (and odd lengths, longer than an allpass) give the frame-by-
+        // frame results bit for bit, in both forms.
+        let p = I3dl2 { wet: 1.0, dry: 0.0, room: -200, room_hf: -300, decay: 2.7, decay_hf: 0.7, reflections: -1200, reflections_delay: 0.02, reverb: 500, reverb_delay: 0.03 };
+        let mut x = 0x1357_2468u32;
+        let input: Vec<f32> = (0..6000)
+            .map(|i| {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                if i % 1500 < 400 { (x as i32) as f32 / 2.2e9 } else { 0.0 }
+            })
+            .collect();
+        for multi in [false, true] {
+            let mut a = Reverb::new(p, 48000, multi);
+            let want: Vec<[f32; 8]> = input.iter().map(|&v| a.process(v)).collect();
+            let mut b = Reverb::new(p, 48000, multi);
+            let mut got = Vec::new();
+            let mut out = Vec::new();
+            for chunk in input.chunks(700).flat_map(|c| c.chunks(256)) {
+                b.process_block(chunk, &mut out);
+                got.extend_from_slice(&out);
+            }
+            assert_eq!(got.len(), want.len());
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(g.iter().zip(w).all(|(p, q)| p.to_bits() == q.to_bits()), "multi {multi} frame {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn multichannel_reverb_fills_every_channel_but_the_lfe() {
+        // Noise in: each output channel but the LFE carries the late reverb
+        // at about the two-channel form's energy, the channels mutually
+        // uncorrelated (|r| < 0.1), the LFE silent.
+        let p = I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 2.0, decay_hf: 0.8, reflections: -10000, reflections_delay: 0.01, reverb: 0, reverb_delay: 0.02 };
+        let (mut multi, mut two) = (Reverb::new(p, 48000, true), Reverb::new(p, 48000, false));
+        let mut x = 0x2468_ace1u32;
+        let (mut e, mut e2, mut cross) = ([0f64; 8], 0f64, [[0f64; 8]; 8]);
+        for i in 0..48000 * 4 {
+            x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let s = (x as i32) as f32 / 2.2e9;
+            let (y, y2) = (multi.process(s), two.process(s));
+            if i < 48000 {
+                continue;
+            }
+            e2 += (y2[0] as f64).powi(2);
+            for a in 0..8 {
+                e[a] += (y[a] as f64).powi(2);
+                for b in 0..8 {
+                    cross[a][b] += y[a] as f64 * y[b] as f64;
+                }
+            }
+        }
+        assert_eq!(e[3], 0.0);
+        for a in REVERB_SLOTS {
+            let db = 10.0 * (e[a] / e2).log10();
+            assert!(db.abs() < 1.5, "channel {a}: {db:.2} dB against the two-channel form");
+            for b in REVERB_SLOTS.into_iter().filter(|&b| b > a) {
+                let r = cross[a][b] / (e[a] * e[b]).sqrt();
+                assert!(r.abs() < 0.1, "channels {a} and {b}: correlation {r:.3}");
+            }
+        }
+    }
+
+    #[test]
     fn reverb_passes_no_dc() {
         // A constant input (DC) leaves no lasting output: the combs used to
         // hold ~13 times the broadband gain at DC.
-        let mut r = Reverb::new(I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 3.0, decay_hf: 0.8, reflections: 0, reflections_delay: 0.02, reverb: 0, reverb_delay: 0.04 }, 48000);
+        let mut r = Reverb::new(I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 3.0, decay_hf: 0.8, reflections: 0, reflections_delay: 0.02, reverb: 0, reverb_delay: 0.04 }, 48000, false);
         let mut last = 0f32;
         for i in 0..48000 * 3 {
-            let [l, _] = r.process(1.0);
+            let l = r.process(1.0)[0];
             if i >= 48000 * 5 / 2 {
                 last = last.max(l.abs());
             }
         }
         assert!(last < 0.01, "lasting output {last}");
         // (Speech-band content still reverberates.)
-        let mut r = Reverb::new(I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 3.0, decay_hf: 0.8, reflections: 0, reflections_delay: 0.02, reverb: 0, reverb_delay: 0.04 }, 48000);
+        let mut r = Reverb::new(I3dl2 { wet: 1.0, dry: 0.0, room: 0, room_hf: 0, decay: 3.0, decay_hf: 0.8, reflections: 0, reflections_delay: 0.02, reverb: 0, reverb_delay: 0.04 }, 48000, false);
         let mut e = 0f32;
         for i in 0..48000 {
             let x = if i < 4800 { (i as f32 * std::f32::consts::TAU * 440.0 / 48000.0).sin() } else { 0.0 };
-            let [l, _] = r.process(x);
+            let l = r.process(x)[0];
             if i >= 9600 {
                 e += l * l;
             }
@@ -1131,7 +1289,7 @@ mod tests {
         // A reverb and a delay after an impulse: not settled while their
         // tails ring, settled within seconds of silence and then cleared:
         // silence in, silence out.
-        let mut r = Reverb::new(I3dl2::default(), 48000);
+        let mut r = Reverb::new(I3dl2::default(), 48000, false);
         r.process(1.0);
         for _ in 0..4800 {
             r.process(0.0);
@@ -1146,7 +1304,7 @@ mod tests {
             assert!(n < 48000 * 30, "the reverb never settled");
         }
         for _ in 0..48000 {
-            assert_eq!(r.process(0.0), [0.0, 0.0]);
+            assert_eq!(r.process(0.0), [0.0; 8]);
         }
         let words = [0, 0, 0.5f32.to_bits(), 0.3f32.to_bits(), 8000f32.to_bits(), 2, 0.6f32.to_bits(), 120f32.to_bits(), 0.4f32.to_bits(), 250f32.to_bits()];
         let mut t = Taps::from_words(&words, 48000).unwrap();

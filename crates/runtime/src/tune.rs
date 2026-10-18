@@ -743,8 +743,13 @@ pub const TEX_MEMO_FIRST: usize = 127;
 /// with its next 64 samples faded out; bit 1, changes of a port's levels
 /// (volume x matrix) ramp across the next grain.
 pub const NGS2_FADES: usize = 128;
+/// NGS2 reverb racks (`TLG_NGS2_REV8`, 3): bit 0, a late reverb of its own
+/// in every output channel but the LFE (else FL and FR only); bit 1, the
+/// input as the non-LFE channels' sum / sqrt(2 x their number) (else the
+/// mean of all channels).
+pub const NGS2_REV8: usize = 129;
 
-const TABLE: [(&str, &str, i64); 129] = [
+const TABLE: [(&str, &str, i64); 130] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -874,6 +879,7 @@ const TABLE: [(&str, &str, i64); 129] = [
     ("surface_memo", "TLG_SURFACE_MEMO", 1),
     ("tex_memo_first", "TLG_TEX_MEMO_FIRST", 1),
     ("ngs2_fades", "TLG_NGS2_FADES", 3),
+    ("ngs2_rev8", "TLG_NGS2_REV8", 3),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
