@@ -194,7 +194,7 @@ new_shaders = wait
 gpu = auto
 # Master volume, 0-100.
 volume = 100
-# The prepared game files (the launcher's setup fills these in).
+# The game folders (the launcher sets these).
 game_dir =
 update_dir =
 # The launcher closes when the game starts (on/off).

@@ -7,8 +7,8 @@
 //!   everything in `<exe dir>\user` (or `<dir>`).
 //! - Installed release (`tlg-release.txt` beside the executable, or no
 //!   checkout around it): settings, bindings and saves in `%APPDATA%\TLG`,
-//!   caches and logs in `%LOCALAPPDATA%\TLG`, prepared game files by
-//!   default in `%LOCALAPPDATA%\TLG\game`.
+//!   caches and logs in `%LOCALAPPDATA%\TLG`; game folders not set in the
+//!   settings are looked for in `%LOCALAPPDATA%\TLG\game`.
 
 use std::path::{Path, PathBuf};
 
@@ -34,7 +34,7 @@ pub struct Paths {
     pub user: PathBuf,
     /// Pipeline cache, the guest's runtime directories, logs.
     pub cache: PathBuf,
-    /// Where setup puts prepared game files by default.
+    /// Where game folders not set in the settings are looked for.
     pub game_root: PathBuf,
 }
 

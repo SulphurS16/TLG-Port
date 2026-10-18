@@ -1,6 +1,6 @@
 # Puts the project-local toolchain (local\tools) on PATH for this PowerShell session.
 #   . .\tools\env.ps1
-# Nothing here is installed system-wide; see tools\bootstrap.ps1 and docs\PROVENANCE.md.
+# Nothing here is installed system-wide; see tools\bootstrap.ps1.
 $root = Split-Path -Parent $PSScriptRoot
 $t = Join-Path $root 'local\tools'
 $env:RUSTUP_HOME = Join-Path $t 'rustup'

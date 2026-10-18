@@ -633,7 +633,7 @@ fn main() {
         let dirs: Vec<String> = app_dirs.iter().map(|d| format!("  {}", d.display())).collect();
         startup_failure(
             "Game files not found",
-            &format!("No prepared game files (eboot.bin) were found in:\n{}\n\nStart the launcher (tlg-launcher.exe) and run its game-file setup, or point settings.txt (game_dir, update_dir) at your prepared copy.", dirs.join("\n")),
+            &format!("No game files (eboot.bin) were found in:\n{}\n\nChoose the game folders in the launcher (tlg-launcher.exe).", dirs.join("\n")),
             1,
         );
     };
@@ -678,7 +678,7 @@ fn main() {
     // Modules.
     let t0 = Instant::now();
     let eboot = loader::load(&eboot_path, true).unwrap_or_else(|e| {
-        startup_failure("Game files unusable", &format!("Loading {} failed: {e}\n\nCheck the game files with the launcher's Verify.", eboot_path.display()), 1);
+        startup_failure("Game files unusable", &format!("Loading {} failed: {e}\n\nCheck the game folders in the launcher.", eboot_path.display()), 1);
     });
     let mut libs: Vec<Arc<loader::LoadedModule>> = Vec::new();
     for name in ["libc.prx", "libSceFios2.prx"] {
@@ -686,7 +686,7 @@ fn main() {
         match p {
             Some(p) => match loader::load(&p, false) {
                 Ok(m) => libs.push(m),
-                Err(e) => startup_failure("Game files unusable", &format!("Loading {} failed: {e}\n\nCheck the game files with the launcher's Verify.", p.display()), 1),
+                Err(e) => startup_failure("Game files unusable", &format!("Loading {} failed: {e}\n\nCheck the game folders in the launcher.", p.display()), 1),
             },
             None => warn!("{name} not found in sce_module"),
         }

@@ -38,6 +38,6 @@ if (-not (Test-Path (Join-Path $tools 'cargo\bin\cargo.exe'))) {
   $h = (Get-FileHash -Algorithm SHA256 $ri).Hash.ToLower()
   if ($h -ne $want) { throw "rustup-init hash mismatch ($h, published $want)" }
   $env:RUSTUP_INIT_SKIP_PATH_CHECK = 'yes'
-  # Pinned to the compiler the imported runtime was last built and tested with (docs/PROVENANCE.md).
+  # Pinned to the compiler the runtime is built and tested with.
   & $ri -y --no-modify-path --profile minimal --default-host x86_64-pc-windows-gnullvm --default-toolchain 1.99.0
 } else { Write-Host "ok rust" }

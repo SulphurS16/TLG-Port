@@ -18,6 +18,13 @@ fn main() {
     }
     build.include(&dir).opt_level(2).warnings(false).compile("atrac9");
     embed_resources();
+    // Symbol names for log lines (data/ps4-names.txt) where the checkout has them.
+    println!("cargo:rustc-check-cfg=cfg(nid_names)");
+    let names = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/ps4-names.txt");
+    println!("cargo:rerun-if-changed={}", names.display());
+    if names.is_file() {
+        println!("cargo:rustc-cfg=nid_names");
+    }
 }
 
 /// res/app.rc (manifest: Common Controls 6 for message boxes, per-monitor

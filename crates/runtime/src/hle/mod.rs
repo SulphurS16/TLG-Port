@@ -270,11 +270,14 @@ pub fn registry() -> &'static Registry {
     })
 }
 
-/// NID -> name table for diagnostics (built from data/ps4-names.txt and the registry).
+/// NID -> name table for diagnostics: names from data/ps4-names.txt where a
+/// checkout has that file (`nid_names`, set by build.rs), else empty.
 pub fn nid_names() -> &'static HashMap<String, String> {
     static NAMES: OnceLock<HashMap<String, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
+        #[allow(unused_mut)]
         let mut m = HashMap::new();
+        #[cfg(nid_names)]
         for line in include_str!("../../../../data/ps4-names.txt").lines() {
             let n = line.trim();
             if n.is_empty() || n.starts_with('#') || n.contains(' ') || n.ends_with('?') {

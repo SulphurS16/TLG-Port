@@ -5,7 +5,7 @@ members = ["crates/*"]
 default-members = ["crates/config", "crates/prep", "crates/runtime", "crates/gcn", "crates/sce-elf", "crates/tlgdis", "crates/tlgdbg"]
 
 [workspace.package]
-version = "0.3.9"
+version = "0.4.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -22,8 +22,11 @@ panic = "abort"
 incremental = true
 codegen-units = 64
 
+# The player package (tools/package.ps1): no debug information, symbols stripped.
 [profile.dist]
 inherits = "release"
+debug = false
+strip = true
 incremental = false
 codegen-units = 16
 
