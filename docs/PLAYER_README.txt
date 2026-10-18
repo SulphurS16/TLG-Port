@@ -1,10 +1,12 @@
 The Last Guardian - unofficial PC port 0.4.0 for Windows (64-bit)
 ==================================================================
 
-A native Windows version of The Last Guardian (PS4, USA, CUSA03627). The
-game's own program runs on your processor; the PS4's system libraries are
-reimplemented and the graphics are drawn with Vulkan. It uses your own copy
-of the game's files. Nothing of the game is included.
+An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627). It is
+not rebuilt from the game's source code: it runs the game's own PS4 program
+from your copy of the game's files. The program's x86-64 code runs directly
+on your processor (no CPU emulation); the PS4 system libraries it calls are
+reimplemented for Windows, and its graphics commands and shaders are
+translated to Vulkan. Nothing of the game is included.
 
 Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment,
 genDESIGN or any other rights holder.

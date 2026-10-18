@@ -1,12 +1,12 @@
 # The Last Guardian: unofficial PC port
 
-A native Windows version of The Last Guardian (PS4, USA, CUSA03627). The game's own PS4 program runs directly on your PC's processor; the PS4's system libraries, graphics, sound and input are reimplemented for Windows, with Vulkan for the graphics. It uses your own copy of the game's files. This project contains no game data, no game code and no keys, and it decrypts nothing.
+An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627) for Windows. It is not rebuilt from the game's source code: it runs the game's own PS4 program, from your copy of the game's files, on a compatibility layer made for this game. The program's x86-64 code runs directly on your processor, without CPU emulation; the PS4 system libraries it calls are reimplemented for Windows (high-level emulation), and its graphics commands and shaders are translated to Vulkan. This project contains no game data, no game code and no keys, and it decrypts nothing.
 
 Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, genDESIGN or any other rights holder. The Last Guardian is a trademark of Sony Interactive Entertainment.
 
 ## Highlights
 
-- Native, not emulated. The game's own x86-64 code runs directly on your processor.
+- No CPU emulation: the game's own x86-64 code runs directly on your processor.
 - Windowed, borderless or fullscreen, with a render resolution from 1280x720 to 3840x2160.
 - 30 fps (the game's own limit) or 60 fps (experimental), at the game's normal speed.
 - Mouse camera with raw input; every keyboard and mouse control can be changed.
@@ -14,7 +14,9 @@ Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, ge
 
 ## How it works
 
-The PS4 has an x86-64 processor, like a PC. The port loads the game's program from your files and links it to its own implementation of the PS4's system libraries: memory, threads, files, saves, sound (the game's NGS2 mixer with ATRAC9 and HE-VAG audio), movies, video output and controllers. The PS4 graphics chip's command stream is translated to Vulkan, and its shaders to SPIR-V as the game uses them.
+The PS4 has an x86-64 processor, like a PC, so the game's program can run on a PC processor. The port loads that program (eboot.bin and the libraries in its sce_module folder) from your files and links it to its own implementation of the PS4's system libraries: memory, threads, files, saves, sound (the game's NGS2 mixer with ATRAC9 and HE-VAG audio), movies, video output and controllers. While loading, it adjusts a few kinds of instructions: thread-local storage goes through Windows, and AMD's SSE4a instructions are emulated on processors that lack them.
+
+The game drives the PS4's graphics chip directly, without a graphics API like DirectX. The port executes the game's graphics command stream with Vulkan and translates its shaders to SPIR-V as the game uses them, the same work a PS4 emulator does for graphics. A few patches to the game's code, applied as it loads and only to the exact 01.03 program, add features such as the raw mouse camera and the resolution setting.
 
 Nothing from the game is in this repository.
 

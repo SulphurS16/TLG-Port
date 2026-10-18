@@ -2,8 +2,10 @@
 
 ## 0.4.0 - first public release
 
-- Runs The Last Guardian (PS4, US, version 01.00 with update 01.03) natively on Windows,
-  from the player's own decrypted game folders.
+- Runs The Last Guardian (PS4, US, version 01.00 with update 01.03) on Windows from the
+  player's own decrypted game folders: the game's own x86-64 program runs directly on the
+  processor, the PS4 system libraries are reimplemented and the graphics are translated
+  to Vulkan.
 - Graphics through Vulkan: windowed, borderless or fullscreen; render resolution from
   1280x720 to 3840x2160; 30 fps or 60 fps (experimental) at the game's normal speed.
 - Sound: the game's NGS2 mixer with ATRAC9 and HE-VAG decoding, its equalizers,
