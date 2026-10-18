@@ -1178,6 +1178,8 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 })
                 .collect();
             crate::info!("mirror binding cache misses/s by queue and reason: {}", miss.join("; "));
+            let a: [u64; 7] = std::array::from_fn(|i| writes::ARM_STATS[i].swap(0, Ordering::Relaxed));
+            crate::info!("queried blocks/s for cold-block arming: {} written, {} clean below the threshold, {} clean waiting after strikes ({:.1} strikes each), {} armed when queried, {} to arm ({} of them refused: lazy write-back {}, not committed {}, protection {} (last {:#x}), protect failed {})", a[0], a[1], a[2], a[3] as f64 / a[2].max(1) as f64, a[4], a[5], a[6], cpuwatch::REFUSALS[0].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[1].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[2].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[4].load(Ordering::Relaxed), cpuwatch::REFUSALS[3].swap(0, Ordering::Relaxed));
         }
         // (The compute queues' share of them.)
         static LAST_CS: Mutex<[(u64, u64); render::BPART_COUNT]> = Mutex::new([(0, 0); render::BPART_COUNT]);

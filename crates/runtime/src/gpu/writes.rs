@@ -77,6 +77,10 @@ pub static BULK_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::a
 /// TLG_PERF: wall time (ns) of bulk rounds, validation harvests (their
 /// queries) and cold-block arming, lock waits and kernel calls included.
 pub static WW_TIMES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+/// TLG_PERF: blocks the queries covered, for cold-block arming: written,
+/// clean but below the arming threshold (no strikes / after strikes - the
+/// strikes summed in [3]), armed when queried, armed now, refused.
+pub static ARM_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
 
 /// TLG_PERF timing of a write-tracker phase into `WW_TIMES[i]`.
 struct Timed(usize, Option<std::time::Instant>);
@@ -288,25 +292,39 @@ impl WriteTracker {
         dirty.sort_unstable();
         dirty.dedup();
         let mut arm: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
+        let perf = super::render::perf_on();
+        let mut st = [0u64; 7];
         for &(lo, hi) in runs {
             for b in lo..hi {
                 let i = b as usize & (CHUNK_BLOCKS - 1);
                 let w = self.watch.entry(b >> (CHUNK_SHIFT - BLOCK_SHIFT)).or_insert_with(|| Watch { armed: 0, clean: [0; CHUNK_BLOCKS], strikes: [0; CHUNK_BLOCKS] });
                 if dirty.binary_search(&b).is_ok() {
                     w.clean[i] = 0;
+                    st[0] += 1;
                     continue;
                 }
                 w.clean[i] = w.clean[i].saturating_add(1);
-                if w.armed >> i & 1 == 0 && w.clean[i] as u32 >= arm_after() << w.strikes[i] {
+                if w.armed >> i & 1 != 0 {
+                    st[4] += 1;
+                } else if w.clean[i] as u32 >= arm_after() << w.strikes[i] {
                     match arm.last_mut() {
                         Some(r) if r.1 == b => r.1 = b + 1,
                         _ => arm.push((b, b + 1)),
                     }
+                } else if w.strikes[i] == 0 {
+                    st[1] += 1;
+                } else {
+                    st[2] += 1;
+                    st[3] += w.strikes[i] as u64;
                 }
             }
         }
+        if perf {
+            st[5] = arm.iter().map(|r| r.1 - r.0).sum();
+        }
         for (lo, hi) in arm {
             if !cpuwatch::arm(lo << BLOCK_SHIFT, hi << BLOCK_SHIFT) {
+                st[6] += hi - lo;
                 // (Not armable: counted from zero again.)
                 for b in lo..hi {
                     if let Some(w) = self.watch.get_mut(&(b >> (CHUNK_SHIFT - BLOCK_SHIFT))) {
@@ -321,6 +339,11 @@ impl WriteTracker {
                 }
             }
             mem::harvest_writes(lo << BLOCK_SHIFT, (hi - lo) << BLOCK_SHIFT, &mut self.buf, &mut self.pages);
+        }
+        if perf {
+            for (a, v) in ARM_STATS.iter().zip(st) {
+                a.fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 

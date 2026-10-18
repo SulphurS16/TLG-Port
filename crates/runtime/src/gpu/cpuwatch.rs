@@ -54,12 +54,24 @@ fn protect(lo: u64, hi: u64, prot: u32) -> bool {
     unsafe { VirtualProtect(lo as _, (hi - lo) as usize, prot, &mut old) != 0 }
 }
 
+/// TLG_PERF: arming refusals by reason - lazy write-back ranges overlap, a
+/// page not committed, a committed page not plain read-write, the
+/// protection change failed - and of the third kind the last protection
+/// value seen.
+pub static REFUSALS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 /// Whether every page of [lo, hi) is committed and exactly read-write.
 fn all_read_write(lo: u64, hi: u64) -> bool {
     let mut a = lo;
     while a < hi {
         let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { VirtualQuery(a as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 || mbi.State != MEM_COMMIT || mbi.Protect != PAGE_READWRITE {
+            if mbi.State != MEM_COMMIT {
+                REFUSALS[1].fetch_add(1, Ordering::Relaxed);
+            } else {
+                REFUSALS[2].fetch_add(1, Ordering::Relaxed);
+                REFUSALS[4].store(mbi.Protect as u64, Ordering::Relaxed);
+            }
             return false;
         }
         a = mbi.BaseAddress as u64 + mbi.RegionSize as u64;
@@ -79,6 +91,7 @@ pub fn arm(lo: u64, hi: u64) -> bool {
         }
         let mut g = STATE.lock();
         if !protect(lo, hi, PAGE_READONLY) {
+            REFUSALS[3].fetch_add(1, Ordering::Relaxed);
             return false;
         }
         g.armed.extend((lo >> BLOCK_SHIFT)..(hi >> BLOCK_SHIFT));
@@ -86,7 +99,10 @@ pub fn arm(lo: u64, hi: u64) -> bool {
         ACTIVE.store(true, Ordering::SeqCst);
         true
     })
-    .unwrap_or(false)
+    .unwrap_or_else(|| {
+        REFUSALS[0].fetch_add(1, Ordering::Relaxed);
+        false
+    })
 }
 
 /// The blocks made writable again since the last call.
