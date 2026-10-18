@@ -1,11 +1,27 @@
-# Machine-local data: toolchains, downloads, keys, prepared game files, runs, saves, research.
-# Proprietary inputs and anything derived from the game never enter Git.
+# Players' own game files, keys, builds, saves and settings never belong here.
 /local/
 /target/
+/dist/
 *.pkg
 *.self
 *.sprx
 *.prx
-eboot.bin
-__pycache__/
-/dist/
+*.elf
+*.bin
+*.psarc
+*.sfo
+*.trp
+*.dat
+*keys*.txt
+*.key
+*.exe
+*.dll
+*.pdb
+*.zip
+
+# Editor / OS noise
+.vs/
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store

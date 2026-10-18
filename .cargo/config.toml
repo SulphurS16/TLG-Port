@@ -1,7 +1,6 @@
 [build]
 target = "x86_64-pc-windows-gnullvm"
 
-# Self-contained executables: libunwind/libc++abi linked statically (only OS DLLs are imported).
-# A PDB next to each executable (function names for the TLG_SAMPLE profiler via dbghelp).
+# Self-contained executables: libunwind linked statically (only system DLLs are imported).
 [target.x86_64-pc-windows-gnullvm]
-rustflags = ["-C", "target-feature=+crt-static", "-C", "link-arg=-Wl,--pdb="]
+rustflags = ["-C", "target-feature=+crt-static"]

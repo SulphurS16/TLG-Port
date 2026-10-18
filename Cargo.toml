@@ -1,8 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/*"]
-# spvval compiles SPIRV-Tools (C++): built on request (-p spvval).
-default-members = ["crates/config", "crates/prep", "crates/runtime", "crates/gcn", "crates/sce-elf", "crates/tlgdis", "crates/tlgdbg"]
+members = ["crates/config", "crates/gcn", "crates/launcher", "crates/runtime", "crates/sce-elf"]
 
 [workspace.package]
 version = "0.4.0"
@@ -17,8 +15,6 @@ panic = "abort"
 [profile.release]
 debug = "line-tables-only"
 panic = "abort"
-# Development builds: incremental with more codegen units (a one-file change in the runtime
-# took ~8.5 min to rebuild otherwise). Distribution builds use `--profile dist`.
 incremental = true
 codegen-units = 64
 
