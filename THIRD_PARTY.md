@@ -12,7 +12,8 @@
 | miniz_oxide / adler2 | zlib for PNG screenshots | MIT OR Zlib OR Apache-2.0 / 0BSD OR MIT OR Apache-2.0 |
 | cc (build dependency) | compiles the vendored LibAtrac9 C sources | MIT OR Apache-2.0 |
 
-Transitive crates are MIT and/or Apache-2.0.
+Their dependencies are MIT and/or Apache-2.0, except libloading (ISC; it loads `vulkan-1.dll`
+for ash) and unicode-ident (also Unicode-3.0; used only while building).
 
 ## In this repository
 
@@ -20,6 +21,7 @@ Transitive crates are MIT and/or Apache-2.0.
 | --- | --- | --- | --- |
 | LibAtrac9 (Alex Barney), C implementation | `third_party/libatrac9` (source, licence and origin with SHA-256 in its README), unmodified | ATRAC9 decoding for NGS2 sampler voices | MIT |
 | vgmstream, the HE-VAG predictor table | `crates/runtime/src/hle/libs/hevag.rs` (the table of `src/coding/psv_decoder.c`, with the notice below) | HE-VAG decoding for NGS2 sampler voices | ISC-style (below) |
+| License texts of crates that ship none | `third_party/licenses` | read by `tools/notices.py` | iced-x86: MIT (its repository's text); rspirv, spirv: Apache-2.0 (the license text) |
 
 vgmstream's notice (its `COPYING`), for the HE-VAG predictor table:
 
@@ -53,24 +55,21 @@ vgmstream's notice (its `COPYING`), for the HE-VAG predictor table:
 | --- | --- | --- |
 | Rust (rustup, `x86_64-pc-windows-gnullvm`) | 1.99.0 | MIT OR Apache-2.0 |
 | llvm-mingw (github.com/mstorsjo/llvm-mingw): LLVM clang, lld, libunwind, compiler-rt; mingw-w64 headers and runtime | 20260908, UCRT, x86_64 | LLVM: Apache-2.0 WITH LLVM-exception; mingw-w64: its own licenses (mostly public domain, ZPL 2.1 and MIT) |
-| Python embeddable (only for `tools/make_icon.py`) | 3.13.9 | PSF License |
+| Python embeddable (for `tools/make_icon.py` and `tools/notices.py`) | 3.13.9 | PSF License |
 
 ## In the programs built from this repository
 
 `tlg.exe` and `tlg-launcher.exe` contain the Rust standard library (MIT OR Apache-2.0), the
 crates and components above, LLVM's libunwind and compiler-rt builtins (Apache-2.0 WITH
-LLVM-exception) and the mingw-w64 runtime startup code.
+LLVM-exception) and the mingw-w64 runtime startup code. Their notices ship next to the
+programs: `THIRD_PARTY_NOTICES.txt` (the crates, LibAtrac9, vgmstream, LLVM and the mingw-w64
+runtime; made by `tools/notices.py`) and `RUST_STD_NOTICES.html` (the Rust standard library's
+notices, from the toolchain).
 
 ## Used from Windows at run time (not redistributed)
 
 Vulkan (`vulkan-1.dll`, installed with the graphics driver), WASAPI, Media Foundation, XInput,
 HID, the common controls and the Universal C Runtime.
-
-## Code from the SOTC and Bloodborne native ports
-
-Most of `crates/*` was first written for the SOTC native port (MIT), which derives from the
-Bloodborne native port (MIT, "Copyright (c) 2026 SulphurS16 and the Bloodborne native port
-contributors"). Their copyright lines are kept in `LICENSE`.
 
 ## Own artwork
 

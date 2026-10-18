@@ -2,7 +2,7 @@
 //! rack, the multi-tap delay module of custom racks and the submixers'
 //! equalizer bands (`Biquad`).
 //!
-//! The envelope follows the SOTC native port's ngs2.rs (MIT): forward points
+//! The envelope's forward points
 //! ramp linearly to their heights over their durations (in samples), the
 //! last height holds until STOP, then the release points run and the voice
 //! ends. The reverb and the delay are written here for the parameters TLG
@@ -20,7 +20,7 @@
 //!   returns: the taps only, no dry signal (every sampler voice has its dry
 //!   path into a submixer on port 0).
 
-/// A voice envelope (SOTC port, MIT): forward points, then release points
+/// A voice envelope: forward points, then release points
 /// from STOP on. Every curve type is linear here.
 #[derive(Default, Clone, Debug)]
 pub struct Envelope {

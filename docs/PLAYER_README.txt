@@ -78,4 +78,7 @@ Known limits
 - The title screen's music plays quieter than it should.
 
 
-Licenses: LICENSE.txt (MIT) and THIRD_PARTY.md.
+License: the port is MIT licensed (LICENSE.txt). The license covers the
+port's own code only, not the game. Third-party components keep their own
+licenses: THIRD_PARTY.md, THIRD_PARTY_NOTICES.txt and
+RUST_STD_NOTICES.html.

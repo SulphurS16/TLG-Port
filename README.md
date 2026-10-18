@@ -88,6 +88,10 @@ In menus the left mouse button selects, the right one goes back and the wheel mo
 
 Run `tools\bootstrap.ps1` once. It downloads the pinned Rust and llvm-mingw toolchains into 'local\tools' and checks their SHA-256. Then `tools\package.ps1` builds `dist\TLG-Port-<version>.zip`.
 
+## License
+
+The port's source code is MIT licensed: see [LICENSE](LICENSE). The license covers this project's code only. It grants nothing for The Last Guardian or any other game data, keys or system software, which you must supply yourself. Third-party components keep their own licenses: see [THIRD_PARTY.md](THIRD_PARTY.md) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+
 ## Community
 
 For more ports, questions, discussion and help join the [Discord](https://discord.gg/Z7pbJ2unX).
