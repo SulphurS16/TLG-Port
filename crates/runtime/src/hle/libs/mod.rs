@@ -8,6 +8,7 @@ pub mod devices;
 pub mod extra;
 pub mod fiber;
 pub mod gnm;
+pub mod hevag;
 pub mod ngs2;
 pub mod ngs2_fx;
 pub mod ime_dialog;

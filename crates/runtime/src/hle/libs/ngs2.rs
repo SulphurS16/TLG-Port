@@ -2,7 +2,7 @@
 //! play waveform data, submixers and mastering voices mix it to output buffers).
 //!
 //! Stage 2 (this file): sampler voices decode their waveform blocks (ATRAC9 through
-//! LibAtrac9, PCM), honour skip/repeat counts and pitch (linear-interpolation
+//! LibAtrac9, VAG as HE-VAG (`hevag`), PCM), honour skip/repeat counts and pitch (linear-interpolation
 //! resampling to the system rate) and report decoding progress through
 //! sceNgs2VoiceGetState, which the title's streaming relies on. Voices are mixed
 //! along their patches with port volumes and port matrices into submixers and the
@@ -17,7 +17,7 @@
 //! types, submixer envelopes and distortion, other custom rack modules, port
 //! delays, peak meters. Unknown parameter ids are logged with their payload.
 
-use super::atrac9;
+use super::{atrac9, hevag};
 use super::ngs2_fx::{lane_mask, Biquad, Compressor, Envelope, FilterKind, I3dl2, Limiter, Reverb, Taps};
 use crate::gpu::render::FastMap;
 use crate::hle::Registry;
@@ -81,25 +81,6 @@ const WF_PCM_I16L: u32 = 0x12;
 const WF_PCM_F32L: u32 = 0x18;
 const WF_VAG: u32 = 0x1C;
 const WF_ATRAC9: u32 = 0x40;
-
-/// Decodes one 16-byte PS-ADPCM (VAG) frame into 28 samples; `hist` holds the
-/// channel's previous two output samples (filter state, scaled to i16 range).
-fn vag_frame(fr: &[u8], hist: &mut [f32; 2]) -> [f32; 28] {
-    const COEF: [(f32, f32); 5] = [(0.0, 0.0), (60.0 / 64.0, 0.0), (115.0 / 64.0, -52.0 / 64.0), (98.0 / 64.0, -55.0 / 64.0), (122.0 / 64.0, -60.0 / 64.0)];
-    let shift = (fr[0] & 0x0F) as i32;
-    let (c1, c2) = COEF[((fr[0] >> 4) as usize).min(4)];
-    let mut out = [0f32; 28];
-    for (i, o) in out.iter_mut().enumerate() {
-        let byte = fr[2 + i / 2];
-        let nib = if i % 2 == 0 { byte & 0x0F } else { byte >> 4 };
-        let raw = ((((nib as i32) << 28) >> 28) << 12) >> shift.min(12);
-        let s = (raw as f32 + hist[0] * c1 + hist[1] * c2).clamp(-32768.0, 32767.0);
-        hist[1] = hist[0];
-        hist[0] = s;
-        *o = s / 32768.0;
-    }
-    out
-}
 
 /// Channels of every mixing bus (output buffers have at most 8).
 const MAX_CH: usize = 8;
@@ -198,7 +179,8 @@ struct Sampler {
     user_data: u64,
     data: u64,
     error_logged: bool,
-    vag_hist: [[f32; 2]; MAX_CH],
+    /// VAG (HE-VAG) decoder history per channel: the last four samples.
+    vag_hist: [[f32; 4]; MAX_CH],
 }
 
 impl Default for Sampler {
@@ -224,7 +206,7 @@ impl Default for Sampler {
             user_data: 0,
             data: 0,
             error_logged: false,
-            vag_hist: [[0.0; 2]; MAX_CH],
+            vag_hist: [[0.0; 4]; MAX_CH],
         }
     }
 }
@@ -459,7 +441,7 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
         {
             let Some(v) = s.voices.get_mut(&vh) else { return ERR_INVALID_HANDLE };
             if id == PARAM_EVENT && trace_voices() && v.kind == Kind::Sampler {
-                crate::info!("NGS2 voice {vh:#x}: event {} (flags {:#x}, {} blocks queued, {} samples decoded)", u32_at(8), v.flags, v.sampler.blocks.len(), v.sampler.decoded_samples);
+                crate::info!("NGS2 voice {vh:#x}: event {} (flags {:#x}, {} blocks queued, {} samples decoded, envelope {}+{} points) at dump frame {}", u32_at(8), v.flags, v.sampler.blocks.len(), v.sampler.decoded_samples, v.env.fwd.min(v.env.points.len()), v.env.points.len().saturating_sub(v.env.fwd), crate::audio::dumped_frames(0));
             }
             match id {
                 PARAM_EVENT => match u32_at(8) {
@@ -984,17 +966,18 @@ fn decode_more(sm: &mut Sampler) -> bool {
                     }
                 }
                 WF_VAG => {
-                    // PS-ADPCM: per channel, 16-byte frames (shift/filter byte, flags
-                    // byte, 28 4-bit samples); channels interleave frame by frame.
-                    let frame_bytes = 16 * ch;
+                    // HE-VAG (PS-ADPCM with the extended predictors, `hevag`): per
+                    // channel, 16-byte frames of 28 samples; channels interleave
+                    // frame by frame.
+                    let frame_bytes = hevag::FRAME_BYTES * ch;
                     let frames_left = ((b.size - sm.byte_pos) as usize / frame_bytes).min(64);
                     let p = sm.byte_pos as usize;
                     if frames_left > 0 && sm.copy.len() >= p + frames_left * frame_bytes {
                         for f in 0..frames_left {
-                            let mut out = [[0f32; MAX_CH]; 28];
+                            let mut out = [[0f32; MAX_CH]; hevag::FRAME_SAMPLES];
                             for c in 0..ch.min(MAX_CH) {
-                                let at = p + f * frame_bytes + c * 16;
-                                let decoded = vag_frame(&sm.copy[at..at + 16], &mut sm.vag_hist[c]);
+                                let at = p + f * frame_bytes + c * hevag::FRAME_BYTES;
+                                let decoded = hevag::decode_frame(&sm.copy[at..at + hevag::FRAME_BYTES], &mut sm.vag_hist[c]);
                                 for (k, x) in decoded.iter().enumerate() {
                                     out[k][c] = *x;
                                 }
@@ -1104,7 +1087,7 @@ fn render_sampler(v: &mut Voice, grain: usize, rate: u32, out: &mut Vec<[f32; MA
     out.resize(grain, [0.0; MAX_CH]);
     if ended && sm.pcm.is_empty() && sm.blocks.is_empty() {
         if trace_voices() {
-            crate::info!("NGS2 voice (rack {:#x} #{}) ran out of data after {} samples ({} bytes decoded)", v.rack, v.index, sm.decoded_samples, sm.decoded_bytes);
+            crate::info!("NGS2 voice (rack {:#x} #{}) ran out of data after {} samples ({} bytes decoded) at dump frame {}", v.rack, v.index, sm.decoded_samples, sm.decoded_bytes, crate::audio::dumped_frames(0));
         }
         v.flags = (v.flags & !STATE_PLAYING) | STATE_STOPPED | STATE_EMPTY;
         v.flags &= !STATE_IN_USE;
