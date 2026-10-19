@@ -470,11 +470,14 @@ pub const KICK_WAIT: usize = 78;
 /// division cost more than a pause, also to the core's other hyperthread.
 pub const SPIN_PAUSES: usize = 79;
 
-/// The HR-timer thread's last stretch before a deadline (`TLG_HRT_SPIN`, 0):
-/// 1 sleeps to ~200 us before it and spins the rest; 0 only sleeps (a
-/// high-resolution sleep, later by up to a few hundred microseconds). The
-/// title's job workers arm ~4,000-6,000 timers of 100 us per second while
-/// idle; without the spins -0.27 core, fps equal (LOG: the CPU budget).
+/// The HR-timer thread's last stretch before a deadline (`TLG_HRT_SPIN`, -1):
+/// 1 spins it (a condvar wait to ~1.5 ms before, then a spin), 0 only
+/// sleeps (Windows sleeps wake on a 0.5 ms grid: a 100 us timer fires after
+/// ~500 us), -1 spins when the frame rate may exceed the game's 30 fps limit
+/// (`equeue::precise_timers`). The title's engine polls with 100 us timers in
+/// its waits (~6,000-14,000 per second): late ones held the cave at ~57 fps
+/// uncapped on a fast desktop, ~65 with precise ones (LOG: the game's own
+/// frame on the desktop); the spin costs ~0.5 core.
 pub const HRT_SPIN: usize = 80;
 
 /// The graphics CP thread runs on a physical core alone (`TLG_GFX_CORE`, -2:
@@ -748,8 +751,30 @@ pub const NGS2_FADES: usize = 128;
 /// input as the non-LFE channels' sum / sqrt(2 x their number) (else the
 /// mean of all channels).
 pub const NGS2_REV8: usize = 129;
+/// With `gfx_core`: our GPU threads on the other cores of the graphics CP's
+/// last-level cache (a CCD of a Ryzen with two), every other thread - the
+/// title's - on the other caches' cores (`TLG_CCD_SPLIT`, -1: when each side
+/// has at least 8 logical processors; 1: whenever there are two caches; 0:
+/// off; `thread::dedicate_core`). Ryzen 9 5900X, First Antenna walking: +6
+/// to +11% uncapped, +13% at the 60 limit, the title's own frame +23%.
+pub const CCD_SPLIT: usize = 130;
+/// A batch slot is reused once the GPU has finished its batch, without
+/// waiting for the completion thread to write that batch back: the batch
+/// keeps its fence and timestamps, the slot takes others; the host-ring
+/// segment waits for the write-backs of its previous batch
+/// (`TLG_SLOT_FENCE`, 1; 0: the slot waits for the completion thread).
+/// First Antenna standing, 5 rounds (run 20261019-200652): 55.7 vs 53.3 fps,
+/// the graphics CP 13.1 vs 14.0 ms of CPU per frame (it waited for the
+/// completion thread 27-37 ms per second, the renderer lock held).
+pub const SLOT_FENCE: usize = 131;
+/// A lazy write-back's readback (lazywb.rs) copies the GPU's data in with
+/// every other guest thread suspended, from the moment its pages turn
+/// accessible: a title thread writing there meanwhile would have its write
+/// buried under the copy (`TLG_LAZY_HOLD`, 1; 0: no hold - the pages turn
+/// accessible right before the copy).
+pub const LAZY_HOLD: usize = 132;
 
-const TABLE: [(&str, &str, i64); 130] = [
+const TABLE: [(&str, &str, i64); 133] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -830,7 +855,7 @@ const TABLE: [(&str, &str, i64); 130] = [
     ("mutex_spins", "TLG_MUTEX_SPINS", 4000),
     ("kick_wait", "TLG_KICK_WAIT", 100),
     ("spin_pauses", "TLG_SPIN_PAUSES", 1),
-    ("hrt_spin", "TLG_HRT_SPIN", 0),
+    ("hrt_spin", "TLG_HRT_SPIN", -1),
     ("gfx_core", "TLG_GFX_CORE", -2),
     ("gfx_core_soft", "TLG_GFX_CORE_SOFT", 0),
     ("cs_core", "TLG_CS_CORE", -1),
@@ -880,6 +905,9 @@ const TABLE: [(&str, &str, i64); 130] = [
     ("tex_memo_first", "TLG_TEX_MEMO_FIRST", 1),
     ("ngs2_fades", "TLG_NGS2_FADES", 3),
     ("ngs2_rev8", "TLG_NGS2_REV8", 3),
+    ("ccd_split", "TLG_CCD_SPLIT", -1),
+    ("slot_fence", "TLG_SLOT_FENCE", 1),
+    ("lazy_hold", "TLG_LAZY_HOLD", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

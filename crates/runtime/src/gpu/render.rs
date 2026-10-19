@@ -1962,6 +1962,7 @@ fn completion_thread() {
                         let end = (page * 4096 - head).min(size);
                         let src = unsafe { std::slice::from_raw_parts(ring_ptr.add((off + start) as usize), (end - start) as usize) };
                         crate::mem::forget_begin(addr + start, end - start);
+                        super::wbprobe::note_range(addr + start, end - start, 1);
                         resources::copy_to_guest(src, addr + start);
                         let tr = std::time::Instant::now();
                         crate::mem::reset_write_watch(addr + start, end - start);
@@ -1991,6 +1992,7 @@ fn completion_thread() {
                         }
                         let src = unsafe { std::slice::from_raw_parts(ring_ptr.add((off + (a - addr)) as usize), (b - a) as usize) };
                         crate::mem::forget_begin(a, b - a);
+                        super::wbprobe::note_range(a, b - a, 2);
                         resources::copy_to_guest(src, a);
                         crate::mem::reset_write_watch(a, b - a);
                         crate::mem::forget_end(a, b - a);
@@ -2007,6 +2009,7 @@ fn completion_thread() {
                 if mirror {
                     crate::mem::forget_begin(addr, size);
                 }
+                super::wbprobe::note_range(addr, size, 3);
                 resources::copy_to_guest(src, addr);
                 wb_bytes += size;
                 if probe {
@@ -2229,6 +2232,79 @@ pub static FLUSH_SITES: parking_lot::Mutex<Option<HashMap<u32, u64>>> = parking_
 /// `wait_overlapping`): actions, write-backs, huge in-place, in-place.
 pub static SYNC_WAIT_KIND_NS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::atomic::AtomicU64::new(0) }; 5];
 
+/// Slots that moved on before the completion thread had dealt with their
+/// last batch (`tune slot_fence`).
+pub static SLOT_SWAPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Fences and timestamp pools of batches whose slots moved on before the
+/// completion thread had dealt with them (sequence number, fence, pool), and
+/// free ones (fence unsignaled).
+static SPARE_SYNC: Mutex<(Vec<(u64, vk::Fence, vk::QueryPool)>, Vec<(vk::Fence, vk::QueryPool)>)> = Mutex::new((Vec::new(), Vec::new()));
+
+/// A slot's fence and timestamp pool for others: they stay with batch `seq`
+/// until the completion thread is through with it.
+fn swap_sync(fence: vk::Fence, exec: vk::QueryPool, seq: u64) -> (vk::Fence, vk::QueryPool) {
+    let c = ctx();
+    let done = *DONE.lock();
+    let mut g = SPARE_SYNC.lock();
+    let (retired, free) = &mut *g;
+    retired.retain(|&(s, f, e)| {
+        if s > done {
+            return true;
+        }
+        unsafe { c.device.reset_fences(&[f]).ok() };
+        free.push((f, e));
+        false
+    });
+    let new = free.pop().or_else(|| unsafe {
+        let f = c.device.create_fence(&vk::FenceCreateInfo::default(), None).ok()?;
+        let e = if exec == vk::QueryPool::null() { exec } else { c.device.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2), None).unwrap_or(vk::QueryPool::null()) };
+        Some((f, e))
+    });
+    match new {
+        Some(n) => {
+            retired.push((seq, fence, exec));
+            n
+        }
+        None => {
+            // (No fence to be had: the slot keeps its own once its batch is done.)
+            drop(g);
+            wait_done(seq);
+            unsafe { c.device.reset_fences(&[fence]).ok() };
+            (fence, exec)
+        }
+    }
+}
+
+/// Slot waits by where the awaited batch was (TLG_PERF): waits, then ns
+/// until the recorder had submitted it, until its fence signalled (the GPU
+/// executing it and the batches before it), until the completion thread
+/// marked it done.
+pub static SLOT_WAIT_SPLIT: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
+fn slot_wait_split(seq: u64, fence: vk::Fence, to_done: bool) {
+    let done = || *DONE.lock() >= seq;
+    if done() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    while super::rec::deferred() && super::rec::submit_time(seq).is_none() && !done() {
+        std::thread::yield_now();
+    }
+    let t1 = std::time::Instant::now();
+    if !done() {
+        unsafe { ctx().device.wait_for_fences(&[fence], true, 10_000_000_000).ok() };
+    }
+    let t2 = std::time::Instant::now();
+    if to_done {
+        wait_done(seq);
+    }
+    let t3 = std::time::Instant::now();
+    for (i, v) in [1, (t1 - t0).as_nanos() as u64, (t2 - t1).as_nanos() as u64, (t3 - t2).as_nanos() as u64].into_iter().enumerate() {
+        SLOT_WAIT_SPLIT[i].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// Blocks until the batch with sequence number `seq` (and all before it) completed.
 pub fn wait_done(seq: u64) {
     let mut d = DONE.lock();
@@ -2380,6 +2456,9 @@ pub(super) struct BatchCtx {
     /// Segments of `ring`, used in turn by batch number (`RING_SEGS`, or
     /// `SLOTS` for small rings).
     ring_segs: usize,
+    /// Per segment of `ring`: the sequence number of the batch that used it
+    /// last (its write-backs are read from there by the completion thread).
+    seg_seqs: Vec<u64>,
     /// End-of-pipe writes queued and maybe not performed yet (completion-time
     /// stores into guest memory): (address, bytes, batch sequence). Copies
     /// over them are not kept for later batches.
@@ -3148,6 +3227,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 reuse_bloom: [0; 16],
                 eop_spans: Vec::new(),
                 ring_segs,
+                seg_seqs: vec![0; ring_segs],
                 upload_seen: FastMap::default(),
                 cmd_queue: 0,
                 batch_copies: 0,
@@ -3607,6 +3687,54 @@ pub static BPARTS_CS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU
 pub fn perf_on() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("TLG_PERF").is_some()) && crate::tune::get(crate::tune::PERF_HOT) != 0
+}
+
+/// `TLG_PERF=2`: draws whose stages (shader addresses) and resource
+/// descriptors (V#, T#, S#) equal those of a draw in the previous frame -
+/// what reusing resolved bindings across frames could serve: draws, matched
+/// anywhere in the previous frame, matched by the draw at the same position.
+pub static DRAW_SIG_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+struct DrawSigs {
+    frame: u64,
+    cur: Vec<u64>,
+    prev: FastSet<u64>,
+    prev_seq: Vec<u64>,
+}
+
+static DRAW_SIGS: parking_lot::Mutex<Option<DrawSigs>> = parking_lot::Mutex::new(None);
+
+fn note_draw_sig(vs: &Prepared, ps: Option<&Prepared>) {
+    use std::hash::{Hash, Hasher};
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut h = FxHasher::default();
+    for p in std::iter::once(vs).chain(ps) {
+        p.addr.hash(&mut h);
+        for r in &p.resources {
+            match r {
+                super::shaders::ResolvedRes::Buffer(v) => (0u8, v).hash(&mut h),
+                super::shaders::ResolvedRes::Image(t) => (1u8, t).hash(&mut h),
+                super::shaders::ResolvedRes::Sampler(s) => (2u8, s).hash(&mut h),
+            }
+        }
+    }
+    let sig = h.finish();
+    let frame = super::FRAMES.load(Relaxed);
+    let mut g = DRAW_SIGS.lock();
+    let s = g.get_or_insert_with(|| DrawSigs { frame, cur: Vec::new(), prev: FastSet::default(), prev_seq: Vec::new() });
+    if s.frame != frame {
+        let cur = std::mem::take(&mut s.cur);
+        s.prev = cur.iter().copied().collect();
+        s.prev_seq = cur;
+        s.frame = frame;
+    }
+    let same_pos = s.prev_seq.get(s.cur.len()) == Some(&sig);
+    let anywhere = s.prev.contains(&sig);
+    s.cur.push(sig);
+    drop(g);
+    DRAW_SIG_STATS[0].fetch_add(1, Relaxed);
+    DRAW_SIG_STATS[1].fetch_add(anywhere as u64, Relaxed);
+    DRAW_SIG_STATS[2].fetch_add(same_pos as u64, Relaxed);
 }
 
 /// Per-binding site statistics (`TLG_PERF=2`): upload, forward and content
@@ -4541,23 +4669,51 @@ impl Renderer {
     fn rotate_ctx(&mut self, seq: u64) {
         let c = ctx();
         self.cx.slots[self.cx.cur].seq = seq;
+        let segs = self.cx.ring_segs as u64;
+        self.cx.seg_seqs[(self.cx.batch % segs) as usize] = seq;
         self.cx.recording = false;
         self.cx.batch += 1;
         self.cx.cur = (self.cx.cur + 1) % SLOTS;
-        let next = &self.cx.slots[self.cx.cur];
-        if next.seq != 0 {
+        let cur = self.cx.cur;
+        if self.cx.slots[cur].seq != 0 {
             // (Back-pressure: the GPU has not finished the batch recorded
             // SLOTS batches ago.)
             let t0 = std::time::Instant::now();
-            wait_done(next.seq);
+            let prev = self.cx.slots[cur].seq;
+            if perf_on() {
+                slot_wait_split(prev, self.cx.slots[cur].fence, crate::tune::get(crate::tune::SLOT_FENCE) == 0 || gpu_profile_on());
+            }
+            // (`tune slot_fence`: once the GPU has finished the slot's batch
+            // its command buffers and descriptor pool are free, though the
+            // completion thread may still be writing back earlier batches:
+            // that batch keeps its fence and timestamps, the slot takes
+            // others. The host-ring segment this batch writes into waits for
+            // the write-backs of the batch that used it before, read from
+            // there.)
+            if crate::tune::get(crate::tune::SLOT_FENCE) != 0 && !gpu_profile_on() && *DONE.lock() < prev {
+                let s = &mut self.cx.slots[cur];
+                if let Err(e) = unsafe { c.device.wait_for_fences(&[s.fence], true, 10_000_000_000) } {
+                    crate::error!("render slot wait: {e} (GPU hang or device lost)");
+                }
+                (s.fence, s.exec) = swap_sync(s.fence, s.exec, prev);
+                SLOT_SWAPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                wait_done(prev);
+                unsafe { c.device.reset_fences(&[self.cx.slots[cur].fence]).ok() };
+            }
+            let last = self.cx.seg_seqs[(self.cx.batch % segs) as usize];
+            if last != 0 {
+                wait_done(last);
+            }
             self.prof[6] += t0.elapsed();
+            let next = &self.cx.slots[cur];
             unsafe {
-                c.device.reset_fences(&[next.fence]).ok();
                 REC.reset_command_buffer(next.cmd, vk::CommandBufferResetFlags::empty()).ok();
                 REC.reset_command_buffer(next.pro, vk::CommandBufferResetFlags::empty()).ok();
                 c.device.reset_descriptor_pool(next.desc_pool, vk::DescriptorPoolResetFlags::empty()).ok();
             }
         }
+        let next = &self.cx.slots[cur];
         self.cx.cmd = next.cmd;
         self.cx.desc_pool = next.desc_pool;
         // (Copies in earlier batches' segments: kept for the next
@@ -8328,6 +8484,7 @@ impl Renderer {
                 let dst = &mut tiled[(l * slice) as usize..((l + 1) * slice) as usize];
                 tiling::tile_slice(src, dst, key.width, key.height, key.width, ph, bpp, mode);
             }
+            super::wbprobe::note_range(key.base, total, 5);
             resources::copy_to_guest(&tiled, key.base);
             mem!(self).writes.note_gpu_write(key.base, total);
             // (A new baseline: these CPU writes are ours, not the title's.)
@@ -9174,6 +9331,9 @@ impl Renderer {
         {
             let stages: smallvec::SmallVec<[&Prepared; 2]> = std::iter::once(&vs).chain(ps.as_ref()).collect();
             self.cross_precheck(&stages);
+        }
+        if perf_detail() {
+            note_draw_sig(&vs, ps.as_ref());
         }
         if let Some(tp) = tp {
             self.prof[5] += tp.elapsed();

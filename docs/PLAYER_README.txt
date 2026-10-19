@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.4.0 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.4.1 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627). It is
@@ -21,8 +21,9 @@ What you need
   the game folder).
 - Windows 10 or 11 (64-bit), and a graphics card and driver with Vulkan 1.3
   and about 4 GB of video memory.
-- A recent processor with high single-core speed: about 25-30 fps on a
-  6-core CPU from 2019 or later.
+- A recent processor with high single-core speed. Tested: a steady 30 fps,
+  and 55-60 fps with the 60 fps limit, on a Ryzen 9 5900X with an RTX 4090;
+  about 25-30 fps on a 6-core laptop CPU from 2019.
 
 
 Getting started
@@ -76,6 +77,8 @@ Known limits
 - The picture keeps the game's 16:9 shape.
 - No mouse pointer in the game's menus (keys, wheel and buttons work).
 - The title screen's music plays quieter than it should.
+- Tested with NVIDIA graphics (a laptop and a desktop); AMD and Intel
+  graphics have not been tested yet.
 
 
 License: the port is MIT licensed (LICENSE.txt). The license covers the

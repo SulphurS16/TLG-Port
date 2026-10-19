@@ -12,7 +12,8 @@
 //! call; lines of inlined code are the inlined function's).
 //! Spikes: the last seconds of samples are kept; `spike(t0, t1, label)`
 //! (the GPU thread calls it for submissions over TLG_SAMPLE_SPIKE_MS, default
-//! 25) logs the functions sampled in that window alone.
+//! 25) logs the functions sampled in that window alone, and the stacks of all
+//! spike windows so far go to `spikes-<thread>.txt` (for `tools/profile.py`).
 //! The PDB only has public symbols (the build's debug information is DWARF):
 //! code in other functions is named after the public symbol before it. Exact
 //! names, inlined frames and lines: every distinct stack with its sample
@@ -245,6 +246,11 @@ fn run(h: HANDLE, name: String) {
 /// the modules the stacks touch, then `<count> <frame>...` per distinct
 /// stack (absolute addresses, leaf first; callers are return addresses).
 fn write_stacks(thread: &str, stacks: &HashMap<Vec<u64>, u64>) {
+    write_stacks_as("samples", thread, stacks);
+}
+
+/// `write_stacks` into `<prefix>-<thread>.txt`.
+fn write_stacks_as(prefix: &str, thread: &str, stacks: &HashMap<Vec<u64>, u64>) {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleExW, GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT};
     let Some(dir) = crate::run_dir() else { return };
     let mut modules: std::collections::BTreeMap<u64, (u64, String)> = std::collections::BTreeMap::new();
@@ -280,7 +286,7 @@ fn write_stacks(thread: &str, stacks: &HashMap<Vec<u64>, u64>) {
         out.push('\n');
     }
     let name: String = thread.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' { c } else { '_' }).collect();
-    let _ = std::fs::write(dir.join(format!("samples-{name}.txt")), out);
+    let _ = std::fs::write(dir.join(format!("{prefix}-{name}.txt")), out);
 }
 
 /// The functions sampled in [t0, t1]: self time, inclusive time (tlg
@@ -291,6 +297,16 @@ fn report_spike(thread: &str, t0: std::time::Instant, t1: std::time::Instant, la
     if n == 0 {
         crate::info!("sampler '{thread}' spike {label}: {:.1} ms, no samples kept", (t1 - t0).as_secs_f64() * 1000.0);
         return;
+    }
+    // (Every spike's stacks so far, for `tools/profile.py spikes-<thread>.txt`.)
+    {
+        static ALL: parking_lot::Mutex<Option<HashMap<String, HashMap<Vec<u64>, u64>>>> = parking_lot::Mutex::new(None);
+        let mut g = ALL.lock();
+        let m = g.get_or_insert_with(HashMap::new).entry(thread.to_string()).or_default();
+        for frames in &window {
+            *m.entry((*frames).clone()).or_default() += 1;
+        }
+        write_stacks_as("spikes", thread, m);
     }
     let mut leaf: HashMap<String, u64> = HashMap::new();
     let mut incl: HashMap<String, u64> = HashMap::new();

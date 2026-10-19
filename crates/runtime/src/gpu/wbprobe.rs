@@ -132,3 +132,20 @@ pub fn report() {
     let t: Vec<String> = g.touched.iter().take(16).map(|((a, b), (who, w))| format!("{a:#x}+{:#x} after {w}: {who}", b - a)).collect();
     crate::info!("wb probe: {} ranges touched: {}", g.touched.len(), t.join("; "));
 }
+
+/// Debug (`TLG_WB_RANGES=1`): every distinct guest range the runtime writes
+/// GPU results into (write-backs by kind: 1 marked pages of a mirror range,
+/// 2 a large mirror range's pieces, 3 a whole range, 4 a lazy write-back's
+/// readback, 5 a render target's tiled write-back) is logged the first time.
+pub fn note_range(addr: u64, len: u64, kind: u8) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("TLG_WB_RANGES").is_ok_and(|v| v == "1")) {
+        return;
+    }
+    static SEEN: parking_lot::Mutex<Option<std::collections::HashSet<(u64, u64, u8)>>> = parking_lot::Mutex::new(None);
+    let mut g = SEEN.lock();
+    let s = g.get_or_insert_with(Default::default);
+    if s.len() < 1 << 18 && s.insert((addr, len, kind)) {
+        crate::info!("wb range {kind}: {addr:#x}-{:#x} ({len:#x} bytes)", addr + len);
+    }
+}

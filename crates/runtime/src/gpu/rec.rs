@@ -168,7 +168,7 @@ pub static BUSY_NS: AtomicU64 = AtomicU64::new(0);
 /// `drain` always wake it).
 const WAKE_AT: usize = 32;
 
-fn deferred() -> bool {
+pub fn deferred() -> bool {
     DEFERRED.load(Ordering::Relaxed)
 }
 

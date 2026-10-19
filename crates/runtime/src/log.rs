@@ -41,6 +41,7 @@ pub fn init(path: &Path) -> std::io::Result<()> {
 pub fn set_thread_name(name: &str) {
     THREAD_NAME.with(|n| *n.borrow_mut() = name.to_string());
     crate::sampler::register_current_thread(name);
+    crate::thread::place_by_name(name);
 }
 
 pub fn thread_name() -> String {

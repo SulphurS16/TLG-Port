@@ -424,12 +424,12 @@ fn gfx_thread() {
     let started = std::time::Instant::now();
     let mut frame_end: Option<u64> = None;
     // (Experiment `tune gfx_core`: applied when it changes.)
-    let mut core = (-1i64, 0i64, -1i64);
+    let mut core = (-1i64, 0i64, -1i64, 0i64);
     loop {
-        let want = (crate::tune::get(crate::tune::GFX_CORE), crate::tune::get(crate::tune::GFX_CORE_SOFT), crate::tune::get(crate::tune::CS_CORE));
+        let want = (crate::tune::get(crate::tune::GFX_CORE), crate::tune::get(crate::tune::GFX_CORE_SOFT), crate::tune::get(crate::tune::CS_CORE), crate::tune::get(crate::tune::CCD_SPLIT));
         if want != core {
             core = want;
-            crate::info!("gfx_core: {}", crate::thread::dedicate_core(core.0, core.1 != 0, core.2));
+            crate::info!("gfx_core: {}", crate::thread::dedicate_core(core.0, core.1 != 0, core.2, core.3));
         }
         set_phase(phase::IDLE, 0);
         let mut s = {
@@ -1098,6 +1098,12 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             })
             .collect();
         crate::info!("dispatch µs/dispatch by queue: {}", cs.join("; "));
+        // (The slot waits by where the awaited batch was.)
+        let sw: Vec<u64> = render::SLOT_WAIT_SPLIT.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
+        let swaps = render::SLOT_SWAPS.swap(0, Ordering::Relaxed);
+        if sw[0] > 0 || swaps > 0 {
+            crate::info!("slot waits/s: {}, {:.1} ms before the recorder submitted the batch, {:.1} ms while the GPU ran it, {:.1} ms until the completion thread marked it done; {swaps} slots moved on before the completion thread (`slot_fence`)", sw[0], sw[1] as f64 / 1e6, sw[2] as f64 / 1e6, sw[3] as f64 / 1e6);
+        }
         // Buffer bindings by path: count/s and µs each (all commands).
         let bp: Vec<String> = render::BUFFER_PATHS
             .iter()
@@ -1224,6 +1230,13 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             pr.join(", "),
             vram
         );
+        // (TLG_PERF=2) Draws as in the previous frame.
+        if render::perf_detail() {
+            let s: [u64; 3] = std::array::from_fn(|i| render::DRAW_SIG_STATS[i].swap(0, Ordering::Relaxed));
+            if s[0] > 0 {
+                crate::info!("draw signatures/s: {} draws, {} ({}%) with the shaders and descriptors of a draw in the previous frame, {} ({}%) of the draw at the same position", s[0], s[1], s[1] * 100 / s[0], s[2], s[2] * 100 / s[0]);
+            }
+        }
         // Images created in the second, the most frequent kinds first.
         let mut ni: Vec<((u32, u32, u32, u32, ash::vk::Format), (u64, u64))> = render::NEW_IMAGES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
         if !ni.is_empty() {

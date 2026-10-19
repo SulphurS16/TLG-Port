@@ -156,9 +156,10 @@ unsafe impl Send for Readback {}
 
 static READBACK: parking_lot::Mutex<Option<Readback>> = parking_lot::Mutex::new(None);
 
-/// Copies [off, off+size) of `buf` into guest memory at `dst` (whose pages
-/// must be accessible), after all work submitted so far.
-fn read_back(buf: vk::Buffer, off: u64, size: u64, dst: u64) -> Result<(), String> {
+/// Copies [off, off+size) of `buf` into guest memory at `dst`, after all work
+/// submitted so far; `unprotect` makes the pages accessible right before the
+/// copy (`guarded`: they were inaccessible until then).
+fn read_back(buf: vk::Buffer, off: u64, size: u64, dst: u64, guarded: bool, unprotect: impl FnOnce()) -> Result<(), String> {
     let c = super::vk::ctx();
     let mut g = READBACK.lock();
     if g.is_none() {
@@ -196,8 +197,20 @@ fn read_back(buf: vk::Buffer, off: u64, size: u64, dst: u64) -> Result<(), Strin
     // (Directly: the memory map lock may be held by this thread. Our copy is
     // not a CPU write of the range: forgotten before a harvest can see it.)
     let _h = crate::mem::HARVEST_LOCK.lock();
-    unsafe { std::ptr::copy_nonoverlapping(sp, dst as *mut u8, size as usize) };
-    crate::mem::reset_write_watch(dst, size);
+    super::wbprobe::note_range(dst, size, 4);
+    // (`unprotect` makes the pages accessible: from then until the copy is
+    // in, no guest thread runs - `tune lazy_hold`.)
+    let install = || {
+        unprotect();
+        unsafe { std::ptr::copy_nonoverlapping(sp, dst as *mut u8, size as usize) };
+        crate::mem::reset_write_watch(dst, size);
+    };
+    // (Pages that were accessible all along: nothing to hold the threads for.)
+    if guarded && crate::tune::get(crate::tune::LAZY_HOLD) != 0 {
+        crate::thread::hold_guest_threads(install);
+    } else {
+        install();
+    }
     Ok(())
 }
 
@@ -235,22 +248,41 @@ fn resolve(g: &mut State, lo: u64, touched: bool) {
     let State { entries, stats, .. } = g;
     let Some(e) = entries.get_mut(&lo) else { return };
     let (hi, lazy) = (e.end, e.lazy.take());
-    if e.protected {
-        protect(stats, lo, hi, PAGE_READWRITE);
-        e.protected = false;
-    }
+    let protected = std::mem::replace(&mut e.protected, false);
     if touched {
         e.strikes += 1;
         e.quiet = 0;
     }
-    if let Some((buf, off)) = lazy {
-        let t0 = std::time::Instant::now();
-        if let Err(e) = read_back(buf, off, hi - lo, lo) {
-            crate::error!("lazy write-back of {lo:#x}-{hi:#x}: {e}");
+    match lazy {
+        // (The GPU's data is staged while the pages are still inaccessible,
+        // then copied in with the title's threads held: a title thread
+        // writing there between the pages turning accessible and the copy
+        // would have its write buried under it - at a stage's load the
+        // title puts new objects in memory a lazy range held, from several
+        // threads at once.)
+        Some((buf, off)) => {
+            let t0 = std::time::Instant::now();
+            let unprotect = || {
+                if protected {
+                    protect(stats, lo, hi, PAGE_READWRITE);
+                }
+            };
+            if let Err(e) = read_back(buf, off, hi - lo, lo, protected, unprotect) {
+                crate::error!("lazy write-back of {lo:#x}-{hi:#x}: {e}");
+                // (The pages accessible regardless: nothing else will.)
+                if protected {
+                    protect(stats, lo, hi, PAGE_READWRITE);
+                }
+            }
+            stats.readbacks += 1;
+            stats.readback_bytes += hi - lo;
+            stats.readback_ns += t0.elapsed().as_nanos() as u64;
         }
-        stats.readbacks += 1;
-        stats.readback_bytes += hi - lo;
-        stats.readback_ns += t0.elapsed().as_nanos() as u64;
+        None => {
+            if protected {
+                protect(stats, lo, hi, PAGE_READWRITE);
+            }
+        }
     }
 }
 

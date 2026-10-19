@@ -226,21 +226,49 @@ pub fn spin_until(limit: std::time::Duration, mut done: impl FnMut() -> bool) ->
     }
 }
 
+/// The CPU sets our GPU threads get while the CCD split is on (`dedicate_core`
+/// with `ccd`); empty while it is off.
+static GPU_SETS: parking_lot::Mutex<Vec<u32>> = parking_lot::Mutex::new(Vec::new());
+
+/// Our GPU threads (`GPU-*` but the graphics CP, `hrtimer`).
+fn gpu_side(name: &str) -> bool {
+    (name.starts_with("GPU-") && name != "GPU-gfx") || name == "hrtimer"
+}
+
+/// A thread of ours named `name` started (`log::set_thread_name`): with the
+/// CCD split on, a GPU thread joins the graphics CP's cache - threads made
+/// after the split took the process default, the title's side.
+pub fn place_by_name(name: &str) {
+    if !gpu_side(name) {
+        return;
+    }
+    let sets = GPU_SETS.lock().clone();
+    if !sets.is_empty() {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadSelectedCpuSets};
+        unsafe { SetThreadSelectedCpuSets(GetCurrentThread(), sets.as_ptr(), sets.len() as u32) };
+    }
+}
+
 /// Gives the calling thread physical core `core` alone (`tune gfx_core`):
 /// it runs on that core's first logical processor and the process's other
 /// threads on every processor but that core's; -1 undoes it. -2 picks the
 /// third of the fastest cores (highest efficiency class: performance cores
 /// on hybrid CPUs; core 0 takes most interrupts), and only when at least 8
-/// logical processors remain for the rest. Returns what it did.
-pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
+/// logical processors remain for the rest. `ccd` (`tune ccd_split`): our
+/// GPU threads (`GPU-*`, `hrtimer`) on the other cores sharing that core's
+/// last-level cache (a CCD on Ryzen), every other thread - the title's
+/// among them - on the cores of the other caches; 1 whenever there are
+/// two caches, -1 when each side has at least 8 logical processors.
+/// Returns what it did.
+pub fn dedicate_core(core: i64, soft: bool, cs_core: i64, ccd: i64) -> String {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, THREADENTRY32, TH32CS_SNAPTHREAD, Thread32First, Thread32Next};
     use windows_sys::Win32::System::SystemInformation::GetSystemCpuSetInformation;
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, GetCurrentThread, GetCurrentThreadId, OpenThread, SetProcessDefaultCpuSets, SetThreadSelectedCpuSets, THREAD_SET_LIMITED_INFORMATION};
     // The process's other threads, as they are now (later ones take the
-    // process default); the compute CPs and the completion thread get
-    // `cs` instead when it is not empty.
-    let others = |sets: &[u32], cs: &[u32]| -> u32 {
+    // process default); threads `special` picks by name get `cs` instead
+    // when it is not empty.
+    let others = |sets: &[u32], cs: &[u32], special: &dyn Fn(&str) -> bool| -> u32 {
         let mut n = 0;
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
@@ -263,7 +291,7 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
                                 let len = (0..).take_while(|&i| *w.add(i) != 0).count();
                                 let name = String::from_utf16_lossy(std::slice::from_raw_parts(w, len));
                                 windows_sys::Win32::Foundation::LocalFree(w as _);
-                                if name.starts_with("GPU-acb") || name == "GPU-complete" {
+                                if special(&name) {
                                     use_set = cs;
                                 }
                             }
@@ -279,10 +307,11 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
         n
     };
     unsafe {
+        GPU_SETS.lock().clear();
         if core < 0 && core != -2 {
             SetThreadSelectedCpuSets(GetCurrentThread(), std::ptr::null(), 0);
             SetProcessDefaultCpuSets(GetCurrentProcess(), std::ptr::null(), 0);
-            let n = others(&[], &[]);
+            let n = others(&[], &[], &|_| false);
             return format!("every core shared again ({n} threads)");
         }
         let mut len = 0u32;
@@ -296,7 +325,7 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
         // CoreIndex u8 (+15), LastLevelCacheIndex, NumaNodeIndex,
         // EfficiencyClass u8 (+18).
         let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const u8, len as usize);
-        let mut sets: Vec<(u32, u8, u8, u8)> = Vec::new();
+        let mut sets: Vec<(u32, u8, u8, u8, u8)> = Vec::new();
         let mut at = 0usize;
         while at + 19 <= bytes.len() {
             let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
@@ -304,7 +333,8 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
                 break;
             }
             let id = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap());
-            sets.push((id, bytes[at + 14], bytes[at + 15], bytes[at + 18]));
+            // (id, logical processor, core, efficiency class, last-level cache)
+            sets.push((id, bytes[at + 14], bytes[at + 15], bytes[at + 18], bytes[at + 16]));
             at += size;
         }
         let mut cores: Vec<u8> = sets.iter().map(|s| s.2).collect();
@@ -334,6 +364,20 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
         if mine.is_empty() || rest.is_empty() {
             return format!("core {core}: nothing to split");
         }
+        // (`ccd`: our GPU threads on the graphics CP's cache's other cores,
+        // everything else on the other caches' cores.)
+        let gpu_threads = |n: &str| gpu_side(n);
+        let cs_threads = |n: &str| n.starts_with("GPU-acb") || n == "GPU-complete";
+        let (rest, cs, split) = match sets.iter().find(|s| s.2 == c).map(|s| s.4) {
+            Some(l) if ccd != 0 => {
+                let near: Vec<u32> = sets.iter().filter(|s| s.4 == l && s.2 != c).map(|s| s.0).collect();
+                let far: Vec<u32> = sets.iter().filter(|s| s.4 != l).map(|s| s.0).collect();
+                let min = if ccd == 1 { 1 } else { 8 };
+                if near.len() < min || far.len() < min { (rest, cs, false) } else { (far, near, true) }
+            }
+            _ => (rest, cs, false),
+        };
+        *GPU_SETS.lock() = if split { cs.clone() } else { Vec::new() };
         let ok1 = if soft {
             // Anywhere, preferably there.
             use windows_sys::Win32::System::Kernel::PROCESSOR_NUMBER;
@@ -348,10 +392,15 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64) -> String {
             SetThreadSelectedCpuSets(GetCurrentThread(), mine.as_ptr(), 1) != 0
         };
         let ok2 = SetProcessDefaultCpuSets(GetCurrentProcess(), rest.as_ptr(), rest.len() as u32) != 0;
-        let n = others(&rest, &cs);
+        let n = others(&rest, &cs, if split { &gpu_threads } else { &cs_threads });
         let lps: Vec<u8> = sets.iter().filter(|s| s.2 == c).map(|s| s.1).collect();
-        let cs_lps: Vec<u8> = sets.iter().filter(|s| Some(s.2) == cc).map(|s| s.1).collect();
-        format!("the core of logical processors {lps:?} dedicated{}{}: thread {ok1}, process default {ok2}, {n} other threads on the other {} sets", if soft { " (preferred only)" } else { "" }, if cs.is_empty() { String::new() } else { format!(", compute CPs and completion on {cs_lps:?}") }, rest.len())
+        let cs_lps: Vec<u8> = if split {
+            sets.iter().filter(|s| cs.contains(&s.0)).map(|s| s.1).collect()
+        } else {
+            sets.iter().filter(|s| Some(s.2) == cc).map(|s| s.1).collect()
+        };
+        let what = if split { "our GPU threads" } else { "compute CPs and completion" };
+        format!("the core of logical processors {lps:?} dedicated{}{}: thread {ok1}, process default {ok2}, {n} other threads on the other {} sets", if soft { " (preferred only)" } else { "" }, if cs.is_empty() { String::new() } else { format!(", {what} on {cs_lps:?}") }, rest.len())
     }
 }
 
@@ -400,6 +449,63 @@ pub fn reapply_guest_priorities() {
         }
     }
     crate::info!("guest thread priorities: {n} above normal (guest_prio {})", crate::tune::get(crate::tune::GUEST_PRIO));
+}
+
+/// Runs `f` with every other guest thread suspended (each one stopped before
+/// `f` starts), for host writes into guest memory that no guest thread may
+/// run into halfway. `f` must not take locks a guest thread may hold or
+/// allocate (a suspended thread may hold the heap's lock); nothing here
+/// allocates once the first thread is suspended.
+pub fn hold_guest_threads<R>(f: impl FnOnce() -> R) -> R {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT, GetThreadContext};
+    use windows_sys::Win32::System::Threading::{GetCurrentThreadId, OpenThread, ResumeThread, SuspendThread, THREAD_GET_CONTEXT, THREAD_SUSPEND_RESUME};
+    #[repr(C, align(16))]
+    struct Ctx(CONTEXT);
+    const CONTEXT_CONTROL_AMD64: u32 = 0x0010_0001;
+    let me = unsafe { GetCurrentThreadId() };
+    // (Callers may hold the memory map lock, which a thread being created
+    // may wait for while it holds the thread list: not waited for long.)
+    let Some(list) = THREADS.try_lock_for(std::time::Duration::from_millis(50)) else {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, Ordering::Relaxed) < 4 {
+            crate::warn!("hold_guest_threads: thread list busy; ran without holding the guest threads");
+        }
+        return f();
+    };
+    let tids: Vec<u32> = list.iter().filter(|t| t.exited.try_lock().is_none_or(|e| e.is_none())).map(|t| t.host_tid.load(Ordering::SeqCst) as u32).filter(|&t| t != 0 && t != me).collect();
+    drop(list);
+    let mut held: Vec<windows_sys::Win32::Foundation::HANDLE> = Vec::with_capacity(tids.len());
+    for tid in tids {
+        unsafe {
+            let h = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, 0, tid);
+            if h.is_null() {
+                continue;
+            }
+            if SuspendThread(h) == u32::MAX {
+                CloseHandle(h);
+                continue;
+            }
+            held.push(h);
+        }
+    }
+    // (Suspension is asynchronous: reading a context waits for that thread to
+    // stop. All are asked first, so they stop together.)
+    for &h in &held {
+        unsafe {
+            let mut c: Ctx = std::mem::zeroed();
+            c.0.ContextFlags = CONTEXT_CONTROL_AMD64;
+            GetThreadContext(h, &mut c.0);
+        }
+    }
+    let r = f();
+    for h in held {
+        unsafe {
+            ResumeThread(h);
+            CloseHandle(h);
+        }
+    }
+    r
 }
 
 /// The current thread at raised (`raise_priority`) or normal priority.

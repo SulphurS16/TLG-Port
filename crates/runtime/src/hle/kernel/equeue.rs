@@ -163,8 +163,14 @@ pub unsafe fn from_handle<'a>(h: u64) -> Option<&'a Equeue> {
 
 // ---------------------------------------------------------------------------
 // High-resolution timers (EVFILT_HRTIMER): one-shot events, fired by one
-// host thread at their deadline (coarse condvar wait, then a high-resolution
-// sleep and a short spin for the last ~1.5 ms).
+// host thread at their deadline. The title's engine waits in its polling
+// loops with 100 us timers (an add/wait/delete sequence inlined at ~1,650
+// sites), so on the PS4 such a poll costs ~100 us; Windows sleeps wake on a
+// 0.5 ms grid (a 100 us sleep takes ~500 us), which made each poll ~5x
+// longer and the title's own frame ~17.5 instead of ~8 ms on a fast CPU.
+// Precise firing (`precise_timers`): a coarse condvar wait until ~1.5 ms
+// before the deadline, then a spin that also notices earlier timers added
+// meanwhile.
 
 struct Timer {
     at: Instant,
@@ -176,9 +182,25 @@ struct Timer {
 static TIMERS: Mutex<Vec<Timer>> = Mutex::new(Vec::new());
 static TIMER_CV: Condvar = Condvar::new();
 static TIMER_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// Timers scheduled so far: a spin toward one deadline ends early when a
+/// timer was added meanwhile (it may be due sooner).
+static TIMERS_ADDED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// HR timers added, their requested time (us) and the timer thread's final
 /// spins (us) - the `cpu` report.
 pub static HRT_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+/// Whether timers fire precisely (`tune hrt_spin`): 1 always, 0 never (a
+/// sleep: up to ~0.5 ms late), -1 (default) when the frame rate may exceed
+/// the game's own 30 fps limit (the 60 fps limit or none) - at 30 fps the
+/// title's frame has room for the late polls, and the spin would only cost
+/// a core.
+fn precise_timers() -> bool {
+    match crate::tune::get(crate::tune::HRT_SPIN) {
+        0 => false,
+        1 => true,
+        _ => crate::hle::libs::videoout::frame_cap() != crate::config::FrameCap::Game,
+    }
+}
 
 fn schedule_timer(queue: u64, ident: u64, timer_gen: u64, at: Instant) {
     static STARTED: std::sync::Once = std::sync::Once::new();
@@ -186,10 +208,12 @@ fn schedule_timer(queue: u64, ident: u64, timer_gen: u64, at: Instant) {
         std::thread::Builder::new().name("hrtimer".into()).spawn(timer_thread).expect("hrtimer thread");
     });
     TIMERS.lock().push(Timer { at, queue, ident, timer_gen });
+    TIMERS_ADDED.fetch_add(1, std::sync::atomic::Ordering::Release);
     TIMER_CV.notify_one();
 }
 
 fn timer_thread() {
+    use std::sync::atomic::Ordering;
     crate::log::set_thread_name("hrtimer");
     crate::thread::raise_priority();
     let mut g = TIMERS.lock();
@@ -211,20 +235,24 @@ fn timer_thread() {
             None => TIMER_CV.wait(&mut g),
             Some(at) => {
                 let rem = at - now;
-                if rem > Duration::from_micros(1500) {
-                    TIMER_CV.wait_for(&mut g, rem - Duration::from_millis(1));
-                } else if crate::tune::get(crate::tune::HRT_SPIN) == 0 {
+                if precise_timers() {
+                    // (A condvar wait overshoots by up to ~1 ms: it ends
+                    // 1.5 ms early, and the spin takes the rest.)
+                    if rem > Duration::from_millis(2) {
+                        TIMER_CV.wait_for(&mut g, rem - Duration::from_micros(1500));
+                        continue;
+                    }
+                    let added = TIMERS_ADDED.load(Ordering::Acquire);
                     drop(g);
-                    std::thread::sleep(rem);
+                    let t0 = Instant::now();
+                    crate::thread::spin_until(rem, || TIMERS_ADDED.load(Ordering::Relaxed) != added);
+                    HRT_STATS[2].fetch_add(t0.elapsed().as_micros() as u64, Ordering::Relaxed);
                     g = TIMERS.lock();
+                } else if rem > Duration::from_micros(1500) {
+                    TIMER_CV.wait_for(&mut g, rem - Duration::from_millis(1));
                 } else {
                     drop(g);
-                    if rem > Duration::from_micros(300) {
-                        std::thread::sleep(rem - Duration::from_micros(200));
-                    }
-                    let t0 = Instant::now();
-                    crate::thread::spin_until(at.saturating_duration_since(t0), || false);
-                    HRT_STATS[2].fetch_add(t0.elapsed().as_micros() as u64, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(rem);
                     g = TIMERS.lock();
                 }
             }
