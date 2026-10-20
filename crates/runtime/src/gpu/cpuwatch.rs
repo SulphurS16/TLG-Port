@@ -146,19 +146,34 @@ pub fn fault(addr: u64) -> bool {
     if !ACTIVE.load(Ordering::SeqCst) {
         return false;
     }
-    let b = addr >> BLOCK_SHIFT;
-    {
-        let mut g = STATE.lock();
-        if g.armed.contains(&b) {
-            g.faults += 1;
-            restore(&mut g, b << BLOCK_SHIFT, (b + 1) << BLOCK_SHIFT);
-            return true;
-        }
+    if fault_armed(addr) {
+        return true;
     }
     // (Raced with another thread restoring the block.)
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let n = unsafe { VirtualQuery(addr as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
     n != 0 && mbi.State == MEM_COMMIT && mbi.Protect == PAGE_READWRITE
+}
+
+/// Exception handler, first for write faults: true when `addr` is in an armed
+/// block (now writable) - a set lookup, no system call. (The lazy
+/// write-back's handler, asked before, checks the page's protection with
+/// VirtualQuery for addresses outside its ranges: tens to hundreds of
+/// microseconds while other threads change protections, at every write to
+/// an armed block - the completion thread's write-backs into armed blocks
+/// spent a fifth of their time there in First Antenna's bursts.)
+pub fn fault_armed(addr: u64) -> bool {
+    if !ACTIVE.load(Ordering::SeqCst) {
+        return false;
+    }
+    let b = addr >> BLOCK_SHIFT;
+    let mut g = STATE.lock();
+    if g.armed.contains(&b) {
+        g.faults += 1;
+        restore(&mut g, b << BLOCK_SHIFT, (b + 1) << BLOCK_SHIFT);
+        return true;
+    }
+    false
 }
 
 /// Report line.

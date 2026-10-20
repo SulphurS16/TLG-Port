@@ -355,6 +355,29 @@ pub fn detile_thick_1d(src: &[u8], dst: &mut [u8], width: u32, height: u32, dept
     }
 }
 
+/// For each element of a 1D-thick volume's surface (`elems` elements from
+/// its first slice): the index of the linear element (packed slices of
+/// `width` x `height`) stored there, or `none` for padding - the GPU
+/// detiler's map (`kernels::remap_cs`), the inverse of `thick_1d_offset`.
+#[allow(clippy::too_many_arguments)]
+pub fn thick_1d_index_map(width: u32, height: u32, depth: u32, pitch: u32, pheight: u32, bpp: u32, thickness: u32, elems: usize, none: u32) -> Vec<u32> {
+    let eb = (bpp / 8) as u64;
+    let mut map = vec![none; elems];
+    let mut l = 0u32;
+    for z in 0..depth {
+        for y in 0..height {
+            for x in 0..width {
+                let t = (thick_1d_offset(x, y, z, pitch, pheight, bpp, thickness) / eb) as usize;
+                if t < elems {
+                    map[t] = l;
+                }
+                l += 1;
+            }
+        }
+    }
+    map
+}
+
 /// Size in bytes of one slice of a surface with the given padded dimensions.
 pub fn slice_bytes(pitch: u32, pheight: u32, bpp: u32) -> u64 {
     pitch as u64 * pheight as u64 * (bpp / 8) as u64
@@ -492,6 +515,35 @@ mod tests {
         assert_eq!(thick_1d_offset(0, 0, 1, w, h, bpp, 4), 8 * 4);
         assert_eq!(thick_1d_offset(8, 0, 0, w, h, bpp, 4), 256 * 4);
         assert_eq!(thick_1d_offset(0, 0, 4, w, h, bpp, 4), (16 * 16 * 4 * 4) as u64);
+    }
+    #[test]
+    fn thick_index_map_matches_cpu_detile() {
+        // First Antenna's light volumes in small: 36x36 RGBA16F (pitch and
+        // height padded to 40), a depth that leaves padding slices.
+        for (bpp, d) in [(64u32, 13u32), (32, 6), (128, 4)] {
+            let (w, h, pitch, ph, th) = (36u32, 36u32, 40u32, 40u32, 4u32);
+            let eb = (bpp / 8) as usize;
+            let total = slice_bytes(pitch, ph, bpp) as usize * th as usize * d.div_ceil(th) as usize;
+            let mut seed = 0x1234_5678u32;
+            let tiled: Vec<u8> = (0..total)
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 24) as u8
+                })
+                .collect();
+            let mut cpu = vec![0u8; (w * h * d) as usize * eb];
+            detile_thick_1d(&tiled, &mut cpu, w, h, d, pitch, ph, bpp, th);
+            // The remap kernel: linear element map[t] takes surface element t.
+            let map = thick_1d_index_map(w, h, d, pitch, ph, bpp, th, total / eb, u32::MAX);
+            let mut gpu = vec![0u8; cpu.len()];
+            for (t, &l) in map.iter().enumerate() {
+                if l != u32::MAX {
+                    gpu[l as usize * eb..(l as usize + 1) * eb].copy_from_slice(&tiled[t * eb..(t + 1) * eb]);
+                }
+            }
+            assert_eq!(gpu, cpu, "bpp {bpp} depth {d}");
+            assert_eq!(map.iter().filter(|&&l| l != u32::MAX).count(), (w * h * d) as usize);
+        }
     }
     #[test]
     fn fast_offsets_match_reference() {

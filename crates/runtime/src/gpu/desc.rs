@@ -167,7 +167,10 @@ pub fn vk_address_mode(m: u32) -> vk::SamplerAddressMode {
         0 => vk::SamplerAddressMode::REPEAT,
         1 => vk::SamplerAddressMode::MIRRORED_REPEAT,
         2 => vk::SamplerAddressMode::CLAMP_TO_EDGE,
-        3 | 5 | 7 => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+        // (Mirror once; where the device lacks it, mirrored repeat - the
+        // same within one mirrored repeat of the texture.)
+        3 | 5 | 7 if super::vk::ctx().mirror_clamp => vk::SamplerAddressMode::MIRROR_CLAMP_TO_EDGE,
+        3 | 5 | 7 => vk::SamplerAddressMode::MIRRORED_REPEAT,
         _ => vk::SamplerAddressMode::CLAMP_TO_BORDER,
     }
 }

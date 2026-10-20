@@ -8,7 +8,8 @@ Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, ge
 
 - No CPU emulation: the game's own x86-64 code runs directly on your processor.
 - Windowed, borderless or fullscreen, with a render resolution from 1280x720 to 3840x2160.
-- 30 fps (the game's own limit) or 60 fps (experimental), at the game's normal speed.
+- 30 fps (the game's own limit), 60 fps or uncapped, at the game's normal speed: its timers count time, not frames.
+- English, Spanish, French or Portuguese, the languages of the game's US release.
 - Mouse camera with raw input; every keyboard and mouse control can be changed.
 - DUALSHOCK 4, DualSense and Xbox controllers.
 
@@ -24,8 +25,8 @@ Nothing from the game is in this repository.
 
 ### What you need
 
-- Windows 10 or 11, 64-bit, and a graphics card with a Vulkan 1.3 driver and about 4 GB of video memory.
-- A recent processor with high single-core speed. Tested: a steady 30 fps, and 55-60 fps with the 60 fps limit, on a Ryzen 9 5900X with an RTX 4090; about 25-30 fps on a 6-core laptop CPU from 2019.
+- Windows 10 or 11, 64-bit, and a graphics card with a Vulkan 1.3 driver (NVIDIA, AMD or Intel) and about 4 GB of video memory.
+- A recent processor with high single-core speed. Tested on a Ryzen 9 5900X with an RTX 4090: 30 fps everywhere but about 8 seconds of the ending's busiest scene (26-27 fps), and 47-60 fps with the 60 fps limit depending on the area (the final battle about 38); about 25-30 fps on a 6-core laptop CPU from 2019.
 - Your own copy of The Last Guardian for PS4 (US release, CUSA03627) at version 01.00 with update 01.03, as decrypted folders. The game folder holds 'eboot.bin', 'sce_module', 'sce_sys' and the 'trico_*.psarc' archives; the update folder holds the same for 01.03, or the update is merged into the game folder.
 - About 25 GB of disk space for those files.
 
@@ -73,16 +74,17 @@ In menus the left mouse button selects, the right one goes back and the wheel mo
 
 ## Settings and saves
 
-- Display mode, resolution, frame-rate limit, graphics card and volume are set in the launcher and apply the next time the game starts.
+- Display mode, resolution, frame-rate limit, graphics card, volume and language are set in the launcher and apply the next time the game starts.
 - Settings and saves are in '%APPDATA%\TLG'. Before each new save, the previous one is copied to 'save-backups' there (the newest 20).
 - An empty file named 'portable.txt' next to 'tlg.exe' keeps everything in a 'user' folder beside it.
 
 ## Known limits
 
-- 60 fps is experimental: a few of the game's script timers count frames, so some moments run faster at 60 fps.
+- At 60 fps the game's timers and effects keep their normal speed, but the game has not been played through at 60 fps yet.
+- Uncapped is not recommended: at 116-119, 156-179 and 237-359 fps the game runs slower than real time.
 - No mouse pointer in the game's menus.
 - The title screen's music plays quieter than it should.
-- Tested with NVIDIA graphics (a laptop and a desktop); AMD and Intel graphics have not been tested yet.
+- Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel graphics have not been tested yet; this release removes the NVIDIA-specific assumptions a review of the port found.
 
 ## Building
 

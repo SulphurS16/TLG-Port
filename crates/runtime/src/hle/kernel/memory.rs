@@ -47,7 +47,7 @@ fn map_common(addr_io: *mut u64, len: u64, prot: i32, flags: i32, kind: VmaKind,
     }
     let len = mem::align_up(len, PAGE);
     let hint = unsafe { *addr_io };
-    let mut st = MEM.lock();
+    let mut st = MEM.write();
     let addr = match choose_addr(&st, hint, len, align, flags) {
         Ok(a) => a,
         Err(e) => return sce(e),
@@ -67,7 +67,7 @@ fn map_common(addr_io: *mut u64, len: u64, prot: i32, flags: i32, kind: VmaKind,
 
 fn flexible(addr_io: *mut u64, len: u64, prot: i32, flags: i32, name: &str) -> i32 {
     {
-        let st = MEM.lock();
+        let st = mem::map_read();
         if st.flexible_used + mem::align_up(len, PAGE) > FLEXIBLE_TOTAL {
             crate::warn!("flexible memory exhausted ({:#x} used, {:#x} requested)", st.flexible_used, len);
             return sce(ENOMEM);
@@ -96,15 +96,15 @@ fn batch_map(entries: *const BatchEntry, n: i32, out: *mut i32, flags: i32) -> i
         let r = match e.operation {
             0 => map_common(&mut a, e.length, e.protection as i32, flags | MAP_FIXED, VmaKind::Direct, e.offset, 0, "batch"),
             1 => {
-                MEM.lock().unmap_range(e.start, e.start + e.length);
+                MEM.write().unmap_range(e.start, e.start + e.length);
                 0
             }
-            2 => match MEM.lock().protect(e.start, e.start + e.length, e.protection as u32) {
+            2 => match MEM.write().protect(e.start, e.start + e.length, e.protection as u32) {
                 Ok(()) => 0,
                 Err(_) => sce(EINVAL),
             },
             3 => flexible(&mut a, e.length, e.protection as i32, flags | MAP_FIXED, "batch-flex"),
-            4 => match MEM.lock().protect(e.start, e.start + e.length, e.protection as u32) {
+            4 => match MEM.write().protect(e.start, e.start + e.length, e.protection as u32) {
                 Ok(()) => 0,
                 Err(_) => sce(EINVAL),
             },
@@ -140,7 +140,7 @@ sysv! {
     fn sceKernelGetDirectMemorySize() -> u64 { mem::dmem_size() }
     fn sceKernelAllocateDirectMemory(start: i64, end: i64, len: u64, align: u64, mtype: i32, out: *mut i64) -> i32 {
         if out.is_null() || len == 0 || len % PAGE != 0 || (align != 0 && !align.is_power_of_two()) { return sce(EINVAL); }
-        match MEM.lock().dmem_allocate(start.max(0) as u64, end.max(0) as u64, len, align, mtype) {
+        match MEM.write().dmem_allocate(start.max(0) as u64, end.max(0) as u64, len, align, mtype) {
             Some(p) => {
                 *out = p as i64;
                 crate::debug!("dmem alloc {:#x}+{:#x} align {:#x} type {}", p, len, align, mtype);
@@ -156,15 +156,15 @@ sysv! {
         sceKernelAllocateDirectMemory(0, mem::dmem_size() as i64, len, align, mtype, out)
     }
     fn sceKernelReleaseDirectMemory(start: i64, len: u64) -> i32 {
-        MEM.lock().dmem_release(start as u64, len);
+        MEM.write().dmem_release(start as u64, len);
         0
     }
     fn sceKernelCheckedReleaseDirectMemory(start: i64, len: u64) -> i32 {
-        MEM.lock().dmem_release(start as u64, len);
+        MEM.write().dmem_release(start as u64, len);
         0
     }
     fn sceKernelAvailableDirectMemorySize(start: i64, end: i64, align: u64, out_start: *mut i64, out_size: *mut u64) -> i32 {
-        let (s, n) = MEM.lock().dmem_largest_free(start.max(0) as u64, end.max(0) as u64);
+        let (s, n) = mem::map_read().dmem_largest_free(start.max(0) as u64, end.max(0) as u64);
         let a = align.max(PAGE);
         let s2 = mem::align_up(s, a);
         let n2 = n.saturating_sub(s2 - s);
@@ -173,7 +173,7 @@ sysv! {
         if n2 == 0 { sce(ENOMEM) } else { 0 }
     }
     fn sceKernelGetDirectMemoryType(start: i64, mtype: *mut i32, out_start: *mut i64, out_end: *mut i64) -> i32 {
-        let st = MEM.lock();
+        let st = mem::map_read();
         let s = start as u64;
         for (&b, blk) in st.dmem.range(..=s).rev().take(1) {
             if s < b + blk.size {
@@ -201,23 +201,23 @@ sysv! {
         flexible(addr, len, prot, flags, cstr(name))
     }
     fn sceKernelReleaseFlexibleMemory(addr: u64, len: u64) -> i32 {
-        MEM.lock().unmap_range(addr, addr + mem::align_up(len, PAGE));
+        MEM.write().unmap_range(addr, addr + mem::align_up(len, PAGE));
         0
     }
     fn sceKernelAvailableFlexibleMemorySize(out: *mut u64) -> i32 {
         if out.is_null() { return sce(EINVAL); }
-        *out = FLEXIBLE_TOTAL.saturating_sub(MEM.lock().flexible_used);
+        *out = FLEXIBLE_TOTAL.saturating_sub(mem::map_read().flexible_used);
         0
     }
     fn sceKernelMunmap(addr: u64, len: u64) -> i32 {
         if addr % PAGE != 0 || len == 0 { return sce(EINVAL); }
-        MEM.lock().unmap_range(addr, addr + mem::align_up(len, PAGE));
+        MEM.write().unmap_range(addr, addr + mem::align_up(len, PAGE));
         0
     }
     fn sceKernelMprotect(addr: u64, len: u64, prot: i32) -> i32 {
         let start = mem::align_down(addr, PAGE);
         let end = mem::align_up(addr + len, PAGE);
-        match MEM.lock().protect(start, end, prot as u32) { Ok(()) => 0, Err(_) => sce(EINVAL) }
+        match MEM.write().protect(start, end, prot as u32) { Ok(()) => 0, Err(_) => sce(EINVAL) }
     }
     fn sceKernelMtypeprotect(addr: u64, len: u64, mtype: i32, prot: i32) -> i32 {
         sceKernelMprotect(addr, len, prot)
@@ -226,7 +226,7 @@ sysv! {
         map_common(addr, len, 0, flags, VmaKind::Reserved, 0, align, "reserved")
     }
     fn sceKernelQueryMemoryProtection(addr: u64, start: *mut u64, end: *mut u64, prot: *mut u32) -> i32 {
-        let st = MEM.lock();
+        let st = mem::map_read();
         match st.find(addr) {
             Some(v) if v.kind != VmaKind::Reserved => {
                 if !start.is_null() { *start = v.start; }
@@ -239,7 +239,7 @@ sysv! {
     }
     fn sceKernelVirtualQuery(addr: u64, flags: i32, info: *mut u8, size: u64) -> i32 {
         if info.is_null() || size < std::mem::size_of::<VirtualQueryInfo>() as u64 { return sce(EINVAL); }
-        let st = MEM.lock();
+        let st = mem::map_read();
         let v = match st.find(addr) {
             Some(v) => Some(v.clone()),
             None if flags & 1 != 0 => st.vmas.range(addr..).next().map(|(_, v)| v.clone()),

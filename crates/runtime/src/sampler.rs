@@ -36,8 +36,10 @@ const STACK_SPAN: u64 = 8 << 20;
 #[repr(C, align(16))]
 struct AlignedContext(CONTEXT);
 
-/// Pending spike reports: window and label.
-static SPIKES: parking_lot::Mutex<Vec<(std::time::Instant, std::time::Instant, String)>> = parking_lot::Mutex::new(Vec::new());
+/// Recent spike windows: number, window and label. Every sampled thread
+/// reports each one (its own samples in the window) once it has ended.
+static SPIKES: parking_lot::Mutex<Vec<(u64, std::time::Instant, std::time::Instant, String)>> = parking_lot::Mutex::new(Vec::new());
+static SPIKE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// Samples kept for spike reports (~4 s at one per millisecond).
 const KEEP: usize = 4096;
 
@@ -58,9 +60,11 @@ pub fn spike_threshold() -> std::time::Duration {
 pub fn spike(t0: std::time::Instant, t1: std::time::Instant, label: String) {
     if active() {
         let mut g = SPIKES.lock();
-        if g.len() < 64 {
-            g.push((t0, t1, label));
+        // (The oldest go: every thread's loop has reported them by then.)
+        if g.len() >= 64 {
+            g.remove(0);
         }
+        g.push((SPIKE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1, t0, t1, label));
     }
 }
 
@@ -107,6 +111,8 @@ fn run(h: HANDLE, name: String) {
     let mut names: HashMap<u64, String> = HashMap::new();
     let mut sym_ready = false;
     let mut recent: std::collections::VecDeque<(std::time::Instant, Vec<u64>)> = std::collections::VecDeque::with_capacity(KEEP);
+    // (The last spike window this thread reported.)
+    let mut spikes_seen = SPIKE_SEQ.load(std::sync::atomic::Ordering::Relaxed);
     // Distinct stacks of the whole run and their sample counts.
     let mut stacks: HashMap<Vec<u64>, u64> = HashMap::new();
     let init_sym = || {
@@ -172,11 +178,20 @@ fn run(h: HANDLE, name: String) {
         }
         recent.push_back((std::time::Instant::now(), frames[..k].to_vec()));
         let ready: Vec<(std::time::Instant, std::time::Instant, String)> = {
-            let mut g = SPIKES.lock();
+            let g = SPIKES.lock();
             let now = std::time::Instant::now();
-            let (done, wait): (Vec<_>, Vec<_>) = g.drain(..).partition(|s| s.1 + std::time::Duration::from_millis(5) <= now);
-            *g = wait;
-            done
+            // (In order: a later one is reported only after the earlier
+            // ones have ended.)
+            let mut out = Vec::new();
+            let seen = spikes_seen;
+            for s in g.iter().filter(|s| s.0 > seen) {
+                if s.2 + std::time::Duration::from_millis(5) > now {
+                    break;
+                }
+                spikes_seen = s.0;
+                out.push((s.1, s.2, s.3.clone()));
+            }
+            out
         };
         for (t0, t1, label) in ready {
             if !sym_ready {

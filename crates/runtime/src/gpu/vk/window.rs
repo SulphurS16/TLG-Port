@@ -113,8 +113,10 @@ pub fn inject_mouse(dx: i64, dy: i64, ms: u64) {
         let (mut sx, mut sy) = (0i64, 0i64);
         for i in 1..=steps {
             let (tx, ty) = (dx * i / steps, dy * i / steps);
-            MOUSE_DX.fetch_add(tx - sx, Ordering::Relaxed);
-            MOUSE_DY.fetch_add(ty - sy, Ordering::Relaxed);
+            if !crate::input::mouse_motion(tx - sx, ty - sy) {
+                MOUSE_DX.fetch_add(tx - sx, Ordering::Relaxed);
+                MOUSE_DY.fetch_add(ty - sy, Ordering::Relaxed);
+            }
             (sx, sy) = (tx, ty);
             if i < steps {
                 std::thread::sleep(std::time::Duration::from_millis(5));
@@ -236,7 +238,9 @@ unsafe fn raw_input(lp: LPARAM) {
     let m = unsafe { ri.data.mouse };
     // (Absolute-position devices such as tablets and remote desktops are not
     // raw counts: MOUSE_MOVE_ABSOLUTE.)
-    if m.usFlags & 1 == 0 {
+    // (Into the game camera at once - `input::mouse_motion` - or kept for
+    // the pad read.)
+    if m.usFlags & 1 == 0 && !crate::input::mouse_motion(m.lLastX as i64, m.lLastY as i64) {
         MOUSE_DX.fetch_add(m.lLastX as i64, Ordering::Relaxed);
         MOUSE_DY.fetch_add(m.lLastY as i64, Ordering::Relaxed);
     }
@@ -637,6 +641,13 @@ pub fn create(title: &str) -> Result<&'static Window, String> {
         .name("ui".into())
         .spawn(move || unsafe {
             crate::log::set_thread_name("ui");
+            // (Raw mouse input goes from here into the game camera: handled
+            // at once even while the GPU threads, above normal, keep cores
+            // busy. The thread waits for messages otherwise.)
+            {
+                use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_HIGHEST};
+                SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            }
             let s = crate::config::settings();
             {
                 let mut d = DISPLAY.lock();

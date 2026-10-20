@@ -581,6 +581,11 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
         }
         if code == 0xC0000005 && rec.NumberParameters >= 2 {
             let rip = (*(*info).ContextRecord).Rip;
+            // (Armed cold blocks first: no system call. Lazy write-back
+            // ranges are never armed - cpuwatch.rs, `lazywb::after_write`.)
+            if rec.ExceptionInformation[0] == 1 && crate::gpu::cpuwatch::fault_armed(rec.ExceptionInformation[1] as u64) {
+                return -1;
+            }
             if crate::gpu::lazywb::fault(rec.ExceptionInformation[1] as u64, rec.ExceptionInformation[0] == 8) {
                 return -1;
             }

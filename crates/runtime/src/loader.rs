@@ -86,7 +86,7 @@ pub fn load(path: &Path, is_main: bool) -> Result<Arc<LoadedModule>, String> {
     let image_size = m.image_span(PAGE);
     let size = image_size + TRAMPOLINE_SPACE;
     let base = {
-        let mut st = MEM.lock();
+        let mut st = MEM.write();
         let base = if is_main {
             mem::MODULE_BASE
         } else {
@@ -224,7 +224,7 @@ const STUB_DATA_SPACE: u64 = 0x10_0000;
 impl Stubs {
     fn ensure(&mut self) {
         if self.code_base == 0 {
-            let mut st = MEM.lock();
+            let mut st = MEM.write();
             self.code_base = st
                 .alloc_internal(STUB_CODE_SPACE, mem::PROT_CPU_READ | mem::PROT_CPU_WRITE | mem::PROT_CPU_EXEC, "import-stubs")
                 .expect("stub space");
@@ -411,7 +411,7 @@ pub fn finalize(m: &LoadedModule) -> Result<PatchStats, String> {
     }
     let (tramp_used, data_used) = (p.tramp_used, p.data_used);
     // Protections.
-    let mut st = MEM.lock();
+    let mut st = MEM.write();
     for ph in &m.phdrs {
         let prot = match ph.p_type {
             sce_elf::PT_LOAD => prot_from_flags(ph.p_flags),

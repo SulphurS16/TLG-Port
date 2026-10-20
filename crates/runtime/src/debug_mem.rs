@@ -20,7 +20,7 @@ pub fn parse_addr(s: &str) -> Result<u64, String> {
     let (mut v, rest) = if let Some(inner) = s.strip_prefix('[') {
         let end = inner.rfind(']').ok_or("unbalanced [")?;
         let p = parse_addr(&inner[..end])?;
-        if !readable(p, 8) {
+        if !readable(p, 8) && !host_readable(p, 8) {
             return Err(format!("{p:#x} is not mapped"));
         }
         (unsafe { std::ptr::read_unaligned(p as *const u64) }, &inner[end + 1..])
@@ -35,17 +35,29 @@ pub fn parse_addr(s: &str) -> Result<u64, String> {
     Ok(v)
 }
 
+/// Committed, readable host memory outside the guest range (the title's
+/// heap objects come from tlg's allocator), for reading only.
+fn host_readable(addr: u64, len: u64) -> bool {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+    if addr < 0x10000 || len == 0 {
+        return false;
+    }
+    let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+    let n = unsafe { VirtualQuery(addr as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
+    n != 0 && mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 && mbi.Protect & 0xEE != 0 && addr + len <= mbi.BaseAddress as u64 + mbi.RegionSize as u64
+}
+
 fn readable(addr: u64, len: u64) -> bool {
     if !crate::mem::is_guest(addr, len) {
         return false;
     }
-    let st = crate::mem::MEM.lock();
+    let st = crate::mem::map_read();
     st.find(addr).is_some_and(|v| v.kind != crate::mem::VmaKind::Reserved && addr + len <= v.end())
 }
 
 pub fn peek(expr: &str, n: u64) -> Result<(), String> {
     let a = parse_addr(expr)?;
-    if !readable(a, n.max(4)) {
+    if !readable(a, n.max(4)) && !host_readable(a, n.max(4)) {
         return Err(format!("peek {a:#x}+{n:#x}: not mapped"));
     }
     let mut out = format!("peek {expr} = {a:#x} ({}):", crate::loader::describe_addr(a));

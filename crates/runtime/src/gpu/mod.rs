@@ -12,6 +12,7 @@ pub mod prepahead;
 pub mod rec;
 pub mod render;
 pub mod resources;
+pub mod suballoc;
 pub mod shaders;
 pub mod texdump;
 pub mod tiling;
@@ -567,6 +568,8 @@ fn gfx_thread() {
                 crate::info!("rings since last report: host peak {} of {} MiB per segment, device peak {} of {} MiB", hp >> 20, hs >> 20, dp >> 20, ds >> 20);
                 let mips: Vec<String> = render::GPU_MIP_STAT_NAMES.iter().zip(render::GPU_MIP_STATS.iter()).map(|(n, v)| format!("{n} {}", v.load(Ordering::Relaxed))).collect();
                 crate::info!("GPU mip-chain/BC texture path: {}", mips.join(", "));
+                let vols: Vec<String> = render::VOLUME_STAT_NAMES.iter().zip(render::VOLUME_STATS.iter()).map(|(n, v)| format!("{n} {}", v.load(Ordering::Relaxed))).collect();
+                crate::info!("thick volume textures on the GPU (left to the CPU by reason): {} ({} MiB)", vols.join(", "), render::VOLUME_EDGE_BYTES.load(Ordering::Relaxed) >> 20);
                 let (clean, dirty) = (r.mem().writes.clean, r.mem().writes.dirty);
                 crate::info!("texture validations: {clean} unwritten, {dirty} hashed ({} MiB hashed in total)", r.hashed_bytes >> 20);
                 if let Some((mib, n, copied, hits)) = r.vcache_stats() {
@@ -1097,7 +1100,13 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 format!("{name} ({}/s) {}", now.cprof_n[c] - p.cprof_n[c], parts.join(", "))
             })
             .collect();
-        crate::info!("dispatch µs/dispatch by queue: {}", cs.join("; "));
+        let rep: Vec<String> = (0..2)
+            .map(|c| {
+                let n: [u64; 4] = std::array::from_fn(|k| render::DISPATCH_REPEATS[c][k].swap(0, Ordering::Relaxed));
+                format!("{} of {}: same shader {} (one resource differs {}, none {})", ["graphics", "compute"][c], n.iter().sum::<u64>(), n[1] + n[2] + n[3], n[2], n[3])
+            })
+            .collect();
+        crate::info!("dispatch µs/dispatch by queue: {}; binding what the dispatch before them bound: {}; engine copies done in guest memory by the CPU {}", cs.join("; "), rep.join(", "), render::CPU_COPIES.swap(0, Ordering::Relaxed));
         // (The slot waits by where the awaited batch was.)
         let sw: Vec<u64> = render::SLOT_WAIT_SPLIT.iter().map(|a| a.swap(0, Ordering::Relaxed)).collect();
         let swaps = render::SLOT_SWAPS.swap(0, Ordering::Relaxed);
@@ -1185,7 +1194,7 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 .collect();
             crate::info!("mirror binding cache misses/s by queue and reason: {}", miss.join("; "));
             let a: [u64; 7] = std::array::from_fn(|i| writes::ARM_STATS[i].swap(0, Ordering::Relaxed));
-            crate::info!("queried blocks/s for cold-block arming: {} written, {} clean below the threshold, {} clean waiting after strikes ({:.1} strikes each), {} armed when queried, {} to arm ({} of them refused: lazy write-back {}, not committed {}, protection {} (last {:#x}), protect failed {})", a[0], a[1], a[2], a[3] as f64 / a[2].max(1) as f64, a[4], a[5], a[6], cpuwatch::REFUSALS[0].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[1].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[2].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[4].load(Ordering::Relaxed), cpuwatch::REFUSALS[3].swap(0, Ordering::Relaxed));
+            crate::info!("queried blocks/s for cold-block arming: {} written, {} clean below the threshold, {} clean waiting after strikes ({:.1} strikes each), {} armed when queried, {} to arm ({} of them refused: lazy write-back {}, not committed {}, protection {} (last {:#x}), protect failed {}); left out as kept inaccessible by the lazy write-back {}", a[0], a[1], a[2], a[3] as f64 / a[2].max(1) as f64, a[4], a[5], a[6], cpuwatch::REFUSALS[0].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[1].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[2].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[4].load(Ordering::Relaxed), cpuwatch::REFUSALS[3].swap(0, Ordering::Relaxed), writes::LAZY_SKIPS.swap(0, Ordering::Relaxed));
         }
         // (The compute queues' share of them.)
         static LAST_CS: Mutex<[(u64, u64); render::BPART_COUNT]> = Mutex::new([(0, 0); render::BPART_COUNT]);

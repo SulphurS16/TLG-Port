@@ -8,7 +8,7 @@
 //! Limitation (reported, never silent): mapping the same direct-memory range at
 //! two virtual addresses (aliasing) is not shared; it is detected and logged.
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use std::collections::BTreeMap;
 use windows_sys::Win32::System::Memory::*;
 
@@ -117,12 +117,43 @@ pub fn take_map_changes() -> Vec<(u64, u64)> {
     std::mem::take(&mut *MAP_CHANGES.lock())
 }
 
-pub static MEM: Mutex<MemState> = Mutex::new(MemState {
+/// The guest mappings. Readers (lookups, and the copies to and from guest
+/// memory that hold the mappings stable while they run) share it; mapping,
+/// unmapping and protection changes take it alone. As one mutex, the copy
+/// thread's ~75,000 guest reads a second held it for their copies and the
+/// completion thread's write-backs and the title's protection queries waited
+/// behind them (Sentinel Tower: 12% and 6.5% of those threads' time).
+pub static MEM: RwLock<MemState> = RwLock::new(MemState {
     vmas: BTreeMap::new(),
     dmem: BTreeMap::new(),
     flexible_used: 0,
     internal_cursor: INTERNAL_BASE,
 });
+
+/// A shared hold of the guest mappings, for lookups and the copies that need
+/// them stable (`tune mem_shared 0`: held alone, as the mutex it was).
+pub enum MapRead {
+    Shared(parking_lot::RwLockReadGuard<'static, MemState>),
+    Alone(parking_lot::RwLockWriteGuard<'static, MemState>),
+}
+
+impl std::ops::Deref for MapRead {
+    type Target = MemState;
+    fn deref(&self) -> &MemState {
+        match self {
+            MapRead::Shared(g) => g,
+            MapRead::Alone(g) => g,
+        }
+    }
+}
+
+pub fn map_read() -> MapRead {
+    if crate::tune::get(crate::tune::MEM_SHARED) != 0 {
+        MapRead::Shared(MEM.read())
+    } else {
+        MapRead::Alone(MEM.write())
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MemError {
@@ -305,9 +336,47 @@ pub fn reset_write_watch(addr: u64, len: u64) {
     }
 }
 
+/// Bytes of the last commit Windows refused for lack of memory (its commit
+/// limit: RAM plus page file), 0 if none was refused.
+pub static COMMIT_REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn host_commit(addr: u64, size: u64, prot: u32) -> Result<(), MemError> {
-    let p = unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) };
-    if p.is_null() { Err(MemError::HostFailure(last_error())) } else { Ok(()) }
+    // A system-managed page file grows when the commit limit is reached, and
+    // commits fail while it grows: such a failure is retried for ~3 s.
+    // (TLG_REFUSE_COMMIT=<MiB>: commits of at least that size fail as at the
+    // commit limit, to test what the player sees.)
+    static REFUSE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let refuse = *REFUSE.get_or_init(|| std::env::var("TLG_REFUSE_COMMIT").ok().and_then(|v| v.parse::<u64>().ok()).map_or(0, |m| m << 20));
+    let mut tries = 0;
+    loop {
+        let p = if refuse != 0 && size >= refuse {
+            unsafe { windows_sys::Win32::Foundation::SetLastError(1455) };
+            std::ptr::null_mut()
+        } else {
+            unsafe { VirtualAlloc(addr as _, size as usize, MEM_COMMIT, win_prot(prot)) }
+        };
+        if !p.is_null() {
+            if tries > 0 {
+                crate::info!("memory: {size:#x} bytes at {addr:#x} committed after {tries} retries");
+            }
+            return Ok(());
+        }
+        let e = last_error();
+        // (ERROR_COMMITMENT_LIMIT, ERROR_NOT_ENOUGH_MEMORY, ERROR_OUTOFMEMORY)
+        let short = matches!(e, 1455 | 8 | 14);
+        if !short || tries == 12 {
+            if short {
+                COMMIT_REFUSED.store(size, std::sync::atomic::Ordering::Relaxed);
+                crate::error!("memory: Windows refused to commit {size:#x} bytes at {addr:#x} (error {e}: its commit limit, RAM plus page file, is reached)");
+            }
+            return Err(MemError::HostFailure(e));
+        }
+        if tries == 0 {
+            crate::warn!("memory: committing {size:#x} bytes at {addr:#x} failed with error {e} (commit limit): retrying while Windows grows its page file");
+        }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 fn host_decommit(addr: u64, size: u64) {
@@ -573,7 +642,7 @@ pub fn arena_alloc(size: u64, align: u64) -> u64 {
     if a.cur == 0 || p + size > a.end {
         let chunk = align_up(size.max(1 << 20), PAGE);
         let base = MEM
-            .lock()
+            .write()
             .alloc_internal(chunk, PROT_CPU_READ | PROT_CPU_WRITE, "hle-arena")
             .expect("internal arena exhausted");
         a.cur = base;

@@ -25,6 +25,7 @@ mod mem;
 mod pacing;
 mod padhid;
 mod patch;
+mod script_fixes;
 mod sse4a;
 mod thread;
 mod title_patches;
@@ -57,7 +58,7 @@ pub struct Config {
     pub dialogs: bool,
 }
 
-static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+pub static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// This run's directory (logs, screenshots, profiles).
 pub fn run_dir() -> Option<&'static Path> {
@@ -348,7 +349,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
             }
             "vmas" => {
                 // Debug: guest address space layout.
-                let m = crate::mem::MEM.lock();
+                let m = crate::mem::map_read();
                 let mut s = format!("{} guest mappings:", m.vmas.len());
                 for v in m.vmas.values() {
                     s.push_str(&format!("\n  {:#014x}-{:#014x} {:>10} KiB {:?} prot {:#x} phys {:#x} '{}'", v.start, v.end(), v.size >> 10, v.kind, v.prot, v.phys, v.name));
@@ -367,6 +368,11 @@ fn poll_control(path: &Path, offset: &mut u64) {
             }
             "cpu" => {
                 thread::cpu_report();
+                Ok(())
+            }
+            "mouselat" => {
+                // mouselat <n>: n injected turns timed until the game camera moves.
+                title_patches::mouse_latency_probe(parts.next().and_then(|v| v.parse().ok()).unwrap_or(30));
                 Ok(())
             }
             "camlog" => {
@@ -624,6 +630,17 @@ fn main() {
         } else {
             warn!("TLG_CPU_AFFINITY {mask:#x}: SetProcessAffinityMask failed");
         }
+    }
+    {
+        let n = thread::apply_cpu_budget();
+        use tune::{COPY_SPIN_US, HRT_SPIN, MUTEX_SPINS, REC_SPIN_US, get};
+        info!(
+            "CPU budget: {n} logical processors: copy/record threads poll {}/{} us, guest mutexes spin {} pauses, timer spin {}",
+            get(COPY_SPIN_US),
+            get(REC_SPIN_US),
+            get(MUTEX_SPINS),
+            get(HRT_SPIN)
+        );
     }
     // The renderer runs whether or not frames reach a window: headless runs (and a
     // window that could not be shown) render offscreen; screenshots still work.

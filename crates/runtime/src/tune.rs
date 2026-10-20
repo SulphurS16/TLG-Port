@@ -105,8 +105,12 @@ pub const DYN_LOADS: usize = 20;
 
 /// Read-only buffer bindings of at least this many KiB come from the VRAM
 /// mirror (copied in when the CPU changes them) rather than a copy into the
-/// host-memory upload ring per binding (`TLG_VCACHE_READ_MIN_KIB`, 64).
-/// Below 64 only in mirror windows that exist.
+/// host-memory upload ring per binding (`TLG_VCACHE_READ_MIN_KIB`, 16).
+/// Below 64 only in mirror windows that exist. (16, not 64: rotated rounds
+/// in one boot, fps / 99th-percentile frame vs 64 - the Trico battle +7% /
+/// -10% (its ~700 culling dispatches a frame each bound 27 and 43 KiB
+/// tables), Falling Bridge +4% / -6%, First Antenna +3% / -5%; 8 KiB as
+/// fast with worse tails.)
 pub const VCACHE_READ_MIN_KIB: usize = 21;
 
 /// Depth targets read through a smaller T# only by integer texel coordinates
@@ -394,7 +398,8 @@ pub const WW_LOG: usize = 64;
 pub const WW_BULK: usize = 65;
 
 /// Microseconds the copy thread (`gpu::copier`) keeps polling for the next
-/// copy before it sleeps (`TLG_COPY_SPIN_US`, 1000; was 50): each copy queued
+/// copy before it sleeps (`TLG_COPY_SPIN_US`, 1000, 50 with 8 or fewer logical
+/// processors - `thread::apply_cpu_budget`; was 50): each copy queued
 /// while it sleeps wakes it (a kernel call on the CP; ~4% of the graphics CP
 /// at 31% clock, where draws come more than 50 us apart). Cave, 31% clock:
 /// wakes per frame 890 -> ~4, frame -4 to -6.5% (200 us: -1%). It polls while a CP
@@ -435,7 +440,8 @@ pub const PERF_HOT: usize = 71;
 pub const DMA_REG_LAST: usize = 72;
 
 /// The recorder thread polls this many microseconds for more operations
-/// before it sleeps (`TLG_REC_SPIN_US`, 1000): a CP publishes every few
+/// before it sleeps (`TLG_REC_SPIN_US`, 1000; 50 with 8 or fewer logical
+/// processors, `thread::apply_cpu_budget`): a CP publishes every few
 /// commands, and waking the sleeping recorder costs the CP a system call.
 pub const REC_SPIN_US: usize = 73;
 
@@ -457,7 +463,8 @@ pub const YIELD_QUEUES: usize = 75;
 pub const SEMA_WAKE: usize = 76;
 
 /// Pause instructions a contended guest mutex spins before parking
-/// (`TLG_MUTEX_SPINS`, 4000; ~140 cycles each on this CPU).
+/// (`TLG_MUTEX_SPINS`, 4000; ~140 cycles each on the laptop's CPU; 400 with 8
+/// or fewer logical processors, `thread::apply_cpu_budget`).
 pub const MUTEX_SPINS: usize = 77;
 
 /// The title's render-kick job waits for ps4render in a loop without a pause
@@ -470,7 +477,8 @@ pub const KICK_WAIT: usize = 78;
 /// division cost more than a pause, also to the core's other hyperthread.
 pub const SPIN_PAUSES: usize = 79;
 
-/// The HR-timer thread's last stretch before a deadline (`TLG_HRT_SPIN`, -1):
+/// The HR-timer thread's last stretch before a deadline (`TLG_HRT_SPIN`, -1;
+/// 0 with 8 or fewer logical processors, `thread::apply_cpu_budget`):
 /// 1 spins it (a condvar wait to ~1.5 ms before, then a spin), 0 only
 /// sleeps (Windows sleeps wake on a 0.5 ms grid: a 100 us timer fires after
 /// ~500 us), -1 spins when the frame rate may exceed the game's 30 fps limit
@@ -580,9 +588,9 @@ pub const CS_ROUTE: usize = 96;
 /// Read-only ring copies reused by later batches of the same CPU epoch and
 /// CP queue, up to this many batches back (`TLG_UPLOAD_XBATCH`, at most 4;
 /// 0: within their batch only, as before). Takes effect only when set at
-/// start: the upload ring then has 4 segments more than there are batch
-/// slots, so a copy's segment is written again only after every batch that
-/// may reuse it has completed (smaller segments: more batches end early).
+/// start; the upload ring has 4 segments more than there are batch slots,
+/// so a copy's segment is written again only after every batch that may
+/// reuse it has completed.
 pub const UPLOAD_XBATCH: usize = 97;
 
 /// Write-back overlap checks answered from indexes when nothing can overlap
@@ -773,8 +781,51 @@ pub const SLOT_FENCE: usize = 131;
 /// buried under the copy (`TLG_LAZY_HOLD`, 1; 0: no hold - the pages turn
 /// accessible right before the copy).
 pub const LAZY_HOLD: usize = 132;
+/// Volume textures in the 1D-thick tile mode are detiled on the GPU from the
+/// VRAM mirror, where the compute shaders that write them left their data
+/// (`render::gpu_volume_validate`; `TLG_GPU_VOLUMES`, 1; 0: the CPU reads and
+/// detiles them, the GPU's writes read back first).
+pub const GPU_VOLUMES: usize = 133;
+/// Lazy write-backs (lazywb.rs): ranges of this many KiB or more go lazy
+/// after one untouched eager write-back instead of four (`lazywb::lazy_after`;
+/// `TLG_LAZY_BIG_KIB`, 0 = four for every range). Measured with 4096 in First
+/// Antenna (LOG: First Antenna's bursts): a streaming event's burst 3 frames
+/// of up to 75 ms instead of 5 of up to 83 (one event each), but 60 MiB more
+/// lazy readbacks - pieces of the light volumes written later read back the
+/// whole range first. Off.
+pub const LAZY_BIG_KIB: usize = 134;
+/// Images take ranges of 64 MiB device allocations instead of one
+/// allocation each (`gpu::suballoc`; `TLG_IMAGE_BLOCKS`, 1). Drivers cap the
+/// allocations alive at once (AMD's on Windows at 4,096).
+pub const IMAGE_BLOCKS: usize = 135;
+/// Lookups and copies share the guest mappings' lock (`mem::MEM`, a
+/// reader/writer lock; `TLG_MEM_SHARED`, 1); 0 takes it alone as the mutex it
+/// was (A/B).
+pub const MEM_SHARED: usize = 136;
+/// Write-watch queries leave out 64 KiB blocks the lazy write-back keeps
+/// inaccessible once they were queried after it began to (`TLG_LAZY_SKIP`;
+/// `writes::WriteTracker::lazy_ok`): no CPU write reaches them unfaulted.
+pub const LAZY_SKIP: usize = 137;
+/// Ring allocations fetch the next lines for writing (`TLG_RING_PREFETCH`, 1;
+/// `resources::Ring::alloc`).
+pub const RING_PREFETCH: usize = 138;
+/// Segments of the graphics upload ring, 6..64 (`TLG_RING_SEGS_TUNE`, 0: as
+/// set at start - 10, `TLG_RING_SEGS`); changed at the next batch, once every
+/// batch has been written back. For A/B windows.
+pub const RING_SEGS: usize = 139;
+/// The engine's copy kernel over at most this many bytes is done in guest
+/// memory by the CPU when no GPU work is pending on either range
+/// (`TLG_CPU_COPY_MAX`, 0: always a dispatch; `Renderer::cpu_copy`). Off:
+/// in the Trico battle ~5,000 copies a second skipped their dispatch, but
+/// the graphics CP took 2-3% more time per frame (10 paired rounds; the
+/// copied pages filled into the mirror again for their readers).
+pub const CPU_COPY_MAX: usize = 140;
+/// Raw mouse motion goes into the game camera's pending turn as it arrives
+/// (`TLG_MOUSE_DIRECT`, 1; 0: at the game's pad reads, one a frame, as
+/// before - for A/Bs; `input::mouse_motion`).
+pub const MOUSE_DIRECT: usize = 141;
 
-const TABLE: [(&str, &str, i64); 133] = [
+const TABLE: [(&str, &str, i64); 142] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -796,7 +847,7 @@ const TABLE: [(&str, &str, i64); 133] = [
     ("pass_barrier", "TLG_PASS_BARRIER", 1),
     ("mirror_gpu_stamps", "TLG_MIRROR_GPU_STAMPS", 0),
     ("dyn_loads", "TLG_DYN_LOADS", 1),
-    ("vcache_read_min_kib", "TLG_VCACHE_READ_MIN_KIB", 64),
+    ("vcache_read_min_kib", "TLG_VCACHE_READ_MIN_KIB", 16),
     ("depth_load_view", "TLG_DEPTH_LOAD_VIEW", 1),
     ("elide_utility", "TLG_ELIDE_UTILITY", 1),
     ("vcache_write_min_kib", "TLG_VCACHE_WRITE_MIN_KIB", 64),
@@ -908,6 +959,15 @@ const TABLE: [(&str, &str, i64); 133] = [
     ("ccd_split", "TLG_CCD_SPLIT", -1),
     ("slot_fence", "TLG_SLOT_FENCE", 1),
     ("lazy_hold", "TLG_LAZY_HOLD", 1),
+    ("gpu_volumes", "TLG_GPU_VOLUMES", 1),
+    ("lazy_big_kib", "TLG_LAZY_BIG_KIB", 0),
+    ("image_blocks", "TLG_IMAGE_BLOCKS", 1),
+    ("mem_shared", "TLG_MEM_SHARED", 1),
+    ("lazy_skip", "TLG_LAZY_SKIP", 1),
+    ("ring_prefetch", "TLG_RING_PREFETCH", 1),
+    ("ring_segs", "TLG_RING_SEGS_TUNE", 0),
+    ("cpu_copy_max", "TLG_CPU_COPY_MAX", 0),
+    ("mouse_direct", "TLG_MOUSE_DIRECT", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];
@@ -921,6 +981,15 @@ pub fn get(i: usize) -> i64 {
     let v = std::env::var(env).ok().and_then(|s| s.parse().ok()).unwrap_or(default);
     VALUES[i].store(v, Ordering::Relaxed);
     v
+}
+
+/// Sets `i`'s value for this run unless its environment variable gives one
+/// (defaults that depend on the machine, decided at start).
+pub fn set_default(i: usize, value: i64) {
+    let (_, env, _) = TABLE[i];
+    if std::env::var(env).ok().and_then(|s| s.parse::<i64>().ok()).is_none() {
+        VALUES[i].store(value, Ordering::Relaxed);
+    }
 }
 
 pub fn set(name: &str, value: &str) -> Result<(), String> {

@@ -1,22 +1,26 @@
 //! Game files page: the game folder (01.00) and the update folder (01.03),
-//! checked when chosen; the settings keep them once they pass.
+//! checked when chosen; the settings keep them once they pass. The game's
+//! language.
 
 use crate::files;
 use crate::ui::{self, Builder};
 use crate::App;
 use std::path::{Path, PathBuf};
+use tlg_config::settings::Language;
 use windows_sys::Win32::Foundation::HWND;
 
 const ID_STATUS: i32 = 101;
 const ID_GAME_DIR: i32 = 130;
 const ID_UPDATE_DIR: i32 = 132;
 const ID_CHECK: i32 = 140;
+const ID_LANGUAGE: i32 = 150;
 
 #[derive(Default)]
 pub struct Page {
     status: usize,
     game_dir: usize,
     update_dir: usize,
+    language: usize,
     /// Whether the folders in the settings passed the check.
     pub ok: bool,
 }
@@ -53,8 +57,14 @@ pub fn build(app: &mut App) {
         app.game.update_dir = path_row(app, &b, 96, "Update folder:", ID_UPDATE_DIR, &update);
         let r = (668, 132, 96, 28);
         app.put(0, b.button("Check", r, ID_CHECK), r, false);
-        let r = (16, 172, 748, 300);
+        let r = (16, 172, 748, 250);
         app.game.status = app.put(0, b.label("", r, ID_STATUS), r, false) as usize;
+        let r = (16, 443, 120, 20);
+        app.put(0, b.label("Language:", r, -1), r, false);
+        let r = (140, 440, 260, 200);
+        app.game.language = app.put(0, b.combo(r, ID_LANGUAGE), r, false) as usize;
+        let names: Vec<String> = Language::ALL.iter().map(|l| l.label().to_string()).collect();
+        ui::combo_fill(h(app.game.language), &names, Language::ALL.iter().position(|&l| l == app.settings.language).unwrap_or(0));
     }
     match g {
         Some(g) => check(app, &g, u.as_deref(), false),
@@ -99,6 +109,13 @@ fn check_fields(app: &mut App) {
 pub fn command(app: &mut App, id: i32, code: u32) {
     match (id, code) {
         (ID_CHECK, 0) => check_fields(app),
+        // (CBN_SELCHANGE)
+        (ID_LANGUAGE, 1) => {
+            let i = unsafe { ui::combo_sel(h(app.game.language)) };
+            app.settings.language = Language::ALL.get(i).copied().unwrap_or(Language::English);
+            app.save_settings();
+            app.set_status("Saved; applies the next time the game starts.");
+        }
         (x, 0) if x == ID_GAME_DIR + 1 || x == ID_UPDATE_DIR + 1 => {
             let (edit, title) = if x == ID_GAME_DIR + 1 { (app.game.game_dir, "Game folder (version 01.00)") } else { (app.game.update_dir, "Update folder (01.03)") };
             if let Some(p) = ui::pick_folder(app.hwnd, title) {

@@ -71,13 +71,71 @@ pub struct Stats {
 /// The emulated CP fetches a submitted command buffer (and the indirect
 /// buffers it calls) when it is submitted, so later CPU reuse of that memory
 /// cannot alter queued work however far the GPU thread lags behind.
-pub type Captured = HashMap<u64, Arc<Vec<u32>>>;
+pub type Captured = HashMap<u64, Arc<Words>>;
+
+/// A captured buffer's words in a vector from `WORD_POOL`, returned there
+/// when the last holder drops it: captures are taken on the submitting title
+/// thread, between its submission and the CP (~2 MB a frame in Falling
+/// Bridge), and fresh vectors cost it their allocation and page faults.
+pub struct Words(Vec<u32>);
+
+impl std::ops::Deref for Words {
+    type Target = Vec<u32>;
+    fn deref(&self) -> &Vec<u32> {
+        &self.0
+    }
+}
+
+impl Drop for Words {
+    fn drop(&mut self) {
+        let v = std::mem::take(&mut self.0);
+        let cap = v.capacity();
+        if cap == 0 {
+            return;
+        }
+        // (Class: the largest power of two the vector holds.)
+        let class = (usize::BITS - 1 - cap.leading_zeros()) as usize;
+        let mut pool = WORD_POOL.lock();
+        if class < WORD_CLASSES && pool.0[class].len() < WORD_CLASS_MAX && pool.1 + cap <= WORD_POOL_DWORDS {
+            pool.1 += cap;
+            pool.0[class].push(v);
+        }
+    }
+}
+
+/// Recycled capture vectors by size class (each keeps its length: all of it
+/// initialized) and their total capacity in dwords.
+static WORD_POOL: parking_lot::Mutex<([Vec<Vec<u32>>; WORD_CLASSES], usize)> = parking_lot::Mutex::new(([const { Vec::new() }; WORD_CLASSES], 0));
+const WORD_CLASSES: usize = 25;
+const WORD_CLASS_MAX: usize = 64;
+const WORD_POOL_DWORDS: usize = 16 << 20;
+
+/// A vector of `n` initialized words for a capture (from the pool when one
+/// of the next size classes has one; only the part beyond a recycled
+/// vector's length is zeroed).
+fn take_words(n: usize) -> Vec<u32> {
+    let class = n.max(1).next_power_of_two().trailing_zeros() as usize;
+    let mut v = {
+        let mut pool = WORD_POOL.lock();
+        let got = (class..(class + 3).min(WORD_CLASSES)).find_map(|c| pool.0[c].pop());
+        if let Some(v) = &got {
+            pool.1 -= v.capacity();
+        }
+        got.unwrap_or_default()
+    };
+    if v.len() >= n {
+        v.truncate(n);
+    } else {
+        v.resize(n, 0);
+    }
+    v
+}
 
 struct Frame {
     cur: u64,
     end: u64,
     base: u64,
-    data: Option<Arc<Vec<u32>>>,
+    data: Option<Arc<Words>>,
 }
 
 /// An end-of-pipe/shader event: memory write and/or interrupt, performed
@@ -238,7 +296,7 @@ pub fn capture(roots: &[(u64, u32)]) -> Captured {
         if dw == 0 || out.contains_key(&addr) || !guest_ok(addr, dw as u64 * 4) || total + dw as usize > LIMIT_DWORDS {
             continue;
         }
-        let mut words = vec![0u32; dw as usize];
+        let mut words = take_words(dw as usize);
         // SAFETY: the dwords' storage, as bytes.
         super::resources::copy_from_guest(unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, dw as usize * 4) }, addr);
         let mut i = 0usize;
@@ -260,7 +318,7 @@ pub fn capture(roots: &[(u64, u32)]) -> Captured {
             }
         }
         total += words.len();
-        out.insert(addr, Arc::new(words));
+        out.insert(addr, Arc::new(Words(words)));
     }
     out
 }
@@ -1274,6 +1332,14 @@ impl CommandProcessor {
                         crate::trace!("{} {} op {:#04x} len {} at {:#x} (decoded)", self.name, if constant { "CE" } else { "DE" }, opcode, n, addr);
                     }
                     let _ = self.exec_packet(opcode, body, addr, hooks);
+                    // (`tune early_release`: another queue waits for our
+                    // queued writes, as in `step`.)
+                    if COMMIT_REQ[self.queue & 63].load(std::sync::atomic::Ordering::Relaxed) && COMMIT_REQ[self.queue & 63].swap(false, std::sync::atomic::Ordering::Acquire) {
+                        if super::render::perf_on() {
+                            COMMITS_REQUESTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                        self.commit(hooks);
+                    }
                     i += 3 + n;
                 }
                 done += 1;
@@ -1531,6 +1597,9 @@ impl CommandProcessor {
 
     /// TLG_PERF: a label write to `addr` queued by the graphics CP that a
     /// compute queue is waiting for releases that queue (`CHAIN_GAPS`).
+    /// (Committing the queued writes right after such a packet instead of at
+    /// the CP's next blocking wait: Falling Bridge 44.7 vs 45.9 fps - the
+    /// waits after it shrank ~0.2-0.4 ms, the extra batches cost more.)
     fn note_release(&mut self, addr: u64) {
         if self.queue != 0 || !super::render::perf_on() {
             return;
@@ -1615,7 +1684,7 @@ impl CommandProcessor {
         val
     }
 
-    fn pending_overlaps(&self, addr: u64, len: u64) -> bool {
+    pub(super) fn pending_overlaps(&self, addr: u64, len: u64) -> bool {
         self.pending.iter().any(|p| p.overlaps(addr, len))
     }
 

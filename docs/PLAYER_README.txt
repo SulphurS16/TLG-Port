@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.4.1 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.5.1 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627). It is
@@ -20,10 +20,12 @@ What you need
   the update folder holds the same for 01.03 (or the update is merged into
   the game folder).
 - Windows 10 or 11 (64-bit), and a graphics card and driver with Vulkan 1.3
-  and about 4 GB of video memory.
-- A recent processor with high single-core speed. Tested: a steady 30 fps,
-  and 55-60 fps with the 60 fps limit, on a Ryzen 9 5900X with an RTX 4090;
-  about 25-30 fps on a 6-core laptop CPU from 2019.
+  (NVIDIA, AMD or Intel) and about 4 GB of video memory.
+- A recent processor with high single-core speed. Tested on a Ryzen 9 5900X
+  with an RTX 4090: 30 fps everywhere but about 8 seconds of the ending's
+  busiest scene (26-27 fps), and 47-60 fps with the 60 fps limit depending
+  on the area (the final battle about 38); about 25-30 fps on a 6-core
+  laptop CPU from 2019.
 
 
 Getting started
@@ -68,20 +70,25 @@ Settings, saves and logs
   session's log folder.
 - Portable use: an empty file named portable.txt next to tlg.exe keeps
   everything in a "user" folder beside it.
+- Language: the launcher's Game files page - English, Spanish (Latin
+  America), French (Canada) or Portuguese (Brazil), the languages of the
+  game's US release.
 
 
 Known limits
 ------------
-- 60 fps is experimental: a few of the game's script timers count frames,
-  so some moments run faster at 60 fps.
+- At 60 fps the game's timers and effects keep their normal speed, but the
+  game has not been played through at 60 fps yet.
+- Uncapped is not recommended: at 116-119, 156-179 and 237-359 fps the
+  game runs slower than real time.
 - The picture keeps the game's 16:9 shape.
 - No mouse pointer in the game's menus (keys, wheel and buttons work).
 - The title screen's music plays quieter than it should.
-- Tested with NVIDIA graphics (a laptop and a desktop); AMD and Intel
-  graphics have not been tested yet.
+- Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel
+  graphics have not been tested yet; this release removes the
+  NVIDIA-specific assumptions a review of the port found.
 
 
-License: the port is MIT licensed (LICENSE.txt). The license covers the
-port's own code only, not the game. Third-party components keep their own
-licenses: THIRD_PARTY.md, THIRD_PARTY_NOTICES.txt and
-RUST_STD_NOTICES.html.
+License: the port is MIT licensed. The license covers the port's own code
+only, not the game. The license and the notices of the third-party
+components in the two programs follow below.

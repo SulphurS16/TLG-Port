@@ -106,6 +106,19 @@ pub fn wait(seq: u64) {
     WAIT_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
 }
 
+/// Whether a queued or running copy reads guest [addr, addr+len).
+pub fn reads_pending(addr: u64, len: u64) -> bool {
+    if DONE.load(Ordering::Acquire) >= QUEUED.load(Ordering::Acquire) {
+        return false;
+    }
+    let hi = addr + len.max(1);
+    if QUEUE.lock().iter().any(|j| j.src < hi && addr < j.src + j.len as u64) {
+        return true;
+    }
+    let c = *CUR.lock();
+    c.2 != 0 && c.0 < hi && addr < c.1
+}
+
 /// Before guest [addr, addr+len) is written by the CP: waits for the queued
 /// copies that read it.
 pub fn wait_overlapping(addr: u64, len: u64) {

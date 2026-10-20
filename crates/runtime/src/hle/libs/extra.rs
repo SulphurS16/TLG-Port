@@ -211,6 +211,18 @@ sysv! {
     }
     fn sceSystemServiceLoadExec(path: *const u8, argv: *const u64) -> i32 {
         crate::error!("sceSystemServiceLoadExec('{}'): launching another executable is not supported", cstr(path));
+        // (The title asks for it after an error it cannot continue from, e.g.
+        // memory it could not map.)
+        let log = crate::RUN_DIR.get().map_or(String::new(), |d| format!("\n\nThe log is in {}.", d.display()));
+        let refused = crate::mem::COMMIT_REFUSED.load(Ordering::Relaxed);
+        if refused != 0 {
+            crate::config::user_error(
+                "Not enough memory",
+                &format!("Windows could not give the game the memory it needs ({} MiB were refused: the memory and page file in use reached Windows' limit). Close other programs, or let Windows manage the page file size, then start the game again.{log}", refused >> 20),
+            );
+        } else {
+            crate::config::user_error("The game stopped", &format!("The game met an error it could not continue from and asked to restart itself. Start it again from the launcher.{log}"));
+        }
         crate::fatal_exit(3, "sceSystemServiceLoadExec");
     }
 

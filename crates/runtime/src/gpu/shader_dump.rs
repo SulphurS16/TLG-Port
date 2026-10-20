@@ -32,7 +32,7 @@ pub fn write_file(name: String, bytes: Vec<u8>) {
 /// Returns the guest code words at `addr`, clamped to its mapping.
 pub fn code_slice(addr: u64) -> Option<&'static [u32]> {
     let end = {
-        let st = crate::mem::MEM.lock();
+        let st = crate::mem::map_read();
         let v = st.find(addr)?;
         v.end()
     };

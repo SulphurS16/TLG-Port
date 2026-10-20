@@ -54,6 +54,10 @@ impl Ring {
     /// Device-local ring the CPU writes through the BAR window (write-combined:
     /// for data the GPU reads, written once by the CPU).
     pub fn new_bar(c: &Ctx, size: u64) -> Result<Ring, String> {
+        // (TLG_NO_BAR=1: as on a GPU without such memory, a test.)
+        if std::env::var("TLG_NO_BAR").is_ok_and(|v| v == "1") {
+            return Err("TLG_NO_BAR".into());
+        }
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::UNIFORM_BUFFER;
         unsafe {
             let bi = vk::BufferCreateInfo::default().size(size).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -85,6 +89,19 @@ impl Ring {
         }
         self.used = off + n.max(4);
         self.peak = self.peak.max(self.used - self.seg_lo);
+        // (The lines the next allocations take, fetched for writing now: a
+        // command's SGPR data is ~100 bytes copied into lines no cache held,
+        // and each store waited for its line - ~3.5% of the graphics CP in
+        // the Trico battle. `tune ring_prefetch`; no-ops on write-combined
+        // memory.)
+        if !self.ptr.is_null() && self.used + 128 <= self.size && crate::tune::get(crate::tune::RING_PREFETCH) != 0 {
+            use core::arch::x86_64::{_MM_HINT_ET0, _mm_prefetch};
+            unsafe {
+                let p = self.ptr.add(self.used as usize) as *const i8;
+                _mm_prefetch::<_MM_HINT_ET0>(p);
+                _mm_prefetch::<_MM_HINT_ET0>(p.add(64));
+            }
+        }
         Some(off)
     }
     /// The highest segment use since the last call, and the segment size.
@@ -166,7 +183,7 @@ pub fn copy_from_guest_with(dst: &mut [u8], addr: u64, ring: bool) {
         dst.fill(0);
         return;
     }
-    let st = crate::mem::MEM.lock();
+    let st = crate::mem::map_read();
     let mut a = addr;
     while a < addr + n {
         let i = (a - addr) as usize;
@@ -195,7 +212,7 @@ pub fn copy_from_guest_with(dst: &mut [u8], addr: u64, ring: bool) {
 /// Fills guest [addr, addr+n) with `byte` (one mapped region), like
 /// `copy_to_guest` without a source buffer.
 pub fn fill_guest(addr: u64, n: u64, byte: u8) -> bool {
-    let st = crate::mem::MEM.lock();
+    let st = crate::mem::map_read();
     match st.find(addr) {
         Some(v) if v.kind != crate::mem::VmaKind::Reserved && addr + n <= v.end() => {
             drop(st);
@@ -208,7 +225,7 @@ pub fn fill_guest(addr: u64, n: u64, byte: u8) -> bool {
 
 pub fn copy_to_guest(src: &[u8], addr: u64) -> bool {
     let n = src.len() as u64;
-    let st = crate::mem::MEM.lock();
+    let st = crate::mem::map_read();
     match st.find(addr) {
         Some(v) if v.kind != crate::mem::VmaKind::Reserved && addr + n <= v.end() => {
             drop(st);
@@ -244,7 +261,8 @@ impl std::hash::Hash for ImageKey {
 pub struct Image {
     pub key: ImageKey,
     pub image: vk::Image,
-    pub memory: vk::DeviceMemory,
+    /// Its memory: a range of a block or an allocation of its own (`suballoc`).
+    pub memory: super::suballoc::ImageMem,
     pub views: super::render::FastMap<(vk::Format, u16, bool, u32, u32), vk::ImageView>,
     /// Contents were produced by the GPU (do not re-upload from guest memory).
     pub gpu_written: bool,
@@ -255,6 +273,8 @@ pub struct Image {
     pub validated: Option<u64>,
     pub upload_batch: u64,
     pub storage_ok: bool,
+    /// The uses the image was created for (views ask for a part of them).
+    pub usage: vk::ImageUsageFlags,
     /// Tile mode index of the guest surface (render targets), for write-back.
     pub tile_index: Option<u8>,
     /// CPU epoch of the last validation against the OS write watch.
@@ -302,30 +322,56 @@ pub fn is_depth(f: vk::Format) -> bool {
     matches!(f, vk::Format::D16_UNORM | vk::Format::D32_SFLOAT | vk::Format::D32_SFLOAT_S8_UINT | vk::Format::D24_UNORM_S8_UINT)
 }
 
-pub fn storage_capable(c: &Ctx, f: vk::Format) -> bool {
-    let p = unsafe { c.instance.get_physical_device_format_properties(c.pdev, f) };
-    p.optimal_tiling_features.contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+/// The device's optimal-tiling features for `f` (cached).
+pub fn format_features(c: &Ctx, f: vk::Format) -> vk::FormatFeatureFlags {
+    static CACHE: parking_lot::Mutex<Option<HashMap<i32, vk::FormatFeatureFlags>>> = parking_lot::Mutex::new(None);
+    if let Some(&v) = CACHE.lock().as_ref().and_then(|m| m.get(&f.as_raw())) {
+        return v;
+    }
+    let v = unsafe { c.instance.get_physical_device_format_properties(c.pdev, f) }.optimal_tiling_features;
+    CACHE.lock().get_or_insert_with(HashMap::new).insert(f.as_raw(), v);
+    v
 }
 
-fn attachment_capable(c: &Ctx, f: vk::Format) -> bool {
-    let p = unsafe { c.instance.get_physical_device_format_properties(c.pdev, f) };
-    p.optimal_tiling_features.intersects(vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+pub fn storage_capable(c: &Ctx, f: vk::Format) -> bool {
+    format_features(c, f).contains(vk::FormatFeatureFlags::STORAGE_IMAGE)
+}
+
+/// The unsigned-integer format with `f`'s texel size (uncompressed formats).
+fn uint_alias(f: vk::Format) -> Option<vk::Format> {
+    use vk::Format as F;
+    Some(match f {
+        F::R8_UNORM | F::R8_SNORM | F::R8_UINT | F::R8_SINT | F::R8_SRGB => F::R8_UINT,
+        F::R8G8_UNORM | F::R8G8_SNORM | F::R8G8_UINT | F::R8G8_SINT | F::R16_UNORM | F::R16_SNORM | F::R16_UINT | F::R16_SINT | F::R16_SFLOAT | F::B5G6R5_UNORM_PACK16 | F::R5G6B5_UNORM_PACK16 | F::B5G5R5A1_UNORM_PACK16 | F::A1R5G5B5_UNORM_PACK16 | F::R4G4B4A4_UNORM_PACK16 | F::B4G4R4A4_UNORM_PACK16 => F::R16_UINT,
+        F::R8G8B8A8_UNORM | F::R8G8B8A8_SNORM | F::R8G8B8A8_UINT | F::R8G8B8A8_SINT | F::R8G8B8A8_SRGB | F::B8G8R8A8_UNORM | F::B8G8R8A8_SNORM | F::B8G8R8A8_SRGB | F::A2B10G10R10_UNORM_PACK32 | F::A2B10G10R10_UINT_PACK32 | F::A2R10G10B10_UNORM_PACK32 | F::B10G11R11_UFLOAT_PACK32 | F::E5B9G9R9_UFLOAT_PACK32 | F::R16G16_UNORM | F::R16G16_SNORM | F::R16G16_UINT | F::R16G16_SINT | F::R16G16_SFLOAT | F::R32_UINT | F::R32_SINT | F::R32_SFLOAT => F::R32_UINT,
+        F::R16G16B16A16_UNORM | F::R16G16B16A16_SNORM | F::R16G16B16A16_UINT | F::R16G16B16A16_SINT | F::R16G16B16A16_SFLOAT | F::R32G32_UINT | F::R32G32_SINT | F::R32G32_SFLOAT => F::R32G32_UINT,
+        F::R32G32B32A32_UINT | F::R32G32B32A32_SINT | F::R32G32B32A32_SFLOAT => F::R32G32B32A32_UINT,
+        _ => return None,
+    })
 }
 
 pub fn create_image(key: ImageKey) -> Result<Image, String> {
     let c = ctx();
     let depth = is_depth(key.format);
+    let feats = format_features(c, key.format);
     let mut usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
-    if attachment_capable(c, key.format) {
+    if feats.intersects(vk::FormatFeatureFlags::COLOR_ATTACHMENT | vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT) {
         usage |= if depth { vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT } else { vk::ImageUsageFlags::COLOR_ATTACHMENT };
     }
-    let storage_ok = !depth && storage_capable(c, key.format);
+    // Storage: the format's own, else (extended usage) through a view
+    // format of the same texel size; a storage view's format must support
+    // it (`view_levels`).
+    let own_storage = feats.contains(vk::FormatFeatureFlags::STORAGE_IMAGE);
+    let storage_ok = !depth && (own_storage || uint_alias(key.format).is_some_and(|a| storage_capable(c, a)));
     if storage_ok {
         usage |= vk::ImageUsageFlags::STORAGE;
     }
     let mut flags = vk::ImageCreateFlags::empty();
     if !depth {
         flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
+        if (storage_ok && !own_storage) || !feats.contains(vk::FormatFeatureFlags::SAMPLED_IMAGE) {
+            flags |= vk::ImageCreateFlags::EXTENDED_USAGE;
+        }
     }
     if !key.ty3d && key.layers >= 6 && key.width == key.height {
         flags |= vk::ImageCreateFlags::CUBE_COMPATIBLE;
@@ -343,11 +389,26 @@ pub fn create_image(key: ImageKey) -> Result<Image, String> {
         .initial_layout(vk::ImageLayout::UNDEFINED);
     unsafe {
         let image = c.device.create_image(&ici, None).map_err(|e| format!("vkCreateImage {key:?}: {e}"))?;
-        let req = c.device.get_image_memory_requirements(image);
-        let memory = c.alloc(req, vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
-        c.device.bind_image_memory(image, memory, 0).map_err(|e| e.to_string())?;
+        // (Whether the driver wants an allocation of its own for it.)
+        let mut ded = vk::MemoryDedicatedRequirements::default();
+        let mut req2 = vk::MemoryRequirements2::default().push_next(&mut ded);
+        c.device.get_image_memory_requirements2(&vk::ImageMemoryRequirementsInfo2::default().image(image), &mut req2);
+        let req = req2.memory_requirements;
+        let dedicated = ded.prefers_dedicated_allocation != 0 || ded.requires_dedicated_allocation != 0;
+        let memory = match super::suballoc::alloc(c, image, req, dedicated) {
+            Ok(m) => m,
+            Err(e) => {
+                c.device.destroy_image(image, None);
+                return Err(e);
+            }
+        };
+        if let Err(e) = c.device.bind_image_memory(image, memory.memory, memory.offset) {
+            c.device.destroy_image(image, None);
+            super::suballoc::free(c, memory);
+            return Err(format!("bind image memory {key:?}: {e}"));
+        }
         let last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-        Ok(Image { key, image, memory, views: Default::default(), gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_listed: false, guest_newer: false, bytes: req.size, last_used })
+        Ok(Image { key, image, memory, views: Default::default(), gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok, usage, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_listed: false, guest_newer: false, bytes: req.size, last_used })
     }
 }
 
@@ -356,15 +417,16 @@ pub fn create_image(key: ImageKey) -> Result<Image, String> {
 #[derive(Default)]
 pub struct PooledImage {
     image: vk::Image,
-    memory: vk::DeviceMemory,
+    memory: super::suballoc::ImageMem,
     views: super::render::FastMap<(vk::Format, u16, bool, u32, u32), vk::ImageView>,
     bytes: u64,
     storage_ok: bool,
+    usage: vk::ImageUsageFlags,
 }
 
 impl PooledImage {
     pub fn of(img: Image) -> PooledImage {
-        PooledImage { image: img.image, memory: img.memory, views: img.views, bytes: img.bytes, storage_ok: img.storage_ok }
+        PooledImage { image: img.image, memory: img.memory, views: img.views, bytes: img.bytes, storage_ok: img.storage_ok, usage: img.usage }
     }
 
     /// (The GPU no longer uses it.)
@@ -376,7 +438,7 @@ impl PooledImage {
             }
             c.device.destroy_image(self.image, None);
         }
-        c.free(self.memory);
+        super::suballoc::free(c, self.memory);
     }
 }
 
@@ -384,7 +446,7 @@ impl PooledImage {
 /// state of a newly created one; its contents are undefined until cleared.
 pub fn reuse_image(key: ImageKey, p: PooledImage) -> Image {
     let last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-    Image { key, image: p.image, memory: p.memory, views: p.views, gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok: p.storage_ok, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_listed: false, guest_newer: false, bytes: p.bytes, last_used }
+    Image { key, image: p.image, memory: p.memory, views: p.views, gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok: p.storage_ok, usage: p.usage, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_listed: false, guest_newer: false, bytes: p.bytes, last_used }
 }
 
 pub fn aspect(f: vk::Format) -> vk::ImageAspectFlags {
@@ -442,13 +504,35 @@ impl Image {
         } else {
             vk::ComponentMapping { r: sel(dst_sel & 7), g: sel((dst_sel >> 3) & 7), b: sel((dst_sel >> 6) & 7), a: sel((dst_sel >> 9) & 7) }
         };
-        let view_usage = if storage {
+        // The uses this view may serve - only those of its image that its
+        // format supports (Vulkan's rule; some drivers set up compression
+        // and render-target state by them). Swizzled views are only sampled.
+        let same = |s: vk::ComponentSwizzle, own: vk::ComponentSwizzle| s == vk::ComponentSwizzle::IDENTITY || s == own;
+        let identity = same(comps.r, vk::ComponentSwizzle::R) && same(comps.g, vk::ComponentSwizzle::G) && same(comps.b, vk::ComponentSwizzle::B) && same(comps.a, vk::ComponentSwizzle::A);
+        let want = if storage {
             vk::ImageUsageFlags::STORAGE
         } else if is_depth(fmt) {
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT
-        } else {
+        } else if identity {
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT
+        } else {
+            vk::ImageUsageFlags::SAMPLED
         };
+        let feats = format_features(c, fmt);
+        let mut view_usage = want & self.usage;
+        for (u, f) in [
+            (vk::ImageUsageFlags::SAMPLED, vk::FormatFeatureFlags::SAMPLED_IMAGE),
+            (vk::ImageUsageFlags::COLOR_ATTACHMENT, vk::FormatFeatureFlags::COLOR_ATTACHMENT),
+            (vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT),
+            (vk::ImageUsageFlags::STORAGE, vk::FormatFeatureFlags::STORAGE_IMAGE),
+        ] {
+            if !feats.contains(f) {
+                view_usage &= !u;
+            }
+        }
+        if view_usage.is_empty() {
+            return Err(format!("a {fmt:?} view cannot serve {want:?} (image usage {:?}, format features {feats:?})", self.usage));
+        }
         let mut usage_ci = vk::ImageViewUsageCreateInfo::default().usage(view_usage);
         let vci = vk::ImageViewCreateInfo::default()
             .image(self.image)
@@ -548,7 +632,7 @@ pub fn hash_guest(addr: u64, n: u64) -> u64 {
         return hash_slice(n, &[]);
     }
     // The lock keeps the mappings stable while they are read.
-    let st = crate::mem::MEM.lock();
+    let st = crate::mem::map_read();
     let mut h = n;
     let mut a = addr;
     while a < end {

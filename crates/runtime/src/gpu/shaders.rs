@@ -467,7 +467,7 @@ fn mapped(lo: u64, hi: u64) -> bool {
     let generation = crate::mem::MAP_GEN.load(std::sync::atomic::Ordering::Acquire);
     let (vlo, vhi, g) = LAST_VMA.get();
     if g != generation || lo < vlo || hi > vhi {
-        let st = crate::mem::MEM.lock();
+        let st = crate::mem::map_read();
         let Some(v) = st.find(lo) else { return false };
         if v.kind == crate::mem::VmaKind::Reserved || hi > v.end() {
             return false;
@@ -609,7 +609,7 @@ fn eval<'a>(p: &'a Prov, user: &[u32], memo: &mut PtrMemo<'a>) -> Option<u32> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum ResolvedRes {
     Buffer(Vsharp),
     Image(Tsharp),

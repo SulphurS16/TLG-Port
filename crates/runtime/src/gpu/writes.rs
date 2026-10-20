@@ -18,6 +18,7 @@
 //! kernel (~0.43 us per call; textures and vertex data share blocks).
 
 use super::cpuwatch;
+use super::lazywb;
 use super::render::FastMap;
 use crate::mem;
 
@@ -74,6 +75,9 @@ pub static HV_STATS: [std::sync::atomic::AtomicU64; 5] = [const { std::sync::ato
 /// TLG_PERF: bulk queries at round starts (`tune ww_bulk`): rounds, runs,
 /// pages queried, written pages found.
 pub static BULK_STATS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+/// TLG_PERF: block queries left out because the lazy write-back keeps the
+/// block inaccessible (`tune lazy_skip`).
+pub static LAZY_SKIPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 /// TLG_PERF: wall time (ns) of bulk rounds, validation harvests (their
 /// queries) and cold-block arming, lock waits and kernel calls included.
 pub static WW_TIMES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
@@ -131,6 +135,12 @@ pub struct WriteTracker {
     disarmed: Vec<u64>,
     /// Block queries left out because the block was armed (TLG_PERF).
     pub armed_skips: u64,
+    /// Per chunk: blocks the lazy write-back keeps inaccessible that were
+    /// queried since it began to (`lazywb::covered`): no CPU write reaches
+    /// them without a fault, which ends that (`take_cover_events`), so they
+    /// are left out of queries as armed blocks are (`tune lazy_skip`).
+    lazy_ok: FastMap<u64, u64>,
+    cover_events: Vec<u64>,
     /// Per queue class (graphics, compute: `class`, set with `required`).
     rounds: [Round; 2],
     pub class: usize,
@@ -138,7 +148,7 @@ pub struct WriteTracker {
 
 impl WriteTracker {
     pub fn new() -> WriteTracker {
-        WriteTracker { seq: 1, chunks: FastMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: FastMap::default(), epoch: 0, required: 0, cached: 0, watch: FastMap::default(), disarmed: Vec::new(), armed_skips: 0, rounds: Default::default(), class: 0 }
+        WriteTracker { seq: 1, chunks: FastMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: FastMap::default(), epoch: 0, required: 0, cached: 0, watch: FastMap::default(), disarmed: Vec::new(), armed_skips: 0, lazy_ok: FastMap::default(), cover_events: Vec::new(), rounds: Default::default(), class: 0 }
     }
 
     /// Collects the OS's records of [addr, addr+len) for a validation: the
@@ -212,6 +222,7 @@ impl WriteTracker {
         if cpuwatch::enabled() {
             self.arm_cold(&runs);
         }
+        self.note_covered(&runs);
         self.stamp_harvest();
         true
     }
@@ -236,6 +247,7 @@ impl WriteTracker {
         if watching {
             self.take_disarmed();
         }
+        let lazy = self.take_cover_events();
         let required = self.required.max(1);
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut done = 0u64;
@@ -243,6 +255,10 @@ impl WriteTracker {
             for b in lo.max(done)..hi {
                 let (ch, i) = (b >> (CHUNK_SHIFT - BLOCK_SHIFT), b as usize & (CHUNK_BLOCKS - 1));
                 if self.queried.get(&ch).is_some_and(|q| q[i] >= required) || (watching && self.watch.get(&ch).is_some_and(|w| w.armed >> i & 1 != 0)) {
+                    continue;
+                }
+                if lazy && self.lazy_ok.get(&ch).is_some_and(|m| m >> i & 1 != 0) && lazywb::covered(b) {
+                    LAZY_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     continue;
                 }
                 match runs.last_mut() {
@@ -279,7 +295,46 @@ impl WriteTracker {
         if watching {
             self.arm_cold(&runs);
         }
+        self.note_covered(&runs);
         self.stamp_harvest();
+    }
+
+    /// Takes the lazy write-back's coverage changes (`lazywb::take_cover_events`):
+    /// those blocks are queried again before they are left out. False when
+    /// covered blocks are queried as any (`tune lazy_skip 0`).
+    fn take_cover_events(&mut self) -> bool {
+        if crate::tune::get(crate::tune::LAZY_SKIP) == 0 {
+            return false;
+        }
+        let mut ev = std::mem::take(&mut self.cover_events);
+        lazywb::take_cover_events(&mut ev);
+        for &b in &ev {
+            let (c, i) = (b >> (CHUNK_SHIFT - BLOCK_SHIFT), b as usize & (CHUNK_BLOCKS - 1));
+            if let Some(m) = self.lazy_ok.get_mut(&c) {
+                *m &= !(1 << i);
+            }
+            if let Some(q) = self.queried.get_mut(&c) {
+                q[i] = 0;
+            }
+        }
+        ev.clear();
+        self.cover_events = ev;
+        true
+    }
+
+    /// After the queries of `runs` (blocks [first, end)): the covered blocks
+    /// among them may be left out from now on (see `lazy_ok`).
+    fn note_covered(&mut self, runs: &[(u64, u64)]) {
+        if crate::tune::get(crate::tune::LAZY_SKIP) == 0 {
+            return;
+        }
+        for &(lo, hi) in runs {
+            for b in lo..hi {
+                if lazywb::covered(b) {
+                    *self.lazy_ok.entry(b >> (CHUNK_SHIFT - BLOCK_SHIFT)).or_insert(0) |= 1 << (b as usize & (CHUNK_BLOCKS - 1));
+                }
+            }
+        }
     }
 
     /// After the queries of `runs` (blocks [first, end)): counts the blocks
@@ -377,20 +432,26 @@ impl WriteTracker {
         if watching {
             self.take_disarmed();
         }
+        let lazy = self.take_cover_events();
         let (epoch, required) = (self.epoch, self.required.max(1));
         let mut runs: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
         let mut b = first;
         while b <= last {
             let c = b >> (CHUNK_SHIFT - BLOCK_SHIFT);
             let q = self.queried.entry(c).or_insert([0; CHUNK_BLOCKS]);
-            // (Armed blocks: unwritten until a write faults.)
+            // (Armed blocks: unwritten until a write faults; so are blocks
+            // the lazy write-back keeps inaccessible.)
             let armed = if watching { self.watch.get(&c).map_or(0, |w| w.armed) } else { 0 };
+            let lazy_ok = if lazy { self.lazy_ok.get(&c).copied().unwrap_or(0) } else { 0 };
             let stop = last.min(((c + 1) << (CHUNK_SHIFT - BLOCK_SHIFT)) - 1);
             while b <= stop {
                 let i = b as usize & (CHUNK_BLOCKS - 1);
                 if q[i] < required && armed >> i & 1 != 0 {
                     q[i] = epoch;
                     self.armed_skips += 1;
+                } else if q[i] < required && lazy_ok >> i & 1 != 0 && lazywb::covered(b) {
+                    q[i] = epoch;
+                    LAZY_SKIPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 } else if q[i] < required {
                     q[i] = epoch;
                     match runs.last_mut() {

@@ -598,6 +598,10 @@ fn sop2(tr: &mut T, ins: &Inst) -> R<()> {
             let wsh = e(tr.b.shift_right_logical(u, None, b, s16))?;
             let k7f = tr.u(0x7F);
             let w = e(tr.b.bitwise_and(u, None, wsh, k7f))?;
+            // (The field ends at bit 31: SPIR-V leaves offset + count > 32 undefined.)
+            let k32 = tr.u(32);
+            let room = e(tr.b.i_sub(u, None, k32, off))?;
+            let w = tr.glsl2(u, GLOp::UMin, w, room)?;
             let r = if ins.op == 39 { e(tr.b.bit_field_u_extract(u, None, a, off, w))? } else { e(tr.b.bit_field_s_extract(u, None, a, off, w))? };
             let nz = nonzero(tr, r)?;
             tr.set_scc(nz)?;
@@ -1246,6 +1250,10 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
             let k31 = tr.u(31);
             let off = e(tr.b.bitwise_and(u, None, b, k31))?;
             let w = e(tr.b.bitwise_and(u, None, c, k31))?;
+            // (The field ends at bit 31, as for s_bfe.)
+            let k32 = tr.u(32);
+            let room = e(tr.b.i_sub(u, None, k32, off))?;
+            let w = tr.glsl2(u, GLOp::UMin, w, room)?;
             let r = if v.op == 0x148 { e(tr.b.bit_field_u_extract(u, None, a, off, w))? } else { e(tr.b.bit_field_s_extract(u, None, a, off, w))? };
             uout(tr, &v, r)?;
         }
@@ -1505,17 +1513,25 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                     let x = tr.to_u(x)?;
                     e(tr.b.select(u, None, nan, z, x))?
                 }
-                0x18C => {
-                    let h = tr.f(0.5);
-                    let s = e(tr.b.f_add(f, None, a, h))?;
-                    let fl = tr.glsl1(f, GLOp::Floor, s)?;
-                    let x = e(tr.b.convert_f_to_s(i, None, fl))?;
-                    tr.to_u(x)?
-                }
                 _ => {
-                    let fl = tr.glsl1(f, GLOp::Floor, a)?;
-                    let x = e(tr.b.convert_f_to_s(i, None, fl))?;
-                    tr.to_u(x)?
+                    // floor(x + 0.5) (rpi) or floor(x), saturated like
+                    // v_cvt_i32_f32 (out-of-range conversions are undefined
+                    // in SPIR-V), NaN to 0.
+                    let s = if v.op == 0x18C {
+                        let h = tr.f(0.5);
+                        e(tr.b.f_add(f, None, a, h))?
+                    } else {
+                        a
+                    };
+                    let fl = tr.glsl1(f, GLOp::Floor, s)?;
+                    let lo = tr.f(-2147483648.0);
+                    let hi = tr.f(2147483520.0);
+                    let c = tr.glsl3(f, GLOp::NClamp, fl, lo, hi)?;
+                    let x = e(tr.b.convert_f_to_s(i, None, c))?;
+                    let nan = e(tr.b.is_nan(bt, None, a))?;
+                    let z = tr.u(0);
+                    let x = tr.to_u(x)?;
+                    e(tr.b.select(u, None, nan, z, x))?
                 }
             };
             uout(tr, &v, r)?;
@@ -1582,8 +1598,11 @@ pub fn vector(tr: &mut T, ins: &Inst) -> R<()> {
                 0x1B3 => tr.glsl1(f, GLOp::Sqrt, a)?,
                 0x1B5 | 0x1B6 => {
                     // Input in revolutions; outside [-256, 256] the result is 0.
+                    // (The fraction first: Vulkan's sin/cos are precise only
+                    // near [-pi, pi], drivers differ beyond.)
                     let two_pi = tr.f(std::f32::consts::TAU);
-                    let x = e(tr.b.f_mul(f, None, a, two_pi))?;
+                    let fr = tr.glsl1(f, GLOp::Fract, a)?;
+                    let x = e(tr.b.f_mul(f, None, fr, two_pi))?;
                     let r = tr.glsl1(f, if v.op == 0x1B5 { GLOp::Sin } else { GLOp::Cos }, x)?;
                     let bt = tr.t.bool_;
                     let abs = tr.glsl1(f, GLOp::FAbs, a)?;

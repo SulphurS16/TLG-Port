@@ -54,6 +54,16 @@
 //! `tlg_kick_wait`, which waits for the same condition with a short spin and
 //! then sleeps between polls (`tune kick_wait`). Applied only when the code
 //! bytes are the expected ones.
+//!
+//! Above the game's 30 fps (the 60 fps limit or none): the game's three
+//! calls of `hksL_loadbuffer` (eboot 0xe7e430) go through
+//! `tlg_lua_loadbuffer`, which hands the compiler `script_fixes`' copy of a
+//! known script (frame-counted timers made time-based), and two fixed 1/30 s
+//! steps per frame - the environment shaders' phases (0xe0f07b) and GPU
+//! particle emission (0xbcb5c9) - take the frame's step instead
+//! (`patch_frame_steps`). Applied only when the code bytes are the expected
+//! ones; at 30 fps neither is (TLG_SCRIPT_LOG=1 routes the loads only to log
+//! them).
 
 use crate::patch::Patcher;
 use crate::sysv;
@@ -79,8 +89,32 @@ const TOLSTRING_BYTES: [u8; 8] = [0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56
 /// Module base of the patched executable (for calling its tolstring).
 static BASE: AtomicU64 = AtomicU64::new(0);
 
+/// Havok Script's `hksL_loadbuffer(lua_State*, const HksCompilerSettings*,
+/// const char* text, size_t size, const char* chunk name)`, which compiles
+/// every script the game loads, its prologue, and its three calls: the
+/// game's script-file runner (eboot 0xd4fde0, after its file read),
+/// loadstring-style loads and the package loader.
+const LOADBUFFER: usize = 0xe7e430;
+const LOADBUFFER_BYTES: [u8; 20] = [0x55, 0x48, 0x89, 0xE5, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, 0x53, 0x48, 0x81, 0xEC, 0x58, 0x01, 0x00, 0x00];
+const LOADBUFFER_CALLS: [usize; 3] = [0xd4fe8e, 0xe7e37f, 0xec24bc];
+
 pub fn apply(p: &mut Patcher, name: &str) {
     patch_gaprint(p, name);
+    // (Script loads pass through tlg where scripts are fixed for frame rates
+    // above the game's own, or logged: at the game's 30 fps nothing changes.)
+    let fixes = crate::hle::libs::videoout::frame_cap() != crate::config::FrameCap::Game;
+    if fixes || crate::script_fixes::log_loads() {
+        match patch_script_loads(p) {
+            Ok(()) => crate::info!("scripts: loads at {name}+{LOADBUFFER:#x} pass through tlg ({})", if fixes { "frame-counted timers made time-based" } else { "logged" }),
+            Err(e) => crate::warn!("scripts: {name}: {e}; the scripts' frame-counted timers stay frame-counted"),
+        }
+    }
+    if fixes {
+        match patch_frame_steps(p) {
+            Ok(()) => crate::info!("frame steps: the environment shaders' phases ({name}+{:#x}) and particle emission (+{:#x}) advance by the frame's time, not 1/30 s per frame", ENV_PHASE.0, PARTICLE_EMIT.0),
+            Err(e) => crate::warn!("frame steps: {name}: {e}; they advance 1/30 s per frame"),
+        }
+    }
     let (w, h) = crate::gpu::vk::window::render_size();
     match patch_render_size(p, w, h) {
         Ok(heap) => {
@@ -475,6 +509,48 @@ pub fn camera_object() -> u64 {
     unsafe { &*((s + 24) as *const AtomicU64) }.load(Ordering::Relaxed)
 }
 
+/// Debug (control `mouselat <n>`): n turns of 40 counts injected at random
+/// moments, each timed until the game camera's yaw ([cam+0x2244]) moves
+/// (polled every ~0.2 ms); logs the median, 90th percentile and worst time.
+pub fn mouse_latency_probe(n: u32) {
+    let _ = std::thread::Builder::new().name("mouse-latency".into()).spawn(move || {
+        let cam = camera_object();
+        if cam == 0 || !crate::mem::is_guest(cam + 0x2244, 4) {
+            crate::info!("mouselat: no camera object");
+            return;
+        }
+        let yaw = || unsafe { std::ptr::read_volatile((cam + 0x2244) as *const f32) };
+        let mut times = Vec::new();
+        let mut seed = crate::log::elapsed_ms().to_bits() | 1;
+        for i in 0..n {
+            // (A random phase against the game's frames: 40-140 ms apart.)
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            std::thread::sleep(std::time::Duration::from_millis(40 + seed % 100));
+            let before = yaw();
+            let t0 = std::time::Instant::now();
+            crate::gpu::vk::window::inject_mouse(if i % 2 == 0 { 40 } else { -40 }, 0, 0);
+            while yaw() == before && t0.elapsed().as_millis() < 500 {
+                std::hint::spin_loop();
+                std::thread::yield_now();
+            }
+            times.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        times.sort_by(f64::total_cmp);
+        let pct = |p: f64| times[((times.len() as f64 * p) as usize).min(times.len() - 1)];
+        crate::info!(
+            "mouselat: {} turns, motion to camera: median {:.1} ms, p90 {:.1} ms, worst {:.1} ms, best {:.1} ms (mouse_direct {})",
+            times.len(),
+            pct(0.5),
+            pct(0.9),
+            times[times.len() - 1],
+            times[0],
+            crate::tune::get(crate::tune::MOUSE_DIRECT)
+        );
+    });
+}
+
 /// Flips left to log the camera for (control `camlog <flips>`).
 static CAMLOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -534,6 +610,56 @@ fn patch_gaprint(p: &mut Patcher, name: &str) {
     crate::info!("script prints: GaPrint at {name}+{GAPRINT:#x} routed to tlg (logged with TLG_LUA_LOG=1)");
 }
 
+/// Routes the game's three calls of `hksL_loadbuffer` through
+/// `tlg_lua_loadbuffer` (a trampoline near the module: `mov rax, imm64; jmp
+/// rax`), which may hand the compiler a fixed copy of the script's text.
+fn patch_script_loads(p: &mut Patcher) -> Result<(), String> {
+    if p.image.get(LOADBUFFER..LOADBUFFER + LOADBUFFER_BYTES.len()) != Some(&LOADBUFFER_BYTES[..]) {
+        return Err(format!("unexpected code at +{LOADBUFFER:#x} (not update 01.03?)"));
+    }
+    for &site in &LOADBUFFER_CALLS {
+        let ok = p.image.get(site..site + 5).is_some_and(|b| b[0] == 0xE8 && (site as i64 + 5 + i32::from_le_bytes([b[1], b[2], b[3], b[4]]) as i64) as usize == LOADBUFFER);
+        if !ok {
+            return Err(format!("+{site:#x} is not a call of +{LOADBUFFER:#x}"));
+        }
+    }
+    let target = tlg_lua_loadbuffer as *const () as usize as u64;
+    let mut code = vec![0x48, 0xB8];
+    code.extend_from_slice(&target.to_le_bytes());
+    code.extend_from_slice(&[0xFF, 0xE0]);
+    let t = p.emit_trampoline(&code).ok_or("trampoline space exhausted")?;
+    for &site in &LOADBUFFER_CALLS {
+        let rel = t as i64 - (p.base as i64 + site as i64 + 5);
+        let rel = i32::try_from(rel).map_err(|_| "trampoline out of rel32 range".to_string())?;
+        p.image[site + 1..site + 5].copy_from_slice(&rel.to_le_bytes());
+    }
+    BASE.store(p.base, Ordering::Relaxed);
+    Ok(())
+}
+
+/// A script load: the text as the game read it, or a fixed copy
+/// (`script_fixes`), compiled by the game's `hksL_loadbuffer`.
+unsafe fn lua_loadbuffer(l: u64, opts: u64, text: u64, size: u64, chunk: u64) -> i32 {
+    let orig = BASE.load(Ordering::Relaxed) + LOADBUFFER as u64;
+    let fixed = (text != 0 && size != 0 && size <= 64 << 20).then(|| {
+        let name = if chunk != 0 { unsafe { cstr(chunk, 512) } } else { String::new() };
+        let bytes = unsafe { std::slice::from_raw_parts(text as *const u8, size as usize) };
+        crate::script_fixes::load(l, &name, bytes)
+    });
+    match fixed.flatten() {
+        // (Ours lives until the compiler is done with it.)
+        Some(v) => {
+            let r = unsafe { crate::hle::call_guest(orig, &[l, opts, v.as_ptr() as u64, v.len() as u64, chunk]) as i32 };
+            if r != 0 {
+                let name = if chunk != 0 { unsafe { cstr(chunk, 512) } } else { String::new() };
+                crate::error!("scripts: {name}: the fixed text did not compile (status {r})");
+            }
+            r
+        }
+        None => unsafe { crate::hle::call_guest(orig, &[l, opts, text, size, chunk]) as i32 },
+    }
+}
+
 /// The render-kick job's spin-counter reset, its first test of the
 /// ps4render state and its busy loop (module docs), and where it continues.
 const KICK_SITE: usize = 0xd0afdd;
@@ -553,6 +679,55 @@ const KICK_STATE: i32 = 0x31ef8;
 
 /// Render-kick waits that had to wait, and their time (ns).
 pub static KICK_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// The app object's pointer (module-relative) and its frame step: the
+/// game's time step for the frame, seconds (1/30 at its own limit).
+const APP_PTR: u64 = 0x59a1b40;
+const APP_STEP: i32 = 0x19c;
+/// Effects that advance a fixed 1/30 s per frame (LOG: The scripts'
+/// frame-counted timers): the environment shaders' twelve phases
+/// (`_default_env_cs`: phase += rate x speed / 30) and the GPU particle
+/// systems' emission (count = rate / 30 + carry). Above 30 fps they take the
+/// frame's step instead; both constants are 1/30.
+const ENV_PHASE: (usize, &[u8], usize) = (0xe0f07b, &[0xC5, 0xF2, 0x59, 0x0D, 0xC9, 0x2A, 0x6E, 0x00], 0x14f1b4c); // vmulss xmm1,xmm1,[1/30]
+const PARTICLE_EMIT: (usize, &[u8], usize) = (0xbcb5c9, &[0xC5, 0xFA, 0x10, 0x05, 0xCB, 0x5A, 0x92, 0x00], 0x14f109c); // vmovss xmm0,[1/30]
+
+fn patch_frame_steps(p: &mut Patcher) -> Result<(), String> {
+    use iced_x86::code_asm::*;
+    let third = (1.0f32 / 30.0).to_le_bytes();
+    for (off, _, k) in [ENV_PHASE, PARTICLE_EMIT] {
+        if p.image.get(k..k + 4) != Some(&third[..]) {
+            return Err(format!("+{off:#x}: its constant at +{k:#x} is not 1/30 (not update 01.03?)"));
+        }
+    }
+    let base = p.base;
+    // `step` (the step, or the constant before the app object exists) into
+    // the instruction's operand; every register and the flags kept.
+    let with_step = |a: &mut CodeAssembler, (off, bytes, k): (usize, &[u8], usize), op: &dyn Fn(&mut CodeAssembler, AsmMemoryOperand) -> Result<(), IcedError>| -> Result<(), IcedError> {
+        let mut none = a.create_label();
+        let mut done = a.create_label();
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.pushfq()?;
+        a.push(rax)?;
+        a.mov(rax, base + APP_PTR)?;
+        a.mov(rax, qword_ptr(rax))?;
+        a.test(rax, rax)?;
+        a.je(none)?;
+        op(a, dword_ptr(rax + APP_STEP))?;
+        a.jmp(done)?;
+        a.set_label(&mut none)?;
+        a.mov(rax, base + k as u64)?;
+        op(a, dword_ptr(rax))?;
+        a.set_label(&mut done)?;
+        a.pop(rax)?;
+        a.popfq()?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.jmp(base + (off + bytes.len()) as u64)
+    };
+    p.detour(ENV_PHASE.0, ENV_PHASE.1, |a, _| with_step(a, ENV_PHASE, &|a, m| a.vmulss(xmm1, xmm1, m)))?;
+    p.detour(PARTICLE_EMIT.0, PARTICLE_EMIT.1, |a, _| with_step(a, PARTICLE_EMIT, &|a, m| a.vmovss(xmm0, m)))?;
+    Ok(())
+}
 
 fn patch_kick_wait(p: &mut Patcher) -> Result<(), String> {
     use iced_x86::code_asm::*;
@@ -643,6 +818,9 @@ sysv! {
         lua_print(l);
         0
     }
+    fn tlg_lua_loadbuffer(l: u64, opts: u64, text: u64, size: u64, chunk: u64) -> i32 {
+        lua_loadbuffer(l, opts, text, size, chunk)
+    }
     fn tlg_kick_wait(state: u64) -> i32 {
         kick_wait(state);
         0
@@ -697,6 +875,49 @@ mod tests {
         let mut p = Patcher { image: &mut image2, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp2, tramp_used: 0, data_used: 0 };
         assert!(patch_kick_wait(&mut p).is_err());
         assert_eq!(p.image[KICK_SITE], 0xC7);
+    }
+
+    #[test]
+    fn frame_step_stubs() {
+        let base = 0x6000_0000u64;
+        let mut image = vec![0x90u8; 0x150_0000];
+        for (off, b, k) in [ENV_PHASE, PARTICLE_EMIT] {
+            image[off..off + b.len()].copy_from_slice(b);
+            image[k..k + 4].copy_from_slice(&(1.0f32 / 30.0).to_le_bytes());
+        }
+        let mut tramp = vec![0u8; 0x1_0000];
+        let tbase = base + 0x160_0000;
+        {
+            let mut p = Patcher { image: &mut image, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp, tramp_used: 0, data_used: 0 };
+            patch_frame_steps(&mut p).unwrap();
+        }
+        for (off, b, _) in [ENV_PHASE, PARTICLE_EMIT] {
+            assert_eq!(image[off], 0xE9);
+            let rel = i32::from_le_bytes(image[off + 1..off + 5].try_into().unwrap()) as i64;
+            let t = (base as i64 + off as i64 + 5 + rel) as u64;
+            let mut d = Decoder::with_ip(64, &tramp[(t - tbase) as usize..], t, DecoderOptions::NONE);
+            let back = base + (off + b.len()) as u64;
+            let mut v = Vec::new();
+            loop {
+                let i = d.decode();
+                assert!(!i.is_invalid() && v.len() < 40, "site +{off:#x}");
+                v.push(i);
+                if i.flow_control() == FlowControl::UnconditionalBranch && i.near_branch_target() == back {
+                    break;
+                }
+            }
+            use iced_x86::Mnemonic as M;
+            let n = |m: M| v.iter().filter(|i| i.mnemonic() == m).count();
+            assert_eq!(n(M::Push) + n(M::Pushfq), n(M::Pop) + n(M::Popfq), "site +{off:#x}");
+            assert!(v.iter().any(|i| matches!(i.mnemonic(), M::Vmulss | M::Vmovss) && i.memory_base() == iced_x86::Register::RAX && i.memory_displacement64() == APP_STEP as u64), "site +{off:#x}");
+        }
+        // Another constant: not patched.
+        let mut image2 = vec![0x90u8; 0x150_0000];
+        image2[ENV_PHASE.0..ENV_PHASE.0 + ENV_PHASE.1.len()].copy_from_slice(ENV_PHASE.1);
+        let mut tramp2 = vec![0u8; 0x1_0000];
+        let mut p = Patcher { image: &mut image2, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp2, tramp_used: 0, data_used: 0 };
+        assert!(patch_frame_steps(&mut p).is_err());
+        assert_eq!(p.image[ENV_PHASE.0], 0xC5);
     }
 
     #[test]

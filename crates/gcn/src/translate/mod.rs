@@ -23,6 +23,11 @@ use rspirv::spirv::{self, BuiltIn, Capability, Decoration, ExecutionMode, Execut
 use crate::DetMap as HashMap;
 use std::collections::BTreeSet;
 
+/// The device's workgroup memory per compute workgroup in bytes
+/// (maxComputeSharedMemorySize; the runtime sets it at start): LDS beyond it
+/// is clamped. 48 KiB until set.
+pub static LDS_MAX_BYTES: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(49152);
+
 thread_local! {
     /// Measurements only (the runtime's `TLG_COMPILE_PROBE`): 1 = buffer
     /// stores leave out their page marks (`mem::mark_dirty`; the bindings
@@ -278,6 +283,11 @@ pub struct Output {
     pub pos_exports: u8,
     pub pos_ignored: u8,
     pub warnings: Vec<String>,
+    /// Compute: LDS shared between lanes inside per-lane control flow kept
+    /// no barrier - correct while each 64 invocations run as one wave, as
+    /// on the console (the runtime asks for 64-wide subgroups where the
+    /// device offers them).
+    pub wave64: bool,
 }
 
 pub const SGPR_DATA_USER: u32 = 16;
@@ -1384,6 +1394,7 @@ fn translate_mode(code: &[Inst], plan: &Plan, spec: &Spec, wave_sync: bool) -> R
         pos_exports: tr.pos_exports,
         pos_ignored: tr.pos_ignored,
         warnings: tr.warnings,
+        wave64: nested > 0,
     };
     Ok((out, nested))
 }

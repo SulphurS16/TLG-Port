@@ -65,17 +65,20 @@ pub struct GuestThread {
     pub specific: Mutex<Vec<u64>>,
     pub host_tid: AtomicU64,
     /// HLE function the thread is in (address of a `&'static str`, 0 = guest code) and
-    /// since when (ms since start): what a stuck thread is waiting in (`threads` command).
+    /// since when (time stamp counter): what a stuck thread is waiting in (`threads` command).
     pub hle_call: AtomicU64,
     pub hle_since: AtomicU64,
 }
 
 /// Records entry into HLE function `name`; returns the previous record for `hle_exit`.
+/// (The time stamp counter, not the log clock: the title's threads make tens
+/// of thousands of HLE calls a frame, and converting the performance counter
+/// to milliseconds was ~5% of the render thread's busy time.)
 #[inline]
 pub fn hle_enter(name: &'static &'static str) -> (u64, u64) {
     match current() {
         Some(t) => {
-            let since = crate::log::elapsed_ms() as u64;
+            let since = unsafe { core::arch::x86_64::_rdtsc() };
             (t.hle_call.swap(name as *const &str as u64, Ordering::Relaxed), t.hle_since.swap(since, Ordering::Relaxed))
         }
         None => (0, 0),
@@ -92,7 +95,8 @@ pub fn hle_exit(prev: (u64, u64)) {
 
 /// Logs every guest thread with the HLE call it is in (diagnosing hangs).
 pub fn dump_threads(why: &str) {
-    let now = crate::log::elapsed_ms() as u64;
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    let per_ms = (crate::hle::kernel::time::tsc_hz_or(1_000_000_000) / 1000).max(1);
     let mut s = format!("guest threads ({why}):");
     for t in THREADS.lock().iter() {
         let exited = t.exited.try_lock().map(|g| g.is_some()).unwrap_or(false);
@@ -103,7 +107,7 @@ pub fn dump_threads(why: &str) {
             "in guest code".to_string()
         } else {
             let name = unsafe { *(call as *const &'static str) };
-            format!("in {name} for {} ms", now.saturating_sub(t.hle_since.load(Ordering::Relaxed)))
+            format!("in {name} for {} ms", now.saturating_sub(t.hle_since.load(Ordering::Relaxed)) / per_ms)
         };
         s.push_str(&format!("\n  {:>3} {:<32} {what}", t.id, t.name()));
     }
@@ -253,8 +257,10 @@ pub fn place_by_name(name: &str) {
 /// it runs on that core's first logical processor and the process's other
 /// threads on every processor but that core's; -1 undoes it. -2 picks the
 /// third of the fastest cores (highest efficiency class: performance cores
-/// on hybrid CPUs; core 0 takes most interrupts), and only when at least 8
-/// logical processors remain for the rest. `ccd` (`tune ccd_split`): our
+/// on hybrid CPUs; core 0 takes most interrupts), and only when at least 6
+/// logical processors remain for the rest (Falling Bridge on 4 cores / 8
+/// threads: +4.4% fps, the graphics CP's time per frame -20%). Only the
+/// processors the process may run on count. `ccd` (`tune ccd_split`): our
 /// GPU threads (`GPU-*`, `hrtimer`) on the other cores sharing that core's
 /// last-level cache (a CCD on Ryzen), every other thread - the title's
 /// among them - on the cores of the other caches; 1 whenever there are
@@ -327,14 +333,20 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64, ccd: i64) -> String {
         let bytes = std::slice::from_raw_parts(buf.as_ptr() as *const u8, len as usize);
         let mut sets: Vec<(u32, u8, u8, u8, u8)> = Vec::new();
         let mut at = 0usize;
+        // (Only the processors the process may run on: TLG_CPU_AFFINITY
+        // measures a smaller CPU, and a core outside the mask is no help.)
+        let mask = process_mask();
         while at + 19 <= bytes.len() {
             let size = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
             if size < 19 {
                 break;
             }
             let id = u32::from_le_bytes(bytes[at + 8..at + 12].try_into().unwrap());
+            let group = u16::from_le_bytes(bytes[at + 12..at + 14].try_into().unwrap());
             // (id, logical processor, core, efficiency class, last-level cache)
-            sets.push((id, bytes[at + 14], bytes[at + 15], bytes[at + 18], bytes[at + 16]));
+            if group != 0 || mask >> (bytes[at + 14] & 63) & 1 != 0 {
+                sets.push((id, bytes[at + 14], bytes[at + 15], bytes[at + 18], bytes[at + 16]));
+            }
             at += size;
         }
         let mut cores: Vec<u8> = sets.iter().map(|s| s.2).collect();
@@ -344,7 +356,7 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64, ccd: i64) -> String {
             let best = sets.iter().map(|s| s.3).max().unwrap_or(0);
             let fast: Vec<u8> = cores.iter().copied().filter(|&c| sets.iter().any(|s| s.2 == c && s.3 == best)).collect();
             let Some(&c) = fast.get(2.min(fast.len().saturating_sub(1))) else { return "no cores listed".into() };
-            if sets.iter().filter(|s| s.2 != c).count() < 8 {
+            if sets.iter().filter(|s| s.2 != c).count() < 6 {
                 return format!("left to Windows ({} logical processors)", sets.len());
             }
             c
@@ -402,6 +414,41 @@ pub fn dedicate_core(core: i64, soft: bool, cs_core: i64, ccd: i64) -> String {
         let what = if split { "our GPU threads" } else { "compute CPs and completion" };
         format!("the core of logical processors {lps:?} dedicated{}{}: thread {ok1}, process default {ok2}, {n} other threads on the other {} sets", if soft { " (preferred only)" } else { "" }, if cs.is_empty() { String::new() } else { format!(", {what} on {cs_lps:?}") }, rest.len())
     }
+}
+
+/// The logical processors of processor group 0 the process may run on (its
+/// affinity mask; all bits when it cannot be read).
+pub fn process_mask() -> u64 {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask};
+    let (mut process, mut system) = (0usize, 0usize);
+    if unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut process, &mut system) } != 0 && process != 0 {
+        process as u64
+    } else {
+        u64::MAX
+    }
+}
+
+/// Spin-wait defaults for the logical processors the process has (`tune
+/// copy_spin_us`, `rec_spin_us`, `mutex_spins`, `hrt_spin`; their
+/// environment variables still decide). With 8 or fewer, the copy and
+/// record threads poll 50 us for more work instead of 1 ms, contended guest
+/// mutexes spin 400 pauses instead of 4,000 and the high-resolution timers
+/// only sleep: their spinning took processor time the title's threads and
+/// the graphics CP needed. Falling Bridge uncapped on 4 cores / 8 threads
+/// of this PC (TLG_CPU_AFFINITY=ff), four A/B runs: +3.4%, +2.7%, +4.2% fps
+/// with the graphics CP on a core of its own, +1.8% without; on 6 cores / 12
+/// threads -1.8% and on all 24 equal (99th percentile frame 22.9 vs 25.0
+/// ms), so larger CPUs keep spinning. Returns the count.
+pub fn apply_cpu_budget() -> u32 {
+    let n = process_mask().count_ones();
+    if n <= 8 {
+        use crate::tune::{COPY_SPIN_US, HRT_SPIN, MUTEX_SPINS, REC_SPIN_US, set_default};
+        set_default(COPY_SPIN_US, 50);
+        set_default(REC_SPIN_US, 50);
+        set_default(MUTEX_SPINS, 400);
+        set_default(HRT_SPIN, 0);
+    }
+    n
 }
 
 /// Gives the calling host thread above-normal priority: the command

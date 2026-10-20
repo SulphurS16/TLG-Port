@@ -1,6 +1,7 @@
 //! Vulkan device context shared by the renderer and the presenter.
 
 pub mod present;
+pub mod requirements;
 pub mod window;
 
 use ash::vk;
@@ -40,6 +41,13 @@ pub struct Ctx {
     pub clip_cull: (bool, bool),
     /// occlusionQueryPrecise enabled (exact sample counts).
     pub occl_precise: bool,
+    /// depthBounds enabled (else the depth bounds test is left off).
+    pub depth_bounds: bool,
+    /// samplerMirrorClampToEdge enabled (else mirrored repeat stands in).
+    pub mirror_clamp: bool,
+    /// Compute pipelines may require 64-wide subgroups (subgroupSizeControl
+    /// with 64 in the device's range for compute; AMD).
+    pub wave64_cs: bool,
     /// shaderDenormFlushToZeroFloat32 (shaders may request FP32 flushing).
     pub denorm_flush32: bool,
     /// VkPhysicalDevicePushDescriptorPropertiesKHR::maxPushDescriptors.
@@ -152,65 +160,6 @@ unsafe extern "system" fn debug_cb(
     vk::FALSE
 }
 
-/// What a device lacks of the API version, extensions and features
-/// `init` enables unconditionally (empty: usable).
-unsafe fn missing_requirements(instance: &ash::Instance, pd: vk::PhysicalDevice, props: &vk::PhysicalDeviceProperties) -> Vec<String> {
-    let mut m = Vec::new();
-    if props.api_version < vk::API_VERSION_1_3 {
-        m.push(format!("Vulkan 1.3 (has {}.{})", vk::api_version_major(props.api_version), vk::api_version_minor(props.api_version)));
-        return m;
-    }
-    let exts = unsafe { instance.enumerate_device_extension_properties(pd) }.unwrap_or_default();
-    for e in [ash::khr::swapchain::NAME, ash::khr::push_descriptor::NAME] {
-        if !exts.iter().any(|x| unsafe { CStr::from_ptr(x.extension_name.as_ptr()) } == e) {
-            m.push(e.to_string_lossy().into_owned());
-        }
-    }
-    let f = unsafe { instance.get_physical_device_features(pd) };
-    let base = [
-        ("robustBufferAccess", f.robust_buffer_access),
-        ("depthBounds", f.depth_bounds),
-        ("geometryShader", f.geometry_shader),
-        ("tessellationShader", f.tessellation_shader),
-        ("independentBlend", f.independent_blend),
-        ("dualSrcBlend", f.dual_src_blend),
-        ("logicOp", f.logic_op),
-        ("fillModeNonSolid", f.fill_mode_non_solid),
-        ("depthClamp", f.depth_clamp),
-        ("depthBiasClamp", f.depth_bias_clamp),
-        ("samplerAnisotropy", f.sampler_anisotropy),
-        ("textureCompressionBC", f.texture_compression_bc),
-        ("imageCubeArray", f.image_cube_array),
-        ("shaderInt64", f.shader_int64),
-        ("shaderStorageImageWriteWithoutFormat", f.shader_storage_image_write_without_format),
-        ("shaderStorageImageReadWithoutFormat", f.shader_storage_image_read_without_format),
-        ("vertexPipelineStoresAndAtomics", f.vertex_pipeline_stores_and_atomics),
-        ("fragmentStoresAndAtomics", f.fragment_stores_and_atomics),
-        ("multiDrawIndirect", f.multi_draw_indirect),
-        ("sampleRateShading", f.sample_rate_shading),
-    ];
-    m.extend(base.iter().filter(|(_, v)| *v == 0).map(|(n, _)| n.to_string()));
-    let mut f12 = vk::PhysicalDeviceVulkan12Features::default();
-    let mut f13 = vk::PhysicalDeviceVulkan13Features::default();
-    {
-        let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut f12).push_next(&mut f13);
-        unsafe { instance.get_physical_device_features2(pd, &mut f2) };
-    }
-    let newer = [
-        ("timelineSemaphore", f12.timeline_semaphore),
-        ("scalarBlockLayout", f12.scalar_block_layout),
-        ("shaderFloat16", f12.shader_float16),
-        ("storageBuffer8BitAccess", f12.storage_buffer8_bit_access),
-        ("uniformAndStorageBuffer8BitAccess", f12.uniform_and_storage_buffer8_bit_access),
-        ("shaderInt8", f12.shader_int8),
-        ("dynamicRendering", f13.dynamic_rendering),
-        ("synchronization2", f13.synchronization2),
-        ("maintenance4", f13.maintenance4),
-    ];
-    m.extend(newer.iter().filter(|(_, v)| *v == 0).map(|(n, _)| n.to_string()));
-    m
-}
-
 pub fn init() -> Result<(), String> {
     if CTX.get().is_some() {
         return Ok(());
@@ -258,7 +207,7 @@ pub fn init() -> Result<(), String> {
             let props = instance.get_physical_device_properties(pd);
             let name = CStr::from_ptr(props.device_name.as_ptr()).to_string_lossy().into_owned();
             let qfs = instance.get_physical_device_queue_family_properties(pd);
-            let missing = missing_requirements(&instance, pd, &props);
+            let missing = requirements::missing(&instance, pd, &props);
             crate::info!(
                 "Vulkan device {i}: {name} ({:?}, API {}.{}.{}, driver {:#x}, vendor {:#06x}){}",
                 props.device_type,
@@ -317,7 +266,9 @@ pub fn init() -> Result<(), String> {
             .enumerate_device_extension_properties(pdev)
             .unwrap_or_default()
             .iter()
-            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::robustness2::NAME);
+            .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::robustness2::NAME)
+            // (TLG_NO_ROBUSTNESS2=1: as on a device without it, a test.)
+            && !std::env::var("TLG_NO_ROBUSTNESS2").is_ok_and(|v| v == "1");
         let mut r2_supported = vk::PhysicalDeviceRobustness2FeaturesEXT::default();
         if has_robust2 {
             let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut r2_supported);
@@ -365,6 +316,27 @@ pub fn init() -> Result<(), String> {
             fc.shader_denorm_flush_to_zero_float32 != 0
         };
         let clip_cull = (have.shader_clip_distance != 0, have.shader_cull_distance != 0);
+        // Optional, with fallbacks: depth bounds (off: light volumes are not
+        // limited to their depth range), mirror-once addressing (mirrored
+        // repeat instead).
+        let depth_bounds = have.depth_bounds != 0 && !std::env::var("TLG_NO_DEPTH_BOUNDS").is_ok_and(|v| v == "1");
+        // 64-wide compute subgroups on request (the console's wave size).
+        let wave64_cs = {
+            let mut s13 = vk::PhysicalDeviceVulkan13Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut s13);
+            instance.get_physical_device_features2(pdev, &mut f2);
+            let mut p13 = vk::PhysicalDeviceVulkan13Properties::default();
+            let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p13);
+            instance.get_physical_device_properties2(pdev, &mut p2);
+            crate::info!("Vulkan subgroups: {}-{} wide, size control {} (stages {:?})", p13.min_subgroup_size, p13.max_subgroup_size, s13.subgroup_size_control, p13.required_subgroup_size_stages);
+            s13.subgroup_size_control != 0 && p13.min_subgroup_size <= 64 && p13.max_subgroup_size >= 64 && p13.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
+        };
+        let mirror_clamp = {
+            let mut s12 = vk::PhysicalDeviceVulkan12Features::default();
+            let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut s12);
+            instance.get_physical_device_features2(pdev, &mut f2);
+            s12.sampler_mirror_clamp_to_edge != 0 && !std::env::var("TLG_NO_MIRROR_CLAMP").is_ok_and(|v| v == "1")
+        };
         let occl_precise = have.occlusion_query_precise != 0;
         let sparse = have.sparse_binding != 0
             && have.sparse_residency_buffer != 0
@@ -377,13 +349,11 @@ pub fn init() -> Result<(), String> {
             .shader_clip_distance(clip_cull.0)
             .shader_cull_distance(clip_cull.1)
             .robust_buffer_access(true)
-            .depth_bounds(true)
+            .depth_bounds(depth_bounds)
             .geometry_shader(true)
             .tessellation_shader(true)
             .independent_blend(true)
             .dual_src_blend(true)
-            .logic_op(true)
-            .fill_mode_non_solid(true)
             .depth_clamp(true)
             .depth_bias_clamp(true)
             .sampler_anisotropy(true)
@@ -394,18 +364,13 @@ pub fn init() -> Result<(), String> {
             .shader_storage_image_read_without_format(true)
             .vertex_pipeline_stores_and_atomics(true)
             .fragment_stores_and_atomics(true)
-            .multi_draw_indirect(true)
-            .sample_rate_shading(true)
             // Non-constant texel offsets (GCN sample/gather offsets come from registers).
             .shader_image_gather_extended(have.shader_image_gather_extended != 0);
-        let mut f12 = vk::PhysicalDeviceVulkan12Features::default()
-            .timeline_semaphore(true)
-            .scalar_block_layout(true)
-            .shader_float16(true)
-            .storage_buffer8_bit_access(true)
-            .uniform_and_storage_buffer8_bit_access(true)
-            .shader_int8(true);
-        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true);
+        let mut f12 = vk::PhysicalDeviceVulkan12Features::default().timeline_semaphore(true).sampler_mirror_clamp_to_edge(mirror_clamp);
+        // (Without robustness2's image robustness: Vulkan 1.3's, so
+        // out-of-range image accesses stay defined.)
+        let robust_image = r2_supported.robust_image_access2 == 0;
+        let mut f13 = vk::PhysicalDeviceVulkan13Features::default().dynamic_rendering(true).synchronization2(true).maintenance4(true).robust_image_access(robust_image).subgroup_size_control(wave64_cs);
         // Device-loss diagnostics: VK_EXT_device_fault (always, no cost) and NV
         // checkpoints (TLG_GPU_DIAG=1: one per recorded command).
         let has_ext = |n: &CStr| instance.enumerate_device_extension_properties(pdev).unwrap_or_default().iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == n);
@@ -447,6 +412,7 @@ pub fn init() -> Result<(), String> {
             r2_supported.robust_image_access2 != 0,
             r2_supported.null_descriptor != 0
         );
+        crate::info!("Vulkan optional features: depth bounds {depth_bounds}, mirror-once addressing {mirror_clamp}, Vulkan 1.3 image robustness {robust_image}, 64-wide compute subgroups {wave64_cs}");
         let queue = device.get_device_queue(qf, 0);
         let present_queue = two_queues.then(|| Mutex::new(device.get_device_queue(qf, 1)));
         let mem_props = instance.get_physical_device_memory_properties(pdev);
@@ -468,6 +434,9 @@ pub fn init() -> Result<(), String> {
             sparse,
             clip_cull,
             occl_precise,
+            depth_bounds,
+            mirror_clamp,
+            wave64_cs,
             denorm_flush32,
             push_max,
             entry,
@@ -478,7 +447,11 @@ pub fn init() -> Result<(), String> {
             present_queue,
             queue_family: qf,
             mem_props,
-            limits: props.limits,
+            limits: {
+                // (Shaders' LDS fits the device's workgroup memory.)
+                gcn::translate::LDS_MAX_BYTES.store(props.limits.max_compute_shared_memory_size, std::sync::atomic::Ordering::Relaxed);
+                props.limits
+            },
             device_name,
             validation,
         };
@@ -495,7 +468,9 @@ pub fn init() -> Result<(), String> {
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut host);
             ctx.instance.get_physical_device_properties2(pdev, &mut p2);
             crate::info!(
-                "Vulkan limits: maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}, graphics_pipeline_library {}, shader_object {}",
+                "Vulkan limits: maxMemoryAllocationCount {}, maxComputeWorkGroupCount {:?}, maxStorageBufferRange {:#x}, minStorageBufferOffsetAlignment {}, external_memory_host {} (import alignment {:#x}), buffer_device_address {}, graphics_pipeline_library {}, shader_object {}",
+                ctx.limits.max_memory_allocation_count,
+                ctx.limits.max_compute_work_group_count,
                 ctx.limits.max_storage_buffer_range,
                 ctx.limits.min_storage_buffer_offset_alignment,
                 has(ash::ext::external_memory_host::NAME),
@@ -544,11 +519,88 @@ impl Ctx {
     pub fn alloc(&self, req: vk::MemoryRequirements, want: vk::MemoryPropertyFlags) -> Result<vk::DeviceMemory, String> {
         let ty = self.memory_type(req.memory_type_bits, want).ok_or("no suitable memory type")?;
         let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty);
-        let mem = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}): {e}", req.size))?;
+        let mem = match unsafe { self.device.allocate_memory(&ai, None) } {
+            Ok(m) => m,
+            // Video memory full (cards with little of it): system memory
+            // where the resource may live there - slower, not lost.
+            Err(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY) if want.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL) => {
+                let rest = want & !vk::MemoryPropertyFlags::DEVICE_LOCAL;
+                let sys = (0..self.mem_props.memory_type_count).find(|&i| {
+                    let t = self.mem_props.memory_types[i as usize];
+                    req.memory_type_bits & (1 << i) != 0 && t.property_flags.contains(rest) && !self.mem_props.memory_heaps[t.heap_index as usize].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+                });
+                let Some(sys) = sys else { return Err(format!("vkAllocateMemory({}): out of video memory", req.size)) };
+                static ONCE: std::sync::Once = std::sync::Once::new();
+                ONCE.call_once(|| crate::warn!("video memory full: allocations go to system memory from now on where they can (slower)"));
+                let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(sys);
+                let m = unsafe { self.device.allocate_memory(&ai, None) }.map_err(|e| format!("vkAllocateMemory({}) in system memory: {e}", req.size))?;
+                let heap = self.mem_props.memory_types[sys as usize].heap_index as usize;
+                let local = self.mem_props.memory_heaps[heap].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+                ALLOCS.lock().insert(vk::Handle::as_raw(m), (req.size, local, std::panic::Location::caller()));
+                return Ok(m);
+            }
+            Err(e) => return Err(format!("vkAllocateMemory({}): {e}", req.size)),
+        };
         let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
         let local = self.mem_props.memory_heaps[heap].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
-        ALLOCS.lock().insert(vk::Handle::as_raw(mem), (req.size, local, std::panic::Location::caller()));
+        let live = {
+            let mut a = ALLOCS.lock();
+            a.insert(vk::Handle::as_raw(mem), (req.size, local, std::panic::Location::caller()));
+            a.len() as u64
+        };
+        // (Each image has an allocation of its own: First Antenna holds
+        // ~2,200. Some drivers allow 4,096 at once - AMD's on Windows.)
+        if live * 4 >= self.limits.max_memory_allocation_count as u64 * 3 {
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| crate::warn!("{live} device memory allocations, three quarters of the device's limit ({})", self.limits.max_memory_allocation_count));
+        }
         Ok(mem)
+    }
+
+    /// A dedicated allocation for `image` (VkMemoryDedicatedAllocateInfo: the
+    /// driver asked for one, e.g. for render targets' compression), device-local
+    /// where it can be, else in system memory as `alloc` falls back.
+    #[track_caller]
+    pub fn alloc_dedicated(&self, req: vk::MemoryRequirements, image: vk::Image) -> Result<vk::DeviceMemory, String> {
+        let local = vk::MemoryPropertyFlags::DEVICE_LOCAL;
+        let system = (0..self.mem_props.memory_type_count).find(|&i| {
+            let t = self.mem_props.memory_types[i as usize];
+            req.memory_type_bits & (1 << i) != 0 && !self.mem_props.memory_heaps[t.heap_index as usize].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)
+        });
+        let types = [self.memory_type(req.memory_type_bits, local), system];
+        let mut last = String::from("no suitable memory type");
+        for ty in types.into_iter().flatten() {
+            let mut ded = vk::MemoryDedicatedAllocateInfo::default().image(image);
+            let ai = vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(ty).push_next(&mut ded);
+            match unsafe { self.device.allocate_memory(&ai, None) } {
+                Ok(mem) => {
+                    let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
+                    let on_device = self.mem_props.memory_heaps[heap].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+                    ALLOCS.lock().insert(vk::Handle::as_raw(mem), (req.size, on_device, std::panic::Location::caller()));
+                    return Ok(mem);
+                }
+                Err(e) => last = format!("vkAllocateMemory(dedicated, {}): {e}", req.size),
+            }
+        }
+        Err(last)
+    }
+
+    /// Allocates `size` bytes of memory type `ty` without `alloc`'s fallback to
+    /// system memory (recorded like `alloc`'s; release it with `free`): image
+    /// blocks (`suballoc`), whose callers fall back per image instead.
+    #[track_caller]
+    pub fn alloc_type(&self, size: u64, ty: u32) -> Option<vk::DeviceMemory> {
+        let ai = vk::MemoryAllocateInfo::default().allocation_size(size).memory_type_index(ty);
+        let mem = unsafe { self.device.allocate_memory(&ai, None) }.ok()?;
+        let heap = self.mem_props.memory_types[ty as usize].heap_index as usize;
+        let local = self.mem_props.memory_heaps[heap].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL);
+        ALLOCS.lock().insert(vk::Handle::as_raw(mem), (size, local, std::panic::Location::caller()));
+        Some(mem)
+    }
+
+    /// Live allocations made through `alloc` and `alloc_type`.
+    pub fn allocation_count(&self) -> usize {
+        ALLOCS.lock().len()
     }
 
     /// Frees memory from `alloc` (or imported).

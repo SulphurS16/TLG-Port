@@ -1,12 +1,14 @@
 //! Where a build keeps its files.
 //!
 //! - Development checkout (the executable under a directory holding `local\`
-//!   or the workspace `Cargo.toml`): everything in `<root>\local`
-//!   (git-ignored), runs in `local\runs`.
+//!   or the workspace `Cargo.toml`; in a release build `local\`, `Cargo.toml`
+//!   and `crates\` together): everything in `<root>\local` (git-ignored),
+//!   runs in `local\runs`.
 //! - Portable (`portable.txt` beside the executable, or `TLG_HOME=<dir>`):
 //!   everything in `<exe dir>\user` (or `<dir>`).
-//! - Installed release (`tlg-release.txt` beside the executable, or no
-//!   checkout around it): settings, bindings and saves in `%APPDATA%\TLG`,
+//! - Installed release (no checkout around it, or `tlg-release.txt` beside
+//!   the executable, as packages up to 0.5.0 had): settings, bindings and
+//!   saves in `%APPDATA%\TLG`,
 //!   caches and logs in `%LOCALAPPDATA%\TLG`; game folders not set in the
 //!   settings are looked for in `%LOCALAPPDATA%\TLG\game`.
 
@@ -38,10 +40,18 @@ pub struct Paths {
     pub game_root: PathBuf,
 }
 
-fn dev_root(dir: &Path) -> Option<PathBuf> {
+/// A release build (`TLG_RELEASE_BUILD` set while tools/package.ps1 builds
+/// it): a checkout around the executable counts only as a whole - `local\`,
+/// the workspace `Cargo.toml` and `crates\` - so a player's folder under one
+/// that happens to hold a `local` folder or a `Cargo.toml` stays an installed
+/// release without a marker file in the package.
+const RELEASE_BUILD: bool = option_env!("TLG_RELEASE_BUILD").is_some();
+
+fn dev_root(dir: &Path, strict: bool) -> Option<PathBuf> {
     let mut p = Some(dir);
     while let Some(d) = p {
-        if d.join("local").is_dir() || d.join("Cargo.toml").is_file() {
+        let (local, cargo) = (d.join("local").is_dir(), d.join("Cargo.toml").is_file());
+        if if strict { local && cargo && d.join("crates").is_dir() } else { local || cargo } {
             return Some(d.to_path_buf());
         }
         p = d.parent();
@@ -60,7 +70,7 @@ impl Paths {
             return portable(exe_dir.join("user"));
         }
         if !exe_dir.join(RELEASE_MARKER).is_file() {
-            if let Some(root) = dev_root(&exe_dir) {
+            if let Some(root) = dev_root(&exe_dir, RELEASE_BUILD) {
                 let local = root.join("local");
                 return Paths { layout: Layout::Dev, exe_dir, user: local.clone(), cache: local.clone(), game_root: local.join("game") };
             }
@@ -163,6 +173,21 @@ mod tests {
             assert_eq!(p.user, rel.join("user"));
             assert_eq!(p.logs(), rel.join("user").join("logs"));
         }
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn strict_checkout() {
+        let tmp = std::env::temp_dir().join(format!("tlg-config-strict-{}", std::process::id()));
+        let game = tmp.join("Games").join("TLG-Port");
+        std::fs::create_dir_all(&game).unwrap();
+        // (A stray local folder above a player's folder.)
+        std::fs::create_dir_all(tmp.join("local")).unwrap();
+        assert_eq!(dev_root(&game, false), Some(tmp.clone()));
+        assert_eq!(dev_root(&game, true), None);
+        std::fs::write(tmp.join("Cargo.toml"), "").unwrap();
+        std::fs::create_dir_all(tmp.join("crates")).unwrap();
+        assert_eq!(dev_root(&game, true), Some(tmp.clone()));
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

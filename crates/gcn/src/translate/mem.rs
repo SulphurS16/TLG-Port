@@ -108,7 +108,9 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
             tr.lane_id = Some(e(tr.b.bitwise_and(tr.t.u32, None, idx, k63))?);
             let lds_dwords = ((tr.spec.cs_rsrc2 >> 15) & 0x1FF) * 128;
             if lds_dwords > 0 {
-                let n = lds_dwords.min(12288);
+                // (The device's limit, less the workgroup vote's 3 dwords.)
+                let max = super::LDS_MAX_BYTES.load(std::sync::atomic::Ordering::Relaxed);
+                let n = lds_dwords.min(max.saturating_sub(if tr.wave_sync { 12 } else { 0 }) / 4);
                 if n < lds_dwords {
                     tr.warn(format!("LDS of {} dwords clamped to {n}", lds_dwords));
                 }
@@ -1712,7 +1714,16 @@ pub fn export(tr: &mut T, ins: &Inst) -> R<()> {
                 Some(v) => v,
                 None => {
                     let v = tr.output(tr.t.v4f, Some(BuiltIn::Position), None);
+                    // (The same position from every shader computing it the
+                    // same way: passes that test equal depth match on every
+                    // driver.)
+                    tr.b.decorate(v, Decoration::Invariant, []);
                     tr.out_pos = Some(v);
+                    // (Points are 1 pixel: Vulkan leaves their size undefined
+                    // unless the shader writes it.)
+                    let ps = tr.output(tr.t.f32, Some(BuiltIn::PointSize), None);
+                    let one = tr.f(1.0);
+                    tr.b.store(ps, one, None, []).map_err(|x| format!("{x:?}"))?;
                     v
                 }
             };

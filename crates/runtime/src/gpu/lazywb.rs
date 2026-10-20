@@ -88,6 +88,52 @@ pub fn enabled() -> bool {
     crate::tune::get(crate::tune::LAZY_WB) != 0 && super::vk::ctx().ext_host.is_none() && !super::wbprobe::enabled()
 }
 
+/// 64 KiB blocks of the guest range entirely inside protected ranges, a bit
+/// each: the CPU cannot write them without faulting into `fault` first, so
+/// the write tracker leaves them out of its write-watch queries once it has
+/// queried them after they were covered (writes.rs, `tune lazy_skip`).
+/// Changed under STATE; each change is listed for the tracker
+/// (`take_cover_events`), which queries the block again.
+const COVER_SHIFT: u32 = 16;
+const COVER_WORDS: usize = ((crate::mem::GUEST_END - crate::mem::GUEST_BASE) >> COVER_SHIFT >> 6) as usize;
+static COVERED: [AtomicU64; COVER_WORDS] = [const { AtomicU64::new(0) }; COVER_WORDS];
+static COVER_EVENTS: parking_lot::Mutex<Vec<u64>> = parking_lot::Mutex::new(Vec::new());
+static COVER_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Marks the blocks entirely inside [lo, hi) covered or not (STATE held).
+fn cover(lo: u64, hi: u64, on: bool) {
+    let base = crate::mem::GUEST_BASE >> COVER_SHIFT;
+    let (b0, b1) = ((lo + (1 << COVER_SHIFT) - 1) >> COVER_SHIFT, hi >> COVER_SHIFT);
+    if b0 >= b1 || b0 < base || (b1 - base) as usize > COVER_WORDS * 64 {
+        return;
+    }
+    let mut ev = COVER_EVENTS.lock();
+    for b in b0..b1 {
+        let i = (b - base) as usize;
+        let bit = 1u64 << (i & 63);
+        let old = if on { COVERED[i >> 6].fetch_or(bit, Ordering::AcqRel) } else { COVERED[i >> 6].fetch_and(!bit, Ordering::AcqRel) };
+        if (old & bit != 0) != on {
+            ev.push(b);
+        }
+    }
+    if !ev.is_empty() {
+        COVER_PENDING.store(true, Ordering::Release);
+    }
+}
+
+/// Whether 64 KiB block `block` (address >> 16) is covered (see `COVERED`).
+pub fn covered(block: u64) -> bool {
+    let i = block.wrapping_sub(crate::mem::GUEST_BASE >> COVER_SHIFT) as usize;
+    i < COVER_WORDS * 64 && COVERED[i >> 6].load(Ordering::Acquire) >> (i & 63) & 1 != 0
+}
+
+/// The blocks covered or uncovered since the last call (appended to `out`).
+pub fn take_cover_events(out: &mut Vec<u64>) {
+    if COVER_PENDING.load(Ordering::Acquire) && COVER_PENDING.swap(false, Ordering::AcqRel) {
+        out.append(&mut COVER_EVENTS.lock());
+    }
+}
+
 fn active() -> bool {
     ACTIVE.load(Ordering::SeqCst)
 }
@@ -120,6 +166,19 @@ fn overlapping(g: &State, lo: u64, hi: u64) -> Vec<u64> {
     g.entries.range(..hi).rev().take_while(|(_, e)| e.end > lo).map(|(k, _)| *k).collect()
 }
 
+/// Untouched write-backs after which a range of `bytes` with `strikes`
+/// touches goes lazy: `LAZY_AFTER`, doubled per strike; with `tune
+/// lazy_big_kib` (off) ranges that large never touched, after one (the
+/// first eager write-back makes guest memory current and protects it, as
+/// for any range).
+fn lazy_after(bytes: u64, strikes: u32) -> u32 {
+    let big = crate::tune::get(crate::tune::LAZY_BIG_KIB);
+    if strikes == 0 && big > 0 && bytes >= (big as u64) << 10 {
+        return 1;
+    }
+    LAZY_AFTER << strikes.min(4)
+}
+
 /// At submission: whether the mirror write-back of the inner pages
 /// [lo, hi) can be skipped (the range is lazy; its newest data at
 /// `buf`+`off`, `off` the mirror offset of `lo`); then the skip's number,
@@ -128,7 +187,7 @@ pub fn skip_writeback(lo: u64, hi: u64, buf: vk::Buffer, off: u64) -> Option<u64
     let mut guard = STATE.lock();
     let State { entries, skips, stats } = &mut *guard;
     let e = entries.get_mut(&lo)?;
-    if e.end != hi || !e.protected || e.strikes >= MAX_STRIKES || e.quiet < LAZY_AFTER << e.strikes.min(4) {
+    if e.end != hi || !e.protected || e.strikes >= MAX_STRIKES || e.quiet < lazy_after(hi - lo, e.strikes) {
         return None;
     }
     *skips += 1;
@@ -249,6 +308,11 @@ fn resolve(g: &mut State, lo: u64, touched: bool) {
     let Some(e) = entries.get_mut(&lo) else { return };
     let (hi, lazy) = (e.end, e.lazy.take());
     let protected = std::mem::replace(&mut e.protected, false);
+    if protected {
+        // (Before the pages turn accessible: the write tracker queries them
+        // again from now on.)
+        cover(lo, hi, false);
+    }
     if touched {
         e.strikes += 1;
         e.quiet = 0;
@@ -337,6 +401,9 @@ pub fn after_write(addr: u64, size: u64, mirror: bool) {
         // (Armed cold blocks there writable first: cpuwatch.rs.)
         super::cpuwatch::touch(lo, hi - lo);
         e.protected = protect(stats, lo, hi, PAGE_NOACCESS);
+        if e.protected {
+            cover(lo, hi, true);
+        }
     }
 }
 

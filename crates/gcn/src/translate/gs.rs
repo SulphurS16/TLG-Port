@@ -26,6 +26,7 @@ pub fn rect_list_gs(num_params: u32) -> Vec<u32> {
     let p_out_v4 = b.type_pointer(None, StorageClass::Output, v4);
     let out_pos = global(&mut b, p_out_v4, StorageClass::Output);
     b.decorate(out_pos, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::Position)]);
+    b.decorate(out_pos, Decoration::Invariant, []);
     let arr_v4 = b.type_array(v4, three);
     let p_in_arr = b.type_pointer(None, StorageClass::Input, arr_v4);
     let p_in_v4 = b.type_pointer(None, StorageClass::Input, v4);

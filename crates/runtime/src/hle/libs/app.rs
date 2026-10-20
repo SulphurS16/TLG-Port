@@ -149,7 +149,21 @@ sysv! {
     fn sceSystemServiceParamGetInt(id: i32, value: *mut i32) -> i32 {
         if value.is_null() { return 0x80A1_0002u32 as i32; }
         *value = match id {
-            1 => 1,    // LANG: English (United States)
+            1 => {
+                // LANG: settings.txt `language` (TLG_LANGUAGE for a run).
+                static LANG: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+                *LANG.get_or_init(|| {
+                    let mut l = crate::config::settings().language;
+                    if let Ok(v) = std::env::var("TLG_LANGUAGE") {
+                        match tlg_config::settings::Language::ALL.iter().find(|x| x.key() == v.to_ascii_lowercase()) {
+                            Some(&x) => l = x,
+                            None => crate::warn!("TLG_LANGUAGE={v}: want english, spanish, french or portuguese"),
+                        }
+                    }
+                    crate::info!("system language: {} (code {})", l.key(), l.system_code());
+                    l.system_code()
+                })
+            }
             2 => 0,    // DATE_FORMAT: YYYYMMDD
             3 => 1,    // TIME_FORMAT: 24 hour
             4 => 0,    // TIME_ZONE (minutes)

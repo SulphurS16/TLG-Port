@@ -55,16 +55,16 @@ vgmstream's notice (its `COPYING`), for the HE-VAG predictor table:
 | --- | --- | --- |
 | Rust (rustup, `x86_64-pc-windows-gnullvm`) | 1.99.0 | MIT OR Apache-2.0 |
 | llvm-mingw (github.com/mstorsjo/llvm-mingw): LLVM clang, lld, libunwind, compiler-rt; mingw-w64 headers and runtime | 20260908, UCRT, x86_64 | LLVM: Apache-2.0 WITH LLVM-exception; mingw-w64: its own licenses (mostly public domain, ZPL 2.1 and MIT) |
-| Python embeddable (for `tools/make_icon.py` and `tools/notices.py`) | 3.13.9 | PSF License |
+| Python embeddable (for `tools/notices.py`) | 3.13.9 | PSF License |
 
 ## In the programs built from this repository
 
 `tlg.exe` and `tlg-launcher.exe` contain the Rust standard library (MIT OR Apache-2.0), the
 crates and components above, LLVM's libunwind and compiler-rt builtins (Apache-2.0 WITH
-LLVM-exception) and the mingw-w64 runtime startup code. Their notices ship next to the
-programs: `THIRD_PARTY_NOTICES.txt` (the crates, LibAtrac9, vgmstream, LLVM and the mingw-w64
-runtime; made by `tools/notices.py`) and `RUST_STD_NOTICES.html` (the Rust standard library's
-notices, from the toolchain).
+LLVM-exception) and the mingw-w64 runtime startup code. Their notices are in
+`THIRD_PARTY_NOTICES.txt` (the crates, LibAtrac9, vgmstream, LLVM, the mingw-w64 runtime and
+the Rust standard library; made by `tools/notices.py`), and the player package's `README.txt`
+carries them after the player instructions and this project's license.
 
 ## Used from Windows at run time (not redistributed)
 
@@ -73,8 +73,8 @@ HID, the common controls and the Universal C Runtime.
 
 ## Own artwork
 
-The application icon (`res/app.ico`, a feather) is drawn by `tools/make_icon.py` (this
-project, MIT); no game assets are used.
+The application icon (`res/app.ico`, the letters TLG) is the project author's; no game
+assets are used.
 
 ## The game
 

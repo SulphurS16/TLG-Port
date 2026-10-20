@@ -44,14 +44,63 @@ pub enum FrameCap {
     Game,
     /// Up to 60 fps: flips at up to 60 Hz and the game's time step snapped
     /// to 1/60 s near that rate instead of 1/30 s, so game speed stays real
-    /// time (experimental: not yet played at 60 fps on a machine reaching it).
+    /// time (not yet played through at 60 fps).
     Fps60,
-    /// No limit (development measurements only: untested game timing).
+    /// No limit (not recommended: at 116-119, 156-179 and 237-359 fps the
+    /// game's own time step falls behind real time).
     Off,
 }
 
+/// The game's language: those of its US release (the system language the
+/// game is told; it loads that language's menus, subtitles and voices).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Language {
+    English,
+    /// Latin American Spanish.
+    Spanish,
+    /// Canadian French.
+    French,
+    /// Brazilian Portuguese.
+    Portuguese,
+}
+
+impl Language {
+    pub const ALL: [Language; 4] = [Language::English, Language::Spanish, Language::French, Language::Portuguese];
+
+    /// The settings.txt value.
+    pub fn key(self) -> &'static str {
+        match self {
+            Language::English => "english",
+            Language::Spanish => "spanish",
+            Language::French => "french",
+            Language::Portuguese => "portuguese",
+        }
+    }
+
+    /// The name shown to players, in that language.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::English => "English",
+            Language::Spanish => "Español (Latinoamérica)",
+            Language::French => "Français (Canada)",
+            Language::Portuguese => "Português (Brasil)",
+        }
+    }
+
+    /// The console's system-language code (English US 1, Brazilian
+    /// Portuguese 17, Latin American Spanish 20, Canadian French 22).
+    pub fn system_code(self) -> i32 {
+        match self {
+            Language::English => 1,
+            Language::Spanish => 20,
+            Language::French => 22,
+            Language::Portuguese => 17,
+        }
+    }
+}
+
 /// Frame caps the launcher offers, in its order.
-pub const OFFERED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game, FrameCap::Fps60];
+pub const OFFERED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game, FrameCap::Fps60, FrameCap::Off];
 
 /// What a frame does with an effect whose shader is still being compiled
 /// (the first time the game shows it).
@@ -119,6 +168,7 @@ pub struct Settings {
     pub gpu: String,
     /// Master volume 0-100.
     pub volume: u32,
+    pub language: Language,
     pub game_dir: Option<PathBuf>,
     pub update_dir: Option<PathBuf>,
     /// The launcher closes when the game starts.
@@ -142,6 +192,7 @@ impl Default for Settings {
             new_shaders: NewShaders::Wait,
             gpu: "auto".into(),
             volume: 100,
+            language: Language::English,
             game_dir: None,
             update_dir: None,
             close_launcher: false,
@@ -182,8 +233,9 @@ scaling = fit
 # smooth (bilinear) or sharp (nearest pixel) scaling.
 filter = smooth
 # game = the game's own frame-rate limit (30 fps with update 01.03); 60 = up
-# to 60 fps (experimental, needs a fast PC: the game's time step follows the
-# frame rate, so its speed stays the same; not yet played at 60 fps).
+# to 60 fps (needs a fast PC: the game's time step follows the frame rate, so
+# its speed stays the same); off = no limit (not recommended: at 116-119,
+# 156-179 and 237-359 fps the game runs slower than real time).
 frame_cap = game
 # The first time the game shows an effect, its shader is compiled: wait =
 # the game pauses for a moment until it is ready; skip = the frame is drawn
@@ -194,6 +246,9 @@ new_shaders = wait
 gpu = auto
 # Master volume, 0-100.
 volume = 100
+# The game's language (menus, subtitles, voices): english, spanish (Latin
+# America), french (Canada) or portuguese (Brazil).
+language = english
 # The game folders (the launcher sets these).
 game_dir =
 update_dir =
@@ -310,6 +365,10 @@ impl Settings {
                     Some(n) => s.volume = n,
                     None => errs.push(bad("0-100")),
                 },
+                "language" => match Language::ALL.iter().find(|l| l.key() == lv || l.key()[..2] == lv) {
+                    Some(&l) => s.language = l,
+                    None => errs.push(bad("english, spanish, french or portuguese")),
+                },
                 "game_dir" => s.game_dir = (!v.is_empty()).then(|| PathBuf::from(v)),
                 "update_dir" => s.update_dir = (!v.is_empty()).then(|| PathBuf::from(v)),
                 "close_launcher" => match flag(v) {
@@ -368,6 +427,7 @@ impl Settings {
         });
         f.set("gpu", &self.gpu);
         f.set("volume", &self.volume.to_string());
+        f.set("language", self.language.key());
         f.set("game_dir", &self.game_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         f.set("update_dir", &self.update_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         f.set("close_launcher", on_off(self.close_launcher));

@@ -163,8 +163,8 @@ pub fn load(app: &mut App) {
 fn cap_name(c: FrameCap) -> &'static str {
     match c {
         FrameCap::Game => "30 fps",
-        FrameCap::Fps60 => "60 fps (experimental)",
-        FrameCap::Off => "No limit",
+        FrameCap::Fps60 => "60 fps",
+        FrameCap::Off => "Uncapped (Not recommended)",
     }
 }
 

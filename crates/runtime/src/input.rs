@@ -394,6 +394,31 @@ fn mouse_sample(s: &Bindings, m: &mut MouseState, in_menu: bool) -> ((f32, f32),
     (m.rs, now < m.wheel_up_until, now < m.wheel_down_until)
 }
 
+/// Raw mouse motion as it arrives (the window's raw input, injected test
+/// motion): with the camera hook, straight into the game camera's pending
+/// turn, so its next update has every count up to that moment. Taken at the
+/// game's pad reads instead (one a frame), motion that came after a read
+/// waited a frame more - up to 33 ms at 30 fps. False: the motion is for
+/// the pad read (no camera hook: the right stick; `tune mouse_direct 0`).
+pub fn mouse_motion(dx: i64, dy: i64) -> bool {
+    if crate::tune::get(crate::tune::MOUSE_DIRECT) == 0 || !crate::title_patches::camera_hooked() {
+        return false;
+    }
+    let s = settings();
+    if !s.mouse_look || (dx == 0 && dy == 0) {
+        return true;
+    }
+    let sx = if s.invert_x { -1.0 } else { 1.0 } * s.sensitivity_x;
+    let sy = if s.invert_y { -1.0 } else { 1.0 } * s.sensitivity_y;
+    let rad = DEG_PER_COUNT.to_radians();
+    // (Right: turn right; forward: look up. The motion is dropped while the
+    // game camera is not updating - menus, other camera modes.)
+    if !crate::title_patches::add_camera_turn(-(dx as f32) * rad * sx, -(dy as f32) * rad * sy) && crate::title_patches::in_menu() != Some(true) {
+        note_dropped_motion(dx.unsigned_abs() + dy.unsigned_abs());
+    }
+    true
+}
+
 /// Mouse motion dropped while playing because the game camera was not
 /// updating (logged every 10 s while it happens: other camera modes to hook).
 fn note_dropped_motion(counts: u64) {

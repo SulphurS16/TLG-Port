@@ -5,6 +5,10 @@ use crate::ui::{from_wide, wide};
 use windows_sys::Win32::Foundation::{LPARAM, RECT};
 use windows_sys::Win32::Graphics::Gdi::*;
 
+// (The game's Vulkan requirements, the same file.)
+#[path = "../../runtime/src/gpu/vk/requirements.rs"]
+mod requirements;
+
 #[derive(Clone, Debug)]
 pub struct Monitor {
     /// The device name (\\.\DISPLAY1): what settings.txt stores.
@@ -84,8 +88,7 @@ pub fn monitors() -> Vec<Monitor> {
 pub struct Gpu {
     pub name: String,
     pub discrete: bool,
-    /// Why tlg cannot use it (None: usable as far as the launcher checks:
-    /// Vulkan 1.3 and push descriptors; the game checks every feature).
+    /// Why tlg cannot use it (None: usable; the same check as the game's).
     pub problem: Option<String>,
 }
 
@@ -100,12 +103,12 @@ pub fn gpus() -> Result<Vec<Gpu>, String> {
         for pd in instance.enumerate_physical_devices().unwrap_or_default() {
             let p = instance.get_physical_device_properties(pd);
             let name = std::ffi::CStr::from_ptr(p.device_name.as_ptr()).to_string_lossy().into_owned();
-            let exts = instance.enumerate_device_extension_properties(pd).unwrap_or_default();
-            let push = exts.iter().any(|e| std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::push_descriptor::NAME);
+            // (The game's own requirement list.)
+            let missing = requirements::missing(&instance, pd, &p);
             let problem = if p.api_version < vk::API_VERSION_1_3 {
                 Some(format!("Vulkan {}.{} only (needs 1.3: a newer driver may help)", vk::api_version_major(p.api_version), vk::api_version_minor(p.api_version)))
-            } else if !push {
-                Some("no VK_KHR_push_descriptor".into())
+            } else if !missing.is_empty() {
+                Some(format!("lacks {} (a newer driver may add them)", missing.join(", ")))
             } else {
                 None
             };
