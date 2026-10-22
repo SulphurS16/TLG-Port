@@ -20,11 +20,16 @@ fn main() {
     embed_resources();
     // PGO training builds (`--cfg tlg_pgo_gen` beside `-Cprofile-generate`, tools/pgo.ps1).
     println!("cargo:rustc-check-cfg=cfg(tlg_pgo_gen)");
-    // Symbol names for log lines (data/ps4-names.txt) where the checkout has them.
+    // Symbol names for log lines (data/ps4-names.txt) where the checkout has
+    // them - not in release builds (TLG_RELEASE_BUILD): the public tree has no
+    // such file, and a PGO profile trained in this checkout must fit the
+    // release build's code (the cfg changes how the crate is split up and
+    // inlined, and with it the profiled functions' shapes).
     println!("cargo:rustc-check-cfg=cfg(nid_names)");
+    println!("cargo:rerun-if-env-changed=TLG_RELEASE_BUILD");
     let names = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/ps4-names.txt");
     println!("cargo:rerun-if-changed={}", names.display());
-    if names.is_file() {
+    if names.is_file() && std::env::var_os("TLG_RELEASE_BUILD").is_none() {
         println!("cargo:rustc-cfg=nid_names");
     }
 }

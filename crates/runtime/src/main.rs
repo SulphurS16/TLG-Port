@@ -447,7 +447,7 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 Ok(())
             }
             "skipps" => {
-                // skipps <ps,...>: skip draws with these pixel shaders ("skipps -" clears).
+                // skipps <ps,...>: skip draws with these pixel (or vertex) shaders ("skipps -" clears).
                 *gpu::render::SKIP_PS.lock() = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
                 gpu::render::SKIP_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())

@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.6.0 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.6.1 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627). It is
@@ -34,6 +34,20 @@ Getting started
 3. On "Game files", choose the game folder and the update folder (leave the
    update folder empty if the update is merged into the game folder).
 4. Click Play.
+
+
+Updating
+--------
+Unpack the new version over the old one or into a new folder and start its
+tlg-launcher.exe. There is nothing to set up again: the game folders,
+settings, key bindings and saves are in %APPDATA%\TLG, which every version
+uses, and the shader caches in %LOCALAPPDATA%\TLG carry on too.
+- Portable install: unpacked into a new folder beside the old one, the new
+  version takes over the old one's settings, key bindings and saves at its
+  first start (the old folder is left as it was).
+- If your game folders are inside the old version's folder, keep that
+  folder, or click "Move here" on "Game files": they move into the new
+  version's folder.
 
 
 Controls

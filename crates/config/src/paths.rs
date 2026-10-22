@@ -75,10 +75,16 @@ impl Paths {
                 return Paths { layout: Layout::Dev, exe_dir, user: local.clone(), cache: local.clone(), game_root: local.join("game") };
             }
         }
-        let env_dir = |name: &str, fallback: &Path| std::env::var_os(name).map(PathBuf::from).unwrap_or_else(|| fallback.to_path_buf());
-        let user = env_dir("APPDATA", &exe_dir).join("TLG");
-        let cache = env_dir("LOCALAPPDATA", &exe_dir).join("TLG");
-        Paths { layout: Layout::User, exe_dir, user, game_root: cache.join("game"), cache }
+        Paths::installed(&exe_dir)
+    }
+
+    /// The installed release's paths (`%APPDATA%\TLG`, `%LOCALAPPDATA%\TLG`)
+    /// for a program in `exe_dir`, whatever its layout.
+    pub fn installed(exe_dir: &Path) -> Paths {
+        let env_dir = |name: &str| std::env::var_os(name).map(PathBuf::from).unwrap_or_else(|| exe_dir.to_path_buf());
+        let user = env_dir("APPDATA").join("TLG");
+        let cache = env_dir("LOCALAPPDATA").join("TLG");
+        Paths { layout: Layout::User, exe_dir: exe_dir.to_path_buf(), user, game_root: cache.join("game"), cache }
     }
 
     pub fn current() -> Paths {

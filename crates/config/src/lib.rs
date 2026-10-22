@@ -5,6 +5,7 @@
 //! rewriting a value keeps the other lines as they are.
 
 pub mod bindings;
+pub mod carry;
 pub mod kv;
 pub mod paths;
 pub mod saves;

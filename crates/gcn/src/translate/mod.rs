@@ -1735,6 +1735,26 @@ mod tests {
     }
 
     #[test]
+    fn typed_buffer_loads_ignore_the_channel_selects() {
+        // tbuffer_load_format_xyz v[0:2], v3, s[0:3], 0 offen dfmt:13 nfmt:7
+        // (the title's embedded tables, read through V#s with selects
+        // X,0,0,0) and buffer_load_format_xyz with the same operands.
+        let (mtbuf, mubuf) = (0xEBEA_1000, 0xE008_1000);
+        let constant_stores = |w0: u32, dst_sel: u16| -> usize {
+            let code = crate::decode_program(&[w0, 0x8000_0003, 0xBF81_0000]).unwrap();
+            let plan = crate::analysis::analyze(&code, 4, 0);
+            let spec = Spec { stage: Stage::Compute, user_sgprs: 4, resources: vec![ResSpec::Buffer { dfmt: 13, nfmt: 7, dst_sel }], buffer_strides: vec![0], ..vertex_spec(0) };
+            let out = translate(&code, &plan, &spec).unwrap();
+            let m = rspirv::dr::load_words(&out.spirv).unwrap();
+            let consts: std::collections::HashSet<Word> = m.types_global_values.iter().filter(|i| i.class.opcode == spirv::Op::Constant).filter_map(|i| i.result_id).collect();
+            m.functions.iter().flat_map(|f| &f.blocks).flat_map(|b| &b.instructions).filter(|i| i.class.opcode == spirv::Op::Store && matches!(i.operands.get(1), Some(Operand::IdRef(id)) if consts.contains(id))).count()
+        };
+        assert_eq!(constant_stores(mtbuf, 0x004), constant_stores(mtbuf, 0xFAC));
+        // Format loads apply them: y and z are zeros.
+        assert_eq!(constant_stores(mubuf, 0x004), constant_stores(mubuf, 0xFAC) + 2);
+    }
+
+    #[test]
     fn bit_moves_apply_vop3_sign_modifiers() {
         // VOP3 v_cndmask_b32 v0, v1, -v1, vcc; VOP3 v_mov_b32 v2, |v3|; s_endpgm
         let vop3 = |op: u32, vdst: u32, abs: u32, src: [u32; 3], neg: u32| [0xD000_0000 | (op << 17) | (abs << 8) | vdst, src[0] | (src[1] << 9) | (src[2] << 18) | (neg << 29)];

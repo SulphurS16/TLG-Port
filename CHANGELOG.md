@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.6.1
+
+- Fixed colors and effects that were drawn wrong or not at all: Trico's
+  broken horns glow teal again instead of red, and the game's small glowing
+  sprites are back - the glowing butterflies, the halos around luminous
+  markings, beams and haze of light, the ending's floating glyphs. The port
+  read the small tables some of the game's shaders carry only in part.
+- Updating is unzip and play: a portable install unzipped into a new folder
+  beside the old one takes over its settings, key bindings and saves at the
+  first start, and when the game folders are inside the old version's
+  folder the launcher says so and can move them into the new one ("Move
+  here" on "Game files"). The installed layout already kept everything in
+  %APPDATA%\TLG, which every version uses.
+
 ## 0.6.0
 
 - License: the port is now free software under the GNU General Public

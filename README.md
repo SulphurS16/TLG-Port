@@ -43,7 +43,10 @@ Nothing from the game is in this repository.
 
 ## Update
 
-Unzip the new release over the old one or into a new folder. Settings and saves are kept.
+Unzip the new release over the old one or into a new folder, and start its 'tlg-launcher.exe'. There is nothing to set up again: your game folders, settings, key bindings and saves are in '%APPDATA%\TLG', which every version uses, and the shader caches in '%LOCALAPPDATA%\TLG' carry on too.
+
+- Portable install (below): unzipped into a new folder beside the old one, the new version takes over the old one's settings, key bindings and saves at its first start (the old folder is left as it was).
+- If your game folders are inside the old release's folder, keep that folder, or click **Move here** on **Game files**: they move into the new one's folder.
 
 ## Uninstall
 

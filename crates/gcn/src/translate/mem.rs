@@ -583,7 +583,11 @@ pub fn buffer(tr: &mut T, ins: &Inst) -> R<()> {
     if is_format_load {
         let n = (op & 3) + 1;
         let v = load_formatted(tr, var, addr, dfmt, nfmt)?;
-        let v = apply_dst_sel(tr, v, dst_sel, float_class(nfmt));
+        // Typed (MTBUF) loads do not apply the V#'s channel selects: the
+        // title's compiler reads 2- and 3-component float tables embedded in
+        // its shaders through V#s it builds with selects X,0,0,0 (Trico's
+        // horn glow colors, particle corner offsets).
+        let v = if mtbuf { v } else { apply_dst_sel(tr, v, dst_sel, float_class(nfmt)) };
         for k in 0..n as usize {
             tr.set_vreg(vd + k as u32, v[k])?;
         }

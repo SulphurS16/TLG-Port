@@ -134,6 +134,7 @@ impl App {
                 unsafe { ui::show(h, i == n) };
             }
         }
+        game::show_move(self);
     }
 
     pub fn update_play(&self) {
@@ -344,7 +345,8 @@ fn main() {
         AdjustWindowRectExForDpi(&mut r, style, 0, 0, dpi);
         SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, r.right - r.left, r.bottom - r.top, SWP_NOMOVE | SWP_NOZORDER);
 
-        let paths = Paths::current();
+        // (A new version's empty profile takes over an earlier one's.)
+        let (paths, carried) = carry_over(Paths::current());
         let (settings, _) = Settings::load(&paths.settings_file());
         let (bindings, _) = Bindings::load(&paths.input_file());
         let font = ui::message_font(dpi, false, 100);
@@ -396,6 +398,9 @@ fn main() {
         app.show_page(first);
         app.update_play();
         startup_status(&mut app);
+        if let Some(s) = carried {
+            app.set_status(&s);
+        }
         APP.with(|a| *a.borrow_mut() = Some(app));
         ShowWindow(hwnd, SW_SHOW);
         let mut msg: MSG = std::mem::zeroed();
@@ -405,6 +410,24 @@ fn main() {
                 DispatchMessageW(&msg);
             }
         }
+    }
+}
+
+/// An update: an empty profile takes over the most recently used earlier
+/// version's (tlg_config::carry). Returns the paths to use and the status
+/// line about it.
+fn carry_over(paths: Paths) -> (Paths, Option<String>) {
+    use tlg_config::carry;
+    if !carry::is_empty(&paths) {
+        return (paths, None);
+    }
+    let Some(e) = carry::find_earlier(&paths) else { return (paths, None) };
+    match carry::carry_over(&paths, &e) {
+        Ok((p, what)) => {
+            let s = (!what.is_empty()).then(|| format!("Carried over from {}: {}.", e.dir.display(), what.join(", ")));
+            (p, s)
+        }
+        Err(err) => (Paths::current(), Some(format!("Could not carry over {}: {err}", e.dir.display()))),
     }
 }
 

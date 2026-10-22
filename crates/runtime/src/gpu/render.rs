@@ -9775,7 +9775,12 @@ impl Renderer {
         phase!(0);
         let tp = perf_now();
         let ps_addr = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64) << 32)) << 8;
-        if ps_addr != 0 && SKIP_ANY.load(std::sync::atomic::Ordering::Relaxed) && SKIP_PS.lock().contains(&ps_addr) {
+        // (The skip list may name vertex shaders too.)
+        let vs_addr = ((regs.sh(0x2C48) as u64) | ((regs.sh(0x2C49) as u64) << 32)) << 8;
+        if SKIP_ANY.load(std::sync::atomic::Ordering::Relaxed) && {
+            let skip = SKIP_PS.lock();
+            (ps_addr != 0 && skip.contains(&ps_addr)) || skip.contains(&vs_addr)
+        } {
             self.skipped += 1;
             return Ok(());
         }
