@@ -2,6 +2,9 @@
 
 An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627) for Windows. It is not rebuilt from the game's source code: it runs the game's own PS4 program, from your copy of the game's files, on a compatibility layer made for this game. The program's x86-64 code runs directly on your processor, without CPU emulation; the PS4 system libraries it calls are reimplemented for Windows (high-level emulation), and its graphics commands and shaders are translated to Vulkan. This project contains no game data, no game code and no keys, and it decrypts nothing.
 
+<img width="2560" height="1440" alt="tlg_MUydREqKdH" src="https://github.com/user-attachments/assets/0e0e1ae6-dcae-4b30-b10f-71010a3cc114" />
+
+
 Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, genDESIGN or any other rights holder. The Last Guardian is a trademark of Sony Interactive Entertainment.
 
 ## Highlights
@@ -32,7 +35,7 @@ Nothing from the game is in this repository.
 
 ### Steps
 
-1. Download `TLG-Port-<version>.zip` from [Releases](../../releases/latest).
+1. Download `TLG-Port-<version>.zip` from [Releases](https://github.com/SulphurS16/TLG-Port/releases/latest).
 2. Right click the zip, choose **Extract All...**, and pick a folder, for example 'C:\Games\TLG-Port'.
 3. Start 'tlg-launcher.exe'. If Windows says "Windows protected your PC" (the launcher is not code-signed), click **More info**, then **Run anyway**.
 4. On **Game files**, choose the game folder and the update folder. Leave the update folder empty if the update is merged into the game folder.
@@ -101,5 +104,5 @@ The license covers this project's code only. It grants nothing for The Last Guar
 
 ## Community
 
-For more ports, questions, discussion and help join the [Discord](https://discord.gg/Z7pbJ2unX).
+For more ports, questions, discussion and help join the [Discord](https://discord.gg/rSr5JhxxtZ).
 Please don't share game files, keys, decrypted files or download links here or on the Discord.
