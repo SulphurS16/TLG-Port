@@ -43,6 +43,9 @@ struct Watch {
     armed: u64,
     clean: [u16; CHUNK_BLOCKS],
     strikes: [u8; CHUNK_BLOCKS],
+    /// Blocks whose last arming was refused (`tune ww_pretend`, measurement
+    /// only: left out of queries while it is on).
+    refused: u64,
 }
 
 struct Chunk {
@@ -85,6 +88,9 @@ pub static WW_TIMES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::ato
 /// clean but below the arming threshold (no strikes / after strikes - the
 /// strikes summed in [3]), armed when queried, armed now, refused.
 pub static ARM_STATS: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
+/// TLG_PERF: pages of blocks whose arming was refused: all, inside the lazy
+/// write-back's tracked ranges, and of those protected (inaccessible).
+pub static REFUSED_PAGES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 /// TLG_PERF timing of a write-tracker phase into `WW_TIMES[i]`.
 struct Timed(usize, Option<std::time::Instant>);
@@ -249,12 +255,14 @@ impl WriteTracker {
         }
         let lazy = self.take_cover_events();
         let required = self.required.max(1);
+        // (`tune ww_pretend`, measurement only: refused blocks left out too.)
+        let skip = if crate::tune::get(crate::tune::WW_PRETEND) != 0 { u64::MAX } else { 0 };
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut done = 0u64;
         for &(lo, hi) in &asked {
             for b in lo.max(done)..hi {
                 let (ch, i) = (b >> (CHUNK_SHIFT - BLOCK_SHIFT), b as usize & (CHUNK_BLOCKS - 1));
-                if self.queried.get(&ch).is_some_and(|q| q[i] >= required) || (watching && self.watch.get(&ch).is_some_and(|w| w.armed >> i & 1 != 0)) {
+                if self.queried.get(&ch).is_some_and(|q| q[i] >= required) || (watching && self.watch.get(&ch).is_some_and(|w| (w.armed | (w.refused & skip)) >> i & 1 != 0)) {
                     continue;
                 }
                 if lazy && self.lazy_ok.get(&ch).is_some_and(|m| m >> i & 1 != 0) && lazywb::covered(b) {
@@ -275,16 +283,42 @@ impl WriteTracker {
         }
         self.pages.clear();
         let epoch = self.epoch;
+        // (`tune ww_round_log`: the round's runs - start, KiB, pages found, us.)
+        let log = crate::tune::get(crate::tune::WW_ROUND_LOG) > 0;
+        let mut logged: Vec<(u64, u64, usize, u64)> = Vec::new();
+        let t_round = log.then(std::time::Instant::now);
         runs.retain(|&(lo, hi)| {
             let (a, n) = (lo << BLOCK_SHIFT, (hi - lo) << BLOCK_SHIFT);
+            let (before, t0) = (self.pages.len(), log.then(std::time::Instant::now));
             if !mem::is_guest(a, n) || !mem::harvest_writes(a, n, &mut self.buf, &mut self.pages) {
                 return false;
+            }
+            if let Some(t0) = t0 {
+                logged.push((a, n >> 10, self.pages.len() - before, t0.elapsed().as_micros() as u64));
             }
             for b in lo..hi {
                 self.queried.entry(b >> (CHUNK_SHIFT - BLOCK_SHIFT)).or_insert([0; CHUNK_BLOCKS])[b as usize & (CHUNK_BLOCKS - 1)] = epoch;
             }
             true
         });
+        if let Some(t0) = t_round {
+            let left = crate::tune::get(crate::tune::WW_ROUND_LOG);
+            let _ = crate::tune::set("ww_round_log", &(left - 1).max(0).to_string());
+            let span = logged.last().map_or(0, |l| l.0 + (l.1 << 10)) - logged.first().map_or(0, |l| l.0);
+            let list: Vec<String> = logged.iter().map(|l| format!("{:#x}+{}:{}:{}", l.0, l.1, l.2, l.3)).collect();
+            crate::info!(
+                "ww round: e{} r{} class {c}: {} runs, {} KiB, span {} MiB, {} found writes ({} pages), {} us: {}",
+                self.epoch,
+                self.required,
+                logged.len(),
+                logged.iter().map(|l| l.1).sum::<u64>(),
+                span >> 20,
+                logged.iter().filter(|l| l.2 > 0).count(),
+                self.pages.len(),
+                t0.elapsed().as_micros(),
+                list.join(" ")
+            );
+        }
         if super::render::perf_on() {
             use std::sync::atomic::Ordering::Relaxed;
             BULK_STATS[0].fetch_add(1, Relaxed);
@@ -352,8 +386,9 @@ impl WriteTracker {
         for &(lo, hi) in runs {
             for b in lo..hi {
                 let i = b as usize & (CHUNK_BLOCKS - 1);
-                let w = self.watch.entry(b >> (CHUNK_SHIFT - BLOCK_SHIFT)).or_insert_with(|| Watch { armed: 0, clean: [0; CHUNK_BLOCKS], strikes: [0; CHUNK_BLOCKS] });
+                let w = self.watch.entry(b >> (CHUNK_SHIFT - BLOCK_SHIFT)).or_insert_with(|| Watch { armed: 0, clean: [0; CHUNK_BLOCKS], strikes: [0; CHUNK_BLOCKS], refused: 0 });
                 if dirty.binary_search(&b).is_ok() {
+                    w.refused &= !(1 << i);
                     w.clean[i] = 0;
                     st[0] += 1;
                     continue;
@@ -380,10 +415,19 @@ impl WriteTracker {
         for (lo, hi) in arm {
             if !cpuwatch::arm(lo << BLOCK_SHIFT, hi << BLOCK_SHIFT) {
                 st[6] += hi - lo;
+                if perf {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let (tracked, protected) = lazywb::tracked_pages(lo << BLOCK_SHIFT, hi << BLOCK_SHIFT);
+                    REFUSED_PAGES[0].fetch_add((hi - lo) << (BLOCK_SHIFT - PAGE_SHIFT), Relaxed);
+                    REFUSED_PAGES[1].fetch_add(tracked, Relaxed);
+                    REFUSED_PAGES[2].fetch_add(protected, Relaxed);
+                }
                 // (Not armable: counted from zero again.)
                 for b in lo..hi {
                     if let Some(w) = self.watch.get_mut(&(b >> (CHUNK_SHIFT - BLOCK_SHIFT))) {
-                        w.clean[b as usize & (CHUNK_BLOCKS - 1)] = 0;
+                        let i = b as usize & (CHUNK_BLOCKS - 1);
+                        w.clean[i] = 0;
+                        w.refused |= 1 << i;
                     }
                 }
                 continue;
@@ -434,6 +478,8 @@ impl WriteTracker {
         }
         let lazy = self.take_cover_events();
         let (epoch, required) = (self.epoch, self.required.max(1));
+        // (`tune ww_pretend`, measurement only: refused blocks left out too.)
+        let skip = if crate::tune::get(crate::tune::WW_PRETEND) != 0 { u64::MAX } else { 0 };
         let mut runs: smallvec::SmallVec<[(u64, u64); 4]> = smallvec::SmallVec::new();
         let mut b = first;
         while b <= last {
@@ -441,7 +487,7 @@ impl WriteTracker {
             let q = self.queried.entry(c).or_insert([0; CHUNK_BLOCKS]);
             // (Armed blocks: unwritten until a write faults; so are blocks
             // the lazy write-back keeps inaccessible.)
-            let armed = if watching { self.watch.get(&c).map_or(0, |w| w.armed) } else { 0 };
+            let armed = if watching { self.watch.get(&c).map_or(0, |w| w.armed | (w.refused & skip)) } else { 0 };
             let lazy_ok = if lazy { self.lazy_ok.get(&c).copied().unwrap_or(0) } else { 0 };
             let stop = last.min(((c + 1) << (CHUNK_SHIFT - BLOCK_SHIFT)) - 1);
             while b <= stop {

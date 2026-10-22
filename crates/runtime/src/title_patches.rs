@@ -109,7 +109,8 @@ pub fn apply(p: &mut Patcher, name: &str) {
             Err(e) => crate::warn!("scripts: {name}: {e}; the scripts' frame-counted timers stay frame-counted"),
         }
     }
-    if fixes {
+    // (Debug: TLG_FRAME_STEPS=0 keeps them at 1/30 s per frame.)
+    if fixes && !std::env::var("TLG_FRAME_STEPS").is_ok_and(|v| v == "0") {
         match patch_frame_steps(p) {
             Ok(()) => crate::info!("frame steps: the environment shaders' phases ({name}+{:#x}) and particle emission (+{:#x}) advance by the frame's time, not 1/30 s per frame", ENV_PHASE.0, PARTICLE_EMIT.0),
             Err(e) => crate::warn!("frame steps: {name}: {e}; they advance 1/30 s per frame"),

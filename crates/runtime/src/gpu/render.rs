@@ -1404,12 +1404,25 @@ fn clear_color_for(format: vk::Format, e: &[u8]) -> Option<vk::ClearColorValue> 
 /// them. Sequence numbers only grow, so a new write's interval replaces what
 /// it overlaps (one map operation per write instead of one per page: a 6 MiB
 /// buffer had 1,536 hash-map inserts per batch).
+/// Writes of up to `SMALL_PAGES` pages go to a map by page instead (`small`;
+/// the Trico battle's ~100,000 small written bindings a second each cost
+/// a few B-tree operations: ~2% of the graphics CP); a page's batch is the
+/// newer of the two.
 #[derive(Default)]
-struct PageSeqs(std::collections::BTreeMap<u64, (u64, u64)>);
+struct PageSeqs(std::collections::BTreeMap<u64, (u64, u64)>, FastMap<u64, u64>);
+
+const SMALL_PAGES: u64 = 2;
 
 impl PageSeqs {
     /// Pages [lo, hi) are written by batch `seq` (>= every sequence noted).
+    /// (`tune page_seqs_small` 0: every write in the B-tree, as before.)
     fn insert(&mut self, lo: u64, hi: u64, seq: u64) {
+        if hi - lo <= SMALL_PAGES && crate::tune::get(crate::tune::PAGE_SEQS_SMALL) != 0 {
+            for p in lo..hi {
+                self.1.insert(p, seq);
+            }
+            return;
+        }
         let (mut lo, mut hi) = (lo, hi);
         // Overlapping intervals: the parts outside [lo, hi) stay.
         let over: smallvec::SmallVec<[(u64, (u64, u64)); 4]> = self.0.range(..hi).rev().take_while(|&(_, &(e, _))| e > lo).map(|(&s, &v)| (s, v)).collect();
@@ -1438,8 +1451,18 @@ impl PageSeqs {
         self.0.insert(lo, (hi, seq));
     }
 
-    /// Entries of batch `from` overlapping pages [lo, hi) become batch `to`.
+    /// Entries of batch `from` overlapping pages [lo, hi) - a range `insert`
+    /// was given - become batch `to`.
     fn renumber(&mut self, lo: u64, hi: u64, from: u64, to: u64) {
+        // (Small ranges in the map; in the B-tree too, where the knob had
+        // put them before it was switched.)
+        if hi - lo <= SMALL_PAGES {
+            for p in lo..hi {
+                if let Some(q) = self.1.get_mut(&p).filter(|q| **q == from) {
+                    *q = to;
+                }
+            }
+        }
         let start = self.0.range(..=lo).next_back().filter(|&(_, &(e, _))| e > lo).map_or(lo, |(&s, _)| s);
         for (_, v) in self.0.range_mut(start..hi) {
             if v.1 == from {
@@ -1450,16 +1473,21 @@ impl PageSeqs {
 
     /// The batch of the newest pending write to `page`, if any.
     fn get(&self, page: u64) -> Option<u64> {
-        self.0.range(..=page).next_back().filter(|&(_, &(e, _))| e > page).map(|(_, &(_, q))| q)
+        let t = self.0.range(..=page).next_back().filter(|&(_, &(e, _))| e > page).map(|(_, &(_, q))| q);
+        match (t, self.1.get(&page)) {
+            (Some(a), Some(&b)) => Some(a.max(b)),
+            (a, b) => a.or(b.copied()),
+        }
     }
 
     fn len(&self) -> usize {
-        self.0.len()
+        self.0.len() + self.1.len()
     }
 
     /// Forgets writes of batches up to `done`.
     fn retain_after(&mut self, done: u64) {
         self.0.retain(|_, &mut (_, q)| q > done);
+        self.1.retain(|_, q| *q > done);
     }
 }
 
@@ -1973,6 +2001,7 @@ fn completion_thread() {
             let bump = crate::tune::get(crate::tune::WB_LOCK_BUMP) != 0;
             let fine = crate::tune::get(crate::tune::WB_LOCK_BUMP) >= 2;
             for (k, &(addr, off, size)) in c.writebacks.iter().enumerate() {
+                wb_log("write-back", addr, size, c.seq);
                 let ring_ptr = if c.wb_cs.get(k).copied().unwrap_or(false) { c.ring_ptr_cs } else { c.ring_ptr };
                 if bump && k > 0 {
                     if let Some(g) = ww.as_mut() {
@@ -2520,6 +2549,14 @@ pub(super) struct BatchCtx {
     /// Segments of `ring`, used in turn by batch number (`RING_SEGS`, or
     /// `SLOTS` for small rings).
     ring_segs: usize,
+    /// Segments of `dring`, used in turn by batch number (`tune dring_segs`;
+    /// `SLOTS` for small rings), and how many it may be divided into (each
+    /// at least `DEV_RING_SIZE / SLOTS`). A segment's data stays intact until
+    /// the batch `dring_segs` later: copies there can be forwarded from that
+    /// long (`forward_oldest`); its previous user has finished on the GPU by
+    /// then (slots wait for the batch `SLOTS` back).
+    dring_segs: usize,
+    dring_max_segs: usize,
     /// Per segment of `ring`: the sequence number of the batch that used it
     /// last (its write-backs are read from there by the completion thread).
     seg_seqs: Vec<u64>,
@@ -3225,7 +3262,12 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
         };
         ring.set_segment(0, ring_segs);
         let mut dring = Ring::new_device(c, dring_bytes)?;
-        dring.set_segment(0, SLOTS);
+        // (The graphics queue's device ring in `dring_segs_default` segments of
+        // `DEV_RING_SIZE / SLOTS` - it was sized for them; small rings by slot.)
+        let unit = resources::DEV_RING_SIZE / SLOTS as u64;
+        let dring_max_segs = if dring_bytes >= resources::DEV_RING_SIZE { (dring_bytes / unit) as usize } else { SLOTS };
+        let dring_segs = dring_max_segs;
+        dring.set_segment(0, dring_segs);
         let bar = match Ring::new_bar(c, bar_bytes) {
             Ok(mut b) => {
                 b.set_segment(0, SLOTS);
@@ -3298,6 +3340,8 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 eop_spans: Vec::new(),
                 ring_segs,
                 seg_seqs: vec![0; ring_segs],
+                dring_segs,
+                dring_max_segs,
                 upload_seen: FastMap::default(),
                 cmd_queue: 0,
                 batch_copies: 0,
@@ -3320,10 +3364,28 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
     }
 }
 
+/// Device-ring segments of the graphics queue's context (`dring_segs`):
+/// twice `SLOTS` - 1 GiB of video memory for the device ring - on cards with
+/// 8 GiB of device-local memory or more, else `SLOTS` (512 MiB). Copies in
+/// it can be forwarded from for that many batches; in the Trico battle the
+/// GPU ran more than `SLOTS` batches behind ~20 times a second, and copies
+/// over such data waited ~1 ms each for its write-back instead. `TLG_DRING_SEGS`
+/// (6..=16) at start.
+fn dring_segs_default(c: &super::vk::Ctx) -> usize {
+    if let Some(n) = std::env::var("TLG_DRING_SEGS").ok().and_then(|v| v.trim().parse::<usize>().ok()) {
+        return n.clamp(SLOTS, 16);
+    }
+    let heaps = &c.mem_props.memory_heaps[..c.mem_props.memory_heap_count as usize];
+    let local: u64 = heaps.iter().filter(|h| h.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|h| h.size).sum();
+    if local >= 8 << 30 { 2 * SLOTS } else { SLOTS }
+}
+
 pub fn init() -> Result<(), String> {
     let c = ctx();
     unsafe {
-        let cx = new_batch_ctx(c, resources::RING_SIZE, resources::DEV_RING_SIZE, resources::BAR_RING_SIZE, false)?;
+        let dring_bytes = resources::DEV_RING_SIZE / SLOTS as u64 * dring_segs_default(c) as u64;
+        let cx = new_batch_ctx(c, resources::RING_SIZE, dring_bytes, resources::BAR_RING_SIZE, false)?;
+        crate::info!("device ring: {} MiB in {} segments", dring_bytes >> 20, cx.dring_segs);
         let slots = &cx.slots;
         let (gds, _gds_mem) = c.device_buffer(
             gcn::translate::GDS_BYTES as u64,
@@ -3670,7 +3732,7 @@ pub const VBIND_MISS_SRC_NAMES: [&str; 6] = ["GPU writes", "CPU writes found", "
 
 /// TLG_PERF: TSC cycles and counts of buffer-binding steps (`BPART_NAMES`).
 pub static BPARTS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); BPART_COUNT] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; BPART_COUNT];
-pub const BPART_COUNT: usize = 27;
+pub const BPART_COUNT: usize = 28;
 pub const BPART_NAMES: [&str; BPART_COUNT] = [
     "mirror written: bind",
     "write-back",
@@ -3699,6 +3761,7 @@ pub const BPART_NAMES: [&str; BPART_COUNT] = [
     "draw targets",
     "written copy: checks",
     "written copy: notes",
+    "compute-queue dispatch: own preparation",
 ];
 
 /// The time-stamp counter for `bpart` and other per-command timers; 0 while
@@ -3837,7 +3900,7 @@ pub static VCACHE_FILL_SITES: parking_lot::Mutex<Option<HashMap<(u64, u64, &'sta
 /// Phase times of one `vcache_fill` (`shader_stats`): TSC at the start, after
 /// residency, the CPU-write check, the runs, the forwards, the waits, the
 /// staging copy and the recording; fills of 1 ms or more from frame 3000 on
-/// are logged (the first 100).
+/// are logged (`tune fill_log` of them: the first 100).
 struct FillTimes {
     t: [u64; 8],
     on: bool,
@@ -3859,6 +3922,16 @@ thread_local! {
     static FWD_FAIL: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }
 
+/// TLG_PERF: mirror fills whose forwards failed, by `FWD_FAIL` reason (0-8;
+/// 8: reason 5 with the overlapping writes all in mirror windows) times what
+/// they then did (0 nothing, 1 this batch's write-back waited for, 2 CPU
+/// write-backs in flight waited for): (count, ns).
+pub static FILL_WAITS: [(std::sync::atomic::AtomicU64, std::sync::atomic::AtomicU64); 27] = [const { (std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)) }; 27];
+/// TLG_PERF: ring copies that waited for write-backs in flight they could not
+/// forward (`upload_guest_ex`): count, ns; then the same for those refused
+/// only for the batch's age with all overlapping writes in mirror windows.
+pub static UPLOAD_WAITS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 impl FillTimes {
     fn start() -> FillTimes {
         let on = shader_stats();
@@ -3878,10 +3951,13 @@ impl FillTimes {
         if !self.on || per_us == 0 || self.t[7].wrapping_sub(self.t[0]) < 1000 * per_us || super::FRAMES.load(std::sync::atomic::Ordering::Relaxed) < 3000 {
             return;
         }
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 100 {
+        // (`tune fill_log`: how many more to log - 100 at start; set again
+        // for a measurement window.)
+        let left = crate::tune::get(crate::tune::FILL_LOG);
+        if left <= 0 {
             return;
         }
+        let _ = crate::tune::set("fill_log", &(left - 1).to_string());
         // (Phases not reached keep 0: shown as 0.)
         let mut prev = self.t[0];
         let ph: Vec<String> = (1..8)
@@ -4754,6 +4830,14 @@ impl Renderer {
             self.cx.reuse_bloom = [0; 16];
             crate::info!("graphics ring: {want} segments of {} MiB", (self.cx.ring.size / want as u64) >> 20);
         }
+        // (`tune dring_segs`: the device ring divided anew likewise, within
+        // the segments it was sized for.)
+        let want = crate::tune::get(crate::tune::DRING_SEGS) as usize;
+        if want >= SLOTS && want <= self.cx.dring_max_segs && want != self.cx.dring_segs {
+            wait_done(seq);
+            self.cx.dring_segs = want;
+            crate::info!("device ring: {want} segments of {} MiB", (self.cx.dring.size / want as u64) >> 20);
+        }
         let segs = self.cx.ring_segs as u64;
         self.cx.cur = (self.cx.cur + 1) % SLOTS;
         let cur = self.cx.cur;
@@ -4820,7 +4904,7 @@ impl Renderer {
             self.cx.eop_spans.retain(|e| e.2 > done);
         }
         self.cx.ring.set_segment((self.cx.batch % self.cx.ring_segs as u64) as usize, self.cx.ring_segs);
-        self.cx.dring.set_segment(self.cx.cur, SLOTS);
+        self.cx.dring.set_segment((self.cx.batch % self.cx.dring_segs as u64) as usize, self.cx.dring_segs);
         if let Some(b) = self.cx.bar.as_mut() {
             b.set_segment(self.cx.cur, SLOTS);
         }
@@ -5512,6 +5596,7 @@ impl Renderer {
     fn note_pending_gpu_write(&mut self, base: u64, len: u64) {
         self.vcache_invalidate(base, len);
         let seq = self.open_seq;
+        wb_log("GPU write recorded", base, len, seq);
         if perf_on() {
             if mem!(self).pending_log.len() >= 4096 {
                 mem!(self).pending_log.drain(..2048);
@@ -7442,6 +7527,8 @@ impl Renderer {
             ft.at(4);
             ft.fwd = fwd.as_ref().map_or(usize::MAX, |f| f.0.len());
             if fwd.is_none() {
+                let tw = perf_on().then(std::time::Instant::now);
+                let mut kind = 0;
                 if let Some(wb) = self.cx.writebacks.iter().find(|wb| wb.base < hi && lo < wb.base + wb.size) {
                     if perf_on() {
                         let k = format!("mirror copy-in {lo:#x}-{hi:#x} ({}) behind this batch's write-back {:#x}+{:#x}{}", self.cx.vc_why, wb.base, wb.size, if wb.mirror { " (mirror)" } else { "" });
@@ -7449,10 +7536,18 @@ impl Renderer {
                     }
                     self.flush_for(1);
                     ft.wait = 1;
+                    kind = 1;
                 } else if cpu_writeback_in_flight(lo, hi - lo) {
                     self.flushes[1] += 1;
                     wait_cpu_writebacks(lo, hi - lo);
                     ft.wait = 2;
+                    kind = 2;
+                }
+                // (TLG_PERF: fills whose forwards failed, by why and what they waited for.)
+                if let Some(tw) = tw {
+                    let i = FWD_FAIL.get().min(8) as usize * 3 + kind;
+                    FILL_WAITS[i].0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    FILL_WAITS[i].1.fetch_add(tw.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
                 }
             }
             ft.at(5);
@@ -7643,7 +7738,7 @@ impl Renderer {
         let overlaps = |w: u64, n: u64| w < hi && lo < w + n && spans.iter().any(|&(a, b)| w < b && a < w + n);
         let mut out = Vec::new();
         if cpu_writeback_in_flight(lo, hi - lo) || writeback_in_flight(lo, hi - lo) {
-            let oldest = (self.last_seq + 2).saturating_sub(SLOTS as u64);
+            let oldest = self.forward_oldest();
             for c in COMPLETIONS.lock().iter() {
                 if c.zc_writes.iter().any(|&(w, n)| overlaps(w, n)) {
                     FWD_FAIL.set(2);
@@ -7654,7 +7749,16 @@ impl Renderer {
                     return None;
                 }
                 if c.writebacks.iter().any(|&(w, _, n)| overlaps(w, n)) && (c.seq < oldest || c.fence == vk::Fence::null()) {
-                    FWD_FAIL.set(if c.fence == vk::Fence::null() { 4 } else { 5 });
+                    // (TLG_PERF: reason 5 split - 5 the overlapping writes include
+                    // a device-ring copy, 8 they are all in mirror windows.)
+                    let dring_src = c.dev_writes.iter().any(|&(w, b, _, n)| overlaps(w, n) && b == self.cx.dring.buffer);
+                    FWD_FAIL.set(if c.fence == vk::Fence::null() {
+                        4
+                    } else if perf_on() && !dring_src {
+                        8
+                    } else {
+                        5
+                    });
                     return None;
                 }
                 out.extend(c.dev_writes.iter().filter(|&&(w, _, _, n)| overlaps(w, n)).copied());
@@ -8277,11 +8381,15 @@ impl Renderer {
         let in_flight = writeback_in_flight(base, size);
         bpart(11, tf);
         if in_flight {
-            let oldest = (self.last_seq + 2).saturating_sub(SLOTS as u64);
+            let oldest = self.forward_oldest();
             let mut forward = true;
+            let mut mirror_only = false;
             for c in COMPLETIONS.lock().iter() {
                 let overlaps = |w: u64, n: u64| w < base + size && base < w + n;
                 if c.zc_writes.iter().any(|&(w, n)| overlaps(w, n)) || (c.writebacks.iter().any(|&(w, _, n)| overlaps(w, n)) && (c.seq < oldest || c.fence == vk::Fence::null())) {
+                    // (TLG_PERF: refused for the batch's age alone, its
+                    // overlapping writes all in mirror windows.)
+                    mirror_only = perf_on() && c.fence != vk::Fence::null() && !c.zc_writes.iter().any(|&(w, n)| overlaps(w, n)) && !c.dev_writes.iter().any(|&(w, b, _, n)| overlaps(w, n) && b == self.cx.dring.buffer);
                     forward = false;
                     break;
                 }
@@ -8300,6 +8408,11 @@ impl Renderer {
                 let t0 = std::time::Instant::now();
                 wait_overlapping(base, size);
                 self.prof[0] += t0.elapsed();
+                if perf_on() {
+                    let i = if mirror_only { 2 } else { 0 };
+                    UPLOAD_WAITS[i].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    UPLOAD_WAITS[i + 1].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
             }
         }
         if devcopy {
@@ -9272,7 +9385,10 @@ impl Renderer {
                         // the dispatch hazards order the two).
                         if p.stage == Stage::Compute && crate::tune::get(crate::tune::CHAIN_WRITTEN) != 0 {
                             let over = |w: &PendingWrite| w.base < base + size && base < w.base + w.size;
-                            let prev = self.cx.writebacks.iter().rev().find(|w| over(w)).filter(|w| !w.mirror && w.bits.is_none() && w.dev_buf == self.cx.dring.buffer && w.base == base && w.size == size).map(|w| w.dev_off);
+                            // (The batch's write-back ranges first: most written
+                            // ranges have no earlier write in it, and the scan
+                            // went through all of them.)
+                            let prev = if wb_maybe(&self.cx, base, size) { self.cx.writebacks.iter().rev().find(|w| over(w)).filter(|w| !w.mirror && w.bits.is_none() && w.dev_buf == self.cx.dring.buffer && w.base == base && w.size == size).map(|w| w.dev_off) } else { None };
                             if let Some(dev_off) = prev {
                                 bpath = 10;
                                 mem!(self).writes.note_gpu_write(base, size);
@@ -9659,7 +9775,7 @@ impl Renderer {
         phase!(0);
         let tp = perf_now();
         let ps_addr = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64) << 32)) << 8;
-        if ps_addr != 0 && SKIP_PS.lock().contains(&ps_addr) {
+        if ps_addr != 0 && SKIP_ANY.load(std::sync::atomic::Ordering::Relaxed) && SKIP_PS.lock().contains(&ps_addr) {
             self.skipped += 1;
             return Ok(());
         }
@@ -10897,7 +11013,7 @@ impl Renderer {
         self.drain_cp_writes();
         let cs_addr = ((cp.regs.sh(0x2E0C) as u64) | ((cp.regs.sh(0x2E0D) as u64) << 32)) << 8;
         super::set_phase(super::phase::DISPATCH, cs_addr);
-        if SKIP_CS.lock().contains(&cs_addr) {
+        if SKIP_ANY.load(std::sync::atomic::Ordering::Relaxed) && SKIP_CS.lock().contains(&cs_addr) {
             self.skipped += 1;
             return Ok(true);
         }
@@ -11949,10 +12065,18 @@ impl Renderer {
         Ok(slot)
     }
 
+    /// The oldest submitted batch whose device-ring copies are still intact:
+    /// a segment is reused `dring_segs` batches later (the open batch counts).
+    /// Forwards from older batches' copies are refused: their write-backs
+    /// are waited for.
+    fn forward_oldest(&self) -> u64 {
+        (self.last_seq + 2).saturating_sub(self.cx.dring_segs as u64)
+    }
+
     /// Where the newest GPU-written copy of guest [addr, addr+len) is on the
     /// device while it has not reached guest memory: a write-back of this
     /// batch or of a batch in flight (device ring segments stay intact until
-    /// their slot is reused, mirror windows while they live) that covers it
+    /// they are reused, mirror windows while they live) that covers it
     /// entirely. None when no such write is pending (or one covers it only
     /// partly).
     fn device_copy_of(&mut self, addr: u64, len: u64) -> Option<(vk::Buffer, u64)> {
@@ -11961,7 +12085,7 @@ impl Renderer {
         if let Some(p) = self.cx.writebacks.iter().rev().find(|p| overlaps(p.base, p.size)) {
             return covers(p.base, p.size).then(|| (p.dev_buf, p.dev_off + (addr - p.base)));
         }
-        let oldest = (self.last_seq + 2).saturating_sub(SLOTS as u64);
+        let oldest = self.forward_oldest();
         let (dring, vc) = (self.cx.dring.buffer, mem!(self).vcache.as_ref());
         let live = |b: vk::Buffer| b == dring || vc.is_some_and(|vc| vc.windows.values().any(|w| w.buf == b));
         for c in COMPLETIONS.lock().iter().rev() {
@@ -13589,7 +13713,12 @@ impl Hooks for VkHooks {
             return;
         }
         let ahead = (crate::tune::get(crate::tune::PREP_AHEAD) != 0 && cp.queue == 0).then(|| super::prepahead::take_dispatch(&cp.regs)).flatten();
+        let tp = tsc();
+        let own = ahead.is_none();
         let pre = ahead.or_else(|| (crate::tune::get(crate::tune::PREPARE_UNLOCKED) != 0).then(|| shaders::prepare(&StageRegs { stage: Stage::Compute, regs: &cp.regs })));
+        if own && cp.queue != 0 {
+            bpart(27, tp);
+        }
         if let Some(Ok(p)) = pre.as_ref().filter(|_| crate::tune::get(crate::tune::PREFETCH) != 0) {
             prefetch_reads(p);
         }
@@ -13682,6 +13811,7 @@ impl Hooks for VkHooks {
         TimedRenderer::lock(cp.queue).as_mut().is_some_and(|r| r.gds_load_on_gpu(offset, src, bytes))
     }
     fn sync_write(&mut self, cp: &CommandProcessor, addr: u64, len: u64) {
+        wb_log("CP write", addr, len, cp.queue as u64);
         // (Queued ring copies of this memory read it first.)
         super::copier::wait_overlapping(addr, len);
         let end = addr + len.max(1);
@@ -13761,6 +13891,8 @@ pub static DUMP_AFTER: Mutex<Option<(Vec<u64>, u32, u32)>> = Mutex::new(None);
 pub static SKIP_PS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Debug: dispatches of these compute shaders are skipped (control `skipcs`).
 pub static SKIP_CS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+/// Either skip list was set (a lock per command otherwise).
+pub static SKIP_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Depth targets sampled through a smaller T#: cropped copies made, direct
 /// views for texel loads (`depth_shadow_view`).
 pub static DEPTH_VIEWS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
@@ -13774,6 +13906,26 @@ pub static DUMP_RAW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 pub static TRACE_FULL_ADDRS: Mutex<Option<Vec<u64>>> = Mutex::new(None);
 
 /// "0x1a2b,3c4d" -> addresses.
+/// Diagnostic (`TLG_WB_LOG_RANGE=<lo>-<hi>`, hex): GPU writes recorded in,
+/// write-backs landing in, lazy write-back events and CP writes in guest
+/// [lo, hi) are logged (the first 4,000).
+pub fn wb_log(what: &str, addr: u64, size: u64, seq: u64) {
+    static RANGE: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
+    let r = *RANGE.get_or_init(|| {
+        let v = std::env::var("TLG_WB_LOG_RANGE").ok()?;
+        let (a, b) = v.split_once('-')?;
+        let p = |x: &str| u64::from_str_radix(x.trim().trim_start_matches("0x"), 16).ok();
+        Some((p(a)?, p(b)?))
+    });
+    let Some((lo, hi)) = r else { return };
+    if addr < hi && lo < addr.saturating_add(size.max(1)) {
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4000 {
+            crate::info!("wblog: {what} {addr:#x}+{size:#x} batch {seq}");
+        }
+    }
+}
+
 pub fn parse_hex_list(v: &str) -> Vec<u64> {
     v.split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()
 }

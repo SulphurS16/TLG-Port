@@ -347,6 +347,29 @@ pub struct DryLog {
     words: Option<Vec<u32>>,
 }
 
+impl DryLog {
+    /// Prefetches what `dry_valid` will read: the log and the guest words it
+    /// compares (the first 16 reads; prefetches never fault).
+    pub fn prefetch(&self) {
+        prefetch_bytes(self.reads.as_ptr() as *const u8, std::mem::size_of_val(&self.reads[..]));
+        if let Some(w) = &self.words {
+            prefetch_bytes(w.as_ptr() as *const u8, w.len() * 4);
+        }
+        for &(addr, n, _) in self.reads.iter().take(16) {
+            prefetch_bytes(addr as *const u8, n as usize * 4);
+        }
+    }
+}
+
+/// Prefetches up to 512 bytes from `p` into the caches.
+pub fn prefetch_bytes(p: *const u8, bytes: usize) {
+    let mut o = 0;
+    while o < bytes.min(512) {
+        unsafe { core::arch::x86_64::_mm_prefetch::<{ core::arch::x86_64::_MM_HINT_T0 }>(p.wrapping_add(o) as *const i8) };
+        o += 64;
+    }
+}
+
 impl Drop for DryLog {
     fn drop(&mut self) {
         pool_give(|p| &mut p.logs, std::mem::take(&mut self.reads));

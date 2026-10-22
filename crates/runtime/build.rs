@@ -18,6 +18,8 @@ fn main() {
     }
     build.include(&dir).opt_level(2).warnings(false).compile("atrac9");
     embed_resources();
+    // PGO training builds (`--cfg tlg_pgo_gen` beside `-Cprofile-generate`, tools/pgo.ps1).
+    println!("cargo:rustc-check-cfg=cfg(tlg_pgo_gen)");
     // Symbol names for log lines (data/ps4-names.txt) where the checkout has them.
     println!("cargo:rustc-check-cfg=cfg(nid_names)");
     let names = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../data/ps4-names.txt");

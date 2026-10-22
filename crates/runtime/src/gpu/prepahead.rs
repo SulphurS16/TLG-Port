@@ -315,7 +315,36 @@ fn take(key: u64, draw: bool) -> Option<Entry> {
         return None;
     };
     q.drain(..i);
-    q.pop_front()
+    let e = q.pop_front();
+    // (`tune prefetch_next`: what the CP touches first of the next result -
+    // made on the prepare thread's core, cold here.)
+    if crate::tune::get(crate::tune::PREFETCH_NEXT) != 0 {
+        if let Some(n) = q.front() {
+            prefetch_entry(n);
+        }
+    }
+    e
+}
+
+/// Prefetches a queued result's prepared stages (resources, SGPR data) and
+/// what its validation reads.
+fn prefetch_entry(e: &Entry) {
+    let stage = |p: &Result<Prepared, String>| {
+        if let Ok(p) = p {
+            shaders::prefetch_bytes(p.resources.as_ptr() as *const u8, std::mem::size_of_val(&p.resources[..]));
+            shaders::prefetch_bytes(p.sgpr_data.as_ptr() as *const u8, p.sgpr_data.len() * 4);
+        }
+    };
+    match &e.prep {
+        Prep::Draw((vs, ps)) => {
+            stage(vs);
+            if let Some(ps) = ps {
+                stage(ps);
+            }
+        }
+        Prep::Dispatch(cs) => stage(cs),
+    }
+    e.log.prefetch();
 }
 
 /// The stage's code is unchanged: checked in the current graphics epoch

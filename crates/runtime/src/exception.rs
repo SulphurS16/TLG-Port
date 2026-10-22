@@ -761,8 +761,21 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
             let mut hi = 0usize;
             windows_sys::Win32::System::Threading::GetCurrentThreadStackLimits(&mut lo, &mut hi);
             let (lo, hi) = (lo as u64, hi as u64);
-            // Frame-pointer chain.
-            let _ = writeln!(r, "  backtrace (rbp chain):");
+            // Frame-pointer chain. With the usual prologue (push rbp; mov
+            // rbp, rsp; push r15 .. rbx) the five qwords below a frame's rbp
+            // are the register values of the function it returns into
+            // (r15, r14, r13, r12, rbx): the objects the callers worked on,
+            // dumped for the first frames.
+            let _ = writeln!(r, "  backtrace (rbp chain; 'saved': the 5 qwords below each rbp):");
+            let readable = |a: u64| -> bool {
+                use windows_sys::Win32::System::Memory::{MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_GUARD, PAGE_NOACCESS, VirtualQuery};
+                let mut mbi: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
+                if VirtualQuery(a as *const _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
+                    return false;
+                }
+                let end = mbi.BaseAddress as u64 + mbi.RegionSize as u64;
+                mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD) == 0 && mbi.Protect != 0 && a + 128 <= end
+            };
             let mut bp = ctx.Rbp;
             for i in 0..32 {
                 if bp < lo || bp + 16 > hi || bp & 7 != 0 {
@@ -770,6 +783,18 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
                 }
                 let ret = *((bp + 8) as *const u64);
                 let _ = writeln!(r, "    #{i:<2} {}", describe(ret));
+                if i < 6 && bp >= lo + 0x28 {
+                    let saved: Vec<u64> = (1..=5).map(|k| *((bp - 8 * k) as *const u64)).collect();
+                    let s: Vec<String> = saved.iter().map(|v| format!("{v:#x}")).collect();
+                    let _ = writeln!(r, "        saved {}", s.join(" "));
+                    for v in saved {
+                        let a = v & !7;
+                        if i < 4 && crate::mem::is_guest(a, 128) && readable(a) {
+                            let q: Vec<String> = (0..16).map(|k| format!("{:016x}", *((a + k * 8) as *const u64))).collect();
+                            let _ = writeln!(r, "        [{a:#x}] {}", q.join(" "));
+                        }
+                    }
+                }
                 bp = *(bp as *const u64);
             }
             // Stack words that point into guest code.

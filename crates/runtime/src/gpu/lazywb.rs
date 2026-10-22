@@ -161,6 +161,21 @@ pub fn without_ranges<R>(lo: u64, hi: u64, f: impl FnOnce() -> R) -> Option<R> {
     Some(f())
 }
 
+/// TLG_PERF: the pages of [lo, hi) inside tracked ranges, and of those the
+/// protected (inaccessible) ones.
+pub fn tracked_pages(lo: u64, hi: u64) -> (u64, u64) {
+    let g = STATE.lock();
+    let mut t = (0, 0);
+    for (&k, e) in g.entries.range(..hi).rev().take_while(|(_, e)| e.end > lo) {
+        let n = (e.end.min(hi) - k.max(lo)) >> 12;
+        t.0 += n;
+        if e.protected {
+            t.1 += n;
+        }
+    }
+    t
+}
+
 /// Keys of the entries overlapping [lo, hi) (entries are disjoint).
 fn overlapping(g: &State, lo: u64, hi: u64) -> Vec<u64> {
     g.entries.range(..hi).rev().take_while(|(_, e)| e.end > lo).map(|(k, _)| *k).collect()
@@ -191,6 +206,7 @@ pub fn skip_writeback(lo: u64, hi: u64, buf: vk::Buffer, off: u64) -> Option<u64
         return None;
     }
     *skips += 1;
+    super::render::wb_log("lazy write-back skipped", lo, hi - lo, *skips);
     e.lazy = Some((buf, off));
     e.skip = *skips;
     stats.lazy_writebacks += 1;
@@ -325,6 +341,7 @@ fn resolve(g: &mut State, lo: u64, touched: bool) {
         // title puts new objects in memory a lazy range held, from several
         // threads at once.)
         Some((buf, off)) => {
+            super::render::wb_log(if touched { "lazy read-back on CPU access" } else { "lazy read-back" }, lo, hi - lo, 0);
             let t0 = std::time::Instant::now();
             let unprotect = || {
                 if protected {

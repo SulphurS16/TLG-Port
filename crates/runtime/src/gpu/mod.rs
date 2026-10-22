@@ -71,6 +71,215 @@ pub struct ComputeRing {
 struct ComputeQueue {
     ring: Mutex<ComputeRing>,
     cv: Condvar,
+    /// The queue's command processor and the rung range under way: run by
+    /// the queue's thread or, while it waits, by the graphics CP
+    /// (`run_compute_inline`).
+    exec: Mutex<QueueExec>,
+}
+
+/// A compute queue's command processor (resumable: `nonblocking`) and the
+/// range of its ring being executed.
+struct QueueExec {
+    cp: CommandProcessor,
+    hooks: render::VkHooks,
+    run: Option<RangeRun>,
+}
+
+/// A rung range [from, to) of a compute ring, wrapping at its end: the piece
+/// `s` executes starts at `pos`.
+struct RangeRun {
+    base: u64,
+    size: u32,
+    from: u32,
+    to: u32,
+    rptr: u64,
+    pos: u32,
+    s: Stream,
+}
+
+enum Progress {
+    /// Nothing rung.
+    Idle,
+    /// A memory wait not met yet (the stream stays on it).
+    Blocked,
+    /// Stopped by the caller between packets.
+    Paused,
+    /// A range executed, committed and submitted, its read pointer written.
+    Done,
+}
+
+/// Goes on with compute queue `vq`: starts the next rung range when none is
+/// under way and executes it until a memory wait is not met (Blocked),
+/// `stop` asks (checked every 16 packets: Paused), or the range is done
+/// (Done).
+fn advance(cq: &ComputeQueue, vq: usize, ex: &mut QueueExec, stop: &mut dyn FnMut() -> bool) -> Progress {
+    if ex.run.is_none() {
+        let (base, size, from, to, rptr) = {
+            let mut r = cq.ring.lock();
+            let Some(p) = r.pending_to.take() else {
+                set_qphase(vq, phase::IDLE, 0);
+                return Progress::Idle;
+            };
+            (r.base, r.size_dw, r.read_dw, p & (r.size_dw - 1), r.read_ptr_addr)
+        };
+        // The title may have written guest memory before ringing: textures
+        // and cached buffers this queue's work reads are validated again.
+        render::with_queue(vq, |r| r.new_epoch(render::EpochKind::Compute));
+        let s = if from == to { Stream::empty() } else { Stream::new(base + from as u64 * 4, if to > from { to } else { size } - from) };
+        ex.run = Some(RangeRun { base, size, from, to, rptr, pos: from, s });
+    }
+    let QueueExec { cp, hooks, run } = ex;
+    let r = run.as_mut().unwrap();
+    let mut n = 0u32;
+    while r.pos != r.to {
+        match cp.step(&mut r.s, Engine::Compute, hooks) {
+            cp::Step::Ok => {
+                n += 1;
+                if n % 16 == 0 && stop() {
+                    return Progress::Paused;
+                }
+            }
+            cp::Step::Blocked => return Progress::Blocked,
+            cp::Step::Done => {
+                // (Wrapping: the rest from the ring's start.)
+                r.pos = if r.to > r.pos { r.to } else { 0 };
+                if r.pos != r.to {
+                    r.s = Stream::new(r.base + r.pos as u64 * 4, r.to - r.pos);
+                }
+            }
+        }
+    }
+    set_qphase(vq, phase::SUBMIT_WAIT, r.to as u64);
+    cp.commit(hooks);
+    render::with_queue(vq, |rd| rd.submit_batch(Vec::new()));
+    if std::env::var_os("TLG_COMPUTE_LOG").is_some() {
+        let mut words = Vec::new();
+        let mut p = r.from;
+        while p != r.to && words.len() < 64 {
+            words.push(format!("{:08x}", unsafe { std::ptr::read_volatile((r.base + p as u64 * 4) as *const u32) }));
+            p = (p + 1) % r.size;
+        }
+        crate::info!("compute vq {vq}: executed [{:#x}, {:#x}) packets {}: {}", r.from, r.to, cp.stats.packets, words.join(" "));
+    }
+    cq.ring.lock().read_dw = r.to;
+    if r.rptr != 0 {
+        unsafe { std::ptr::write_volatile(r.rptr as *mut u32, r.to) };
+    }
+    *run = None;
+    Progress::Done
+}
+
+/// The graphics CP goes on with each compute queue no other thread is
+/// running (`tune cs_on_gfx`), until the queue blocks, has nothing rung or
+/// `stop` (checked every 16 packets) says so: between its own packets
+/// (`service_compute`) and in its memory waits, where `stop` is the wait
+/// being met. The work a graphics wait is for is often a compute queue's,
+/// which its thread would record only after waking and taking the renderer
+/// lock (in the Trico battle ~3 ms per wait for ~1.2 ms of work). True when
+/// a queue went on.
+pub fn run_compute_inline(stop: &mut dyn FnMut() -> bool) -> bool {
+    GFX_SERVICE_TSC.store(unsafe { core::arch::x86_64::_rdtsc() }, Ordering::Relaxed);
+    let mut any = false;
+    let mut again = false;
+    // (Lowest queue first: queue 13 hands the graphics CP its work back.)
+    for vq in 0..CQ_MAX.load(Ordering::Acquire) {
+        let p = CQ_PTRS[vq].load(Ordering::Acquire);
+        if p.is_null() {
+            continue;
+        }
+        // SAFETY: mapped queues are leaked (`map_compute_queue`).
+        let cq: &'static ComputeQueue = unsafe { &*p };
+        let Some(mut ex) = cq.exec.try_lock() else { continue };
+        let before = ex.cp.stats.packets;
+        let p = advance(cq, vq, &mut ex, stop);
+        again |= matches!(p, Progress::Paused);
+        any |= ex.cp.stats.packets != before || matches!(p, Progress::Done);
+        if any && stop() {
+            // (The queues after it: at the next look.)
+            again = true;
+            break;
+        }
+    }
+    // (Work left: looked at again at the graphics CP's next packet.)
+    SERVICE_AGAIN.set(again);
+    if any && render::perf_on() {
+        INLINE_RUNS.fetch_add(1, Ordering::Relaxed);
+    }
+    any
+}
+
+/// TLG_PERF: `run_compute_inline` calls that went on with a compute queue.
+pub static INLINE_RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// Mapped compute queues by virtual queue number, and one past the highest:
+/// the graphics CP looks at them between packets without `COMPUTE`'s lock.
+static CQ_PTRS: [std::sync::atomic::AtomicPtr<ComputeQueue>; 64] = [const { std::sync::atomic::AtomicPtr::new(std::ptr::null_mut()) }; 64];
+static CQ_MAX: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Doorbells rung so far (`ding_dong`).
+static DOORBELLS: AtomicU64 = AtomicU64::new(0);
+/// When the graphics CP last looked for compute work (TSC; 0: it went idle).
+static GFX_SERVICE_TSC: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// The doorbell count, label generation and TSC at the graphics CP's
+    /// last look for compute work, and whether a queue it ran has work left.
+    static SERVICE_SEEN: std::cell::Cell<(u64, u64, u64)> = const { std::cell::Cell::new((u64::MAX, 0, 0)) };
+    static SERVICE_AGAIN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// The graphics CP between its packets (`tune cs_on_gfx`): when a doorbell
+/// rang, labels changed (a wait of a compute queue may be met, also in GPU
+/// order), 100 us passed (the title's CPU writes are seen by polling) or a
+/// queue has work left, the compute queues that can go on run here, up to 16
+/// packets each, interleaved with its own.
+/// (`cs_on_gfx 2`: only while the graphics CP waits or is idle - the
+/// compute queues' work fills its waits; between packets it only keeps
+/// their threads off.)
+#[inline]
+pub fn service_compute() {
+    let mode = crate::tune::get(crate::tune::CS_ON_GFX);
+    if mode == 0 {
+        return;
+    }
+    let now = unsafe { core::arch::x86_64::_rdtsc() };
+    GFX_SERVICE_TSC.store(now, Ordering::Relaxed);
+    if mode == 2 {
+        return;
+    }
+    let seen = (DOORBELLS.load(Ordering::Relaxed), render::label_gen());
+    let (bells, labels, t) = SERVICE_SEEN.get();
+    let poll = crate::hle::kernel::time::tsc_hz_or(0) / 10_000;
+    if (bells, labels) == seen && now.wrapping_sub(t) < poll && !SERVICE_AGAIN.get() {
+        return;
+    }
+    SERVICE_SEEN.set((seen.0, seen.1, now));
+    run_compute_inline(&mut || true);
+}
+
+/// Whether the graphics CP runs the compute queues now (`tune cs_on_gfx`:
+/// it looked for their work within `cs_defer_us`).
+fn gfx_services_compute() -> bool {
+    if crate::tune::get(crate::tune::CS_ON_GFX) == 0 {
+        return false;
+    }
+    let t = GFX_SERVICE_TSC.load(Ordering::Relaxed);
+    let defer = (crate::tune::get(crate::tune::CS_DEFER_US).max(0) as u64).saturating_mul(crate::hle::kernel::time::tsc_hz_or(0) / 1_000_000);
+    t != 0 && unsafe { core::arch::x86_64::_rdtsc() }.wrapping_sub(t) < defer
+}
+
+/// The graphics CP goes idle (no submission queued): the compute queues'
+/// threads run them again at once.
+fn compute_handback() {
+    if GFX_SERVICE_TSC.swap(0, Ordering::Relaxed) == 0 {
+        return;
+    }
+    for vq in 0..CQ_MAX.load(Ordering::Acquire) {
+        let p = CQ_PTRS[vq].load(Ordering::Acquire);
+        if !p.is_null() {
+            // SAFETY: mapped queues are leaked (`map_compute_queue`).
+            unsafe { &*p }.cv.notify_one();
+        }
+    }
 }
 
 static GFX: OnceLock<GfxQueue> = OnceLock::new();
@@ -355,17 +564,14 @@ fn gfx_queue() -> &'static GfxQueue {
     })
 }
 
-/// Debug (TLG_PM4_CAPTURE=1): execute command buffers as fetched at submit
-/// time instead of reading them live. Live reading is what the hardware does
-/// and is required: titles patch submitted command buffers (e.g. calls to
-/// worker command lists written into reserved slots after submission).
-/// Command buffers (and the indirect buffers they call) are snapshotted at
-/// submission and executed from the snapshot: the title rewrites its DCBs
-/// once it believes the GPU is done with them, which can happen while our
-/// command processor still lags behind. `TLG_PM4_CAPTURE=0` executes live.
+/// Command buffers (and the indirect buffers they call) snapshotted at
+/// submission and executed from the snapshot (`tune pm4_capture`), instead
+/// of read live as the hardware does: for titles that rewrite submitted
+/// command buffers while our command processor still lags behind (the
+/// earlier port's title patched them after submission instead, which only
+/// live reading follows). TLG's case: the knob.
 fn pm4_capture() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("TLG_PM4_CAPTURE").map(|v| v != "0").unwrap_or(true))
+    crate::tune::get(crate::tune::PM4_CAPTURE) != 0
 }
 
 pub fn submit(mut s: Submission) {
@@ -435,6 +641,11 @@ fn gfx_thread() {
         set_phase(phase::IDLE, 0);
         let mut s = {
             let mut g = q.pending.lock();
+            // (`tune cs_on_gfx`: the compute queues' threads run them while
+            // this waits for the title.)
+            if g.is_empty() {
+                compute_handback();
+            }
             while g.is_empty() {
                 q.cv.wait(&mut g);
             }
@@ -493,6 +704,19 @@ fn gfx_thread() {
         match &decoded {
             Some(d) => cp.run_decoded(d, &mut hooks),
             None => cp.run(&mut de, &mut ce, &mut hooks),
+        }
+        // (TLG_PM4_CHECK: every captured buffer - indirect ones too - against
+        // guest memory once the submission has executed.)
+        if pm4_check() {
+            for (&addr, snap) in captured.iter() {
+                let now = read_dwords(addr, snap.len() as u32);
+                let diffs: Vec<usize> = (0..now.len()).filter(|&k| now[k] != snap[k]).collect();
+                if !diffs.is_empty() {
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    let show: Vec<String> = if N.fetch_add(1, Ordering::Relaxed) < 40 { diffs.iter().take(8).map(|&k| format!("+{:#x}: {:08x}->{:08x}", k * 4, snap[k], now[k])).collect() } else { Vec::new() };
+                    crate::warn!("gfx: command buffer {addr:#x} ({} dw) was rewritten by the end of its execution: {} dwords differ; queue depth {}; {}", snap.len(), diffs.len(), q.pending.lock().len(), show.join(" "));
+                }
+            }
         }
         // (Coalescing, `tune::COALESCE`: the next queued submission continues
         // this batch; its end-of-pipe actions stay pending in the CP, where
@@ -780,9 +1004,14 @@ pub fn map_compute_queue(pipe: u32, queue: u32, base: u64, size_dw: u32, read_pt
         return 0x8026_0001u32 as i32;
     }
     let vq = (pipe * 8 + queue + 1) as usize;
+    let name = format!("GPU-acb{pipe}.{queue}");
+    let mut cp = CommandProcessor::new(&name);
+    cp.queue = vq;
+    cp.nonblocking = true;
     let cq: &'static ComputeQueue = Box::leak(Box::new(ComputeQueue {
         ring: Mutex::new(ComputeRing { base, size_dw, read_ptr_addr: read_ptr, read_dw: 0, pending_to: None }),
         cv: Condvar::new(),
+        exec: Mutex::new(QueueExec { cp, hooks: render::VkHooks { fallback: NullRenderer { logged: 0, gfx: false } }, run: None }),
     }));
     {
         let mut c = COMPUTE.lock();
@@ -790,8 +1019,9 @@ pub fn map_compute_queue(pipe: u32, queue: u32, base: u64, size_dw: u32, read_pt
             c.resize(vq + 1, None);
         }
         c[vq] = Some(cq);
+        CQ_PTRS[vq].store(cq as *const ComputeQueue as *mut ComputeQueue, Ordering::Release);
+        CQ_MAX.fetch_max(vq + 1, Ordering::AcqRel);
     }
-    let name = format!("GPU-acb{pipe}.{queue}");
     let tname = name.clone();
     crate::thread::spawn_host(&name, 8 << 20, Box::new(move || compute_thread(cq, tname, vq))).expect("compute thread");
     crate::info!("compute queue pipe {pipe} queue {queue} ring {base:#x} ({size_dw} dw) rptr {read_ptr:#x} -> vqueue {vq}");
@@ -806,6 +1036,7 @@ pub fn ding_dong(vq: u32, next_dw: u32) {
     match c {
         Some(cq) => {
             cq.ring.lock().pending_to = Some(next_dw);
+            DOORBELLS.fetch_add(1, Ordering::Relaxed);
             cq.cv.notify_one();
         }
         None => crate::error!("sceGnmDingDong on unmapped vqueue {vq}"),
@@ -825,48 +1056,43 @@ pub fn compute_queues_idle() -> bool {
 fn compute_thread(cq: &'static ComputeQueue, name: String, vq: usize) {
     crate::log::set_thread_name(&name);
     crate::thread::raise_priority();
-    let mut cp = CommandProcessor::new(&name);
-    cp.queue = vq;
-    let mut hooks = render::VkHooks { fallback: NullRenderer { logged: 0, gfx: false } };
     loop {
-        let (base, size, from, to, rptr) = {
-            set_qphase(vq, phase::IDLE, 0);
-            if crate::tune::get(crate::tune::EARLY_EOP) != 0 && cq.ring.lock().pending_to.is_none() {
-                render::try_early_eop();
-            }
+        // (`tune cs_on_gfx`: while the graphics CP runs the compute queues,
+        // this thread leaves the queue to it - woken by a doorbell, by the
+        // graphics CP going idle, or after `cs_defer_us` to look again.)
+        if gfx_services_compute() {
+            // (Without work under way or rung, until a doorbell or the
+            // hand-back; with it, also to step in should the graphics CP stop
+            // looking - blocked in a GPU wait.)
+            let busy = cq.exec.try_lock().is_none_or(|e| e.run.is_some());
+            let defer = std::time::Duration::from_micros(crate::tune::get(crate::tune::CS_DEFER_US).max(1) as u64);
             let mut r = cq.ring.lock();
-            while r.pending_to.is_none() {
+            if busy || r.pending_to.is_some() {
+                let _ = cq.cv.wait_for(&mut r, defer);
+            } else {
                 cq.cv.wait(&mut r);
             }
-            let to = r.pending_to.take().unwrap() & (r.size_dw - 1);
-            (r.base, r.size_dw, r.read_dw, to, r.read_ptr_addr)
-        };
-        // The title may have written guest memory before ringing: textures
-        // and cached buffers this queue's work reads are validated again.
-        render::with_queue(vq, |r| r.new_epoch(render::EpochKind::Compute));
-        // Execute [from, to) with wrap-around.
-        let mut pos = from;
-        while pos != to {
-            let end = if to > pos { to } else { size };
-            let mut s = Stream::new(base + pos as u64 * 4, end - pos);
-            cp.run_single(&mut s, Engine::Compute, &mut hooks);
-            pos = end % size;
+            continue;
         }
-        set_qphase(vq, phase::SUBMIT_WAIT, to as u64);
-        cp.commit(&mut hooks);
-        render::with_queue(vq, |r| r.submit_batch(Vec::new()));
-        if std::env::var_os("TLG_COMPUTE_LOG").is_some() {
-            let mut words = Vec::new();
-            let mut p = from;
-            while p != to && words.len() < 64 {
-                words.push(format!("{:08x}", unsafe { std::ptr::read_volatile((base + p as u64 * 4) as *const u32) }));
-                p = (p + 1) % size;
+        let seen = render::label_gen();
+        // (Paused for the graphics CP once it looks for compute work again.)
+        let p = advance(cq, vq, &mut cq.exec.lock(), &mut gfx_services_compute);
+        match p {
+            Progress::Done | Progress::Paused => {}
+            // (A memory wait: retried once labels change or after 100 us -
+            // the title's CPU writes are seen by polling.)
+            Progress::Blocked => {
+                render::wait_labels(seen, std::time::Duration::from_micros(100));
             }
-            crate::info!("compute vq {vq}: executed [{from:#x}, {to:#x}) packets {}: {}", cp.stats.packets, words.join(" "));
-        }
-        cq.ring.lock().read_dw = to;
-        if rptr != 0 {
-            unsafe { std::ptr::write_volatile(rptr as *mut u32, to) };
+            Progress::Idle => {
+                if crate::tune::get(crate::tune::EARLY_EOP) != 0 && cq.ring.lock().pending_to.is_none() {
+                    render::try_early_eop();
+                }
+                let mut r = cq.ring.lock();
+                while r.pending_to.is_none() {
+                    cq.cv.wait(&mut r);
+                }
+            }
         }
     }
 }
@@ -1194,7 +1420,18 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
                 .collect();
             crate::info!("mirror binding cache misses/s by queue and reason: {}", miss.join("; "));
             let a: [u64; 7] = std::array::from_fn(|i| writes::ARM_STATS[i].swap(0, Ordering::Relaxed));
-            crate::info!("queried blocks/s for cold-block arming: {} written, {} clean below the threshold, {} clean waiting after strikes ({:.1} strikes each), {} armed when queried, {} to arm ({} of them refused: lazy write-back {}, not committed {}, protection {} (last {:#x}), protect failed {}); left out as kept inaccessible by the lazy write-back {}", a[0], a[1], a[2], a[3] as f64 / a[2].max(1) as f64, a[4], a[5], a[6], cpuwatch::REFUSALS[0].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[1].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[2].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[4].load(Ordering::Relaxed), cpuwatch::REFUSALS[3].swap(0, Ordering::Relaxed), writes::LAZY_SKIPS.swap(0, Ordering::Relaxed));
+            // (Mirror fills whose forwards failed, by reason / what they waited for.)
+            let fw: Vec<String> = (0..27)
+                .filter_map(|i| {
+                    let n = render::FILL_WAITS[i].0.swap(0, Ordering::Relaxed);
+                    let ns = render::FILL_WAITS[i].1.swap(0, Ordering::Relaxed);
+                    (n > 0).then(|| format!("reason {} {}: {n} x {:.0} us", i / 3, ["no wait", "this batch's write-back", "write-backs in flight"][i % 3], ns as f64 / n as f64 / 1e3))
+                })
+                .collect();
+            let uw: [u64; 4] = std::array::from_fn(|i| render::UPLOAD_WAITS[i].swap(0, Ordering::Relaxed));
+            crate::info!("forwards that failed/s: mirror fills [{}]; ring copies waiting for write-backs {} x {:.0} us (+ {} x {:.0} us whose writes were all in mirror windows)", fw.join(", "), uw[0], uw[1] as f64 / uw[0].max(1) as f64 / 1e3, uw[2], uw[3] as f64 / uw[2].max(1) as f64 / 1e3);
+            let rp: [u64; 3] = std::array::from_fn(|i| writes::REFUSED_PAGES[i].swap(0, Ordering::Relaxed));
+            crate::info!("queried blocks/s for cold-block arming: {} written, {} clean below the threshold, {} clean waiting after strikes ({:.1} strikes each), {} armed when queried, {} to arm ({} of them refused: lazy write-back {}, not committed {}, protection {} (last {:#x}), protect failed {}; their pages {}, in the lazy write-back's ranges {}, protected {}); left out as kept inaccessible by the lazy write-back {}", a[0], a[1], a[2], a[3] as f64 / a[2].max(1) as f64, a[4], a[5], a[6], cpuwatch::REFUSALS[0].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[1].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[2].swap(0, Ordering::Relaxed), cpuwatch::REFUSALS[4].load(Ordering::Relaxed), cpuwatch::REFUSALS[3].swap(0, Ordering::Relaxed), rp[0], rp[1], rp[2], writes::LAZY_SKIPS.swap(0, Ordering::Relaxed));
         }
         // (The compute queues' share of them.)
         static LAST_CS: Mutex<[(u64, u64); render::BPART_COUNT]> = Mutex::new([(0, 0); render::BPART_COUNT]);
@@ -1318,11 +1555,18 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             if cr != 0 {
                 recorder.push_str(&format!("; commits requested by waiting queues {cr}"));
             }
+            let ir = INLINE_RUNS.swap(0, Ordering::Relaxed);
+            if ir != 0 {
+                recorder.push_str(&format!("; compute-queue work run by the graphics CP {ir}x"));
+            }
             crate::info!("queues/s (ms): {}{recorder}", qs.join("; "));
             let ts: [u64; 5] = std::array::from_fn(|i| TAIL_STATS[i].swap(0, Ordering::Relaxed));
             if ts[0] != 0 {
                 let ms = |v: u64| v as f64 / ts[0] as f64 / 1e6;
                 let cs: [u64; 3] = std::array::from_fn(|i| CAPTURE_STATS[i].swap(0, Ordering::Relaxed));
+                let cp_parts: [u64; 3] = std::array::from_fn(|i| cp::CAPTURE_PARTS[i].swap(0, Ordering::Relaxed));
+                let per_us = render::TSC_PER_US.load(Ordering::Relaxed).max(1) as f64;
+                crate::info!("PM4 capture parts/s: {} buffers, copying {:.2} ms, scanning {:.2} ms", cp_parts[0], cp_parts[1] as f64 / per_us / 1e3, cp_parts[2] as f64 / per_us / 1e3);
                 crate::info!("frame tail (ms per frame, after the graphics CP finished the frame): its last batch done on the GPU {:.2}, its end-of-pipe actions {:.2}, the title's next submission {:.2}, taken up {:.2} ({} frames); PM4 captures {} ({:.2} ms, {} KiB); batches split by a context switch {:?}; end-of-pipe actions performed early {} (in flight then: batches {}, eager write-backs {} of {} KiB, in-place accesses {}, other end-of-pipe writes {}; nothing of those {} times)", ms(ts[1]), ms(ts[2]), ms(ts[3]), ms(ts[4]), ts[0], cs[0], cs[1] as f64 / 1e6, cs[2] * 4 >> 10, (0..32).filter_map(|q| { let n = render::CTX_SUBMITS[q].swap(0, Ordering::Relaxed); (n > 0).then_some((q, n)) }).collect::<Vec<_>>(), render::EARLY_DONE.swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[0].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[1].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[2].swap(0, Ordering::Relaxed) >> 10, render::EARLY_INFLIGHT[3].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[4].swap(0, Ordering::Relaxed), render::EARLY_INFLIGHT[5].swap(0, Ordering::Relaxed));
             }
         }

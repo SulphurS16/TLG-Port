@@ -15,6 +15,14 @@ const FLEXIBLE_TOTAL: u64 = 448 << 20;
 
 static PRT_APERTURES: parking_lot::Mutex<[(u64, u64); 3]> = parking_lot::Mutex::new([(0, 0); 3]);
 
+/// Debug (`TLG_MEM_LOG=1`): every change the title makes to its memory map
+/// (mappings, unmappings, protection, direct memory allocated and released)
+/// logged as `mem:` lines.
+fn mem_log() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_MEM_LOG").is_ok_and(|v| v == "1"))
+}
+
 /// Picks a virtual address for a new mapping following PS4 hint/fixed rules.
 fn choose_addr(st: &MemState, hint: u64, size: u64, align: u64, flags: i32) -> Result<u64, i32> {
     let align = align.max(PAGE);
@@ -55,7 +63,11 @@ fn map_common(addr_io: *mut u64, len: u64, prot: i32, flags: i32, kind: VmaKind,
     match st.map(addr, len, kind, prot as u32, phys, 0, name) {
         Ok(a) => {
             unsafe { *addr_io = a };
-            crate::debug!("map {:?} {:#x}+{:#x} prot={:#x} flags={:#x} phys={:#x} '{}'", kind, a, len, prot, flags, phys, name);
+            if mem_log() {
+                crate::info!("mem: map {:?} {:#x}+{:#x} prot={:#x} flags={:#x} phys={:#x} '{}'", kind, a, len, prot, flags, phys, name);
+            } else {
+                crate::debug!("map {:?} {:#x}+{:#x} prot={:#x} flags={:#x} phys={:#x} '{}'", kind, a, len, prot, flags, phys, name);
+            }
             0
         }
         Err(e) => {
@@ -93,6 +105,9 @@ fn batch_map(entries: *const BatchEntry, n: i32, out: *mut i32, flags: i32) -> i
     for i in 0..n.max(0) as usize {
         let e = unsafe { &*entries.add(i) };
         let mut a = e.start;
+        if mem_log() && matches!(e.operation, 1 | 2 | 4) {
+            crate::info!("mem: batch operation {} {:#x}+{:#x} prot={:#x}", e.operation, e.start, e.length, e.protection);
+        }
         let r = match e.operation {
             0 => map_common(&mut a, e.length, e.protection as i32, flags | MAP_FIXED, VmaKind::Direct, e.offset, 0, "batch"),
             1 => {
@@ -143,7 +158,11 @@ sysv! {
         match MEM.write().dmem_allocate(start.max(0) as u64, end.max(0) as u64, len, align, mtype) {
             Some(p) => {
                 *out = p as i64;
-                crate::debug!("dmem alloc {:#x}+{:#x} align {:#x} type {}", p, len, align, mtype);
+                if mem_log() {
+                    crate::info!("mem: dmem alloc {:#x}+{:#x} align {:#x} type {}", p, len, align, mtype);
+                } else {
+                    crate::debug!("dmem alloc {:#x}+{:#x} align {:#x} type {}", p, len, align, mtype);
+                }
                 0
             }
             None => {
@@ -156,10 +175,12 @@ sysv! {
         sceKernelAllocateDirectMemory(0, mem::dmem_size() as i64, len, align, mtype, out)
     }
     fn sceKernelReleaseDirectMemory(start: i64, len: u64) -> i32 {
+        if mem_log() { crate::info!("mem: dmem release {:#x}+{:#x}", start, len); }
         MEM.write().dmem_release(start as u64, len);
         0
     }
     fn sceKernelCheckedReleaseDirectMemory(start: i64, len: u64) -> i32 {
+        if mem_log() { crate::info!("mem: dmem release (checked) {:#x}+{:#x}", start, len); }
         MEM.write().dmem_release(start as u64, len);
         0
     }
@@ -201,6 +222,7 @@ sysv! {
         flexible(addr, len, prot, flags, cstr(name))
     }
     fn sceKernelReleaseFlexibleMemory(addr: u64, len: u64) -> i32 {
+        if mem_log() { crate::info!("mem: flexible release {:#x}+{:#x}", addr, len); }
         MEM.write().unmap_range(addr, addr + mem::align_up(len, PAGE));
         0
     }
@@ -211,12 +233,14 @@ sysv! {
     }
     fn sceKernelMunmap(addr: u64, len: u64) -> i32 {
         if addr % PAGE != 0 || len == 0 { return sce(EINVAL); }
+        if mem_log() { crate::info!("mem: munmap {:#x}+{:#x}", addr, len); }
         MEM.write().unmap_range(addr, addr + mem::align_up(len, PAGE));
         0
     }
     fn sceKernelMprotect(addr: u64, len: u64, prot: i32) -> i32 {
         let start = mem::align_down(addr, PAGE);
         let end = mem::align_up(addr + len, PAGE);
+        if mem_log() { crate::info!("mem: mprotect {:#x}+{:#x} prot={:#x}", addr, len, prot); }
         match MEM.write().protect(start, end, prot as u32) { Ok(()) => 0, Err(_) => sce(EINVAL) }
     }
     fn sceKernelMtypeprotect(addr: u64, len: u64, mtype: i32, prot: i32) -> i32 {

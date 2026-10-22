@@ -538,6 +538,11 @@ pub fn load(l: u64, chunk: &str, text: &[u8]) -> Option<Vec<u8>> {
     if crate::hle::libs::videoout::frame_cap() == crate::config::FrameCap::Game {
         return None;
     }
+    // (Debug: TLG_SCRIPT_FIXES=0 keeps the game's scripts above 30 fps too.)
+    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *OFF.get_or_init(|| std::env::var("TLG_SCRIPT_FIXES").is_ok_and(|v| v == "0")) {
+        return None;
+    }
     static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let probe = *PROBE.get_or_init(|| std::env::var("TLG_SCRIPT_PROBE").is_ok_and(|v| v == "1"));
     let fixes: Vec<&ScriptFix> = FIXES.iter().chain(if probe { PROBES } else { &[] }).filter(|f| f.hash == hash).collect();

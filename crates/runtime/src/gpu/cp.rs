@@ -296,9 +296,12 @@ pub fn capture(roots: &[(u64, u32)]) -> Captured {
         if dw == 0 || out.contains_key(&addr) || !guest_ok(addr, dw as u64 * 4) || total + dw as usize > LIMIT_DWORDS {
             continue;
         }
+        let perf = super::render::perf_on();
+        let t0 = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         let mut words = take_words(dw as usize);
         // SAFETY: the dwords' storage, as bytes.
         super::resources::copy_from_guest(unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, dw as usize * 4) }, addr);
+        let t1 = if perf { unsafe { core::arch::x86_64::_rdtsc() } } else { 0 };
         let mut i = 0usize;
         while i < words.len() {
             let h = words[i];
@@ -319,9 +322,20 @@ pub fn capture(roots: &[(u64, u32)]) -> Captured {
         }
         total += words.len();
         out.insert(addr, Arc::new(Words(words)));
+        if perf {
+            use std::sync::atomic::Ordering::Relaxed;
+            let t2 = unsafe { core::arch::x86_64::_rdtsc() };
+            CAPTURE_PARTS[0].fetch_add(1, Relaxed);
+            CAPTURE_PARTS[1].fetch_add(t1.wrapping_sub(t0), Relaxed);
+            CAPTURE_PARTS[2].fetch_add(t2.wrapping_sub(t1), Relaxed);
+        }
     }
     out
 }
+
+/// TLG_PERF: command buffers captured (`capture`), TSC cycles copying them
+/// and scanning them for indirect buffers (with the rest of the loop).
+pub static CAPTURE_PARTS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
 
 #[derive(PartialEq, Eq, Debug)]
 pub enum Engine {
@@ -330,7 +344,7 @@ pub enum Engine {
     Compute,
 }
 
-enum Step {
+pub(super) enum Step {
     Ok,
     Blocked,
     Done,
@@ -483,6 +497,10 @@ pub struct CommandProcessor {
     /// Dry run (`prepahead`): registers, indirect buffers, constant RAM and
     /// the draw/dispatch hooks only; memory writes go to `Hooks::dry_write`.
     pub dry: bool,
+    /// Resumable (the compute queues, `super::advance`): a memory wait that
+    /// is not met makes `step` return Blocked without advancing the stream,
+    /// instead of waiting inside it.
+    pub nonblocking: bool,
     /// Synchronizing packets since this CP's last dispatch, and those before
     /// the dispatch being executed (`SYNC_*` bits; TLG_PERF).
     pub sync_seen: u8,
@@ -712,6 +730,7 @@ impl CommandProcessor {
             markers: Vec::new(),
             trace: false,
             dry: false,
+            nonblocking: false,
             sync_seen: 0,
             last_sync: 0,
         }
@@ -774,21 +793,9 @@ impl CommandProcessor {
         }
     }
 
-    /// Runs a single stream (compute rings).
-    pub fn run_single(&mut self, s: &mut Stream, engine: Engine, hooks: &mut dyn Hooks) {
-        loop {
-            match self.step(s, engine_clone(&engine), hooks) {
-                Step::Ok => {}
-                Step::Blocked => {
-                    crate::error!("{}: stream blocked on CE/DE counter in single-stream mode", self.name);
-                    return;
-                }
-                Step::Done => return,
-            }
-        }
-    }
-
-    fn step(&mut self, s: &mut Stream, engine: Engine, hooks: &mut dyn Hooks) -> Step {
+    /// Executes the next packet of `s` (Blocked: a counter wait, or a memory
+    /// wait of a resumable queue, not met; the stream stays on it).
+    pub(super) fn step(&mut self, s: &mut Stream, engine: Engine, hooks: &mut dyn Hooks) -> Step {
         if s.done() {
             return Step::Done;
         }
@@ -897,10 +904,24 @@ impl CommandProcessor {
         };
         if blocked {
             let skip = if engine == Engine::Draw { &mut self.skip_de_wait } else { &mut self.skip_ce_wait };
-            if !*skip {
+            // (Resumable queues - the compute queues - have no constant
+            // engine to wait for: passed rather than retried forever.)
+            if !*skip && !self.nonblocking {
                 return Step::Blocked;
             }
             *skip = false;
+        }
+        // (Resumable queues: a memory wait not met returns Blocked here, the
+        // stream left on it; met, it is complete.)
+        if self.nonblocking && !self.dry && opcode == op::WAIT_REG_MEM {
+            if !self.wait_reg_mem(body, hooks, true) {
+                return Step::Blocked;
+            }
+            s.set_cur(next);
+            self.stats.packets += 1;
+            OPCODES[(opcode as usize) | if self.watch { 0 } else { 256 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            title_sync_point(self.queue as usize);
+            return Step::Ok;
         }
         s.set_cur(next);
         self.stats.packets += 1;
@@ -938,7 +959,12 @@ impl CommandProcessor {
             return step;
         }
         OPCODES[(opcode as usize) | if self.watch { 0 } else { 256 }].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.exec_packet(opcode, body, cur, hooks)
+        let step = self.exec_packet(opcode, body, cur, hooks);
+        // (`tune cs_on_gfx`: compute queues' work between our packets.)
+        if self.watch {
+            super::service_compute();
+        }
+        step
     }
 
     /// Executes type-3 packet `opcode` with `body` (at guest `cur`): all but
@@ -1057,7 +1083,7 @@ impl CommandProcessor {
                 }
             }
             op::WAIT_REG_MEM => {
-                self.wait_reg_mem(&body, hooks);
+                self.wait_reg_mem(&body, hooks, false);
                 if !self.dry {
                     title_sync_point(self.queue as usize);
                 }
@@ -1332,6 +1358,11 @@ impl CommandProcessor {
                         crate::trace!("{} {} op {:#04x} len {} at {:#x} (decoded)", self.name, if constant { "CE" } else { "DE" }, opcode, n, addr);
                     }
                     let _ = self.exec_packet(opcode, body, addr, hooks);
+                    // (`tune cs_on_gfx`: compute queues' work between our
+                    // packets.)
+                    if self.watch {
+                        super::service_compute();
+                    }
                     // (`tune early_release`: another queue waits for our
                     // queued writes, as in `step`.)
                     if COMMIT_REQ[self.queue & 63].load(std::sync::atomic::Ordering::Relaxed) && COMMIT_REQ[self.queue & 63].swap(false, std::sync::atomic::Ordering::Acquire) {
@@ -1702,7 +1733,9 @@ impl CommandProcessor {
         }
     }
 
-    fn wait_reg_mem(&mut self, body: &[u32], hooks: &mut dyn Hooks) {
+    /// WAIT_REG_MEM; `nonblocking`: false (nothing done but committing our
+    /// queued writes, the stream not to advance) when the wait would block.
+    fn wait_reg_mem(&mut self, body: &[u32], hooks: &mut dyn Hooks, nonblocking: bool) -> bool {
         let func = body[0] & 7;
         let mem = body[0] & (1 << 4) != 0;
         let addr = (body[1] as u64 & !3) | ((body[2] as u64 & 0xFFFF) << 32);
@@ -1710,11 +1743,11 @@ impl CommandProcessor {
         let mask = body[4];
         self.stats.waits += 1;
         if !mem {
-            return; // register polls: our registers never change asynchronously
+            return true; // register polls: our registers never change asynchronously
         }
         if !guest_ok(addr, 4) {
             crate::error!("{}: WAIT_REG_MEM on invalid address {:#x}", self.name, addr);
-            return;
+            return true;
         }
         let test = |v: u32| -> bool {
             let v = v & mask;
@@ -1751,13 +1784,13 @@ impl CommandProcessor {
             if virtual_waits && inbatch && self.own_pending_value(addr).is_some_and(|v| test(v)) {
                 self.stats.inbatch_waits += 1;
                 hooks.order_barrier(self);
-                return;
+                return true;
             }
             // Another queue's queued writes: the same, without committing ours.
             if virtual_waits && cross_waits_for(self.queue) && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
                 self.stats.cross_waits += 1;
                 hooks.order_barrier(self);
-                return;
+                return true;
             }
             // (`tune early_release`: another queue's queued writes would meet
             // it; that queue commits them at its next packet.)
@@ -1774,11 +1807,18 @@ impl CommandProcessor {
             // always stall until the write happened).
             if virtual_waits && super::render::pending_label_value(addr).is_some_and(|v| test(v)) {
                 self.stats.virtual_waits += 1;
-                return;
+                return true;
             }
             let t0 = Instant::now();
             hooks.sync_range(self, addr, 4);
             note_sync(line!(), t0);
+            // (Resumable queues: not met - tried again later, counted then.
+            // The queue's phase names the wait whichever thread runs it.)
+            if nonblocking && !test(unsafe { rd(addr) }) {
+                self.stats.waits -= 1;
+                super::set_qphase(self.queue, super::phase::WAIT_REG_MEM, addr);
+                return false;
+            }
         }
         if self.watch {
             super::set_phase(super::phase::WAIT_REG_MEM, addr);
@@ -1829,27 +1869,36 @@ impl CommandProcessor {
         }
         let poll = Poll { queue: self.queue, func, reference, before: unsafe { rd(addr) }, addr, start, polled: std::cell::Cell::new(false), gap: self.last_label_queued.take().map(|t| start.saturating_duration_since(t)) };
         let mut seen = super::render::label_gen();
+        // (`tune cs_on_gfx`: the graphics CP goes on with the compute queues
+        // that can - what it waits for is often their work - instead of
+        // sleeping until they have recorded it; first right after its
+        // commit.)
+        let inline = self.watch && !self.dry && crate::tune::get(crate::tune::CS_ON_GFX) != 0;
         while !test(unsafe { rd(addr) }) {
             poll.polled.set(true);
             spins += 1;
-            if spins < 64 {
+            if spins < 64 && !(inline && spins == 1) {
                 std::hint::spin_loop();
             } else {
+                let ran = inline && super::run_compute_inline(&mut || test(unsafe { rd(addr) }) || (virtual_waits && super::render::pending_label_value(addr).is_some_and(|v| test(v))));
                 // Until a batch is submitted or completes or a CP writes
                 // memory; the title's CPU writes are polled for every 100 us.
-                super::render::wait_labels(seen, Duration::from_micros(100));
+                // (The first, early inline attempt: spinning goes on after it.)
+                if !ran && spins >= 64 {
+                    super::render::wait_labels(seen, Duration::from_micros(100));
+                }
                 seen = super::render::label_gen();
                 // Another queue may meanwhile have recorded the end-of-pipe
                 // write that satisfies the wait: met in GPU order from then
                 // on (as above), without waiting for that work to execute.
                 if virtual_waits && super::render::pending_label_value(addr).is_some_and(|v| test(v)) {
                     self.stats.virtual_waits += 1;
-                    return;
+                    return true;
                 }
                 if virtual_waits && cross_waits_for(self.queue) && queued_label_value(addr, self.queue).is_some_and(|v| test(v)) {
                     self.stats.cross_waits += 1;
                     hooks.order_barrier(self);
-                    return;
+                    return true;
                 }
                 if virtual_waits && early_release() {
                     request_commit(addr, self.queue, &test);
@@ -1869,6 +1918,7 @@ impl CommandProcessor {
                 );
             }
         }
+        true
     }
 
     /// MEM_SEMAPHORE: 64-bit memory semaphore. Signal increments it (or sets
@@ -2155,10 +2205,3 @@ impl CommandProcessor {
     }
 }
 
-fn engine_clone(e: &Engine) -> Engine {
-    match e {
-        Engine::Draw => Engine::Draw,
-        Engine::Constant => Engine::Constant,
-        Engine::Compute => Engine::Compute,
-    }
-}

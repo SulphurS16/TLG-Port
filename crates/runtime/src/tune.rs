@@ -123,7 +123,12 @@ pub const ELIDE_UTILITY: usize = 23;
 
 /// Written buffer bindings of at least this many KiB work in the VRAM mirror
 /// (else a device-ring copy set up per binding and written back)
-/// (`TLG_VCACHE_WRITE_MIN_KIB`, 64). Below 64 only in mirror windows that exist.
+/// (`TLG_VCACHE_WRITE_MIN_KIB`, 16). Below 64 only in mirror windows that exist.
+/// (16, not 64: rotated in one boot each, uncapped, fps vs 64 - the Trico
+/// battle +6.5% (4 KiB +3.1%), Second Flight +2.5% (32 KiB +1.7%), First
+/// Antenna +1.4% (8 KiB +2.5%, sd ~3). The copy each smaller one costs - an
+/// upload with forwards, a GPU copy and a write-back the next write-watch
+/// round finds written again - ~1.6 us against ~1.0 in the mirror.)
 pub const VCACHE_WRITE_MIN_KIB: usize = 24;
 
 /// Read-only bindings smaller than `vcache_read_min_kib` whose range has GPU
@@ -824,8 +829,59 @@ pub const CPU_COPY_MAX: usize = 140;
 /// (`TLG_MOUSE_DIRECT`, 1; 0: at the game's pad reads, one a frame, as
 /// before - for A/Bs; `input::mouse_motion`).
 pub const MOUSE_DIRECT: usize = 141;
+/// MEASUREMENT ONLY, unsafe: while on, cold blocks whose last arming was
+/// refused (lazy write-back ranges overlap) are left out of write-watch
+/// queries as armed blocks are, but nothing faults on a write there: CPU
+/// writes are missed (`TLG_WW_PRETEND`, 0; the upper bound of arming them,
+/// writes.rs `Watch::refused`).
+pub const WW_PRETEND: usize = 142;
+/// Segments of the graphics queue's device ring, SLOTS..its size (render.rs
+/// `dring_segs`; `TLG_DRING_SEGS_TUNE`, 0: as set at start -
+/// `TLG_DRING_SEGS`, else 12 with 8 GiB of video memory or more, 6 below);
+/// changed at the next batch once every batch is written back.
+pub const DRING_SEGS: usize = 143;
+/// Slow mirror fills (1 ms or more) still to be logged with their phase
+/// times (`shader_stats`; `TLG_FILL_LOG`, 100; set again for a window).
+pub const FILL_LOG: usize = 144;
+/// Pending GPU writes of up to 2 pages are kept in a map by page rather
+/// than the B-tree of page ranges (`TLG_PAGE_SEQS_SMALL`, 1; render.rs
+/// `PageSeqs`).
+pub const PAGE_SEQS_SMALL: usize = 145;
+/// Taking a prepared result, the CP prefetches the next one's data and the
+/// guest words its validation compares (`TLG_PREFETCH_NEXT`, 1; prepahead.rs):
+/// made on the prepare thread's core, they were cold here. Trico battle, two
+/// runs of 12 rotated rounds: fps +3.0% / +1.8%, graphics-CP CPU per frame
+/// -2.8% / -4.8%.
+pub const PREFETCH_NEXT: usize = 146;
+/// The graphics CP runs the compute queues itself (`TLG_CS_ON_GFX`, 1;
+/// gpu/mod.rs `service_compute`): 1 between its packets and while it waits
+/// for a label, 2 only while it waits, 0 their own threads; so their work and
+/// the graphics CP's take no turns on the renderer lock across threads. A
+/// compute queue's own thread steps in when the graphics CP has not looked
+/// for `cs_defer_us` (blocked in a GPU wait) and while it is idle. Rotated
+/// in one boot each, uncapped, 1 vs 0: First Antenna +7.6%, Second Flight
+/// +4.8%, the Trico battle +1.7% (2: +1.6%).
+pub const CS_ON_GFX: usize = 147;
+/// How long (us) a compute queue's thread leaves its work to the graphics CP
+/// (`cs_on_gfx`; `TLG_CS_DEFER_US`, 300).
+pub const CS_DEFER_US: usize = 148;
+/// Command buffers are snapshotted at the title's submission and executed
+/// from the snapshot (1), or read live (`TLG_PM4_CAPTURE`, 0; gpu/mod.rs
+/// `pm4_capture`). The snapshot ran on the title's thread between its
+/// submission and the graphics CP taking it up (~2.3 MB, ~0.65 ms a frame in
+/// the Trico battle). TLG_PM4_CHECK runs found TLG never changing a
+/// submitted buffer before its execution; by its end only labels inside
+/// them differ (0 -> 1: the command processor's own writes into data areas,
+/// which it never reads as commands). Live, the graphics CP takes up the
+/// next frame 0.34 ms after the previous one instead of 1.05: the battle
+/// +2.4%, First Antenna +8.2% (in-boot A/Bs, uncapped).
+pub const PM4_CAPTURE: usize = 149;
+/// Diagnostics: logs the next this many bulk write-watch rounds (`ww round:`
+/// lines: each run's start, KiB, pages found and microseconds), then 0 again
+/// (`TLG_WW_ROUND_LOG`, 0).
+pub const WW_ROUND_LOG: usize = 150;
 
-const TABLE: [(&str, &str, i64); 142] = [
+const TABLE: [(&str, &str, i64); 151] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -850,7 +906,7 @@ const TABLE: [(&str, &str, i64); 142] = [
     ("vcache_read_min_kib", "TLG_VCACHE_READ_MIN_KIB", 16),
     ("depth_load_view", "TLG_DEPTH_LOAD_VIEW", 1),
     ("elide_utility", "TLG_ELIDE_UTILITY", 1),
-    ("vcache_write_min_kib", "TLG_VCACHE_WRITE_MIN_KIB", 64),
+    ("vcache_write_min_kib", "TLG_VCACHE_WRITE_MIN_KIB", 16),
     ("vcache_gpu_reads", "TLG_VCACHE_GPU_READS", 0),
     ("lazy_wb", "TLG_LAZY_WB", 1),
     ("cp_wait_notify", "TLG_CP_WAIT_NOTIFY", 1),
@@ -968,6 +1024,15 @@ const TABLE: [(&str, &str, i64); 142] = [
     ("ring_segs", "TLG_RING_SEGS_TUNE", 0),
     ("cpu_copy_max", "TLG_CPU_COPY_MAX", 0),
     ("mouse_direct", "TLG_MOUSE_DIRECT", 1),
+    ("ww_pretend", "TLG_WW_PRETEND", 0),
+    ("dring_segs", "TLG_DRING_SEGS_TUNE", 0),
+    ("fill_log", "TLG_FILL_LOG", 100),
+    ("page_seqs_small", "TLG_PAGE_SEQS_SMALL", 1),
+    ("prefetch_next", "TLG_PREFETCH_NEXT", 1),
+    ("cs_on_gfx", "TLG_CS_ON_GFX", 1),
+    ("cs_defer_us", "TLG_CS_DEFER_US", 300),
+    ("pm4_capture", "TLG_PM4_CAPTURE", 0),
+    ("ww_round_log", "TLG_WW_ROUND_LOG", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

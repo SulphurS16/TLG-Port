@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.5.1 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.6.0 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627). It is
@@ -22,10 +22,9 @@ What you need
 - Windows 10 or 11 (64-bit), and a graphics card and driver with Vulkan 1.3
   (NVIDIA, AMD or Intel) and about 4 GB of video memory.
 - A recent processor with high single-core speed. Tested on a Ryzen 9 5900X
-  with an RTX 4090: 30 fps everywhere but about 8 seconds of the ending's
-  busiest scene (26-27 fps), and 47-60 fps with the 60 fps limit depending
-  on the area (the final battle about 38); about 25-30 fps on a 6-core
-  laptop CPU from 2019.
+  with an RTX 4090: 30 fps everywhere, and with the 60 fps limit 60 in
+  nearly every area, about 51-57 at the ending's start and 42-45 in the
+  final battle; about 25-30 fps on a 6-core laptop CPU from 2019.
 
 
 Getting started
@@ -85,10 +84,27 @@ Known limits
 - No mouse pointer in the game's menus (keys, wheel and buttons work).
 - The title screen's music plays quieter than it should.
 - Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel
-  graphics have not been tested yet; this release removes the
-  NVIDIA-specific assumptions a review of the port found.
+  graphics have not been tested yet.
+- Now and then the game closes with an error just after an area starts
+  loading (seen with the 60 fps limit and with none). Start it again and
+  choose Continue: the game goes on from its last checkpoint.
 
 
-License: the port is MIT licensed. The license covers the port's own code
-only, not the game. The license and the notices of the third-party
-components in the two programs follow below.
+License
+-------
+Copyright (C) 2026 SulphurS16 and The Last Guardian unofficial PC port
+contributors.
+
+The port is free software: you can redistribute it and/or modify it under
+the terms of the GNU General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option)
+any later version. It is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+Public License, whose full text follows at the end of this file, for more
+details.
+
+The source code of this release is at
+https://github.com/SulphurS16/TLG-Port (the tag of this version). The
+license covers the port's own code only, not the game. The notices of the
+third-party components in the two programs follow below.

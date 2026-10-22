@@ -171,6 +171,37 @@ fn single_instance() -> bool {
     !h.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
 }
 
+/// The game's code runs on this CPU as it is, with instructions of the PS4's
+/// CPU (tlgdis `--isa` over the 01.03 eboot: AVX ~714,000, BMI1 1,501, LZCNT
+/// 78, POPCNT 19, MOVBE 17; SSE4a is emulated, sse4a.rs). Missing ones are
+/// named for the player before the game starts; it goes on (code that uses
+/// them may never run), but most likely stops with an error later.
+fn cpu_check() {
+    // (MOVBE: CPUID leaf 1, ECX bit 22.)
+    let movbe = unsafe { core::arch::x86_64::__cpuid(1) }.ecx >> 22 & 1 != 0;
+    let need = [
+        ("AVX", std::arch::is_x86_feature_detected!("avx")),
+        ("BMI1", std::arch::is_x86_feature_detected!("bmi1")),
+        ("LZCNT", std::arch::is_x86_feature_detected!("lzcnt")),
+        ("POPCNT", std::arch::is_x86_feature_detected!("popcnt")),
+        ("MOVBE", movbe),
+    ];
+    // (Test hook: `TLG_CPU_PRETEND_MISSING=<name>` takes that one as missing.)
+    let pretend = std::env::var("TLG_CPU_PRETEND_MISSING").unwrap_or_default();
+    let missing: Vec<&str> = need.iter().filter(|(n, ok)| !ok || pretend.eq_ignore_ascii_case(n)).map(|(n, _)| *n).collect();
+    if missing.is_empty() {
+        info!("CPU: the instructions the game's code uses are all there (AVX, BMI1, LZCNT, POPCNT, MOVBE)");
+        return;
+    }
+    config::user_error(
+        "The Last Guardian (tlg)",
+        &format!(
+            "This processor lacks instructions the game's own code uses: {}.\n\nThe game will most likely stop with an error or misbehave. Processors from Intel's Haswell generation (2013) or AMD's Zen (2017) on have them.",
+            missing.join(", ")
+        ),
+    );
+}
+
 /// Per-monitor DPI awareness (v2): the window's pixels are the screen's,
 /// not scaled by Windows.
 fn dpi_aware() {
@@ -418,11 +449,13 @@ fn poll_control(path: &Path, offset: &mut u64) {
             "skipps" => {
                 // skipps <ps,...>: skip draws with these pixel shaders ("skipps -" clears).
                 *gpu::render::SKIP_PS.lock() = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
+                gpu::render::SKIP_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             "skipcs" => {
                 // skipcs <cs,...>: skip dispatches of these compute shaders ("skipcs -" clears).
                 *gpu::render::SKIP_CS.lock() = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
+                gpu::render::SKIP_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             "tracefull" => {
@@ -481,6 +514,8 @@ fn thread_summary() -> String {
 pub fn fatal_exit(code: u32, reason: &str) -> ! {
     crate::log::write(crate::log::Level::Error, format_args!("terminating: {reason}\n{}", thread_summary()));
     crate::log::try_flush();
+    // (A save-data write in progress on another thread finishes first.)
+    hle::libs::savedata::wait_writes(Duration::from_millis(1500));
     // (A display mode switched for exclusive fullscreen goes back.)
     gpu::vk::window::restore_display();
     unsafe {
@@ -497,6 +532,21 @@ fn startup_failure(title: &str, text: &str, code: u32) -> ! {
     fatal_exit(code, title);
 }
 
+/// PGO training builds (`--cfg tlg_pgo_gen` with `-Cprofile-generate`,
+/// tools/pgo.ps1): the process ends with TerminateProcess, which skips the
+/// profiler runtime's exit handler, so the counters are written here.
+#[cfg(tlg_pgo_gen)]
+fn write_pgo_profile() {
+    unsafe extern "C" {
+        fn __llvm_profile_write_file() -> i32;
+    }
+    let r = unsafe { __llvm_profile_write_file() };
+    info!("PGO profile written (status {r})");
+}
+
+#[cfg(not(tlg_pgo_gen))]
+fn write_pgo_profile() {}
+
 pub fn shutdown(code: i32) -> ! {
     // A save being written finishes first.
     hle::libs::savedata::wait_writes(Duration::from_secs(3));
@@ -511,6 +561,7 @@ pub fn shutdown(code: i32) -> ! {
         }
     }
     pacing::finish();
+    write_pgo_profile();
     info!("shutdown with status {code}\n{}", thread_summary());
     crate::log::flush();
     unsafe {
@@ -614,6 +665,7 @@ fn main() {
             s.display_mode, s.monitor, s.window_width, s.window_height, s.resolution, s.refresh_rate, s.vsync, s.scaling, s.filter, s.frame_cap, s.new_shaders, s.gpu, s.volume
         );
     }
+    cpu_check();
     exception::install();
     gpu::shader_dump::DIR.set(run_dir.join("shaders")).ok();
     if std::env::var_os("TLG_TEST_FAULT").is_some() {

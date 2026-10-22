@@ -1,5 +1,11 @@
 # Third-party components
 
+The port's own code is licensed under the GNU General Public License, version 3 or (at
+your option) any later version ([LICENSE](LICENSE); releases up to 0.5.1 were MIT
+licensed). The components below keep their own licenses, all of which allow their use in
+a program under the GPL version 3 (MIT, Apache-2.0, ISC, BSD, Zlib, 0BSD; Unicode-3.0 only
+in a crate used while building).
+
 ## Rust crates (fetched by Cargo, not included; versions pinned in `Cargo.lock`)
 
 | Crate | Use | License |
@@ -64,7 +70,7 @@ crates and components above, LLVM's libunwind and compiler-rt builtins (Apache-2
 LLVM-exception) and the mingw-w64 runtime startup code. Their notices are in
 `THIRD_PARTY_NOTICES.txt` (the crates, LibAtrac9, vgmstream, LLVM, the mingw-w64 runtime and
 the Rust standard library; made by `tools/notices.py`), and the player package's `README.txt`
-carries them after the player instructions and this project's license.
+carries them after the player instructions, followed by the text of the GPL.
 
 ## Used from Windows at run time (not redistributed)
 

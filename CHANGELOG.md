@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.6.0
+
+- License: the port is now free software under the GNU General Public
+  License, version 3 or (at your option) any later version. Releases up to
+  0.5.1 were MIT licensed. Third-party components keep their own licenses.
+- Faster in busy areas: the port's graphics thread now runs the game's
+  compute work itself instead of handing it over to other threads, reads the
+  game's command buffers in place instead of copying them first, and keeps
+  mid-sized data the game's shaders write in video memory. tlg.exe is also
+  built with profile-guided optimization. On a Ryzen 9 5900X with an RTX
+  4090, with the 60 fps limit, every area but the ending's start (51-57)
+  and the final battle (42-45; was about 38) now runs at 60 (in 0.5.1 many
+  ran at 47-59), and the 30 fps default now holds through the ending's
+  busiest scene too.
+- A message at start-up when the processor lacks instructions the game's own
+  code needs (AVX, BMI1, LZCNT, POPCNT, MOVBE: processors from about 2013 on
+  have them).
+- The 30 fps default is unchanged.
+
 ## 0.5.1
 
 - Faster in the game's heaviest moments: the battle against the armoured

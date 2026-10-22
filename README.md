@@ -26,7 +26,7 @@ Nothing from the game is in this repository.
 ### What you need
 
 - Windows 10 or 11, 64-bit, and a graphics card with a Vulkan 1.3 driver (NVIDIA, AMD or Intel) and about 4 GB of video memory.
-- A recent processor with high single-core speed. Tested on a Ryzen 9 5900X with an RTX 4090: 30 fps everywhere but about 8 seconds of the ending's busiest scene (26-27 fps), and 47-60 fps with the 60 fps limit depending on the area (the final battle about 38); about 25-30 fps on a 6-core laptop CPU from 2019.
+- A recent processor with high single-core speed. Tested on a Ryzen 9 5900X with an RTX 4090: 30 fps everywhere, and with the 60 fps limit 60 in nearly every area, about 51-57 at the ending's start and 42-45 in the final battle; about 25-30 fps on a 6-core laptop CPU from 2019.
 - Your own copy of The Last Guardian for PS4 (US release, CUSA03627) at version 01.00 with update 01.03, as decrypted folders. The game folder holds 'eboot.bin', 'sce_module', 'sce_sys' and the 'trico_*.psarc' archives; the update folder holds the same for 01.03, or the update is merged into the game folder.
 - About 25 GB of disk space for those files.
 
@@ -84,7 +84,8 @@ In menus the left mouse button selects, the right one goes back and the wheel mo
 - Uncapped is not recommended: at 116-119, 156-179 and 237-359 fps the game runs slower than real time.
 - No mouse pointer in the game's menus.
 - The title screen's music plays quieter than it should.
-- Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel graphics have not been tested yet; this release removes the NVIDIA-specific assumptions a review of the port found.
+- Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel graphics have not been tested yet.
+- Now and then the game closes with an error just after an area starts loading (seen with the 60 fps limit and with none). Start it again and choose Continue: the game goes on from its last checkpoint.
 
 ## Building
 
@@ -92,7 +93,11 @@ Run `tools\bootstrap.ps1` once. It downloads the pinned Rust and llvm-mingw tool
 
 ## License
 
-The port's source code is MIT licensed: see [LICENSE](LICENSE). The license covers this project's code only. It grants nothing for The Last Guardian or any other game data, keys or system software, which you must supply yourself. Third-party components keep their own licenses: see [THIRD_PARTY.md](THIRD_PARTY.md) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+Copyright (C) 2026 SulphurS16 and The Last Guardian unofficial PC port contributors.
+
+The port is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version (SPDX: GPL-3.0-or-later). It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text. Releases up to 0.5.1 were MIT licensed.
+
+The license covers this project's code only. It grants nothing for The Last Guardian or any other game data, keys or system software, which you must supply yourself. Third-party components keep their own licenses, all compatible with the GPL version 3: see [THIRD_PARTY.md](THIRD_PARTY.md) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 
 ## Community
 
