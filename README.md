@@ -50,7 +50,7 @@ Unzip the new release over the old one or into a new folder, and start its 'tlg-
 
 ## Uninstall
 
-Delete the folder. Settings and saves are in '%APPDATA%\TLG', logs and caches in '%LOCALAPPDATA%\TLG'.
+Delete the folder. Settings and saves are in '%APPDATA%\TLG', logs and caches in '%LOCALAPPDATA%\TLG'. If you moved your game folders into the port's folder (**Move here** on **Game files**), move them out first, or they are deleted with it.
 
 ## Controls
 
