@@ -26,6 +26,8 @@ pub struct Page {
     game_dir: usize,
     update_dir: usize,
     language: usize,
+    /// The languages the combo lists, in its order.
+    languages: Vec<Language>,
     move_here: usize,
     /// Whether the folders in the settings passed the check.
     pub ok: bool,
@@ -74,9 +76,8 @@ pub fn build(app: &mut App) {
         app.put(0, b.label("Language:", r, -1), r, false);
         let r = (140, 440, 260, 200);
         app.game.language = app.put(0, b.combo(r, ID_LANGUAGE), r, false) as usize;
-        let names: Vec<String> = Language::ALL.iter().map(|l| l.label().to_string()).collect();
-        ui::combo_fill(h(app.game.language), &names, Language::ALL.iter().position(|&l| l == app.settings.language).unwrap_or(0));
     }
+    fill_languages(app, g.as_deref());
     match g {
         Some(g) => check(app, &g, u.as_deref(), false),
         None => {
@@ -86,10 +87,30 @@ pub fn build(app: &mut App) {
     }
 }
 
+/// Fills the language combo: the languages the game folder holds, each
+/// under the name of the variant it has there (English (UK) in European
+/// releases); without one, the US release's four. A setting the folder
+/// lacks stays listed (the game falls back to one it holds).
+fn fill_languages(app: &mut App, game: Option<&Path>) {
+    let mut list: Vec<(Language, String)> = game.map(files::languages).unwrap_or_default().into_iter().map(|(l, c)| (l, tlg_config::settings::variant_label(c).to_string())).collect();
+    if list.is_empty() {
+        list = Language::ALL[..4].iter().map(|&l| (l, l.label().to_string())).collect();
+    }
+    let cur = app.settings.language;
+    if !list.iter().any(|(l, _)| *l == cur) {
+        list.push((cur, format!("{} (not in these game files)", cur.label())));
+    }
+    let names: Vec<String> = list.iter().map(|(_, n)| n.clone()).collect();
+    let sel = list.iter().position(|(l, _)| *l == cur).unwrap_or(0);
+    app.game.languages = list.into_iter().map(|(l, _)| l).collect();
+    unsafe { ui::combo_fill(h(app.game.language), &names, sel) };
+}
+
 /// Checks the folders; once they pass (and `keep`), the settings take them.
 fn check(app: &mut App, game: &Path, update: Option<&Path>, keep: bool) {
     let r = files::check_pair(game, update);
     app.game.ok = r.is_ok();
+    fill_languages(app, Some(game));
     let text = match &r {
         Ok(s) => s.clone(),
         Err(e) => e.clone(),
@@ -187,7 +208,7 @@ pub fn command(app: &mut App, id: i32, code: u32) {
         // (CBN_SELCHANGE)
         (ID_LANGUAGE, 1) => {
             let i = unsafe { ui::combo_sel(h(app.game.language)) };
-            app.settings.language = Language::ALL.get(i).copied().unwrap_or(Language::English);
+            app.settings.language = app.game.languages.get(i).copied().unwrap_or(Language::English);
             app.save_settings();
             app.set_status("Saved; applies the next time the game starts.");
         }

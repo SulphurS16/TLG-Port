@@ -1,6 +1,6 @@
 # The Last Guardian: unofficial PC port
 
-An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627) for Windows. It is not rebuilt from the game's source code: it runs the game's own PS4 program, from your copy of the game's files, on a compatibility layer made for this game. The program's x86-64 code runs directly on your processor, without CPU emulation; the PS4 system libraries it calls are reimplemented for Windows (high-level emulation), and its graphics commands and shaders are translated to Vulkan. This project contains no game data, no game code and no keys, and it decrypts nothing.
+An unofficial PC port of The Last Guardian (PS4: the US release CUSA03627 or the European release CUSA03745) for Windows. It is not rebuilt from the game's source code: it runs the game's own PS4 program, from your copy of the game's files, on a compatibility layer made for this game. The program's x86-64 code runs directly on your processor, without CPU emulation; the PS4 system libraries it calls are reimplemented for Windows (high-level emulation), and its graphics commands and shaders are translated to Vulkan. This project contains no game data, no game code and no keys, and it decrypts nothing.
 
 <img width="2560" height="1440" alt="tlg_MUydREqKdH" src="https://github.com/user-attachments/assets/0e0e1ae6-dcae-4b30-b10f-71010a3cc114" />
 
@@ -12,7 +12,7 @@ Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, ge
 - No CPU emulation: the game's own x86-64 code runs directly on your processor.
 - Windowed, borderless or fullscreen, with a render resolution from 1280x720 to 3840x2160.
 - 30 fps (the game's own limit), 60 fps or uncapped, at the game's normal speed: its timers count time, not frames.
-- English, Spanish, French or Portuguese, the languages of the game's US release.
+- The languages your copy of the game carries: the US release's English, Spanish, French and Portuguese, or a European release's.
 - Mouse camera with raw input; every keyboard and mouse control can be changed.
 - DUALSHOCK 4, DualSense and Xbox controllers.
 
@@ -30,7 +30,7 @@ Nothing from the game is in this repository.
 
 - Windows 10 or 11, 64-bit, and a graphics card with a Vulkan 1.3 driver (NVIDIA, AMD or Intel) and about 4 GB of video memory.
 - A recent processor with high single-core speed. Tested on a Ryzen 9 5900X with an RTX 4090: 30 fps everywhere, and with the 60 fps limit 60 in nearly every area, about 51-57 at the ending's start and 42-45 in the final battle; about 25-30 fps on a 6-core laptop CPU from 2019.
-- Your own copy of The Last Guardian for PS4 (US release, CUSA03627) at version 01.00 with update 01.03, as decrypted folders. The game folder holds 'eboot.bin', 'sce_module', 'sce_sys' and the 'trico_*.psarc' archives; the update folder holds the same for 01.03, or the update is merged into the game folder.
+- Your own copy of The Last Guardian for PS4 (US release CUSA03627 or European release CUSA03745) at version 01.00 with update 01.03, as decrypted folders. The game folder holds 'eboot.bin', 'sce_module', 'sce_sys' and the 'trico_*.psarc' archives; the update folder holds the same for 01.03, or the update is merged into the game folder.
 - About 25 GB of disk space for those files.
 
 ### Steps
@@ -91,6 +91,7 @@ In menus the left mouse button selects, the right one goes back and the wheel mo
 - No mouse pointer in the game's menus.
 - The title screen's music plays quieter than it should.
 - Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel graphics have not been tested yet.
+- The European release is tested with an English-only copy. Its other languages are offered when your game files carry them, but have not been tested. Japanese and the other Asian languages are in the game's program but need a copy that carries them.
 - Now and then the game closes with an error just after an area starts loading (seen with the 60 fps limit and with none). Start it again and choose Continue: the game goes on from its last checkpoint.
 
 ## Building

@@ -880,8 +880,12 @@ pub const PM4_CAPTURE: usize = 149;
 /// lines: each run's start, KiB, pages found and microseconds), then 0 again
 /// (`TLG_WW_ROUND_LOG`, 0).
 pub const WW_ROUND_LOG: usize = 150;
+/// Linear images up to this many KiB that shaders store to are written back
+/// to guest memory after the command, for the title's CPU reads
+/// (`TLG_READBACK_KIB`, 256; 0 = never: render.rs `note_readback`).
+pub const READBACK_KIB: usize = 151;
 
-const TABLE: [(&str, &str, i64); 151] = [
+const TABLE: [(&str, &str, i64); 152] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -1033,6 +1037,7 @@ const TABLE: [(&str, &str, i64); 151] = [
     ("cs_defer_us", "TLG_CS_DEFER_US", 300),
     ("pm4_capture", "TLG_PM4_CAPTURE", 0),
     ("ww_round_log", "TLG_WW_ROUND_LOG", 0),
+    ("readback_kib", "TLG_READBACK_KIB", 256),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

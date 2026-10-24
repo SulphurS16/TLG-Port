@@ -42,6 +42,14 @@ struct Presenter {
     frame: usize,
     /// Frames not shown because the window was not taking images.
     skipped: u64,
+    /// Swapchains replaced (with their present semaphores) and the frame
+    /// count then: destroyed once every slot's blit since has finished
+    /// (`release_retired`). Waiting for the device instead
+    /// (vkDeviceWaitIdle) on the presenting thread, while the renderer
+    /// threads keep submitting to the game's queue, hung windowed boots now
+    /// and then: no GPU work completed again (the threads' stacks showed this
+    /// one in vkDeviceWaitIdle, the rest waiting for fences).
+    retired: Vec<(usize, vk::SwapchainKHR, Vec<vk::Semaphore>)>,
 }
 
 unsafe impl Send for Presenter {}
@@ -96,11 +104,8 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .old_swapchain(old);
         let sc = c.swapchain_d.create_swapchain(&sci, None).map_err(|e| format!("create swapchain: {e}"))?;
         if old != vk::SwapchainKHR::null() {
-            c.device.device_wait_idle().ok();
-            c.swapchain_d.destroy_swapchain(old, None);
-            for s in p.done.drain(..) {
-                c.device.destroy_semaphore(s, None);
-            }
+            let done = std::mem::take(&mut p.done);
+            p.retired.push((p.frame, old, done));
         }
         p.swapchain = sc;
         p.images = c.swapchain_d.get_swapchain_images(sc).map_err(|e| format!("swapchain images: {e}"))?;
@@ -186,6 +191,7 @@ pub fn init(title: &str) -> Result<(), String> {
             done: Vec::new(),
             frame: 0,
             skipped: 0,
+            retired: Vec::new(),
         };
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
@@ -264,6 +270,7 @@ pub fn present(src: Source) -> bool {
                 return false;
             }
         }
+        release_retired(p);
         let k = p.frame % FRAMES;
         // The slot's previous frame not yet presented: the window is not
         // taking images (minimized, hidden, a throttled compositor). This
@@ -380,6 +387,31 @@ pub fn present(src: Source) -> bool {
         }
     }
     true
+}
+
+/// Destroys the replaced swapchains whose images no blit uses any more:
+/// every slot has been used since the replacement (`FRAMES` presents) and
+/// its blit has finished (the present queue runs in order, so the earlier
+/// blits and presents into the old swapchain are done too). Never waits.
+unsafe fn release_retired(p: &mut Presenter) {
+    if p.retired.is_empty() {
+        return;
+    }
+    let c = ctx();
+    let idle = p.slots.iter().all(|s| unsafe { c.device.get_fence_status(s.fence) } == Ok(true));
+    let frame = p.frame;
+    p.retired.retain(|(at, sc, sems)| {
+        if !idle || frame < at + FRAMES {
+            return true;
+        }
+        unsafe {
+            c.swapchain_d.destroy_swapchain(*sc, None);
+            for &s in sems {
+                c.device.destroy_semaphore(s, None);
+            }
+        }
+        false
+    });
 }
 
 /// Logs the first frames left out and then every 300th.

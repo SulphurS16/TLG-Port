@@ -4,11 +4,41 @@
 
 use std::path::Path;
 
-/// The supported release: The Last Guardian, US (CUSA03627), version 01.00
-/// with update 01.03.
+/// The supported releases: The Last Guardian US (CUSA03627) and EU
+/// (CUSA03745), version 01.00 with update 01.03 (one 01.03 program in both).
 pub const TITLE_ID: &str = "CUSA03627";
+pub const TITLE_ID_EU: &str = "CUSA03745";
 pub const BASE_VERSION: &str = "01.00";
 pub const UPDATE_VERSION: &str = "01.03";
+
+/// The size of update 01.03's eboot.bin (the same in both releases): a
+/// folder whose param.sfo still says 01.00 (repacks) holds the update merged
+/// in when its eboot is this one and the update's archives are there.
+const EBOOT_0103: u64 = 93_028_655;
+
+/// A release.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Region {
+    Us,
+    Eu,
+}
+
+impl Region {
+    fn of(title: &str) -> Option<Region> {
+        match title {
+            TITLE_ID => Some(Region::Us),
+            TITLE_ID_EU => Some(Region::Eu),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Region::Us => "US",
+            Region::Eu => "EU",
+        }
+    }
+}
 
 const MODULES: [&str; 3] = ["eboot.bin", "sce_module/libc.prx", "sce_module/libSceFios2.prx"];
 
@@ -23,6 +53,11 @@ const BASE_ARCHIVES: [(&str, u64); 8] = [
     ("trico_frc.psarc", 288_351_232),
     ("trico_ptb.psarc", 288_843_008),
 ];
+
+/// The EU release's shared archives, base and update (by name: European
+/// packages differ in the languages they carry, and so in their sizes).
+const EU_BASE_ARCHIVES: [&str; 4] = ["trico_001.psarc", "trico_002.psarc", "trico_003.psarc", "trico_boot.psarc"];
+const EU_UPDATE_ARCHIVES: [&str; 4] = ["trico_001p.psarc", "trico_002p.psarc", "trico_003p.psarc", "trico_bootp.psarc"];
 
 /// The update's archives and their sizes.
 const UPDATE_ARCHIVES: [(&str, u64); 8] = [
@@ -54,6 +89,8 @@ pub enum Contents {
 #[derive(Clone, Debug)]
 pub struct Report {
     pub contents: Contents,
+    /// The release (None: not one the port knows).
+    pub region: Option<Region>,
     /// Problems found (empty: usable for its contents).
     pub problems: Vec<String>,
 }
@@ -97,7 +134,7 @@ fn executable(p: &Path) -> std::io::Result<bool> {
 
 /// Checks a folder: its title and version, then every file the game needs.
 pub fn check(dir: &Path) -> Report {
-    let mut r = Report { contents: Contents::Empty, problems: Vec::new() };
+    let mut r = Report { contents: Contents::Empty, region: None, problems: Vec::new() };
     let sfo = match std::fs::read(dir.join("sce_sys").join("param.sfo")) {
         Ok(b) => b,
         Err(_) if !dir.join("eboot.bin").exists() => return r,
@@ -114,22 +151,33 @@ pub fn check(dir: &Path) -> Report {
     };
     let get = |k: &str| values.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str()).unwrap_or("");
     let (title, version, category) = (get("TITLE_ID"), get("APP_VER"), get("CATEGORY"));
-    r.contents = match (title, version, category) {
-        (TITLE_ID, BASE_VERSION, "gd") => Contents::Base,
-        (TITLE_ID, UPDATE_VERSION, "gp") if dir.join(BASE_ARCHIVES[0].0).exists() => Contents::Merged,
-        (TITLE_ID, UPDATE_VERSION, "gp") => Contents::Update,
-        (TITLE_ID, v, _) => Contents::Other(format!("version {v}")),
-        (t, v, _) => Contents::Other(format!("{t} {v}")),
+    r.region = Region::of(title);
+    let merged_in = || std::fs::metadata(dir.join("eboot.bin")).is_ok_and(|m| m.len() == EBOOT_0103) && dir.join("trico_bootp.psarc").exists();
+    r.contents = match (r.region, version, category) {
+        (Some(_), BASE_VERSION, "gd") if merged_in() => Contents::Merged,
+        (Some(_), BASE_VERSION, "gd") => Contents::Base,
+        (Some(_), UPDATE_VERSION, "gp") if dir.join("trico_boot.psarc").exists() => Contents::Merged,
+        (Some(_), UPDATE_VERSION, "gp") => Contents::Update,
+        (Some(_), v, _) => Contents::Other(format!("version {v}")),
+        (None, v, _) => Contents::Other(format!("{title} {v}")),
     };
-    let archives: Vec<(&str, u64)> = match r.contents {
-        Contents::Base => BASE_ARCHIVES.to_vec(),
-        Contents::Update => UPDATE_ARCHIVES.to_vec(),
-        Contents::Merged => BASE_ARCHIVES.iter().chain(UPDATE_ARCHIVES.iter()).copied().collect(),
-        _ => {
-            r.problems.push(format!("not The Last Guardian {BASE_VERSION} or update {UPDATE_VERSION} ({TITLE_ID})"));
-            return r;
+    let (base, update) = (matches!(r.contents, Contents::Base | Contents::Merged), matches!(r.contents, Contents::Update | Contents::Merged));
+    if !base && !update {
+        r.problems.push(format!("not The Last Guardian {BASE_VERSION} or update {UPDATE_VERSION} (US {TITLE_ID} or EU {TITLE_ID_EU})"));
+        return r;
+    }
+    // (US: every archive at its size. EU: the shared ones by name, and one
+    // language at least - `trico_<code>.psarc`, its `p` one in the update.)
+    let archives: Vec<(&str, u64)> = match r.region {
+        Some(Region::Us) => BASE_ARCHIVES.iter().filter(|_| base).chain(UPDATE_ARCHIVES.iter().filter(|_| update)).copied().collect(),
+        _ => EU_BASE_ARCHIVES.iter().filter(|_| base).chain(EU_UPDATE_ARCHIVES.iter().filter(|_| update)).map(|&n| (n, 0)).collect(),
+    };
+    if r.region == Some(Region::Eu) {
+        let suffix = if base { "" } else { "p" };
+        if tlg_config::settings::Language::available(|c| dir.join(format!("trico_{c}{suffix}.psarc")).exists()).is_empty() {
+            r.problems.push(format!("no language archive (trico_<language>{suffix}.psarc, e.g. trico_ene{suffix}.psarc)"));
         }
-    };
+    }
     for m in MODULES {
         let p = dir.join(m);
         match executable(&p) {
@@ -140,12 +188,19 @@ pub fn check(dir: &Path) -> Report {
     }
     for (name, size) in archives {
         match std::fs::metadata(dir.join(name)) {
-            Ok(m) if m.len() == size => {}
+            Ok(m) if m.len() == size || (size == 0 && m.len() > 0) => {}
+            Ok(m) if size == 0 => r.problems.push(format!("{name} is empty ({} bytes)", m.len())),
             Ok(m) => r.problems.push(format!("{name}: {} bytes, expected {size}", m.len())),
             Err(_) => r.problems.push(format!("{name} is missing")),
         }
     }
     r
+}
+
+/// The languages the game folder holds (its language archives), each with
+/// the variant it takes there.
+pub fn languages(game: &Path) -> Vec<(tlg_config::settings::Language, &'static str)> {
+    tlg_config::settings::Language::available(|c| game.join(format!("trico_{c}.psarc")).exists()).into_iter().map(|(l, _, c)| (l, c)).collect()
 }
 
 /// Checks the game folder and the update folder (None: 01.03 merged into
@@ -170,9 +225,14 @@ pub fn check_pair(game: &Path, update: Option<&Path>) -> Result<String, String> 
             Contents::Base | Contents::Merged => problems.push(format!("Update folder: holds the game; choose update {UPDATE_VERSION} here")),
             Contents::Other(_) => {}
         }
+        if let (Some(a), Some(b)) = (g.region, ur.region) {
+            if a != b {
+                problems.push(format!("Update folder: the {} release's update; the game folder holds the {} release", b.name(), a.name()));
+            }
+        }
     }
     if problems.is_empty() {
-        Ok(format!("The Last Guardian {BASE_VERSION} with update {UPDATE_VERSION}"))
+        Ok(format!("The Last Guardian ({}) {BASE_VERSION} with update {UPDATE_VERSION}", g.region.map_or("?", Region::name)))
     } else {
         Err(problems.join("\n"))
     }
@@ -235,6 +295,31 @@ mod tests {
         std::fs::write(tmp.join("sce_sys").join("param.sfo"), sfo(&[("APP_VER", "01.00"), ("CATEGORY", "gd"), ("TITLE_ID", "CUSA00000")])).unwrap();
         assert!(matches!(check(&tmp).contents, Contents::Other(_)));
         assert!(check_pair(&tmp, None).is_err());
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn eu_folders() {
+        let tmp = std::env::temp_dir().join(format!("tlg-launcher-eu-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(tmp.join("sce_sys")).unwrap();
+        // A repack: the base's param.sfo (01.00), the 01.03 program and the
+        // update's archives merged in.
+        std::fs::write(tmp.join("sce_sys").join("param.sfo"), sfo(&[("APP_VER", "01.00"), ("CATEGORY", "gd"), ("TITLE_ID", "CUSA03745")])).unwrap();
+        std::fs::File::create(tmp.join("eboot.bin")).unwrap().set_len(EBOOT_0103).unwrap();
+        for n in EU_BASE_ARCHIVES.iter().chain(EU_UPDATE_ARCHIVES.iter()) {
+            std::fs::write(tmp.join(n), b"x").unwrap();
+        }
+        let r = check(&tmp);
+        assert_eq!((r.contents.clone(), r.region), (Contents::Merged, Some(Region::Eu)));
+        assert!(r.problems.iter().any(|p| p.starts_with("no language archive")), "{:?}", r.problems);
+        std::fs::write(tmp.join("trico_ene.psarc"), b"x").unwrap();
+        let r = check(&tmp);
+        assert!(!r.problems.iter().any(|p| p.starts_with("no language archive") || p.contains("psarc")), "{:?}", r.problems);
+        assert_eq!(languages(&tmp), vec![(tlg_config::settings::Language::English, "ene")]);
+        // Without the update's archives: the base alone.
+        std::fs::remove_file(tmp.join("trico_bootp.psarc")).unwrap();
+        assert_eq!(check(&tmp).contents, Contents::Base);
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }

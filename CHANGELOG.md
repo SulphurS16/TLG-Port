@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.7.0
+
+- Fixed the lighting being far too bright in bright places (GitHub issue
+  #3): skies and sunlit areas washed out to white - the first outdoor
+  areas, the mirror chamber, the Falling Bridge courtyard, the Large Tower,
+  the Column Corridor, the condor's arena and more. The game measures how
+  bright each frame is on the graphics card and reads that back to set its
+  exposure (its eye adaptation) and bloom; the port never handed the
+  measurement back, so the game always saw a black frame and turned both up
+  to the maximum. Exposure now follows the scene as on the PS4: bright
+  places are no longer washed out, and some dark places come out brighter.
+- The European release (CUSA03745) works too: the game's program is the
+  same in every region. The launcher recognizes its folders, also one with
+  the update already merged in.
+- Languages: the launcher lists the languages your game files carry - the
+  US release's English, Spanish, French and Portuguese, or a European
+  release's. The game's program also has Japanese, Korean, Chinese and more,
+  for copies that carry them.
+- Fixed a rare hang when the game starts in a window: now and then it
+  stopped before the title screen.
+
 ## 0.6.1
 
 - Fixed colors and effects that were drawn wrong or not at all: Trico's

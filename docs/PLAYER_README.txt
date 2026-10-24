@@ -1,12 +1,13 @@
-The Last Guardian - unofficial PC port 0.6.1 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.7.0 for Windows (64-bit)
 ==================================================================
 
-An unofficial PC port of The Last Guardian (PS4, USA, CUSA03627). It is
-not rebuilt from the game's source code: it runs the game's own PS4 program
-from your copy of the game's files. The program's x86-64 code runs directly
-on your processor (no CPU emulation); the PS4 system libraries it calls are
-reimplemented for Windows, and its graphics commands and shaders are
-translated to Vulkan. Nothing of the game is included.
+An unofficial PC port of The Last Guardian (PS4: US release CUSA03627 or
+European release CUSA03745). It is not rebuilt from the game's source code:
+it runs the game's own PS4 program from your copy of the game's files. The
+program's x86-64 code runs directly on your processor (no CPU emulation);
+the PS4 system libraries it calls are reimplemented for Windows, and its
+graphics commands and shaders are translated to Vulkan. Nothing of the game
+is included.
 
 Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment,
 genDESIGN or any other rights holder.
@@ -14,11 +15,11 @@ genDESIGN or any other rights holder.
 
 What you need
 -------------
-- Your own copy of The Last Guardian for PS4, US release (CUSA03627): the
-  game (version 01.00) and update 01.03, as decrypted folders. The game
-  folder holds eboot.bin, sce_module, sce_sys and the trico_*.psarc files;
-  the update folder holds the same for 01.03 (or the update is merged into
-  the game folder).
+- Your own copy of The Last Guardian for PS4, US release (CUSA03627) or
+  European release (CUSA03745): the game (version 01.00) and update 01.03,
+  as decrypted folders. The game folder holds eboot.bin, sce_module,
+  sce_sys and the trico_*.psarc files; the update folder holds the same for
+  01.03 (or the update is merged into the game folder).
 - Windows 10 or 11 (64-bit), and a graphics card and driver with Vulkan 1.3
   (NVIDIA, AMD or Intel) and about 4 GB of video memory.
 - A recent processor with high single-core speed. Tested on a Ryzen 9 5900X
@@ -83,9 +84,10 @@ Settings, saves and logs
   session's log folder.
 - Portable use: an empty file named portable.txt next to tlg.exe keeps
   everything in a "user" folder beside it.
-- Language: the launcher's Game files page - English, Spanish (Latin
-  America), French (Canada) or Portuguese (Brazil), the languages of the
-  game's US release.
+- Language: the launcher's Game files page lists the languages your game
+  files carry: in the US release English, Spanish (Latin America), French
+  (Canada) and Portuguese (Brazil); in a European release its languages
+  (English (UK), ...).
 
 
 Known limits
@@ -99,6 +101,10 @@ Known limits
 - The title screen's music plays quieter than it should.
 - Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel
   graphics have not been tested yet.
+- The European release is tested with an English-only copy. Its other
+  languages are offered when your game files carry them, but have not been
+  tested. Japanese and the other Asian languages are in the game's program
+  but need a copy that carries them.
 - Now and then the game closes with an error just after an area starts
   loading (seen with the 60 fps limit and with none). Start it again and
   choose Continue: the game goes on from its last checkpoint.

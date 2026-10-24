@@ -51,21 +51,58 @@ pub enum FrameCap {
     Off,
 }
 
-/// The game's language: those of its US release (the system language the
-/// game is told; it loads that language's menus, subtitles and voices).
+/// The game's language: the system language the game is told. It loads that
+/// language's archive (`trico_<code>.psarc`: menus, subtitles, voices); the
+/// 01.03 program, the same in every region, names one for each system
+/// language, but a release carries only some (the US one English (US),
+/// Latin American Spanish, Canadian French and Brazilian Portuguese).
+/// English, Spanish, French and Portuguese take whichever variant the game
+/// files hold (`variant`); the others only exist where their archive does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Language {
     English,
-    /// Latin American Spanish.
     Spanish,
-    /// Canadian French.
     French,
-    /// Brazilian Portuguese.
     Portuguese,
+    German,
+    Italian,
+    Dutch,
+    Russian,
+    Polish,
+    Finnish,
+    Swedish,
+    Danish,
+    Norwegian,
+    Turkish,
+    Arabic,
+    Japanese,
+    Korean,
+    ChineseTraditional,
+    ChineseSimplified,
 }
 
 impl Language {
-    pub const ALL: [Language; 4] = [Language::English, Language::Spanish, Language::French, Language::Portuguese];
+    pub const ALL: [Language; 19] = [
+        Language::English,
+        Language::Spanish,
+        Language::French,
+        Language::Portuguese,
+        Language::German,
+        Language::Italian,
+        Language::Dutch,
+        Language::Russian,
+        Language::Polish,
+        Language::Finnish,
+        Language::Swedish,
+        Language::Danish,
+        Language::Norwegian,
+        Language::Turkish,
+        Language::Arabic,
+        Language::Japanese,
+        Language::Korean,
+        Language::ChineseTraditional,
+        Language::ChineseSimplified,
+    ];
 
     /// The settings.txt value.
     pub fn key(self) -> &'static str {
@@ -74,28 +111,100 @@ impl Language {
             Language::Spanish => "spanish",
             Language::French => "french",
             Language::Portuguese => "portuguese",
+            Language::German => "german",
+            Language::Italian => "italian",
+            Language::Dutch => "dutch",
+            Language::Russian => "russian",
+            Language::Polish => "polish",
+            Language::Finnish => "finnish",
+            Language::Swedish => "swedish",
+            Language::Danish => "danish",
+            Language::Norwegian => "norwegian",
+            Language::Turkish => "turkish",
+            Language::Arabic => "arabic",
+            Language::Japanese => "japanese",
+            Language::Korean => "korean",
+            Language::ChineseTraditional => "chinese-traditional",
+            Language::ChineseSimplified => "chinese-simplified",
         }
     }
 
-    /// The name shown to players, in that language.
+    /// The game's variants of the language, preferred first: the console's
+    /// system-language code and the code of its archive (the 01.03
+    /// program's table, indexed by system-language code).
+    pub fn variants(self) -> &'static [(i32, &'static str)] {
+        match self {
+            Language::English => &[(1, "enu"), (18, "ene")],
+            Language::Spanish => &[(20, "esl"), (3, "ess")],
+            Language::French => &[(22, "frc"), (2, "frf")],
+            Language::Portuguese => &[(17, "ptb"), (7, "ptp")],
+            Language::German => &[(4, "ger")],
+            Language::Italian => &[(5, "ita")],
+            Language::Dutch => &[(6, "dut")],
+            Language::Russian => &[(8, "rus")],
+            Language::Polish => &[(16, "pol")],
+            Language::Finnish => &[(12, "fin")],
+            Language::Swedish => &[(13, "swe")],
+            Language::Danish => &[(14, "dan")],
+            Language::Norwegian => &[(15, "nor")],
+            Language::Turkish => &[(19, "tur")],
+            Language::Arabic => &[(21, "ara")],
+            Language::Japanese => &[(0, "jpn")],
+            Language::Korean => &[(9, "kor")],
+            Language::ChineseTraditional => &[(10, "zht")],
+            Language::ChineseSimplified => &[(11, "zhc")],
+        }
+    }
+
+    /// The variant the game files hold (`has`: whether they hold an
+    /// archive code's `trico_<code>.psarc`), the preferred one first.
+    pub fn variant(self, has: impl Fn(&str) -> bool) -> Option<(i32, &'static str)> {
+        self.variants().iter().copied().find(|&(_, code)| has(code))
+    }
+
+    /// The languages the game files hold, each with its variant.
+    pub fn available(has: impl Fn(&str) -> bool) -> Vec<(Language, i32, &'static str)> {
+        Self::ALL.iter().filter_map(|&l| l.variant(&has).map(|(n, c)| (l, n, c))).collect()
+    }
+
+    /// The name shown to players, in that language (its preferred variant).
     pub fn label(self) -> &'static str {
-        match self {
-            Language::English => "English",
-            Language::Spanish => "Español (Latinoamérica)",
-            Language::French => "Français (Canada)",
-            Language::Portuguese => "Português (Brasil)",
-        }
+        variant_label(self.variants()[0].1)
     }
 
-    /// The console's system-language code (English US 1, Brazilian
-    /// Portuguese 17, Latin American Spanish 20, Canadian French 22).
+    /// The console's system-language code of the preferred variant.
     pub fn system_code(self) -> i32 {
-        match self {
-            Language::English => 1,
-            Language::Spanish => 20,
-            Language::French => 22,
-            Language::Portuguese => 17,
-        }
+        self.variants()[0].0
+    }
+}
+
+/// The name of a language variant (archive code), in that language.
+pub fn variant_label(code: &str) -> &'static str {
+    match code {
+        "enu" => "English",
+        "ene" => "English (UK)",
+        "esl" => "Español (Latinoamérica)",
+        "ess" => "Español (España)",
+        "frc" => "Français (Canada)",
+        "frf" => "Français",
+        "ptb" => "Português (Brasil)",
+        "ptp" => "Português (Portugal)",
+        "ger" => "Deutsch",
+        "ita" => "Italiano",
+        "dut" => "Nederlands",
+        "rus" => "Русский",
+        "pol" => "Polski",
+        "fin" => "Suomi",
+        "swe" => "Svenska",
+        "dan" => "Dansk",
+        "nor" => "Norsk",
+        "tur" => "Türkçe",
+        "ara" => "العربية",
+        "jpn" => "日本語",
+        "kor" => "한국어",
+        "zht" => "繁體中文",
+        "zhc" => "简体中文",
+        _ => "?",
     }
 }
 
@@ -246,8 +355,12 @@ new_shaders = wait
 gpu = auto
 # Master volume, 0-100.
 volume = 100
-# The game's language (menus, subtitles, voices): english, spanish (Latin
-# America), french (Canada) or portuguese (Brazil).
+# The game's language (menus, subtitles, voices), one the game files hold:
+# english, spanish, french, portuguese (in the US release: Latin American
+# Spanish, Canadian French, Brazilian Portuguese; in European ones the
+# European variants), german, italian, dutch, russian, polish, finnish,
+# swedish, danish, norwegian, turkish, arabic, japanese, korean,
+# chinese-traditional or chinese-simplified.
 language = english
 # The game folders (the launcher sets these).
 game_dir =
@@ -365,9 +478,10 @@ impl Settings {
                     Some(n) => s.volume = n,
                     None => errs.push(bad("0-100")),
                 },
-                "language" => match Language::ALL.iter().find(|l| l.key() == lv || l.key()[..2] == lv) {
-                    Some(&l) => s.language = l,
-                    None => errs.push(bad("english, spanish, french or portuguese")),
+                // (The first four also by their first two letters, as before.)
+                "language" => match Language::ALL.iter().enumerate().find(|&(i, l)| l.key() == lv || (i < 4 && l.key()[..2] == lv)) {
+                    Some((_, &l)) => s.language = l,
+                    None => errs.push(bad("english, spanish, french, portuguese, german, italian, japanese, ... (see the launcher)")),
                 },
                 "game_dir" => s.game_dir = (!v.is_empty()).then(|| PathBuf::from(v)),
                 "update_dir" => s.update_dir = (!v.is_empty()).then(|| PathBuf::from(v)),
@@ -473,6 +587,32 @@ mod tests {
         let (s, errs) = Settings::parse("frame_cap = 60 # experimental\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(s.frame_cap, FrameCap::Fps60);
+    }
+
+    #[test]
+    fn languages_and_their_variants() {
+        // (The first four also by two letters: "po" is Portuguese, not Polish.)
+        for (v, l) in [("sp", Language::Spanish), ("po", Language::Portuguese), ("german", Language::German), ("japanese", Language::Japanese), ("chinese-simplified", Language::ChineseSimplified)] {
+            let (s, errs) = Settings::parse(&format!("language = {v}\n"));
+            assert!(errs.is_empty(), "{v}: {errs:?}");
+            assert_eq!(s.language, l, "{v}");
+        }
+        assert_eq!(Settings::parse("language = klingon\n").1.len(), 1);
+        // US archives: the US variants; an English-only EU set: English (UK).
+        let us = |c: &str| ["enu", "esl", "frc", "ptb"].contains(&c);
+        assert_eq!(Language::English.variant(us), Some((1, "enu")));
+        assert_eq!(Language::Spanish.variant(us), Some((20, "esl")));
+        assert_eq!(Language::German.variant(us), None);
+        assert_eq!(Language::available(us).len(), 4);
+        let eu = |c: &str| c == "ene";
+        assert_eq!(Language::English.variant(eu), Some((18, "ene")));
+        assert_eq!(Language::available(eu), vec![(Language::English, 18, "ene")]);
+        assert_eq!(variant_label("ene"), "English (UK)");
+        // Every variant's code is a distinct system-language code.
+        let mut codes: Vec<i32> = Language::ALL.iter().flat_map(|l| l.variants().iter().map(|v| v.0)).collect();
+        codes.sort_unstable();
+        codes.dedup();
+        assert_eq!(codes, (0..=22).collect::<Vec<i32>>());
     }
 
     #[test]

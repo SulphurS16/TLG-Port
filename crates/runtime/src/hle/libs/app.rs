@@ -153,15 +153,34 @@ sysv! {
                 // LANG: settings.txt `language` (TLG_LANGUAGE for a run).
                 static LANG: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
                 *LANG.get_or_init(|| {
+                    use tlg_config::settings::Language;
                     let mut l = crate::config::settings().language;
                     if let Ok(v) = std::env::var("TLG_LANGUAGE") {
-                        match tlg_config::settings::Language::ALL.iter().find(|x| x.key() == v.to_ascii_lowercase()) {
+                        match Language::ALL.iter().find(|x| x.key() == v.to_ascii_lowercase()) {
                             Some(&x) => l = x,
-                            None => crate::warn!("TLG_LANGUAGE={v}: want english, spanish, french or portuguese"),
+                            None => crate::warn!("TLG_LANGUAGE={v}: not a language key (english, spanish, french, portuguese, german, japanese, ...)"),
                         }
                     }
-                    crate::info!("system language: {} (code {})", l.key(), l.system_code());
-                    l.system_code()
+                    // The variant whose archive the game files hold (the US
+                    // release English (US), European ones English (UK), ...);
+                    // a language they lack: the first they hold.
+                    let has = |code: &str| crate::hle::kernel::fs::host_path_existing(&format!("/app0/trico_{code}.psarc")).is_some();
+                    match l.variant(has) {
+                        Some((n, code)) => {
+                            crate::info!("system language: {} ({code}, code {n})", l.key());
+                            n
+                        }
+                        None => match Language::available(has).first() {
+                            Some(&(o, n, code)) => {
+                                crate::warn!("language {}: not in the game files; {} ({code}, code {n}) instead", l.key(), o.key());
+                                n
+                            }
+                            None => {
+                                crate::warn!("no language archive (trico_<code>.psarc) in the game files; system language {} (code {})", l.key(), l.system_code());
+                                l.system_code()
+                            }
+                        },
+                    }
                 })
             }
             2 => 0,    // DATE_FORMAT: YYYYMMDD

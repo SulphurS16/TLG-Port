@@ -1,7 +1,8 @@
 //! The game's save folder and its backups.
 //!
 //! The title keeps its progress in save-data memory, stored by the runtime
-//! as `saves\<user>\CUSA03627\sdmemory\memory.dat` (+ `memory.dat.bak`, the
+//! as `saves\<user>\<title id>\sdmemory\memory.dat` (CUSA03627 for the US
+//! release, CUSA03745 for the EU one; + `memory.dat.bak`, the
 //! previous write, and `sce_sys\param.bin`). Before it replaces the file the
 //! runtime copies the previous one into `save-backups\<UTC stamp>\` (at
 //! most one copy per few minutes, the newest `KEEP` kept); the launcher
@@ -11,6 +12,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub const TITLE: &str = "CUSA03627";
+/// The titles whose saves are looked for (US, EU).
+pub const TITLES: [&str; 2] = ["CUSA03627", "CUSA03745"];
 /// Backups kept.
 pub const KEEP: usize = 20;
 /// The files of a save (relative to its sdmemory folder).
@@ -27,13 +30,13 @@ pub struct SaveInfo {
     pub scene: Option<String>,
 }
 
-/// The sdmemory folders under `saves` (one per user id).
+/// The sdmemory folders under `saves` (one per user id and title).
 pub fn memory_dirs(saves: &Path) -> Vec<PathBuf> {
     let mut v: Vec<PathBuf> = std::fs::read_dir(saves)
         .into_iter()
         .flatten()
         .flatten()
-        .map(|e| e.path().join(TITLE).join("sdmemory"))
+        .flat_map(|e| TITLES.map(|t| e.path().join(t).join("sdmemory")))
         .filter(|d| d.join("memory.dat").is_file() || d.join("memory.dat.bak").is_file())
         .collect();
     v.sort();
@@ -41,9 +44,13 @@ pub fn memory_dirs(saves: &Path) -> Vec<PathBuf> {
 }
 
 /// The memory folder of the first user (`saves\1\...` unless only another
-/// user has one).
+/// user has one); of its titles the one saved last (US and EU saves apart).
 pub fn main_memory_dir(saves: &Path) -> PathBuf {
-    memory_dirs(saves).into_iter().next().unwrap_or_else(|| saves.join("1").join(TITLE).join("sdmemory"))
+    let dirs = memory_dirs(saves);
+    let user = |d: &Path| d.parent().and_then(Path::parent).map(Path::to_path_buf);
+    let first = dirs.first().and_then(|d| user(d));
+    let saved = |d: &Path| std::fs::metadata(d.join("memory.dat")).or_else(|_| std::fs::metadata(d.join("memory.dat.bak"))).and_then(|m| m.modified()).ok();
+    dirs.iter().filter(|d| user(d) == first).max_by_key(|d| saved(d)).cloned().unwrap_or_else(|| saves.join("1").join(TITLE).join("sdmemory"))
 }
 
 fn lp_string(d: &[u8], at: usize) -> Option<(String, usize)> {
@@ -77,7 +84,7 @@ fn info(dir: &Path, mem: &Path) -> SaveInfo {
 
 /// The current save, if there is one.
 pub fn current(saves: &Path) -> Option<SaveInfo> {
-    let m = memory_dirs(saves).into_iter().next()?;
+    let m = Some(main_memory_dir(saves)).filter(|d| d.join("memory.dat").is_file() || d.join("memory.dat.bak").is_file())?;
     Some(info(&m, &m))
 }
 

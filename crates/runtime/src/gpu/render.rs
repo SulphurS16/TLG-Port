@@ -2479,6 +2479,9 @@ pub(super) struct BatchCtx {
     /// Device-ring copies of shader-written buffers to copy back to guest
     /// memory after the current command: (ring offset, guest buffer, offset, size).
     gpu_wb: Vec<(u64, vk::Buffer, u64, u64)>,
+    /// Linear images the current command stores to, written back to guest
+    /// memory after it for the title's CPU reads (`note_readback`).
+    readback: Vec<ImageKey>,
     /// Device-ring dwords where shaders mark pages of untracked writes: (batch, offset).
     dirty_sink: (u64, u64),
     /// Who asked for the next VRAM mirror binding (TLG_PERF copy-in report).
@@ -2915,6 +2918,10 @@ pub struct Renderer {
     tess_bufs: Option<(vk::Buffer, vk::Buffer)>,
     /// Write-backs skipped because the title reused the image's memory.
     reused_skips: u64,
+    /// Linear images written back for the title's CPU reads
+    /// (`readback_images`): on the CPU after waiting for their batch, and
+    /// without a wait (device ring or GPU tiling).
+    readbacks: [u64; 2],
     /// Sampled render targets whose memory the title reused for CPU data
     /// (`reused_target`): sampled from guest memory instead.
     reused_targets: u64,
@@ -3311,6 +3318,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 mirror_used_id: next_mirror_used_id(),
                 zc_reads: Ranges::default(),
                 gpu_wb: Vec::new(),
+                readback: Vec::new(),
                 dirty_sink: (u64::MAX, 0),
                 vc_why: "other",
                 work_seq: 0,
@@ -4446,6 +4454,7 @@ impl Renderer {
         occl_next: 0,
         tess_bufs: None,
         reused_skips: 0,
+        readbacks: [0; 2],
         reused_targets: 0,
         edge_skips: 0,
         mem_g: None,
@@ -5740,16 +5749,20 @@ impl Renderer {
     /// Copies the device-ring working copies of buffers the command just
     /// wrote back to guest memory (GPU timeline).
     fn perform_gpu_writebacks(&mut self) {
-        if self.cx.gpu_wb.is_empty() {
-            return;
+        if !self.cx.gpu_wb.is_empty() {
+            self.end_rendering();
+            full_barrier!(self);
+            for (dev_off, zbuf, zoff, size) in std::mem::take(&mut self.cx.gpu_wb) {
+                unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: dev_off, dst_offset: zoff, size }]) };
+            }
+            unordered!(self);
+            self.mark(|| "written buffer write-back copies (GPU)".into());
         }
-        self.end_rendering();
-        full_barrier!(self);
-        for (dev_off, zbuf, zoff, size) in std::mem::take(&mut self.cx.gpu_wb) {
-            unsafe { REC.cmd_copy_buffer(self.cx.cmd, self.cx.dring.buffer, zbuf, &[vk::BufferCopy { src_offset: dev_off, dst_offset: zoff, size }]) };
+        // (After the copies above: a write-back may submit the batch, whose
+        // device-ring offsets they use.)
+        if !self.cx.readback.is_empty() {
+            self.readback_images();
         }
-        unordered!(self);
-        self.mark(|| "written buffer write-back copies (GPU)".into());
     }
 
     /// The image (not depth, not 3D) whose guest surface is exactly
@@ -6389,6 +6402,110 @@ impl Renderer {
         *img!(self).write_gen.entry(key).or_default() += 1;
     }
 
+    /// A shader stores to a small linear 2D image (one level): titles copy
+    /// GPU results they read on the CPU into such surfaces, and the CPU sees
+    /// guest memory only, never our images. TLG reads its auto exposure's
+    /// 16x16 luminance (R32F) every frame from one; read as zeros, its
+    /// exposure and bloom ran at their maximum, bright areas washed out. (In
+    /// some areas it also reads a pair of 128x128 R32F grids.) The image is
+    /// written back to its guest surface after the command
+    /// (`readback_images`), where the PS4 GPU's stores would have landed.
+    fn note_readback(&mut self, key: ImageKey, t: &Tsharp) {
+        let max_kib = crate::tune::get(crate::tune::READBACK_KIB);
+        if max_kib <= 0 || !matches!(t.tiling_index, 8 | 31) || key.ty3d || key.depth || key.levels > 1 || (key.width, key.height) != (t.width, t.height) {
+            return;
+        }
+        let Some(img) = img!(self).images.get_mut(&key) else { return };
+        if img.tile_index.is_none() {
+            img.tile_index = Some(t.tiling_index);
+            img.pitch = t.pitch.max(t.width);
+        }
+        // (An image that stands for another layout of this memory too is
+        // left alone.)
+        if img.tile_index != Some(t.tiling_index) {
+            return;
+        }
+        let Some((_, _, _, total)) = Self::image_guest_layout(&key, img) else { return };
+        if total > max_kib as u64 * 1024 {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::info!("linear storage image {:#x} {}x{} {:?} ({total} bytes) not written back for CPU reads: over readback_kib", key.base, key.width, key.height, key.format);
+            }
+            return;
+        }
+        // (Stale first: `mark_stale` takes the write-tracking baseline of an
+        // image that was not.)
+        self.mark_stale(key);
+        let frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+        let img = img!(self).images.get_mut(&key).unwrap();
+        img.guest_stale = true;
+        img.guest_newer = false;
+        img.last_write_frame = frame;
+        if !self.cx.readback.contains(&key) {
+            self.cx.readback.push(key);
+            // (Each image once, the first 16.)
+            static SEEN: parking_lot::Mutex<Vec<ImageKey>> = parking_lot::Mutex::new(Vec::new());
+            let mut seen = SEEN.lock();
+            if seen.len() < 16 && !seen.contains(&key) {
+                seen.push(key);
+                crate::info!("linear storage image {:#x} {}x{} {:?} pitch {} ({total} bytes): written back after its stores (CPU reads)", key.base, key.width, key.height, key.format, t.pitch);
+            }
+        }
+    }
+
+    /// Writes the images `note_readback` listed back to guest memory (after
+    /// the command that stored to them): surfaces without row padding like
+    /// a shader-written buffer (`readback_linear`), others as render targets
+    /// are (`write_back_image`).
+    fn readback_images(&mut self) {
+        for key in std::mem::take(&mut self.cx.readback) {
+            let Some(img) = img!(self).images.get(&key).filter(|i| i.guest_stale && !i.guest_newer) else { continue };
+            let tight = img.pitch <= key.width;
+            let Some((_, _, _, total)) = Self::image_guest_layout(&key, img) else { continue };
+            self.cx.attach_marked = false;
+            let gpu = (tight && self.readback_linear(key, total)) || self.write_back_image(key);
+            self.readbacks[gpu as usize] += 1;
+        }
+    }
+
+    /// A linear surface without row padding (`total` bytes) is the image's
+    /// texels in order: copied into the device ring, it lands in guest
+    /// memory at the batch end as a shader-written buffer does (host ring,
+    /// then the completion's copy), with no tiling pass, no VRAM mirror
+    /// window (which small ranges get only where one exists) and no wait.
+    /// Returns false when the rings have no room even after a submission.
+    fn readback_linear(&mut self, key: ImageKey, total: u64) -> bool {
+        let need = total + 4096;
+        if self.cx.dring.remaining() < need || self.cx.ring.remaining() < need {
+            self.flushes[2] += 1;
+            self.submit_batch(Vec::new());
+        }
+        if self.cx.dring.remaining() < need || self.cx.ring.remaining() < need {
+            return false;
+        }
+        let (Some(dev_off), Some(host_off)) = (self.cx.dring.alloc(total), self.cx.ring.alloc(total)) else { return false };
+        self.begin();
+        self.end_rendering();
+        full_barrier!(self);
+        let region = vk::BufferImageCopy {
+            buffer_offset: dev_off,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: key.layers.max(1) },
+            image_offset: vk::Offset3D::default(),
+            image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
+        };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, self.cx.dring.buffer, &[region]) };
+        unordered!(self);
+        self.push_writeback(PendingWrite { base: key.base, size: total, host_off, dev_off, dev_buf: self.cx.dring.buffer, mirror: false, bits: None });
+        mem!(self).writes.note_gpu_write(key.base, total);
+        self.note_pending_gpu_write(key.base, total);
+        img!(self).images.get_mut(&key).unwrap().guest_stale = false;
+        mem!(self).epoch += 1;
+        self.mark(|| "linear image write-back for CPU reads".into());
+        true
+    }
+
     /// Stand-in for a T# that cannot be honored (invalid descriptor, address
     /// outside guest memory, or a format we do not implement): a zeroed 1x1
     /// image of the expected view type and numeric class, so the rest of the
@@ -6660,6 +6777,7 @@ impl Renderer {
                     self.sync_alias(k)?;
                     if storage {
                         self.note_storage_write(k);
+                        self.note_readback(k, t);
                     }
                     let img = img!(self).images.get_mut(&k).unwrap();
                     let v = img.view_levels(if storage { canonical(vfmt) } else { vfmt }, t.dst_sel, view_type, storage, view_base, layers, view_level, view_levels)?;
@@ -6767,6 +6885,7 @@ impl Renderer {
         if storage {
             self.sync_alias(key)?;
             self.note_storage_write(key);
+            self.note_readback(key, t);
         }
         let img = img!(self).images.get_mut(&key).unwrap();
         let view = img.view_levels(if storage { canonical(vfmt) } else { vfmt }, t.dst_sel, view_type, storage, view_base, layers, view_level, view_levels)?;
@@ -7127,6 +7246,13 @@ impl Renderer {
             differ.first().map(|&i| format!(" (first: element {i}, z {})", i / (key.width * key.height) as usize)).unwrap_or_default(),
             if zero { "; all zero" } else { "" }
         );
+        // (TLG_VOLUME_DUMP=1: the detiled volume into the run's folder, for
+        // looking at, e.g., colour-grading LUTs.)
+        if std::env::var_os("TLG_VOLUME_DUMP").is_some() {
+            if let Some(dir) = super::shader_dump::DIR.get().and_then(|d| d.parent()) {
+                let _ = std::fs::write(dir.join(format!("vol_{:x}_{}x{}x{}_f{}_{}.bin", t.base, key.width, key.height, depth, t.dfmt, t.nfmt)), &cpu);
+            }
+        }
     }
 
     /// VRAM mirror of read-only guest [base, base+size) for a draw/dispatch
@@ -8841,7 +8967,7 @@ impl Renderer {
             self.cx.attach_marked = false;
         }
         for key in keys {
-            let Some((bpp, mode, ph, total)) = Self::image_guest_layout(&key, &img!(self).images[&key]) else { continue };
+            let Some((_, _, _, total)) = Self::image_guest_layout(&key, &img!(self).images[&key]) else { continue };
             // The title wrote this memory since the image was rendered: it
             // freed the surface and reused the memory (e.g. heap blocks), so
             // the contents are dead. (Our own CPU-path write-backs complete
@@ -8866,69 +8992,39 @@ impl Renderer {
                     continue;
                 }
             }
-            let lin_slice = key.width as u64 * key.height as u64 * (bpp / 8) as u64;
-            // GPU path: copy the image to the device ring and tile it in place
-            // into guest memory (ordered with later GPU readers; CPU readers
-            // wait for the batch like any in-place write).
-            let lin_bytes = lin_slice * key.layers.max(1) as u64;
-            // Device ring: the linear copy of the image and the tiled surface.
-            let need = lin_bytes + total + 8192;
-            // (On the GPU: into the imported guest memory, or into the VRAM
-            // mirror, see `gpu_remap`.)
-            let mirrored = ctx().ext_host.is_none();
-            let gpu_tiling = Self::gpu_remap_eligible(bpp) && (!mirrored || (mirror_tiling_on() && total <= VCACHE_MAX));
-            if gpu_tiling && self.cx.dring.remaining() < need {
-                self.flushes[2] += 1;
-                self.submit_batch(Vec::new());
-            }
-            let gpu_off = (gpu_tiling && self.cx.dring.remaining() >= need).then(|| self.cx.dring.alloc(lin_bytes)).flatten();
-            if let Some(lin_off) = gpu_off {
-                self.begin();
-                self.end_rendering();
-                full_barrier!(self);
-                let region = vk::BufferImageCopy {
-                    buffer_offset: lin_off,
-                    buffer_row_length: 0,
-                    buffer_image_height: 0,
-                    image_subresource: vk::ImageSubresourceLayers {
-                        aspect_mask: if key.depth { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR },
-                        mip_level: 0,
-                        base_array_layer: 0,
-                        layer_count: key.layers,
-                    },
-                    image_offset: vk::Offset3D::default(),
-                    image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
-                };
-                unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, self.cx.dring.buffer, &[region]) };
-                match self.gpu_remap(&key, true, lin_off) {
-                    Ok(true) => {
-                        // (Mirror tiling registered its write-back itself.)
-                        if !mirrored {
-                            self.push_zc_write(key.base, total);
-                            mem!(self).writes.note_gpu_write(key.base, total);
-                            self.note_pending_gpu_write(key.base, total);
-                        }
-                        img!(self).images.get_mut(&key).unwrap().guest_stale = false;
-                        mem!(self).epoch += 1;
-                        self.gpu_remaps[1] += 1;
-                        continue;
-                    }
-                    Ok(false) => {}
-                    Err(e) => self.report(format!("GPU render target tiling failed: {e}")),
-                }
-            }
-            if self.cx.ring.remaining() < lin_slice * key.layers as u64 + 4096 {
-                self.submit_batch(Vec::new());
-            }
-            let Some(off) = self.cx.ring.alloc(lin_slice * key.layers as u64) else {
-                self.report(format!("render target write-back {:#x} too large for the ring", key.base));
-                continue;
-            };
+            let _ = self.write_back_image(key);
+        }
+    }
+
+    /// Writes image `key` (newer than guest memory) back to its guest
+    /// surface in its tiled layout: on the GPU when it can (into the imported
+    /// guest memory, or into the VRAM mirror, written back at the batch end),
+    /// else on the CPU after its batch (submits and waits). Returns whether
+    /// it went on the GPU.
+    fn write_back_image(&mut self, key: ImageKey) -> bool {
+        let Some((bpp, mode, ph, total)) = Self::image_guest_layout(&key, &img!(self).images[&key]) else { return false };
+        let lin_slice = key.width as u64 * key.height as u64 * (bpp / 8) as u64;
+        // GPU path: copy the image to the device ring and tile it in place
+        // into guest memory (ordered with later GPU readers; CPU readers
+        // wait for the batch like any in-place write).
+        let lin_bytes = lin_slice * key.layers.max(1) as u64;
+        // Device ring: the linear copy of the image and the tiled surface.
+        let need = lin_bytes + total + 8192;
+        // (On the GPU: into the imported guest memory, or into the VRAM
+        // mirror, see `gpu_remap`.)
+        let mirrored = ctx().ext_host.is_none();
+        let gpu_tiling = Self::gpu_remap_eligible(bpp) && (!mirrored || (mirror_tiling_on() && total <= VCACHE_MAX));
+        if gpu_tiling && self.cx.dring.remaining() < need {
+            self.flushes[2] += 1;
+            self.submit_batch(Vec::new());
+        }
+        let gpu_off = (gpu_tiling && self.cx.dring.remaining() >= need).then(|| self.cx.dring.alloc(lin_bytes)).flatten();
+        if let Some(lin_off) = gpu_off {
             self.begin();
             self.end_rendering();
             full_barrier!(self);
             let region = vk::BufferImageCopy {
-                buffer_offset: off,
+                buffer_offset: lin_off,
                 buffer_row_length: 0,
                 buffer_image_height: 0,
                 image_subresource: vk::ImageSubresourceLayers {
@@ -8940,33 +9036,80 @@ impl Renderer {
                 image_offset: vk::Offset3D::default(),
                 image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
             };
-            unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
-            self.flush_for(1);
-            let t0 = std::time::Instant::now();
-            let lin = unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(off as usize), (lin_slice * key.layers as u64) as usize) };
-            let slice = total / key.layers as u64;
-            let mut tiled = vec![0u8; total as usize];
-            resources::copy_from_guest(&mut tiled, key.base);
-            for l in 0..key.layers as u64 {
-                let src = &lin[(l * lin_slice) as usize..((l + 1) * lin_slice) as usize];
-                let dst = &mut tiled[(l * slice) as usize..((l + 1) * slice) as usize];
-                tiling::tile_slice(src, dst, key.width, key.height, key.width, ph, bpp, mode);
-            }
-            super::wbprobe::note_range(key.base, total, 5);
-            resources::copy_to_guest(&tiled, key.base);
-            mem!(self).writes.note_gpu_write(key.base, total);
-            // (A new baseline: these CPU writes are ours, not the title's.)
-            let (_, stamp) = mem!(self).writes.cpu_written_since(key.base, total, u64::MAX);
-            if let Some(i) = img!(self).images.get_mut(&key) {
-                i.stale_stamp = stamp;
-            }
-            self.prof[1] += t0.elapsed();
-            img!(self).images.get_mut(&key).unwrap().guest_stale = false;
-            mem!(self).epoch += 1;
-            if crate::log::enabled(crate::log::Level::Debug) {
-                crate::debug!("render target {:#x} {}x{} {:?} written back to guest memory", key.base, key.width, key.height, key.format);
+            unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, self.cx.dring.buffer, &[region]) };
+            match self.gpu_remap(&key, true, lin_off) {
+                Ok(true) => {
+                    // (Mirror tiling registered its write-back itself.)
+                    if !mirrored {
+                        self.push_zc_write(key.base, total);
+                        mem!(self).writes.note_gpu_write(key.base, total);
+                        self.note_pending_gpu_write(key.base, total);
+                    }
+                    img!(self).images.get_mut(&key).unwrap().guest_stale = false;
+                    mem!(self).epoch += 1;
+                    self.gpu_remaps[1] += 1;
+                    return true;
+                }
+                Ok(false) => {}
+                Err(e) => self.report(format!("GPU render target tiling failed: {e}")),
             }
         }
+        {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::info!("write-back of {:#x} {}x{} {:?} on the CPU (GPU path: tiling {gpu_tiling}, ring space {}, renderer {})", key.base, key.width, key.height, key.format, gpu_off.is_some(), self.inst);
+            }
+        }
+        if self.cx.ring.remaining() < lin_slice * key.layers as u64 + 4096 {
+            self.submit_batch(Vec::new());
+        }
+        let Some(off) = self.cx.ring.alloc(lin_slice * key.layers as u64) else {
+            self.report(format!("render target write-back {:#x} too large for the ring", key.base));
+            return false;
+        };
+        self.begin();
+        self.end_rendering();
+        full_barrier!(self);
+        let region = vk::BufferImageCopy {
+            buffer_offset: off,
+            buffer_row_length: 0,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers {
+                aspect_mask: if key.depth { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR },
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: key.layers,
+            },
+            image_offset: vk::Offset3D::default(),
+            image_extent: vk::Extent3D { width: key.width, height: key.height, depth: 1 },
+        };
+        unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
+        self.flush_for(1);
+        let t0 = std::time::Instant::now();
+        let lin = unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(off as usize), (lin_slice * key.layers as u64) as usize) };
+        let slice = total / key.layers as u64;
+        let mut tiled = vec![0u8; total as usize];
+        resources::copy_from_guest(&mut tiled, key.base);
+        for l in 0..key.layers as u64 {
+            let src = &lin[(l * lin_slice) as usize..((l + 1) * lin_slice) as usize];
+            let dst = &mut tiled[(l * slice) as usize..((l + 1) * slice) as usize];
+            tiling::tile_slice(src, dst, key.width, key.height, key.width, ph, bpp, mode);
+        }
+        super::wbprobe::note_range(key.base, total, 5);
+        resources::copy_to_guest(&tiled, key.base);
+        mem!(self).writes.note_gpu_write(key.base, total);
+        // (A new baseline: these CPU writes are ours, not the title's.)
+        let (_, stamp) = mem!(self).writes.cpu_written_since(key.base, total, u64::MAX);
+        if let Some(i) = img!(self).images.get_mut(&key) {
+            i.stale_stamp = stamp;
+        }
+        self.prof[1] += t0.elapsed();
+        img!(self).images.get_mut(&key).unwrap().guest_stale = false;
+        mem!(self).epoch += 1;
+        if crate::log::enabled(crate::log::Level::Debug) {
+            crate::debug!("render target {:#x} {}x{} {:?} written back to guest memory", key.base, key.width, key.height, key.format);
+        }
+        false
     }
 
     /// Before a draw/dispatch allocates descriptors: makes guest memory read
@@ -10110,6 +10253,15 @@ impl Renderer {
                     img.guest_stale = true;
                     img.last_write = tick;
                     img.last_write_frame = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
+                    // (Linear color targets may be read by the CPU too; not
+                    // written back for it as linear storage images are,
+                    // `note_readback`. TLG renders none so far.)
+                    if matches!(img.tile_index, Some(8 | 31)) {
+                        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                            crate::info!("linear render target {:#x} {}x{} {:?} rendered (not written back for CPU reads)", a.key.base, a.key.width, a.key.height, a.key.format);
+                        }
+                    }
                 }
                 *img!(self).write_gen.entry(a.key).or_default() += 1;
             }
@@ -10278,6 +10430,12 @@ impl Renderer {
             }
         }
         Ok(())
+    }
+
+    /// Linear images written back for the title's CPU reads: on the CPU
+    /// (after a wait), without a wait.
+    pub fn readbacks(&self) -> [u64; 2] {
+        self.readbacks
     }
 
     /// Write-backs skipped because the title had reused the image's memory.
@@ -11364,6 +11522,9 @@ impl Renderer {
         }
         if trace_frame() {
             self.trace_timing("dispatch");
+            // (`dumpafter` with compute shader addresses: the GPU-written
+            // images it binds, its storage images included.)
+            self.dump_after(&cs, &[], None);
         }
         Ok(true)
     }
