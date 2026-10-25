@@ -563,6 +563,9 @@ pub fn shutdown(code: i32) -> ! {
         }
     }
     pacing::finish();
+    if let Some(n) = title_patches::foot_pin_misses().filter(|&n| n > 0) {
+        info!("foot pins: {n} lookups of Trico's skeleton found none yet (the game's crash at +0xe19214 avoided)");
+    }
     write_pgo_profile();
     info!("shutdown with status {code}\n{}", thread_summary());
     crate::log::flush();

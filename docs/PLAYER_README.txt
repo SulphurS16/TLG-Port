@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.7.1 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.7.2 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4: US release CUSA03627 or

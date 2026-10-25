@@ -155,6 +155,12 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
             .present_mode(present_mode(p.surface))
             .clipped(true)
             .old_swapchain(old);
+        // Windowed and borderless: no exclusive full screen. Left to them,
+        // drivers take a window that covers its monitor exclusively, with a
+        // display mode of their own choosing (NVIDIA's: GitHub issue #4).
+        let mut no_fse = vk::SurfaceFullScreenExclusiveInfoEXT::default().full_screen_exclusive(vk::FullScreenExclusiveEXT::DISALLOWED);
+        let disallow = c.fse && window::current_mode() != crate::config::DisplayMode::Fullscreen;
+        let sci = if disallow { sci.push_next(&mut no_fse) } else { sci };
         let sc = c.swapchain_d.create_swapchain(&sci, None).map_err(|e| format!("create swapchain: {e}"))?;
         if old != vk::SwapchainKHR::null() {
             let done = std::mem::take(&mut p.done);
@@ -167,7 +173,7 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
         for _ in 0..p.images.len() {
             p.done.push(c.device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| e.to_string())?);
         }
-        crate::info!("swapchain {}x{} {:?} ({} images, {:?})", extent.width, extent.height, fmt.format, p.images.len(), sci.present_mode);
+        crate::info!("swapchain {}x{} {:?} ({} images, {:?}{})", extent.width, extent.height, fmt.format, p.images.len(), sci.present_mode, if disallow { ", exclusive full screen disallowed" } else { "" });
     }
     Ok(())
 }

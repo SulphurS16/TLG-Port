@@ -211,7 +211,7 @@ dependencies = [
 
 [[package]]
 name = "tlg"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "ash",
  "cc",
@@ -229,11 +229,11 @@ dependencies = [
 
 [[package]]
 name = "tlg-config"
-version = "0.7.1"
+version = "0.7.2"
 
 [[package]]
 name = "tlg-launcher"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "ash",
  "tlg-config",

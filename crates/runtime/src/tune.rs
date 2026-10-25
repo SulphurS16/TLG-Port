@@ -845,7 +845,8 @@ pub const DRING_SEGS: usize = 143;
 pub const FILL_LOG: usize = 144;
 /// Pending GPU writes of up to 2 pages are kept in a map by page rather
 /// than the B-tree of page ranges (`TLG_PAGE_SEQS_SMALL`, 1; render.rs
-/// `PageSeqs`).
+/// `PageSeqs`); 2: every pending write in a page table indexed by address
+/// (`PageTable`).
 pub const PAGE_SEQS_SMALL: usize = 145;
 /// Taking a prepared result, the CP prefetches the next one's data and the
 /// guest words its validation compares (`TLG_PREFETCH_NEXT`, 1; prepahead.rs):
@@ -889,8 +890,27 @@ pub const READBACK_KIB: usize = 151;
 /// sampled as arrays (`TLG_DEPTH_SLICES`, 1; 0 = every slice in layer 0,
 /// as before 0.7.1: render.rs `depth_target`).
 pub const DEPTH_SLICES: usize = 152;
+/// GPU writes to guest memory where no image and no metadata surface was
+/// ever placed (64 KiB blocks, render.rs `BlockGens`) skip the image and
+/// metadata searches without the memo's lookup (`TLG_SURFACE_BLOCKS`, 1).
+pub const SURFACE_BLOCKS: usize = 153;
+/// Batch sizes while the GPU is behind (render.rs `maybe_submit`): after a
+/// batch-slot change waited for the GPU, the next `TLG_BATCH_DEEP_SPAN` (32;
+/// 0 = never) batches are submitted at `TLG_BATCH_MAX_DEEP` (256) commands,
+/// or `TLG_BATCH_IDLE_DEEP` (128) once the GPU has nothing left. At the
+/// ending's start, its GPU behind on ~33,000 single-workgroup compute
+/// dispatches a second, every frame waited ~3.5 ms for a free slot with
+/// 128/64; with 256/128 throughout ~1.2 ms, -6.0% frame time (256/64 -4.3%,
+/// 128/128 -1.5%), but the light frames after the cut at +50 s (~11.5 ms)
+/// took 13.9-15.1 ms: deeper batches hand short frames' work to the GPU later.
+/// Only while waiting (this): the start -5.0%, the heavy stretch's steady part
+/// the same, the 2 s of light frames after the cut 8% fewer; a span of 8 kept
+/// those but lost the start's gain.
+pub const BATCH_DEEP_SPAN: usize = 154;
+pub const BATCH_MAX_DEEP: usize = 155;
+pub const BATCH_IDLE_DEEP: usize = 156;
 
-const TABLE: [(&str, &str, i64); 153] = [
+const TABLE: [(&str, &str, i64); 157] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -1036,7 +1056,7 @@ const TABLE: [(&str, &str, i64); 153] = [
     ("ww_pretend", "TLG_WW_PRETEND", 0),
     ("dring_segs", "TLG_DRING_SEGS_TUNE", 0),
     ("fill_log", "TLG_FILL_LOG", 100),
-    ("page_seqs_small", "TLG_PAGE_SEQS_SMALL", 1),
+    ("page_seqs_small", "TLG_PAGE_SEQS_SMALL", 2),
     ("prefetch_next", "TLG_PREFETCH_NEXT", 1),
     ("cs_on_gfx", "TLG_CS_ON_GFX", 1),
     ("cs_defer_us", "TLG_CS_DEFER_US", 300),
@@ -1044,6 +1064,10 @@ const TABLE: [(&str, &str, i64); 153] = [
     ("ww_round_log", "TLG_WW_ROUND_LOG", 0),
     ("readback_kib", "TLG_READBACK_KIB", 256),
     ("depth_slices", "TLG_DEPTH_SLICES", 1),
+    ("surface_blocks", "TLG_SURFACE_BLOCKS", 1),
+    ("batch_deep_span", "TLG_BATCH_DEEP_SPAN", 32),
+    ("batch_max_deep", "TLG_BATCH_MAX_DEEP", 256),
+    ("batch_idle_deep", "TLG_BATCH_IDLE_DEEP", 128),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -88,6 +88,11 @@ pub fn request_mode(m: Option<DisplayMode>) -> Result<(), String> {
 /// The monitor whose display mode was switched (device name, NUL-terminated).
 static SWITCHED: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 
+/// The window's display mode now.
+pub fn current_mode() -> DisplayMode {
+    DISPLAY.lock().mode
+}
+
 pub fn get() -> Option<&'static Window> {
     WINDOW.get()
 }
@@ -608,7 +613,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        // (Logged: any display mode change while the game runs, ours or a
+        // driver's - GitHub issue #4 reported one in borderless.)
         WM_DISPLAYCHANGE => {
+            let mode = DISPLAY.lock().mode;
+            crate::info!("display: the monitor's mode changed to {}x{} ({} bits per pixel) in {}", lp & 0xFFFF, (lp >> 16) & 0xFFFF, wp, mode_name(mode));
             unsafe { refit(hwnd) };
             unsafe { DefWindowProcW(hwnd, msg, wp, lp) }
         }

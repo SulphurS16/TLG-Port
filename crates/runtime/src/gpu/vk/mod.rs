@@ -35,6 +35,9 @@ pub struct Ctx {
     pub ext_host: Option<ash::ext::external_memory_host::Device>,
     /// VK_EXT_memory_budget enabled (see `vram`).
     pub mem_budget: bool,
+    /// VK_EXT_full_screen_exclusive enabled: swapchains outside exclusive
+    /// full screen are created with it disallowed (present.rs).
+    pub fse: bool,
     /// VK_EXT_conditional_rendering (fast-clear metadata decided on the GPU).
     pub cond_render: Option<ash::ext::conditional_rendering::Device>,
     /// shaderClipDistance / shaderCullDistance enabled.
@@ -189,6 +192,11 @@ pub fn init() -> Result<(), String> {
         if inst_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::swapchain_colorspace::NAME) {
             exts.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
         }
+        // (VK_EXT_full_screen_exclusive's requirement.)
+        let caps2 = inst_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::khr::get_surface_capabilities2::NAME);
+        if caps2 {
+            exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
+        }
         let ici = vk::InstanceCreateInfo::default().application_info(&app).enabled_layer_names(&layers).enabled_extension_names(&exts);
         let instance = entry.create_instance(&ici, None).map_err(|e| format!("vkCreateInstance: {e}"))?;
         if validation {
@@ -263,6 +271,17 @@ pub fn init() -> Result<(), String> {
             .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::memory_budget::NAME);
         if mem_budget {
             dexts.push(ash::ext::memory_budget::NAME.as_ptr());
+        }
+        // A borderless window is not to be taken exclusively by the driver
+        // (NVIDIA's did, with its own display mode: GitHub issue #4).
+        let fse = caps2
+            && instance
+                .enumerate_device_extension_properties(pdev)
+                .unwrap_or_default()
+                .iter()
+                .any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::full_screen_exclusive::NAME);
+        if fse {
+            dexts.push(ash::ext::full_screen_exclusive::NAME.as_ptr());
         }
         // Out-of-range buffer/image accesses must not fault: GCN bounds-checks
         // buffer accesses against the descriptor (loads return 0, stores are
@@ -433,6 +452,7 @@ pub fn init() -> Result<(), String> {
             ext_host: (host_import && std::env::var("TLG_ZERO_COPY").is_ok_and(|v| v == "1"))
                 .then(|| ash::ext::external_memory_host::Device::new(&instance, &device)),
             mem_budget,
+            fse,
             cond_render: cond_render.then(|| ash::ext::conditional_rendering::Device::new(&instance, &device)),
             device_fault: device_fault.then(|| ash::ext::device_fault::Device::new(&instance, &device)),
             checkpoints: checkpoints.then(|| ash::nv::device_diagnostic_checkpoints::Device::new(&instance, &device)),
@@ -737,6 +757,25 @@ impl Ctx {
     /// `submit` of several command buffers, executed in order.
     pub fn submit_cmds(&self, cmds: &[vk::CommandBuffer], wait: &[(vk::Semaphore, vk::PipelineStageFlags)], signal: &[vk::Semaphore], fence: vk::Fence) -> Result<(), String> {
         self.submit_to(&self.queue, cmds, wait, signal, fence)
+    }
+
+    /// Waits for a submitted `fence`, through timeouts for up to a minute (a
+    /// wait that returns at once, as AMD's drivers do for a fence not yet
+    /// submitted, pauses before the next): Err for a hang or a lost device.
+    pub fn wait_fence(&self, fence: vk::Fence) -> Result<(), vk::Result> {
+        let t0 = std::time::Instant::now();
+        loop {
+            let t = std::time::Instant::now();
+            match unsafe { self.device.wait_for_fences(&[fence], true, 1_000_000_000) } {
+                Ok(()) => return Ok(()),
+                Err(vk::Result::TIMEOUT) if t0.elapsed() < std::time::Duration::from_secs(60) => {
+                    if t.elapsed() < std::time::Duration::from_millis(1) {
+                        std::thread::sleep(std::time::Duration::from_micros(500));
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        }
     }
 
     /// `submit_cmds` to a given queue (`queue` or `present_queue`).

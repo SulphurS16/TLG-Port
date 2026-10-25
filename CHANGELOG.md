@@ -1,5 +1,33 @@
 # Changelog
 
+## 0.7.2
+
+- Fixed a crash on the way into the last cutscene (GitHub issue #7): the
+  game ran out of its graphics memory while loading the ending on top of the
+  area before it ("vram allocation failed!" in the log), then crashed. Slower
+  graphics cards, integrated ones especially, hit it most. The game now gets
+  the larger graphics memory a PS4 Pro gives it (512 MB more) at every
+  resolution, not only above 1080p.
+- AMD graphics: the port could treat a batch of graphics work as finished
+  before the graphics card had run it - mostly in the first seconds, while
+  shaders are being prepared - and hand the game results too early. It now
+  waits until the work is submitted and done. (Found in a log from an AMD
+  system; not tested on AMD hardware yet.)
+- Borderless (GitHub issue #4): some graphics drivers (NVIDIA's) took a
+  borderless window that covers the screen for exclusive fullscreen and
+  switched the monitor to a resolution and refresh rate of their own.
+  Borderless and windowed now tell the driver not to; exclusive fullscreen
+  stays as it was. The log now notes any display mode change while the game
+  runs.
+- Fixed a rare crash while the title screen loads, about half a minute
+  after the start: the game could look at Trico's skeleton a moment before
+  it existed. It happened more often while another program kept the
+  computer busy.
+- The ending's start runs about 5% faster: while the graphics card is
+  behind, the port hands it larger batches of work. Busy scenes such as the
+  battle at Sentinel Tower and the ending run 1-2% faster: less bookkeeping
+  on the port's graphics thread.
+
 ## 0.7.1
 
 - Fixed the lighting "breaking" in some places (GitHub issue #3): after the

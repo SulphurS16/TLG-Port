@@ -32,9 +32,11 @@
 //! displays has "1680x1890(cb)" first and "3840x2160(native)" among them).
 //! That entry is set to the chosen size for both; its render targets, the
 //! viewports and constants derived from it and the display buffers follow
-//! (checked at 1280x720 and 3840x2160: picture and interface whole). Above
-//! 1080p the graphics heap takes the PS4 Pro's size (+512 MB, the direct
-//! memory with it). Applied only when the bytes are the expected ones.
+//! (checked at 1280x720 and 3840x2160: picture and interface whole). The
+//! graphics heap takes the PS4 Pro's size (+512 MB, the direct memory with
+//! it) at any size: the base size ran out on the way into the ending's last
+//! cutscene (GitHub issue #7). Applied only when the bytes are the expected
+//! ones.
 //!
 //! Script prints: every `log(fmt, ...)` and `GaPrint(...)` in the Lua (Havok
 //! Script) game scripts ends in the C function `GaPrint`, which the retail
@@ -54,6 +56,19 @@
 //! `tlg_kick_wait`, which waits for the same condition with a short spin and
 //! then sleeps between polls (`tune kick_wait`). Applied only when the code
 //! bytes are the expected ones.
+//!
+//! Trico's foot pins: a per-frame job (eboot 0xe15db0) finds the entity
+//! named "Condor" (Trico) and reads four bones of its skeleton component
+//! (`pin_FL_pin`, ...) through the component lookup at 0xd73040, which
+//! returns null when the entity has no such component - and this caller
+//! never checks. While a stage script sets Trico up (`SetupAI`, about 54 ms
+//! in: the title screen's Trico, 33-35 s into a boot) the entity is there
+//! without it: ACCESS_VIOLATION at +0xe19214, a read of [null+0x478] (runs
+//! 20261011-101844, ..., 20261025-201344). The compare there is detoured: a
+//! null component takes the game's own path for a missing entity (+0xe19320:
+//! the bone's slot gets the defaults for that frame) and is counted
+//! (`foot_pin_misses`, logged at shutdown). Applied only when the code bytes
+//! are the expected ones (`TLG_FOOT_PINS=0` keeps the original).
 //!
 //! Above the game's 30 fps (the 60 fps limit or none): the game's three
 //! calls of `hksL_loadbuffer` (eboot 0xe7e430) go through
@@ -128,6 +143,12 @@ pub fn apply(p: &mut Patcher, name: &str) {
         Ok(()) => crate::info!("render-kick wait: busy loop at {name}+{KICK_SITE:#x} detoured to a polling wait"),
         Err(e) => crate::warn!("render-kick wait: {name}: {e}; not patched"),
     }
+    if !std::env::var("TLG_FOOT_PINS").is_ok_and(|v| v == "0") {
+        match patch_foot_pins(p) {
+            Ok(()) => crate::info!("foot pins: Trico's bone lookup at {name}+{PINS_SITE:#x} checked for a missing skeleton"),
+            Err(e) => crate::warn!("foot pins: {name}: {e}; not patched"),
+        }
+    }
     let sixty = crate::hle::libs::videoout::frame_cap() == crate::config::FrameCap::Fps60;
     match find_step(p) {
         Ok(a) => {
@@ -172,9 +193,13 @@ const HEAP_SITES: [(usize, [u8; 4]); 5] = [
 ];
 const HEAP_EXTRA: u64 = 0x2000_0000;
 
-/// Sets the game's display mode to render and show `w` x `h`; above 1080p
-/// also gives it the PS4 Pro's graphics heap (its higher-resolution modes'
-/// memory). Returns whether the heap grew.
+/// Sets the game's display mode to render and show `w` x `h`, and gives it
+/// the PS4 Pro's graphics heap, as a PS4 Pro does at any output: the base
+/// size ran out where the game, played into the ending's last cutscene,
+/// loads it over the area before (Gomalloc "Garlic: Out of Memory", "vram
+/// allocation failed! wait for 10 secs...", then a crash in its loader at
+/// launch_tricom+0x1476321; GitHub issue #7: all 2816 MB in use). Returns
+/// whether the heap grew (`TLG_PRO_HEAP=0` keeps the base size).
 fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<bool, String> {
     if !(64..=8192).contains(&w) || !(64..=8192).contains(&h) {
         return Err(format!("{w}x{h} is out of range"));
@@ -182,7 +207,7 @@ fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<bool, String> {
     if p.image.get(MODE_TABLE..MODE_TABLE + 12) != Some(&MODE_1080P[..]) {
         return Err("not the expected executable (display-mode table differs)".into());
     }
-    let heap = w as u64 * h as u64 > 1920 * 1080;
+    let heap = !std::env::var("TLG_PRO_HEAP").is_ok_and(|v| v == "0");
     if heap && HEAP_SITES.iter().any(|(off, b)| p.image.get(*off..*off + 4) != Some(&b[..])) {
         return Err("not the expected executable (graphics heap code differs)".into());
     }
@@ -681,6 +706,42 @@ const KICK_STATE: i32 = 0x31ef8;
 /// Render-kick waits that had to wait, and their time (ns).
 pub static KICK_STATS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// The foot-pin job's compare of the looked-up skeleton component (module
+/// docs), the branch on its flags, and the path for a missing entity.
+const PINS_SITE: usize = 0xe19214;
+const PINS_BYTES: [u8; 7] = [0x83, 0xB8, 0x78, 0x04, 0x00, 0x00, 0x00]; // cmp dword [rax+478h], 0
+const PINS_NEXT: u64 = 0xe1921b;
+const PINS_MISSING: u64 = 0xe19320;
+/// The data slot counting lookups that found no skeleton (0: not patched).
+static PINS_COUNT: AtomicU64 = AtomicU64::new(0);
+
+fn patch_foot_pins(p: &mut Patcher) -> Result<(), String> {
+    use iced_x86::code_asm::*;
+    let count = p.alloc_data(&[0u8; 8]).ok_or("no data space")?;
+    let base = p.base;
+    p.detour(PINS_SITE, &PINS_BYTES, |a, ins| {
+        let mut found = a.create_label();
+        a.test(rax, rax)?;
+        a.jne(found)?;
+        // (rax and the flags are dead on the missing-entity path.)
+        a.mov(rax, count)?;
+        a.lock().inc(qword_ptr(rax))?;
+        a.jmp(base + PINS_MISSING)?;
+        a.set_label(&mut found)?;
+        a.add_instruction(*ins)?;
+        a.jmp(base + PINS_NEXT)
+    })?;
+    PINS_COUNT.store(count, Ordering::Relaxed);
+    Ok(())
+}
+
+/// Foot-pin lookups that found no skeleton (`patch_foot_pins`), if patched.
+pub fn foot_pin_misses() -> Option<u64> {
+    let slot = PINS_COUNT.load(Ordering::Relaxed);
+    // SAFETY: the patch's data slot (writable, never freed).
+    (slot != 0).then(|| unsafe { std::ptr::read_volatile(slot as *const u64) })
+}
+
 /// The app object's pointer (module-relative) and its frame step: the
 /// game's time step for the frame, seconds (1/30 at its own limit).
 const APP_PTR: u64 = 0x59a1b40;
@@ -986,5 +1047,45 @@ mod tests {
         assert!(patch_mouse_camera(&mut p).is_err());
         assert_eq!(p.tramp_used, 0);
         assert_eq!(p.image[CAM_GATE.0], CAM_GATE.1[0]);
+    }
+
+    #[test]
+    fn foot_pins_stub() {
+        use iced_x86::{Mnemonic as M, OpKind, Register as R};
+        let base = 0x6000_0000u64;
+        let mut image = vec![0x90u8; 0xe2_0000];
+        image[PINS_SITE..PINS_SITE + PINS_BYTES.len()].copy_from_slice(&PINS_BYTES);
+        let mut tramp = vec![0u8; 0x1_0000];
+        let tbase = base + 0xf0_0000;
+        {
+            let mut p = Patcher { image: &mut image, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp, tramp_used: 0, data_used: 0 };
+            patch_foot_pins(&mut p).unwrap();
+        }
+        let count = PINS_COUNT.swap(0, Ordering::Relaxed);
+        assert!(count >= tbase && count < tbase + 0x1_0000);
+        // The rest of the replaced compare is never executed.
+        assert_eq!(&image[PINS_SITE + 5..PINS_SITE + 7], &[0xCC, 0xCC]);
+        // A null component: counted, then the game's path for a missing entity.
+        let v = stub(&image, &tramp, base, tbase, PINS_SITE);
+        assert_eq!((v[0].mnemonic(), v[0].op0_register(), v[0].op1_register()), (M::Test, R::RAX, R::RAX));
+        assert_eq!(v[1].mnemonic(), M::Jne);
+        assert!(v.iter().any(|i| i.mnemonic() == M::Mov && i.op0_register() == R::RAX && matches!(i.op1_kind(), OpKind::Immediate64 | OpKind::Immediate32to64) && i.immediate(1) == count));
+        assert!(v.iter().any(|i| i.mnemonic() == M::Inc && i.has_lock_prefix() && i.memory_base() == R::RAX));
+        assert_eq!(v.last().unwrap().near_branch_target(), base + PINS_MISSING);
+        // Otherwise the original compare, then the branch on its flags.
+        let found = v[1].near_branch_target();
+        let mut d = Decoder::with_ip(64, &tramp[(found - tbase) as usize..], found, DecoderOptions::NONE);
+        let cmp = d.decode();
+        assert_eq!(&tramp[(found - tbase) as usize..][..cmp.len()], &PINS_BYTES);
+        let j = d.decode();
+        assert_eq!((j.flow_control(), j.near_branch_target()), (FlowControl::UnconditionalBranch, base + PINS_NEXT));
+        // Other bytes: not patched.
+        let mut image2 = vec![0x90u8; 0xe2_0000];
+        image2[PINS_SITE..PINS_SITE + 7].copy_from_slice(&[0x83, 0xB8, 0x70, 0x04, 0x00, 0x00, 0x00]);
+        let mut tramp2 = vec![0u8; 0x1_0000];
+        let mut p = Patcher { image: &mut image2, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp2, tramp_used: 0, data_used: 0 };
+        assert!(patch_foot_pins(&mut p).is_err());
+        assert_eq!(p.image[PINS_SITE], 0x83);
+        PINS_COUNT.store(0, Ordering::Relaxed);
     }
 }

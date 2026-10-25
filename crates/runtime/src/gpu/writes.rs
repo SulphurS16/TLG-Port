@@ -22,6 +22,9 @@ use super::lazywb;
 use super::render::FastMap;
 use crate::mem;
 
+/// Merged byte runs of a range (`dirty_runs`): a few, kept inline.
+pub type Runs = smallvec::SmallVec<[(u64, u64); 4]>;
+
 const PAGE_SHIFT: u32 = 12;
 /// Pages are stamped in 4 MiB chunks (1024 host pages).
 const CHUNK_SHIFT: u32 = 22;
@@ -117,11 +120,85 @@ struct Round {
     asked: Vec<(u64, u64)>,
 }
 
+/// Chunks indexed directly (guest memory below 1 TiB); a map beyond.
+const TABLE_CHUNKS: u64 = 1 << 18;
+
+/// Per-chunk state found by the chunk's index instead of a hash lookup (the
+/// tracker's maps were probed several times per validated binding): a
+/// vector of boxed entries up to `TABLE_CHUNKS`, a map for the rest. The
+/// subset of the map API the tracker uses.
+struct ChunkMap<T> {
+    direct: Vec<Option<Box<T>>>,
+    beyond: FastMap<u64, T>,
+    len: usize,
+}
+
+impl<T> Default for ChunkMap<T> {
+    fn default() -> Self {
+        ChunkMap { direct: Vec::new(), beyond: FastMap::default(), len: 0 }
+    }
+}
+
+impl<T> ChunkMap<T> {
+    fn get(&self, c: &u64) -> Option<&T> {
+        if *c < TABLE_CHUNKS {
+            self.direct.get(*c as usize).and_then(|x| x.as_deref())
+        } else {
+            self.beyond.get(c)
+        }
+    }
+
+    fn get_mut(&mut self, c: &u64) -> Option<&mut T> {
+        if *c < TABLE_CHUNKS {
+            self.direct.get_mut(*c as usize).and_then(|x| x.as_deref_mut())
+        } else {
+            self.beyond.get_mut(c)
+        }
+    }
+
+    fn entry(&mut self, c: u64) -> ChunkEntry<'_, T> {
+        ChunkEntry(self, c)
+    }
+
+    fn len(&self) -> usize {
+        self.len + self.beyond.len()
+    }
+
+    fn capacity(&self) -> usize {
+        self.direct.len() + self.beyond.capacity()
+    }
+}
+
+struct ChunkEntry<'a, T>(&'a mut ChunkMap<T>, u64);
+
+impl<'a, T> ChunkEntry<'a, T> {
+    fn or_insert_with(self, f: impl FnOnce() -> T) -> &'a mut T {
+        let (m, c) = (self.0, self.1);
+        if c < TABLE_CHUNKS {
+            if m.direct.len() <= c as usize {
+                m.direct.resize_with(c as usize + 1, || None);
+            }
+            let slot = &mut m.direct[c as usize];
+            if slot.is_none() {
+                *slot = Some(Box::new(f()));
+                m.len += 1;
+            }
+            slot.as_deref_mut().unwrap()
+        } else {
+            m.beyond.entry(c).or_insert_with(f)
+        }
+    }
+
+    fn or_insert(self, v: T) -> &'a mut T {
+        self.or_insert_with(|| v)
+    }
+}
+
 pub struct WriteTracker {
     /// Stamp counter: advances with every harvest that finds written pages
     /// and every registered GPU write.
     seq: u64,
-    chunks: FastMap<u64, Chunk>,
+    chunks: ChunkMap<Chunk>,
     buf: Vec<usize>,
     pages: Vec<u64>,
     /// Validations that found the range unwritten (no hashing needed) and
@@ -129,7 +206,7 @@ pub struct WriteTracker {
     pub clean: u64,
     pub dirty: u64,
     /// CPU epoch of each 64 KiB block's last write-watch query, per chunk.
-    queried: FastMap<u64, [u64; CHUNK_BLOCKS]>,
+    queried: ChunkMap<[u64; CHUNK_BLOCKS]>,
     /// The current CPU epoch and the oldest one whose block queries still
     /// answer for the current command (the renderer's `required_epoch`).
     pub epoch: u64,
@@ -137,7 +214,7 @@ pub struct WriteTracker {
     /// Validation queries answered from this epoch's block queries alone.
     pub cached: u64,
     /// Write protection of cold blocks (cpuwatch.rs).
-    watch: FastMap<u64, Watch>,
+    watch: ChunkMap<Watch>,
     disarmed: Vec<u64>,
     /// Block queries left out because the block was armed (TLG_PERF).
     pub armed_skips: u64,
@@ -145,7 +222,7 @@ pub struct WriteTracker {
     /// queried since it began to (`lazywb::covered`): no CPU write reaches
     /// them without a fault, which ends that (`take_cover_events`), so they
     /// are left out of queries as armed blocks are (`tune lazy_skip`).
-    lazy_ok: FastMap<u64, u64>,
+    lazy_ok: ChunkMap<u64>,
     cover_events: Vec<u64>,
     /// Per queue class (graphics, compute: `class`, set with `required`).
     rounds: [Round; 2],
@@ -154,7 +231,7 @@ pub struct WriteTracker {
 
 impl WriteTracker {
     pub fn new() -> WriteTracker {
-        WriteTracker { seq: 1, chunks: FastMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: FastMap::default(), epoch: 0, required: 0, cached: 0, watch: FastMap::default(), disarmed: Vec::new(), armed_skips: 0, lazy_ok: FastMap::default(), cover_events: Vec::new(), rounds: Default::default(), class: 0 }
+        WriteTracker { seq: 1, chunks: ChunkMap::default(), buf: Vec::new(), pages: Vec::new(), clean: 0, dirty: 0, queried: ChunkMap::default(), epoch: 0, required: 0, cached: 0, watch: ChunkMap::default(), disarmed: Vec::new(), armed_skips: 0, lazy_ok: ChunkMap::default(), cover_events: Vec::new(), rounds: Default::default(), class: 0 }
     }
 
     /// Collects the OS's records of [addr, addr+len) for a validation: the
@@ -643,24 +720,30 @@ impl WriteTracker {
 
     /// Merged runs of [lo, hi) with pages written after stamp `since`: by
     /// the CPU (the OS's records) or by registered GPU writes.
-    pub fn dirty_runs(&self, lo: u64, hi: u64, since: u64) -> Vec<(u64, u64)> {
+    pub fn dirty_runs(&self, lo: u64, hi: u64, since: u64) -> Runs {
         self.runs_after(lo, hi, since, false)
     }
 
     /// Merged runs of [lo, hi) with pages the OS saw written after stamp
     /// `since` (CPU writes only, see `cpu_changed_since`).
-    pub fn cpu_dirty_runs(&self, lo: u64, hi: u64, since: u64) -> Vec<(u64, u64)> {
+    pub fn cpu_dirty_runs(&self, lo: u64, hi: u64, since: u64) -> Runs {
         self.runs_after(lo, hi, since, true)
     }
 
-    fn runs_after(&self, lo: u64, hi: u64, since: u64, cpu_only: bool) -> Vec<(u64, u64)> {
-        let mut runs: Vec<(u64, u64)> = Vec::new();
+    fn runs_after(&self, lo: u64, hi: u64, since: u64, cpu_only: bool) -> Runs {
+        // (Chunks and their pages are visited in address order: the runs
+        // come out sorted and are merged as they are found.)
+        let mut out = Runs::new();
+        let mut add = |a: u64, b: u64| match out.last_mut() {
+            Some(m) if a <= m.1 => m.1 = m.1.max(b),
+            _ => out.push((a, b)),
+        };
         let mut c = lo >> CHUNK_SHIFT;
         while (c << CHUNK_SHIFT) < hi {
             if let Some(ch) = self.chunks.get(&c).filter(|ch| if cpu_only { ch.cpu_max > since } else { ch.max > since }) {
                 let base = c << CHUNK_SHIFT;
                 if !cpu_only && ch.whole > since {
-                    runs.push((lo.max(base), hi.min(base + (1 << CHUNK_SHIFT))));
+                    add(lo.max(base), hi.min(base + (1 << CHUNK_SHIFT)));
                     c += 1;
                     continue;
                 }
@@ -670,19 +753,11 @@ impl WriteTracker {
                 for p in first..last.min(CHUNK_PAGES) {
                     if stamps[p] > since || (!cpu_only && ch.blocks[p / BLOCK_PAGES] > since) {
                         let a = base + ((p as u64) << PAGE_SHIFT);
-                        runs.push((a.max(lo), (a + (1 << PAGE_SHIFT)).min(hi)));
+                        add(a.max(lo), (a + (1 << PAGE_SHIFT)).min(hi));
                     }
                 }
             }
             c += 1;
-        }
-        runs.sort_unstable();
-        let mut out: Vec<(u64, u64)> = Vec::with_capacity(runs.len());
-        for (a, b) in runs {
-            match out.last_mut() {
-                Some(m) if a <= m.1 => m.1 = m.1.max(b),
-                _ => out.push((a, b)),
-            }
         }
         out
     }
@@ -797,7 +872,7 @@ mod tests {
         let mid = base + (2 << CHUNK_SHIFT);
         assert!(t.gpu_written_since(mid + 0x5000, 4, s2 - 1));
         assert!(!t.gpu_written_since(mid + 0x5000, 4, s2));
-        assert_eq!(t.dirty_runs(mid, mid + 0x3000, s2 - 1), vec![(mid, mid + 0x3000)]);
+        assert_eq!(t.dirty_runs(mid, mid + 0x3000, s2 - 1).to_vec(), vec![(mid, mid + 0x3000)]);
         assert!(!t.gpu_written_since(base + (4 << CHUNK_SHIFT), 4, s2 - 1));
         // CPU-only views ignore the registered GPU writes.
         assert!(t.cpu_dirty_runs(mid, mid + 0x3000, 0).is_empty());
@@ -806,10 +881,10 @@ mod tests {
         t.pages = vec![mid + 0x1000];
         t.stamp_harvest();
         let s3 = t.seq;
-        assert_eq!(t.cpu_dirty_runs(mid, mid + 0x3000, s3 - 1), vec![(mid + 0x1000, mid + 0x2000)]);
+        assert_eq!(t.cpu_dirty_runs(mid, mid + 0x3000, s3 - 1).to_vec(), vec![(mid + 0x1000, mid + 0x2000)]);
         assert!(t.cpu_pages_after(mid, mid + 0x3000, s3 - 1));
         assert!(!t.cpu_pages_after(mid, mid + 0x3000, s3));
-        assert_eq!(t.dirty_runs(mid, mid + 0x3000, s3 - 1), vec![(mid + 0x1000, mid + 0x2000)]);
+        assert_eq!(t.dirty_runs(mid, mid + 0x3000, s3 - 1).to_vec(), vec![(mid + 0x1000, mid + 0x2000)]);
     }
 
     #[test]
@@ -828,7 +903,7 @@ mod tests {
         // A range that ends inside the block-stamped block.
         assert!(t.gpu_written_since(base + 0x14000, 0x2000, s - 1));
         // Runs page by page, merged.
-        assert_eq!(t.dirty_runs(base, base + 0x40000, s - 1), vec![(base + 0x3000, base + 0x28000)]);
+        assert_eq!(t.dirty_runs(base, base + 0x40000, s - 1).to_vec(), vec![(base + 0x3000, base + 0x28000)]);
         // A newer page write inside the block keeps the block's pages written.
         t.note_gpu_write(base + 0x11000, 0x10);
         let s2 = t.seq;

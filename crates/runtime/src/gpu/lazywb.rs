@@ -268,7 +268,7 @@ fn read_back(buf: vk::Buffer, off: u64, size: u64, dst: u64, guarded: bool, unpr
         c.device.end_command_buffer(rb.cmd).map_err(|e| e.to_string())?;
     }
     c.submit(rb.cmd, &[], &[], rb.fence)?;
-    unsafe { c.device.wait_for_fences(&[rb.fence], true, 10_000_000_000) }.map_err(|e| format!("lazy write-back readback: {e}"))?;
+    c.wait_fence(rb.fence).map_err(|e| format!("lazy write-back readback: {e}"))?;
     // (Directly: the memory map lock may be held by this thread. Our copy is
     // not a CPU write of the range: forgotten before a harvest can see it.)
     let _h = crate::mem::HARVEST_LOCK.lock();

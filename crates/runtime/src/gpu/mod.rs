@@ -1577,6 +1577,9 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let top: Vec<String> = fills.iter().take(8).map(|&((b, s, why), (n, bytes))| format!("{n} x {b:#x}+{s:#x} {why} ({} KiB)", bytes >> 10)).collect();
             let ci: [u64; 2] = std::array::from_fn(|i| render::COPYIN_STATS[i].swap(0, Ordering::Relaxed));
             crate::info!("mirror copy-ins/s: {} MiB for {} bindings ({} copies in their batch, {} ahead of it); largest: {}", total >> 20, fills.iter().map(|f| f.1.0).sum::<u64>(), ci[0], ci[1], top.join(", "));
+            fills.sort_by_key(|&(_, (n, _))| std::cmp::Reverse(n));
+            let most: Vec<String> = fills.iter().take(12).map(|&((b, s, why), (n, bytes))| format!("{n} x {b:#x}+{s:#x} {why} ({} KiB)", bytes >> 10)).collect();
+            crate::info!("mirror copy-ins/s, most frequent: {} ranges; {}", fills.len(), most.join(", "));
         }
         let mut wbs: Vec<((u64, u64, bool), u64)> = render::WRITEBACK_SITES.lock().take().map(|m| m.into_iter().collect()).unwrap_or_default();
         if !wbs.is_empty() {

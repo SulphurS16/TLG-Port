@@ -157,6 +157,42 @@ static STARTED: std::sync::Once = std::sync::Once::new();
 /// nanoseconds since `EPOCH`), for the GPU-busy accounting.
 static SUBMITS: [(AtomicU64, AtomicU64); 64] = [const { (AtomicU64::new(0), AtomicU64::new(0)) }; 64];
 static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+/// The newest batch handed to the queue (batches are submitted in order),
+/// queued or direct: a wait for a batch's fence starts once it is there
+/// (`submitted`, `wait_submitted`; `SUBMIT_CV` tells the waiters).
+static SUBMITTED: AtomicU64 = AtomicU64::new(0);
+static SUBMIT_LOCK: Mutex<()> = Mutex::new(());
+static SUBMIT_CV: Condvar = Condvar::new();
+
+/// Whether batch `seq` has been handed to the Vulkan queue (its fence can
+/// signal): AMD's drivers answer a wait for a fence not yet submitted with
+/// VK_TIMEOUT at once, which ended such waits early (GitHub issue #7).
+pub fn submitted(seq: u64) -> bool {
+    SUBMITTED.load(Ordering::Acquire) >= seq
+}
+
+/// Blocks until batch `seq` has been handed to the queue (`submitted`), for
+/// at most `timeout`: whether it was.
+pub fn wait_submitted(seq: u64, timeout: std::time::Duration) -> bool {
+    if submitted(seq) {
+        return true;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    let mut g = SUBMIT_LOCK.lock();
+    while !submitted(seq) {
+        if SUBMIT_CV.wait_until(&mut g, deadline).timed_out() {
+            return submitted(seq);
+        }
+    }
+    true
+}
+
+fn mark_submitted(seq: u64) {
+    SUBMITTED.fetch_max(seq, Ordering::AcqRel);
+    // (Under the lock: a waiter between its check and its wait holds it.)
+    let _g = SUBMIT_LOCK.lock();
+    SUBMIT_CV.notify_all();
+}
 /// Operations performed, and how many arrived while the recorder slept
 /// (TLG_PERF).
 pub static OPS: AtomicU64 = AtomicU64::new(0);
@@ -427,6 +463,7 @@ unsafe fn perform(d: &ash::Device, op: Op, data: &[PushEntry], unsignaled: &mut 
                 let (s, t) = &SUBMITS[(seq % 64) as usize];
                 t.store(ns, Ordering::Relaxed);
                 s.store(seq, Ordering::Release);
+                mark_submitted(seq);
                 if let Some(t) = lazy {
                     super::lazywb::submitted(t);
                 }
@@ -544,6 +581,7 @@ impl Rec {
         }
         super::copier::wait(copies);
         let r = ctx().submit_cmds(cmds, waits, &[], fence);
+        mark_submitted(seq);
         if let Some(t) = lazy {
             super::lazywb::submitted(t);
         }

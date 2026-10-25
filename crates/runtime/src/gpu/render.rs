@@ -1214,10 +1214,10 @@ enum Retired {
 }
 
 /// `spans` minus the ranges `cut` (all half-open, in the same units).
-fn subtract_ranges(spans: &[(u64, u64)], cut: &[(u64, u64)]) -> Vec<(u64, u64)> {
-    let mut out: Vec<(u64, u64)> = spans.to_vec();
+fn subtract_ranges(spans: &[(u64, u64)], cut: &[(u64, u64)]) -> Spans {
+    let mut out: Spans = spans.iter().copied().collect();
     for &(c, d) in cut {
-        let mut next = Vec::with_capacity(out.len() + 1);
+        let mut next = Spans::with_capacity(out.len() + 1);
         for (x, y) in out {
             if d <= x || y <= c {
                 next.push((x, y));
@@ -1250,9 +1250,15 @@ fn bits_set(v: &mut [u64], a: usize, b: usize, on: bool) {
     }
 }
 
+/// Page runs and byte spans of one binding: a few at most, kept inline (a
+/// heap vector each cost an allocation per mirror fill and upload).
+type PageRuns = smallvec::SmallVec<[(usize, usize); 4]>;
+type Spans = smallvec::SmallVec<[(u64, u64); 4]>;
+type Regions = smallvec::SmallVec<[vk::BufferCopy; 4]>;
+
 /// Runs [a, b) of clear bits within [lo, hi) (a word at a time).
-fn bits_clear_runs(v: &[u64], lo: usize, hi: usize) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+fn bits_clear_runs(v: &[u64], lo: usize, hi: usize) -> PageRuns {
+    let mut out = PageRuns::new();
     let mut i = lo;
     while i < hi {
         // The next clear bit at or after i.
@@ -1407,17 +1413,117 @@ fn clear_color_for(format: vk::Format, e: &[u8]) -> Option<vk::ClearColorValue> 
 /// Writes of up to `SMALL_PAGES` pages go to a map by page instead (`small`;
 /// the Trico battle's ~100,000 small written bindings a second each cost
 /// a few B-tree operations: ~2% of the graphics CP); a page's batch is the
-/// newer of the two.
+/// newer of the two. `tune page_seqs_small` 2: every write in the page
+/// table instead (`PageTable`); lookups consult all three.
 #[derive(Default)]
-struct PageSeqs(std::collections::BTreeMap<u64, (u64, u64)>, FastMap<u64, u64>);
+struct PageSeqs(std::collections::BTreeMap<u64, (u64, u64)>, FastMap<u64, u64>, PageTable);
 
 const SMALL_PAGES: u64 = 2;
+
+/// Per guest page, the sequence of the newest batch writing it (0: none),
+/// in 4 MiB chunks of entries found by address directly (a vector of chunks
+/// up to `TABLE_CHUNKS`, a map beyond): a write sets its pages, a lookup
+/// reads one entry - no tree operations. Entries of completed batches stay
+/// (readers compare with the completed sequence).
+#[derive(Default)]
+struct PageTable(Vec<Option<Box<[u64; 1024]>>>, FastMap<u64, Box<[u64; 1024]>>);
+
+/// Chunks the page table indexes directly: guest memory below 1 TiB.
+const TABLE_CHUNKS: u64 = 1 << 18;
+
+/// Per 64 KiB block of guest memory, the generation of the last image
+/// (its `img_bases` bound) or metadata surface placed over it; 0: never
+/// (`MemModel::surf_gen`, `tune surface_blocks`). The searches of
+/// `note_surface_writes` look only at those, so a GPU write to blocks none
+/// was ever placed over finds nothing - known without the memo's lookup (a
+/// large table probed for every GPU write: ~2% of the graphics CP's samples
+/// in the Trico battle). Generations only grow.
+#[derive(Default)]
+struct BlockGens(Vec<Option<Box<[u64; 64]>>>, FastMap<u64, Box<[u64; 64]>>);
+
+impl BlockGens {
+    /// Blocks overlapping [lo, hi) get generation `g`.
+    fn bump(&mut self, lo: u64, hi: u64, g: u64) {
+        let (b0, b1) = (lo >> 16, (hi.max(lo + 1) - 1) >> 16);
+        for b in b0..=b1 {
+            let c = b >> 6;
+            let chunk = if c < TABLE_CHUNKS {
+                if self.0.len() <= c as usize {
+                    self.0.resize_with(c as usize + 1, || None);
+                }
+                self.0[c as usize].get_or_insert_with(|| Box::new([0; 64]))
+            } else {
+                self.1.entry(c).or_insert_with(|| Box::new([0; 64]))
+            };
+            chunk[(b & 63) as usize] = g;
+        }
+    }
+
+    /// The newest generation of the blocks overlapping [lo, hi).
+    fn max(&self, lo: u64, hi: u64) -> u64 {
+        let (b0, b1) = (lo >> 16, (hi.max(lo + 1) - 1) >> 16);
+        let mut g = 0;
+        for b in b0..=b1 {
+            let c = b >> 6;
+            let chunk = if c < TABLE_CHUNKS { self.0.get(c as usize).and_then(|x| x.as_deref()) } else { self.1.get(&c).map(|x| &**x) };
+            if let Some(ch) = chunk {
+                g = g.max(ch[(b & 63) as usize]);
+            }
+        }
+        g
+    }
+}
+
+impl PageTable {
+    fn chunk(&self, c: u64) -> Option<&[u64; 1024]> {
+        if c < TABLE_CHUNKS {
+            self.0.get(c as usize).and_then(|x| x.as_deref())
+        } else {
+            self.1.get(&c).map(|b| &**b)
+        }
+    }
+
+    fn chunk_mut(&mut self, c: u64) -> &mut [u64; 1024] {
+        if c < TABLE_CHUNKS {
+            if self.0.len() <= c as usize {
+                self.0.resize_with(c as usize + 1, || None);
+            }
+            self.0[c as usize].get_or_insert_with(|| Box::new([0; 1024]))
+        } else {
+            self.1.entry(c).or_insert_with(|| Box::new([0; 1024]))
+        }
+    }
+
+    /// Calls `f` with the entries of pages [lo, hi), chunk by chunk.
+    fn each_mut(&mut self, lo: u64, hi: u64, mut f: impl FnMut(&mut [u64])) {
+        let mut p = lo;
+        while p < hi {
+            let c = p >> 10;
+            let end = hi.min((c + 1) << 10);
+            f(&mut self.chunk_mut(c)[(p & 1023) as usize..(end - (c << 10)) as usize]);
+            p = end;
+        }
+    }
+
+    fn get(&self, page: u64) -> Option<u64> {
+        self.chunk(page >> 10).map(|c| c[(page & 1023) as usize]).filter(|&s| s != 0)
+    }
+}
 
 impl PageSeqs {
     /// Pages [lo, hi) are written by batch `seq` (>= every sequence noted).
     /// (`tune page_seqs_small` 0: every write in the B-tree, as before.)
     fn insert(&mut self, lo: u64, hi: u64, seq: u64) {
-        if hi - lo <= SMALL_PAGES && crate::tune::get(crate::tune::PAGE_SEQS_SMALL) != 0 {
+        self.insert_mode(lo, hi, seq, crate::tune::get(crate::tune::PAGE_SEQS_SMALL));
+    }
+
+    /// `insert` with the knob's `mode` given (tests).
+    fn insert_mode(&mut self, lo: u64, hi: u64, seq: u64, mode: i64) {
+        if mode == 2 {
+            self.2.each_mut(lo, hi, |e| e.fill(seq));
+            return;
+        }
+        if hi - lo <= SMALL_PAGES && mode != 0 {
             for p in lo..hi {
                 self.1.insert(p, seq);
             }
@@ -1454,6 +1560,16 @@ impl PageSeqs {
     /// Entries of batch `from` overlapping pages [lo, hi) - a range `insert`
     /// was given - become batch `to`.
     fn renumber(&mut self, lo: u64, hi: u64, from: u64, to: u64) {
+        // (In the table, the map or the B-tree: wherever the knob put them.)
+        if !self.2.0.is_empty() || !self.2.1.is_empty() {
+            self.2.each_mut(lo, hi, |e| {
+                for s in e {
+                    if *s == from {
+                        *s = to;
+                    }
+                }
+            });
+        }
         // (Small ranges in the map; in the B-tree too, where the knob had
         // put them before it was switched.)
         if hi - lo <= SMALL_PAGES {
@@ -1473,11 +1589,10 @@ impl PageSeqs {
 
     /// The batch of the newest pending write to `page`, if any.
     fn get(&self, page: u64) -> Option<u64> {
-        let t = self.0.range(..=page).next_back().filter(|&(_, &(e, _))| e > page).map(|(_, &(_, q))| q);
-        match (t, self.1.get(&page)) {
-            (Some(a), Some(&b)) => Some(a.max(b)),
-            (a, b) => a.or(b.copied()),
-        }
+        let p = self.2.get(page);
+        let t = if self.0.is_empty() { None } else { self.0.range(..=page).next_back().filter(|&(_, &(e, _))| e > page).map(|(_, &(_, q))| q) };
+        let m = if self.1.is_empty() { None } else { self.1.get(&page).copied() };
+        [p, t, m].into_iter().flatten().max()
     }
 
     fn len(&self) -> usize {
@@ -1946,6 +2061,20 @@ pub fn try_early_eop() {
 /// completion thread performs or performed): each batch's are performed once.
 static EARLY_STATE: Mutex<(u64, u64)> = Mutex::new((0, 0));
 
+/// Waits for batch `seq`'s `fence`: for the recorder to have submitted the
+/// batch, then for the fence (`Ctx::wait_fence`). AMD's drivers answer a
+/// wait for a fence not yet submitted with VK_TIMEOUT at once: batches the
+/// recorder still held (behind a pipeline being compiled) were taken as
+/// completed - their write-backs and end-of-pipe writes done before the GPU
+/// ran them (GitHub issue #7's log, at start-up). Err after a minute or a
+/// lost device.
+fn wait_batch_fence(fence: vk::Fence, seq: u64) -> Result<(), vk::Result> {
+    if !super::rec::wait_submitted(seq, std::time::Duration::from_secs(60)) {
+        return Err(vk::Result::TIMEOUT);
+    }
+    ctx().wait_fence(fence)
+}
+
 /// Waits for submitted batches, then performs their buffer write-backs and
 /// end-of-pipe actions in order.
 fn completion_thread() {
@@ -1962,7 +2091,7 @@ fn completion_thread() {
         };
         let tf = std::time::Instant::now();
         if c.fence != vk::Fence::null() {
-            if let Err(e) = unsafe { ctx().device.wait_for_fences(&[c.fence], true, 10_000_000_000) } {
+            if let Err(e) = wait_batch_fence(c.fence, c.seq) {
                 crate::error!("render wait: {e} (GPU hang or device lost)");
                 if e == vk::Result::ERROR_DEVICE_LOST {
                     super::vk::report_device_lost();
@@ -2378,12 +2507,12 @@ fn slot_wait_split(seq: u64, fence: vk::Fence, to_done: bool) {
         return;
     }
     let t0 = std::time::Instant::now();
-    while super::rec::deferred() && super::rec::submit_time(seq).is_none() && !done() {
+    while !super::rec::submitted(seq) && !done() {
         std::thread::yield_now();
     }
     let t1 = std::time::Instant::now();
     if !done() {
-        unsafe { ctx().device.wait_for_fences(&[fence], true, 10_000_000_000).ok() };
+        ctx().wait_fence(fence).ok();
     }
     let t2 = std::time::Instant::now();
     if to_done {
@@ -2489,6 +2618,9 @@ pub(super) struct BatchCtx {
     /// Draws and dispatches begun (`TargetCache::seq`) and the previous
     /// draw's targets.
     work_seq: u64,
+    /// Batches before this number take the deep sizes (`maybe_submit`): set
+    /// when a slot change had to wait for the GPU.
+    deep_until: u64,
     /// TLG_PERF: the previous dispatch's shader, resources, written set, batch
     /// and command number (`DISPATCH_REPEATS`).
     last_dispatch_sig: Option<(u64, Vec<ResolvedRes>, std::sync::Arc<Vec<usize>>, u64, u64)>,
@@ -2661,6 +2793,10 @@ pub struct MemModel {
     /// Ranges GPU writes covered without meeting a metadata surface or an
     /// image (`note_surface_writes`), with the `meta_gen` then.
     surface_none: FastMap<(u64, u64), u64>,
+    /// Where images and metadata surfaces were ever placed, by 64 KiB block
+    /// (`BlockGens`), and the counter of its generations.
+    surf_gen: BlockGens,
+    surf_seq: u64,
     /// All images by guest base (range queries) with an upper bound of each
     /// one's guest surface size, and the largest bound.
     img_bases: std::collections::BTreeMap<u64, Vec<(ImageKey, u64)>>,
@@ -3322,6 +3458,7 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 dirty_sink: (u64::MAX, 0),
                 vc_why: "other",
                 work_seq: 0,
+                deep_until: 0,
                 last_dispatch_sig: None,
                 target_cache: None,
                 targets_same: false,
@@ -3441,6 +3578,8 @@ pub fn init() -> Result<(), String> {
             meta_gen: 1,
             meta_cache: (0, Vec::new(), 0),
             surface_none: FastMap::default(),
+            surf_gen: BlockGens::default(),
+            surf_seq: 0,
             img_bases: std::collections::BTreeMap::new(),
             img_max_bytes: 0,
             img_bases_large: std::collections::BTreeMap::new(),
@@ -4280,13 +4419,18 @@ impl Renderer {
     /// drain: submits the batch once it holds `batch_max` commands, or
     /// `batch_idle` while the GPU has no submitted work left (after a
     /// synchronizing flush the GPU would otherwise idle until a whole batch
-    /// is recorded). See `tune.rs`.
+    /// is recorded). See `tune.rs`. While the GPU is behind - a slot change
+    /// waited for it within the last `batch_deep_span` batches - the deep
+    /// sizes (`batch_max_deep`, `batch_idle_deep`): fewer batches, each ending
+    /// in a full barrier and its write-back copies, let it catch up.
     fn maybe_submit(&mut self) {
         if !self.cx.recording || self.cx.batch_cmds == 0 {
             return;
         }
-        let max = crate::tune::get(crate::tune::BATCH_MAX).max(1) as u64;
-        let idle = crate::tune::get(crate::tune::BATCH_IDLE).max(1) as u64;
+        let deep = self.cx.batch < self.cx.deep_until;
+        let (max, idle) = if deep { (crate::tune::BATCH_MAX_DEEP, crate::tune::BATCH_IDLE_DEEP) } else { (crate::tune::BATCH_MAX, crate::tune::BATCH_IDLE) };
+        let max = crate::tune::get(max).max(1) as u64;
+        let idle = crate::tune::get(idle).max(1) as u64;
         if self.cx.batch_cmds >= max || (self.cx.batch_cmds >= idle && COMPLETIONS.lock().is_empty()) {
             self.submit_batch(Vec::new());
         }
@@ -4688,7 +4832,10 @@ impl Renderer {
             e.1 += self.cx.batch_cmds;
         }
         self.cx.batch_cmds = 0;
-        let mut pending = std::mem::take(&mut self.cx.writebacks);
+        // (The next batch's list starts at this one's size: it grew from
+        // empty in every batch, ~40 entries each in the Trico battle.)
+        let cap = self.cx.writebacks.len().next_power_of_two().max(16);
+        let mut pending = std::mem::replace(&mut self.cx.writebacks, Vec::with_capacity(cap));
         self.cx.wb_bloom = [0; 4];
         self.cx.wb_ranges = Ranges::new();
         // (In-flight forwards see the whole written ranges, lazy ones too.)
@@ -4867,7 +5014,7 @@ impl Renderer {
             // there.)
             if crate::tune::get(crate::tune::SLOT_FENCE) != 0 && !gpu_profile_on() && *DONE.lock() < prev {
                 let s = &mut self.cx.slots[cur];
-                if let Err(e) = unsafe { c.device.wait_for_fences(&[s.fence], true, 10_000_000_000) } {
+                if let Err(e) = wait_batch_fence(s.fence, prev) {
                     crate::error!("render slot wait: {e} (GPU hang or device lost)");
                 }
                 (s.fence, s.exec) = swap_sync(s.fence, s.exec, prev);
@@ -4880,7 +5027,12 @@ impl Renderer {
             if last != 0 {
                 wait_done(last);
             }
-            self.prof[6] += t0.elapsed();
+            let waited = t0.elapsed();
+            self.prof[6] += waited;
+            // (Waiting means the GPU is behind: deeper batches for a while.)
+            if waited >= std::time::Duration::from_micros(50) {
+                self.cx.deep_until = self.cx.batch + crate::tune::get(crate::tune::BATCH_DEEP_SPAN).max(0) as u64;
+            }
             let next = &self.cx.slots[cur];
             unsafe {
                 REC.reset_command_buffer(next.cmd, vk::CommandBufferResetFlags::empty()).ok();
@@ -5155,6 +5307,9 @@ impl Renderer {
         };
         let bytes = (linear * k.layers.max(1) as u64 * 2).max(256 << 10);
         mem!(self).img_bases.entry(k.base).or_default().push((k, bytes));
+        let m = mem!(self);
+        m.surf_seq += 1;
+        m.surf_gen.bump(k.base, k.base.saturating_add(bytes), m.surf_seq);
         if bytes > IMG_NEAR_BYTES {
             mem!(self).img_bases_large.entry(k.base).or_default().push((k, bytes));
         }
@@ -5382,7 +5537,12 @@ impl Renderer {
         let meta = (info & (1 << 13) != 0 && cmask != 0).then(|| (cmask, (pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64).div_ceil(2)));
         if img.meta != meta {
             img.meta = meta;
-            mem!(self).meta_gen += 1;
+            let m = mem!(self);
+            m.meta_gen += 1;
+            if let Some((a, n)) = meta {
+                m.surf_seq += 1;
+                m.surf_gen.bump(a, a.saturating_add(n), m.surf_seq);
+            }
         }
         if img.meta.is_some() && !img.meta_listed {
             img.meta_listed = true;
@@ -5441,7 +5601,12 @@ impl Renderer {
         let meta = (zinfo & (1 << 29) != 0 && htile != 0).then(|| (htile, pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64 * 4 * key.layers as u64));
         if img.meta != meta {
             img.meta = meta;
-            mem!(self).meta_gen += 1;
+            let m = mem!(self);
+            m.meta_gen += 1;
+            if let Some((a, n)) = meta {
+                m.surf_seq += 1;
+                m.surf_gen.bump(a, a.saturating_add(n), m.surf_seq);
+            }
         }
         if img.meta.is_some() && !img.meta_listed {
             img.meta_listed = true;
@@ -5558,13 +5723,18 @@ impl Renderer {
         n.meta_listed = o.meta_listed;
         n.guest_newer = o.guest_newer;
         n.last_used = o.last_used;
+        let meta = n.meta;
         let m = mem!(self);
         for k in m.meta_images.iter_mut().chain(m.stale.values_mut().flatten()) {
             if *k == old {
                 *k = new;
             }
         }
-        mem!(self).meta_gen += 1;
+        m.meta_gen += 1;
+        if let Some((a, n)) = meta {
+            m.surf_seq += 1;
+            m.surf_gen.bump(a, a.saturating_add(n), m.surf_seq);
+        }
         // (`stale_ivals` rebuilt with the next aging.)
         mem!(self).stale_aged = u64::MAX;
         if let Some(v) = img!(self).by_base.get_mut(&old.base) {
@@ -7702,7 +7872,7 @@ impl Renderer {
             // window (the copy-in replaces its pages), from in-place or
             // CPU-performed writes (end-of-pipe actions), or from batches whose
             // device-ring segment may be reused: those are waited for.
-            let abs: Vec<(u64, u64)> = runs.iter().map(|&(a, b)| (wlo + ((a as u64) << 12), (wlo + ((b as u64) << 12)).min(whi))).collect();
+            let abs: Spans = runs.iter().map(|&(a, b)| (wlo + ((a as u64) << 12), (wlo + ((b as u64) << 12)).min(whi))).collect();
             // (The window's own pending writes are left out of the copy-in:
             // the window holds their data already.)
             let fwd = self.mirror_forwards_keep(&abs, vbuf);
@@ -7733,16 +7903,16 @@ impl Renderer {
                 }
             }
             ft.at(5);
-            let keep: Vec<(u64, u64)> = fwd.as_ref().map_or(Vec::new(), |f| f.1.iter().map(|&(a, b)| (a.saturating_sub(wlo), b.saturating_sub(wlo))).collect());
+            let keep: Spans = fwd.as_ref().map_or(Spans::new(), |f| f.1.iter().map(|&(a, b)| (a.saturating_sub(wlo), b.saturating_sub(wlo))).collect());
             if !keep.is_empty() {
                 self.copyin_kept += 1;
             }
-            let spans = subtract_ranges(&runs.iter().map(|&(a, b)| ((a as u64) << 12, ((b as u64) << 12).min(whi - wlo))).collect::<Vec<_>>(), &keep);
+            let spans = subtract_ranges(&runs.iter().map(|&(a, b)| ((a as u64) << 12, ((b as u64) << 12).min(whi - wlo))).collect::<Spans>(), &keep);
             let (src, regions) = if spans.is_empty() {
-                (vbuf, Vec::new())
+                (vbuf, Regions::new())
             } else if ctx().ext_host.is_some() {
                 let (zbuf, zoff, _) = self.zc_binding(wlo, whi - wlo).filter(|z| z.2 >= whi - wlo)?;
-                (zbuf, spans.iter().map(|&(off, end)| vk::BufferCopy { src_offset: zoff + off, dst_offset: off, size: end - off }).collect::<Vec<_>>())
+                (zbuf, spans.iter().map(|&(off, end)| vk::BufferCopy { src_offset: zoff + off, dst_offset: off, size: end - off }).collect::<Regions>())
             } else {
                 // Guest memory is not imported: staged through the upload
                 // ring (a buffer of its own when the ring cannot take it),
@@ -7762,7 +7932,7 @@ impl Renderer {
                         (sb, 0, Some(sp))
                     }
                 };
-                let mut regions = Vec::with_capacity(spans.len());
+                let mut regions = Regions::with_capacity(spans.len());
                 let mut at = 0;
                 for &(off, end) in &spans {
                     let n = end - off;
@@ -7812,7 +7982,7 @@ impl Renderer {
                 unsafe { REC.cmd_copy_buffer(pro, src, vbuf, &regions) };
                 // (The forwards land after the copy-in and the earlier
                 // forwards they overlap, as below.)
-                let mut since: Vec<(u64, u64)> = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
+                let mut since: Spans = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
                 for (pbuf, over) in &fwd_copies {
                     if over.iter().any(|r| since.iter().any(|&(x, y)| r.dst_offset < y && x < r.dst_offset + r.size)) {
                         prologue_barrier(pro);
@@ -7832,7 +8002,7 @@ impl Renderer {
                 if !regions.is_empty() {
                     unsafe { REC.cmd_copy_buffer(self.cx.cmd, src, vbuf, &regions) };
                 }
-                let mut since: Vec<(u64, u64)> = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
+                let mut since: Spans = regions.iter().map(|r| (r.dst_offset, r.dst_offset + r.size)).collect();
                 for (pbuf, over) in &fwd_copies {
                     if over.iter().any(|r| since.iter().any(|&(x, y)| r.dst_offset < y && x < r.dst_offset + r.size)) {
                         full_barrier!(self);
@@ -8565,7 +8735,7 @@ impl Renderer {
         // memory yet: forwarded from their device-ring copies (intact until
         // their slot is reused, which the queue orders after this batch)
         // rather than waited for.
-        let mut inflight: Vec<(u64, vk::Buffer, u64, u64)> = Vec::new();
+        let mut inflight: smallvec::SmallVec<[(u64, vk::Buffer, u64, u64); 4]> = smallvec::SmallVec::new();
         let tf = tsc();
         let in_flight = writeback_in_flight(base, size);
         bpart(11, tf);
@@ -8630,8 +8800,8 @@ impl Renderer {
         if let Some(t0) = t0 {
             self.prof[2] += t0.elapsed();
         }
-        let regions: Vec<(vk::Buffer, vk::BufferCopy)> = if inflight.is_empty() && !wb_maybe(&self.cx, base, size) {
-            Vec::new()
+        let regions: smallvec::SmallVec<[(vk::Buffer, vk::BufferCopy); 4]> = if inflight.is_empty() && !wb_maybe(&self.cx, base, size) {
+            smallvec::SmallVec::new()
         } else {
             inflight
                 .iter()
@@ -11645,6 +11815,9 @@ impl Renderer {
     /// [base, base+size): nothing to do for a range where both found
     /// nothing while `meta_gen` is unchanged (`tune surface_memo`).
     fn note_surface_writes(&mut self, base: u64, size: u64) {
+        if crate::tune::get(crate::tune::SURFACE_BLOCKS) != 0 && mem!(self).surf_gen.max(base, base.saturating_add(size)) == 0 {
+            return;
+        }
         let on = crate::tune::get(crate::tune::SURFACE_MEMO) != 0;
         let mg = mem!(self).meta_gen;
         if on && mem!(self).surface_none.get(&(base, size)) == Some(&mg) {
@@ -14478,18 +14651,42 @@ mod tests {
     /// overlaps, merging of neighbours of one batch.
     #[test]
     fn page_seqs_track_the_newest_batch() {
+        // (The B-tree and the small-write map: `page_seqs_small` 1.)
         let mut p = PageSeqs::default();
-        p.insert(10, 20, 1);
-        p.insert(20, 30, 1);
+        p.insert_mode(10, 20, 1, 1);
+        p.insert_mode(20, 30, 1, 1);
         assert_eq!(p.len(), 1);
-        p.insert(15, 25, 2);
+        p.insert_mode(15, 25, 2, 1);
         assert_eq!((p.get(9), p.get(10), p.get(14), p.get(15), p.get(24), p.get(25), p.get(29), p.get(30)), (None, Some(1), Some(1), Some(2), Some(2), Some(1), Some(1), None));
-        p.insert(0, 40, 3);
+        p.insert_mode(0, 40, 3, 1);
         assert_eq!(p.len(), 1);
         assert_eq!((p.get(0), p.get(39), p.get(40)), (Some(3), Some(3), None));
-        p.insert(50, 51, 4);
+        p.insert_mode(50, 51, 4, 1);
         p.retain_after(3);
         assert_eq!((p.get(5), p.get(50)), (None, Some(4)));
+    }
+
+    /// The page table (`page_seqs_small` 2): the newest batch per page across
+    /// chunks, renumbering at submission, entries kept after completion.
+    #[test]
+    fn page_table_tracks_the_newest_batch() {
+        let mut p = PageSeqs::default();
+        // (Across the 1024-page chunk boundary, and beyond the direct range.)
+        p.insert_mode(1020, 1030, 1, 2);
+        p.insert_mode(1025, 1040, 2, 2);
+        assert_eq!((p.get(1019), p.get(1020), p.get(1024), p.get(1025), p.get(1039), p.get(1040)), (None, Some(1), Some(1), Some(2), Some(2), None));
+        p.insert_mode(1022, 1023, OPEN_SEQ, 2);
+        p.renumber(1022, 1023, OPEN_SEQ, 3);
+        p.renumber(1020, 1040, OPEN_SEQ, 9);
+        assert_eq!((p.get(1021), p.get(1022), p.get(1023)), (Some(1), Some(3), Some(1)));
+        let far = TABLE_CHUNKS << 10;
+        p.insert_mode(far + 5, far + 7, 4, 2);
+        assert_eq!((p.get(far + 4), p.get(far + 5), p.get(far + 6), p.get(far + 7)), (None, Some(4), Some(4), None));
+        // (Lookups see the newer of the table and the older structures.)
+        p.insert_mode(1030, 1031, 5, 1);
+        assert_eq!(p.get(1030), Some(5));
+        p.insert_mode(1030, 1031, 6, 2);
+        assert_eq!(p.get(1030), Some(6));
     }
 
     #[test]
@@ -14555,16 +14752,16 @@ mod tests {
     #[test]
     fn vcache_page_bits() {
         let mut v = vec![0u64; 4];
-        assert_eq!(bits_clear_runs(&v, 0, 256), vec![(0, 256)]);
+        assert_eq!(bits_clear_runs(&v, 0, 256).to_vec(), vec![(0, 256)]);
         bits_set(&mut v, 3, 130, true);
         assert_eq!(v[0], !0b111);
         assert_eq!(v[1], u64::MAX);
         assert_eq!(v[2], 0b11);
-        assert_eq!(bits_clear_runs(&v, 0, 256), vec![(0, 3), (130, 256)]);
-        assert_eq!(bits_clear_runs(&v, 10, 120), vec![]);
+        assert_eq!(bits_clear_runs(&v, 0, 256).to_vec(), vec![(0, 3), (130, 256)]);
+        assert_eq!(bits_clear_runs(&v, 10, 120).to_vec(), vec![]);
         bits_set(&mut v, 64, 65, false);
         bits_set(&mut v, 100, 110, false);
-        assert_eq!(bits_clear_runs(&v, 0, 140), vec![(0, 3), (64, 65), (100, 110), (130, 140)]);
+        assert_eq!(bits_clear_runs(&v, 0, 140).to_vec(), vec![(0, 3), (64, 65), (100, 110), (130, 140)]);
         bits_set(&mut v, 0, 256, true);
         assert!(v.iter().all(|&w| w == u64::MAX));
         assert!(bits_clear_runs(&v, 0, 256).is_empty());
@@ -14589,7 +14786,7 @@ mod tests {
             let w: Vec<u64> = (0..4).map(|k| x.rotate_left(k * 17) & x.rotate_right(k * 5 + 3)).collect();
             let lo = (x % 256) as usize;
             let hi = lo + ((x >> 8) % (257 - lo as u64)) as usize;
-            assert_eq!(bits_clear_runs(&w, lo, hi), reference(&w, lo, hi), "{w:x?} {lo}..{hi}");
+            assert_eq!(bits_clear_runs(&w, lo, hi).to_vec(), reference(&w, lo, hi), "{w:x?} {lo}..{hi}");
         }
     }
 }
@@ -14600,12 +14797,12 @@ mod range_tests {
 
     #[test]
     fn subtract() {
-        assert_eq!(subtract_ranges(&[(0, 100)], &[]), vec![(0, 100)]);
-        assert_eq!(subtract_ranges(&[(0, 100)], &[(20, 30)]), vec![(0, 20), (30, 100)]);
-        assert_eq!(subtract_ranges(&[(0, 100)], &[(0, 100)]), vec![]);
-        assert_eq!(subtract_ranges(&[(0, 100)], &[(50, 200)]), vec![(0, 50)]);
-        assert_eq!(subtract_ranges(&[(10, 20), (30, 40)], &[(15, 35)]), vec![(10, 15), (35, 40)]);
-        assert_eq!(subtract_ranges(&[(0, 4096)], &[(2816, 4096), (0, 100)]), vec![(100, 2816)]);
-        assert_eq!(subtract_ranges(&[(0, 10)], &[(10, 20)]), vec![(0, 10)]);
+        assert_eq!(subtract_ranges(&[(0, 100)], &[]).to_vec(), vec![(0, 100)]);
+        assert_eq!(subtract_ranges(&[(0, 100)], &[(20, 30)]).to_vec(), vec![(0, 20), (30, 100)]);
+        assert_eq!(subtract_ranges(&[(0, 100)], &[(0, 100)]).to_vec(), vec![]);
+        assert_eq!(subtract_ranges(&[(0, 100)], &[(50, 200)]).to_vec(), vec![(0, 50)]);
+        assert_eq!(subtract_ranges(&[(10, 20), (30, 40)], &[(15, 35)]).to_vec(), vec![(10, 15), (35, 40)]);
+        assert_eq!(subtract_ranges(&[(0, 4096)], &[(2816, 4096), (0, 100)]).to_vec(), vec![(100, 2816)]);
+        assert_eq!(subtract_ranges(&[(0, 10)], &[(10, 20)]).to_vec(), vec![(0, 10)]);
     }
 }
