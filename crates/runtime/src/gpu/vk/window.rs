@@ -312,6 +312,68 @@ unsafe fn window_monitor(hwnd: HWND) -> Option<Monitor> {
     unsafe { monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)) }
 }
 
+/// Windows HDR ("advanced color") on the monitor showing the window, and
+/// that monitor's SDR content brightness (the white level Windows shows SDR
+/// content at, in nits).
+pub struct DisplayHdr {
+    pub supported: bool,
+    pub enabled: bool,
+    pub sdr_white: f32,
+    /// The monitor's device name (\\.\DISPLAY1).
+    pub device: String,
+}
+
+pub fn display_hdr() -> Option<DisplayHdr> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Devices::Display::*;
+    let w = get()?;
+    let m = unsafe { window_monitor(w.hwnd as HWND) }?;
+    let device = &m.device[..m.device.len() - 1];
+    unsafe {
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != 0 {
+            return None;
+        }
+        let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = vec![zeroed(); np as usize];
+        let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> = vec![zeroed(); nm as usize];
+        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), std::ptr::null_mut()) != 0 {
+            return None;
+        }
+        for p in &paths[..np as usize] {
+            let mut src: DISPLAYCONFIG_SOURCE_DEVICE_NAME = zeroed();
+            src.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            src.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            src.header.adapterId = p.sourceInfo.adapterId;
+            src.header.id = p.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut src.header) != 0 {
+                continue;
+            }
+            let n = src.viewGdiDeviceName.iter().position(|&c| c == 0).unwrap_or(src.viewGdiDeviceName.len());
+            if String::from_utf16_lossy(&src.viewGdiDeviceName[..n]).to_ascii_lowercase() != String::from_utf16_lossy(device).to_ascii_lowercase() {
+                continue;
+            }
+            let mut ac: DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO = zeroed();
+            ac.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADVANCED_COLOR_INFO;
+            ac.header.size = size_of::<DISPLAYCONFIG_GET_ADVANCED_COLOR_INFO>() as u32;
+            ac.header.adapterId = p.targetInfo.adapterId;
+            ac.header.id = p.targetInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut ac.header) != 0 {
+                return None;
+            }
+            let v = ac.Anonymous.value;
+            // (SDRWhiteLevel: 1000 = 80 nits.)
+            let mut wl: DISPLAYCONFIG_SDR_WHITE_LEVEL = zeroed();
+            wl.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            wl.header.size = size_of::<DISPLAYCONFIG_SDR_WHITE_LEVEL>() as u32;
+            wl.header.adapterId = p.targetInfo.adapterId;
+            wl.header.id = p.targetInfo.id;
+            let sdr_white = if DisplayConfigGetDeviceInfo(&mut wl.header) == 0 && wl.SDRWhiteLevel > 0 { wl.SDRWhiteLevel as f32 * 80.0 / 1000.0 } else { 80.0 };
+            return Some(DisplayHdr { supported: v & 1 != 0, enabled: v & 2 != 0, sdr_white, device: String::from_utf16_lossy(device) });
+        }
+    }
+    None
+}
+
 const WINDOWED_STYLE: WINDOW_STYLE = WS_OVERLAPPEDWINDOW;
 const FULL_STYLE: WINDOW_STYLE = WS_POPUP;
 

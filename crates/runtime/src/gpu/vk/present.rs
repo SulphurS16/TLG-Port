@@ -28,6 +28,23 @@ struct Slot {
     image: Option<(vk::Image, vk::DeviceMemory, u32, u32, vk::Format)>,
     /// Staging buffer of `Source::Pixels`.
     staging: Option<(vk::Buffer, vk::DeviceMemory, *mut u8, u64)>,
+    /// HDR10 output: a view of `image` for the kernel, and its output (32-bit
+    /// packed A2B10G10R10 at the swapchain's size: image, memory, view, size).
+    view: Option<vk::ImageView>,
+    out: Option<(vk::Image, vk::DeviceMemory, vk::ImageView, u32, u32)>,
+}
+
+/// HDR10 output (`hdr = auto` with Windows HDR on for the window's monitor):
+/// the frame converted by `gcn::translate::kernels::hdr10_cs` (gamma 2.2
+/// decode, paper white, BT.709 -> BT.2020, PQ) into a 32-bit image that is
+/// copied into the ST 2084 swapchain image.
+struct Hdr10 {
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    /// One descriptor set per slot.
+    sets: Vec<vk::DescriptorSet>,
+    /// Bilinear and nearest (`filter`).
+    samplers: [vk::Sampler; 2],
 }
 
 struct Presenter {
@@ -50,15 +67,32 @@ struct Presenter {
     /// and then: no GPU work completed again (the threads' stacks showed this
     /// one in vkDeviceWaitIdle, the rest waiting for fences).
     retired: Vec<(usize, vk::SwapchainKHR, Vec<vk::Semaphore>)>,
+    /// The kernel's objects (made for the first HDR10 swapchain) and, for
+    /// the current swapchain, its paper-white scale (nits / 10000) and
+    /// flags; None = SDR.
+    hdr: Option<Hdr10>,
+    hdr_out: Option<(f32, u32)>,
 }
 
 unsafe impl Send for Presenter {}
 
 static PRESENTER: Mutex<Option<Presenter>> = Mutex::new(None);
 
+/// The title's display buffers hold PQ-encoded BT.2020 (its own HDR mode,
+/// `hdr = game`): set by libSceVideoOut from their pixel format. The HDR10
+/// swapchain stays while it is set, whatever Windows' HDR state.
+pub static GAME_PQ: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The current swapchain takes HDR10 (for libSceVideoOut's device
+/// capability: the title's own HDR mode is offered only then).
+pub fn hdr_active() -> bool {
+    PRESENTER.lock().as_ref().is_some_and(|p| p.hdr_out.is_some())
+}
+
 pub enum Source {
-    /// An image the GPU wrote; `layout` is its current layout (kept).
-    Image { image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32, format: vk::Format },
+    /// An image the GPU wrote; `layout` is its current layout (kept); `pq`:
+    /// it holds PQ-encoded BT.2020 (the title's HDR mode).
+    Image { image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32, format: vk::Format, pq: bool },
     /// Linear BGRA8 pixels.
     Pixels { data: Vec<u8>, width: u32, height: u32 },
 }
@@ -71,14 +105,33 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
         // UNORM: display images hold sRGB-encoded values in UNORM storage
         // (8-bit sRGB targets are stored as UNORM, A2R10G10B10 sRGB has no
         // sRGB format), which a blit must pass through unchanged; an sRGB
-        // swapchain would encode them a second time.
-        let fmt = formats
-            .iter()
-            .find(|f| f.format == vk::Format::B8G8R8A8_UNORM)
-            .or_else(|| formats.iter().find(|f| f.format == vk::Format::R8G8B8A8_UNORM))
-            .or_else(|| formats.first())
-            .copied()
+        // swapchain would encode them a second time. HDR10 (ST 2084) where
+        // wanted and offered.
+        let white = hdr_wanted();
+        let hdr_fmt = white.and_then(|_| {
+            formats.iter().find(|f| f.color_space == vk::ColorSpaceKHR::HDR10_ST2084_EXT && matches!(f.format, vk::Format::A2B10G10R10_UNORM_PACK32 | vk::Format::A2R10G10B10_UNORM_PACK32)).copied()
+        });
+        if white.is_some() && hdr_fmt.is_none() {
+            crate::warn!("HDR output: the window's surface offers no HDR10 (ST 2084) format; SDR output");
+        }
+        let fmt = hdr_fmt
+            .or_else(|| formats.iter().find(|f| f.format == vk::Format::B8G8R8A8_UNORM && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR).copied())
+            .or_else(|| formats.iter().find(|f| f.format == vk::Format::R8G8B8A8_UNORM && f.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR).copied())
+            .or_else(|| formats.first().copied())
             .ok_or("no surface format")?;
+        p.hdr_out = None;
+        if let (Some(white), Some(f)) = (white, hdr_fmt) {
+            if p.hdr.is_none() {
+                p.hdr = Some(make_hdr10(p.slots.len())?);
+            }
+            // Flags: bit 0 the piecewise sRGB curve (TLG_HDR_SRGB=1; gamma 2.2
+            // by default, as SDR monitors show the frame), bit 1 red in the
+            // high bits (A2R10G10B10).
+            let flags = (std::env::var_os("TLG_HDR_SRGB").is_some() as u32) | (((f.format == vk::Format::A2R10G10B10_UNORM_PACK32) as u32) << 1);
+            p.hdr_out = Some((white / 10000.0, flags));
+            let why = if crate::config::settings().hdr_white == 0 { "the monitor's SDR content brightness" } else { "setting hdr_white" };
+            crate::info!("HDR output: HDR10 (ST 2084, BT.2020) {:?}, white {white} nits ({why})", f.format);
+        }
         let mut extent = caps.current_extent;
         if extent.width == u32::MAX {
             extent = vk::Extent2D { width: window::CLIENT_W.load(std::sync::atomic::Ordering::Relaxed), height: window::CLIENT_H.load(std::sync::atomic::Ordering::Relaxed) };
@@ -123,6 +176,127 @@ unsafe fn create_swapchain(p: &mut Presenter) -> Result<(), String> {
 /// (vsync without back-pressure: the newest frame is shown, for uncapped
 /// rates above the display's) or `TLG_PRESENT=immediate` (no vsync, tears)
 /// when the surface supports them; else settings.txt `vsync`.
+/// The title's PQ frames on an SDR swapchain: the nits shown as white.
+const PQ_SDR_WHITE: f32 = 100.0;
+
+/// The gain on the title's own PQ output: TLG_HDR_GAIN, else 1 (as the
+/// title renders it). (`white`: the SDR paper-white scale, nits / 10000.)
+fn hdr_game_gain(_white: f32) -> f32 {
+    static GAIN: std::sync::OnceLock<f32> = std::sync::OnceLock::new();
+    *GAIN.get_or_init(|| std::env::var("TLG_HDR_GAIN").ok().and_then(|v| v.parse().ok()).filter(|g: &f32| *g > 0.0 && *g <= 10.0).unwrap_or(1.0))
+}
+
+/// HDR10 output for the next swapchain: `hdr = auto` and Windows HDR on for
+/// the window's monitor (development: TLG_HDR=force always, =off never).
+/// Returns the paper white (nits): `hdr_white`, or for 0 the monitor's SDR
+/// content brightness.
+fn hdr_wanted() -> Option<f32> {
+    let s = crate::config::settings();
+    let force = std::env::var("TLG_HDR").ok();
+    let disp = window::display_hdr();
+    static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if LOGGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+        match &disp {
+            Some(d) => crate::info!(
+                "display {}: Windows HDR {} ({}), SDR content brightness {} nits; setting hdr {:?}, hdr_white {}",
+                d.device,
+                if d.enabled { "on" } else { "off" },
+                if d.supported { "supported" } else { "not supported" },
+                d.sdr_white,
+                s.hdr,
+                s.hdr_white
+            ),
+            None => crate::info!("display: Windows HDR state unknown; setting hdr {:?}", s.hdr),
+        }
+    }
+    match force.as_deref() {
+        Some("off") => return None,
+        Some("force") => {}
+        // (The title renders PQ: HDR10 regardless.)
+        _ if GAME_PQ.load(std::sync::atomic::Ordering::Relaxed) => {}
+        _ => {
+            if s.hdr == crate::config::Hdr::Off || !disp.as_ref().is_some_and(|d| d.enabled) {
+                return None;
+            }
+        }
+    }
+    Some(if s.hdr_white == 0 { disp.map_or(80.0, |d| d.sdr_white) } else { s.hdr_white as f32 })
+}
+
+/// The HDR10 kernel's pipeline, descriptor sets (one per slot) and samplers.
+unsafe fn make_hdr10(slots: usize) -> Result<Hdr10, String> {
+    let c = ctx();
+    unsafe {
+        let bindings = [
+            vk::DescriptorSetLayoutBinding::default().binding(0).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+            vk::DescriptorSetLayoutBinding::default().binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE),
+        ];
+        let set_layout = c.device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).map_err(|e| e.to_string())?;
+        let pcr = [vk::PushConstantRange { stage_flags: vk::ShaderStageFlags::COMPUTE, offset: 0, size: 32 }];
+        let sls = [set_layout];
+        let layout = c.device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&sls).push_constant_ranges(&pcr), None).map_err(|e| e.to_string())?;
+        let code = gcn::translate::kernels::hdr10_cs();
+        let module = c.device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).map_err(|e| e.to_string())?;
+        let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
+        let pci = [vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout)];
+        let pipeline = c.device.create_compute_pipelines(vk::PipelineCache::null(), &pci, None).map_err(|(_, e)| e.to_string())?[0];
+        c.device.destroy_shader_module(module, None);
+        let n = slots as u32;
+        let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: n }, vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: n }];
+        let pool = c.device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(n).pool_sizes(&sizes), None).map_err(|e| e.to_string())?;
+        let layouts = vec![set_layout; slots];
+        let sets = c.device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)).map_err(|e| e.to_string())?;
+        let sampler = |f: vk::Filter| {
+            let sci = vk::SamplerCreateInfo::default()
+                .mag_filter(f)
+                .min_filter(f)
+                .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                .max_lod(0.0);
+            c.device.create_sampler(&sci, None).map_err(|e| e.to_string())
+        };
+        let samplers = [sampler(vk::Filter::LINEAR)?, sampler(vk::Filter::NEAREST)?];
+        Ok(Hdr10 { layout, pipeline, sets, samplers })
+    }
+}
+
+/// TLG_HDR_CHECK=<n>: the n-th HDR10 frame's output read back once and its
+/// brightest pixels and mean logged in nits (PQ decoded), to check the
+/// conversion without an HDR display.
+unsafe fn hdr_check(c: &super::Ctx, cmd: vk::CommandBuffer, out: vk::Image, w: u32, h: u32, scale: f32, pq: bool) {
+    static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let Some(at) = std::env::var("TLG_HDR_CHECK").ok().and_then(|v| v.parse::<u64>().ok()) else { return };
+    if FRAMES.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1 != at.max(1) {
+        return;
+    }
+    let size = (w * h * 4) as u64;
+    let Ok((buf, _mem, ptr)) = c.host_buffer(size, vk::BufferUsageFlags::TRANSFER_DST) else { return };
+    let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+    let region = vk::BufferImageCopy { buffer_offset: 0, buffer_row_length: 0, buffer_image_height: 0, image_subresource: layers, image_offset: vk::Offset3D::default(), image_extent: vk::Extent3D { width: w, height: h, depth: 1 } };
+    unsafe { c.device.cmd_copy_image_to_buffer(cmd, out, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buf, &[region]) };
+    let ptr = ptr as usize;
+    std::thread::spawn(move || {
+        // (After the blit has finished; leaked: once per run.)
+        std::thread::sleep(std::time::Duration::from_secs(2));
+        let px = unsafe { std::slice::from_raw_parts(ptr as *const u32, (w * h) as usize) };
+        let nits = |code: u32| {
+            let e = (code as f64 / 1023.0).powf(1.0 / 78.843_75);
+            let y = ((e - 0.835_937_5).max(0.0) / (18.851_562_5 - 18.687_5 * e)).powf(1.0 / 0.159_301_757_812_5);
+            y * 10000.0
+        };
+        let (mut sum, mut max) = (0.0f64, 0.0f64);
+        for &v in px {
+            let g = nits((v >> 10) & 0x3FF);
+            sum += g;
+            max = max.max(g);
+        }
+        let what = if pq { format!("the title's PQ frame, gain {scale}") } else { format!("white set to {:.0} nits", scale as f64 * 10000.0) };
+        crate::info!("HDR check: output {w}x{h}, green channel mean {:.1} nits, max {:.1} nits ({what})", sum / px.len() as f64, max);
+    });
+}
+
 fn present_mode(surface: vk::SurfaceKHR) -> vk::PresentModeKHR {
     use crate::config::VSync;
     let want = match std::env::var("TLG_PRESENT").as_deref() {
@@ -178,6 +352,8 @@ pub fn init(title: &str) -> Result<(), String> {
                 fence: c.device.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None).map_err(|e| e.to_string())?,
                 image: None,
                 staging: None,
+                view: None,
+                out: None,
             });
         }
         let mut p = Presenter {
@@ -192,6 +368,8 @@ pub fn init(title: &str) -> Result<(), String> {
             frame: 0,
             skipped: 0,
             retired: Vec::new(),
+            hdr: None,
+            hdr_out: None,
         };
         create_swapchain(&mut p)?;
         *PRESENTER.lock() = Some(p);
@@ -280,11 +458,33 @@ pub fn present(src: Source) -> bool {
             note_skipped(p.skipped);
             return false;
         }
-        let (sw, sh, fmt) = match &src {
-            Source::Image { width, height, format, .. } => (*width, *height, *format),
-            Source::Pixels { width, height, .. } => (*width, *height, vk::Format::B8G8R8A8_UNORM),
+        let (sw, sh, fmt, pq) = match &src {
+            Source::Image { width, height, format, pq, .. } => (*width, *height, *format, *pq),
+            Source::Pixels { width, height, .. } => (*width, *height, vk::Format::B8G8R8A8_UNORM, false),
         };
-        if let Err(e) = prepare_slot(&mut p.slots[k], sw, sh, fmt, &src) {
+        // The kernel's mode: scale and flags (HDR10 output of SDR or PQ frames,
+        // or PQ frames on an SDR swapchain); None = a blit.
+        let kmode = match (p.hdr_out, pq) {
+            (Some((white, flags)), false) => Some((white, flags)),
+            (Some((white, flags)), true) => Some((hdr_game_gain(white), flags | 4)),
+            (None, true) => Some((10000.0 / PQ_SDR_WHITE, 4 | 8 | (((p.format == vk::Format::B8G8R8A8_UNORM) as u32) << 1))),
+            (None, false) => None,
+        };
+        let kmode = match kmode {
+            Some(m) if p.hdr.is_none() => match make_hdr10(p.slots.len()) {
+                Ok(h) => {
+                    p.hdr = Some(h);
+                    Some(m)
+                }
+                Err(e) => {
+                    crate::error!("present: HDR kernel: {e}");
+                    None
+                }
+            },
+            m => m,
+        };
+        let out_size = kmode.map(|_| (p.extent.width, p.extent.height));
+        if let Err(e) = prepare_slot(&mut p.slots[k], sw, sh, fmt, &src, out_size) {
             crate::error!("present: {e}");
             return false;
         }
@@ -342,8 +542,40 @@ pub fn present(src: Source) -> bool {
         c.device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).ok();
         c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         let dst = p.images[idx as usize];
-        barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         let (dx0, dy0, dx1, dy1) = dst_rect(sw, sh, p.extent.width, p.extent.height);
+        let filter = match crate::config::settings().filter {
+            crate::config::Filter::Smooth => vk::Filter::LINEAR,
+            crate::config::Filter::Sharp => vk::Filter::NEAREST,
+        };
+        if let (Some((scale, flags)), Some(h)) = (kmode, p.hdr.as_ref()) {
+            // HDR10: the kernel samples the copy into the slot's output (black
+            // outside the frame's rectangle), copied into the swapchain image.
+            let (out, _, out_view, ow, oh) = s.out.unwrap();
+            barrier(c, cmd, copy_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            barrier(c, cmd, out, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
+            let set = h.sets[k];
+            let src_info = [vk::DescriptorImageInfo { sampler: h.samplers[(filter == vk::Filter::NEAREST) as usize], image_view: s.view.unwrap(), image_layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL }];
+            let out_info = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: out_view, image_layout: vk::ImageLayout::GENERAL }];
+            let writes = [
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&src_info),
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&out_info),
+            ];
+            c.device.update_descriptor_sets(&writes, &[]);
+            c.device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, h.pipeline);
+            c.device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, h.layout, 0, &[set], &[]);
+            let pc: [u32; 8] = [(dx0 as f32).to_bits(), (dy0 as f32).to_bits(), (dx1 as f32).to_bits(), (dy1 as f32).to_bits(), ow, oh, scale.to_bits(), flags];
+            let bytes: Vec<u8> = pc.iter().flat_map(|v| v.to_le_bytes()).collect();
+            c.device.cmd_push_constants(cmd, h.layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes);
+            c.device.cmd_dispatch(cmd, ow.div_ceil(8), oh.div_ceil(8), 1);
+            barrier(c, cmd, out, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
+            let region = vk::ImageCopy { src_subresource: layers, src_offset: vk::Offset3D::default(), dst_subresource: layers, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: ow.min(p.extent.width), height: oh.min(p.extent.height), depth: 1 } };
+            c.device.cmd_copy_image(cmd, out, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
+            if flags & 8 == 0 {
+                hdr_check(c, cmd, out, ow, oh, scale, pq);
+            }
+        } else {
+        barrier(c, cmd, dst, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
         if (dx0, dy0, dx1, dy1) != (0, 0, p.extent.width as i32, p.extent.height as i32) {
             // Black bars around the frame.
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
@@ -357,18 +589,16 @@ pub fn present(src: Source) -> bool {
             dst_subresource: layers,
             dst_offsets: [vk::Offset3D { x: dx0, y: dy0, z: 0 }, vk::Offset3D { x: dx1, y: dy1, z: 1 }],
         };
-        let filter = match crate::config::settings().filter {
-            crate::config::Filter::Smooth => vk::Filter::LINEAR,
-            crate::config::Filter::Sharp => vk::Filter::NEAREST,
-        };
         c.device.cmd_blit_image(cmd, copy_img, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], filter);
+        }
         barrier(c, cmd, dst, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR);
         c.device.end_command_buffer(cmd).ok();
         let done = p.done[idx as usize];
         let queue = c.present_queue.as_ref().unwrap_or(&c.queue);
         let mut waits = vec![(s.acquire, vk::PipelineStageFlags::TRANSFER)];
         if two {
-            waits.push((s.copied, vk::PipelineStageFlags::TRANSFER));
+            // (The HDR10 kernel reads the copy.)
+            waits.push((s.copied, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER));
         }
         c.device.reset_fences(&[s.fence]).ok();
         if let Err(e) = c.submit_to(queue, &[cmd], &waits, &[done], s.fence) {
@@ -422,11 +652,15 @@ fn note_skipped(n: u64) {
 }
 
 /// The slot's copy image (and staging buffer for pixels) for a `w` x `h`
-/// frame of `fmt`; the slot is idle (its fence signalled).
-unsafe fn prepare_slot(s: &mut Slot, w: u32, h: u32, fmt: vk::Format, src: &Source) -> Result<(), String> {
+/// frame of `fmt`, and with HDR10 output (`out`: the swapchain's size) the
+/// kernel's view and output image; the slot is idle (its fence signalled).
+unsafe fn prepare_slot(s: &mut Slot, w: u32, h: u32, fmt: vk::Format, src: &Source, out: Option<(u32, u32)>) -> Result<(), String> {
     let c = ctx();
     unsafe {
         if s.image.is_none_or(|i| (i.2, i.3, i.4) != (w, h, fmt)) {
+            if let Some(v) = s.view.take() {
+                c.device.destroy_image_view(v, None);
+            }
             if let Some((img, mem, ..)) = s.image.take() {
                 c.device.destroy_image(img, None);
                 c.free(mem);
@@ -439,11 +673,41 @@ unsafe fn prepare_slot(s: &mut Slot, w: u32, h: u32, fmt: vk::Format, src: &Sour
                 .array_layers(1)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
-                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC);
+                .usage(vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED);
             let img = c.device.create_image(&ici, None).map_err(|e| e.to_string())?;
             let mem = c.alloc(c.device.get_image_memory_requirements(img), vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
             c.device.bind_image_memory(img, mem, 0).map_err(|e| e.to_string())?;
             s.image = Some((img, mem, w, h, fmt));
+        }
+        let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        if out.is_some() && s.view.is_none() {
+            let (img, ..) = s.image.unwrap();
+            let vci = vk::ImageViewCreateInfo::default().image(img).view_type(vk::ImageViewType::TYPE_2D).format(fmt).subresource_range(range);
+            s.view = Some(c.device.create_image_view(&vci, None).map_err(|e| e.to_string())?);
+        }
+        if let Some((ow, oh)) = out {
+            if s.out.is_none_or(|o| (o.3, o.4) != (ow, oh)) {
+                if let Some((img, mem, view, ..)) = s.out.take() {
+                    c.device.destroy_image_view(view, None);
+                    c.device.destroy_image(img, None);
+                    c.free(mem);
+                }
+                let ici = vk::ImageCreateInfo::default()
+                    .image_type(vk::ImageType::TYPE_2D)
+                    .format(vk::Format::R32_UINT)
+                    .extent(vk::Extent3D { width: ow, height: oh, depth: 1 })
+                    .mip_levels(1)
+                    .array_layers(1)
+                    .samples(vk::SampleCountFlags::TYPE_1)
+                    .tiling(vk::ImageTiling::OPTIMAL)
+                    .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC);
+                let img = c.device.create_image(&ici, None).map_err(|e| e.to_string())?;
+                let mem = c.alloc(c.device.get_image_memory_requirements(img), vk::MemoryPropertyFlags::DEVICE_LOCAL)?;
+                c.device.bind_image_memory(img, mem, 0).map_err(|e| e.to_string())?;
+                let vci = vk::ImageViewCreateInfo::default().image(img).view_type(vk::ImageViewType::TYPE_2D).format(vk::Format::R32_UINT).subresource_range(range);
+                let view = c.device.create_image_view(&vci, None).map_err(|e| e.to_string())?;
+                s.out = Some((img, mem, view, ow, oh));
+            }
         }
         if let Source::Pixels { data, .. } = src {
             let size = (w * h * 4) as u64;

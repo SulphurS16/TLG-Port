@@ -184,6 +184,11 @@ pub fn init() -> Result<(), String> {
         if validation {
             exts.push(ash::ext::debug_utils::NAME.as_ptr());
         }
+        // (HDR10 swapchains: the ST 2084 colour space.)
+        let inst_exts = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+        if inst_exts.iter().any(|e| CStr::from_ptr(e.extension_name.as_ptr()) == ash::ext::swapchain_colorspace::NAME) {
+            exts.push(ash::ext::swapchain_colorspace::NAME.as_ptr());
+        }
         let ici = vk::InstanceCreateInfo::default().application_info(&app).enabled_layer_names(&layers).enabled_extension_names(&exts);
         let instance = entry.create_instance(&ici, None).map_err(|e| format!("vkCreateInstance: {e}"))?;
         if validation {

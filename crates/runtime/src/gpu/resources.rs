@@ -306,6 +306,12 @@ pub struct Image {
     /// The last write of the metadata surface was a fill of all of it with
     /// this dword (known without reading guest memory back).
     pub meta_fill: Option<u32>,
+    /// Layered depth targets (HTILE holds one surface per slice): the
+    /// slices whose metadata was written since examined (bit n = slice n,
+    /// bit 63 = slices 63 and above) and the dword each one's last write
+    /// filled all of it with (`meta_fill` per slice).
+    pub meta_layers: u64,
+    pub meta_layer_fill: Vec<Option<u32>>,
     /// In the renderer's list of images with metadata (`meta_images`).
     pub meta_listed: bool,
     /// GPU buffer writes (compute stores, GDS/DMA transfers) changed the
@@ -408,7 +414,7 @@ pub fn create_image(key: ImageKey) -> Result<Image, String> {
             return Err(format!("bind image memory {key:?}: {e}"));
         }
         let last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-        Ok(Image { key, image, memory, views: Default::default(), gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok, usage, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_listed: false, guest_newer: false, bytes: req.size, last_used })
+        Ok(Image { key, image, memory, views: Default::default(), gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok, usage, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_layers: 0, meta_layer_fill: Vec::new(), meta_listed: false, guest_newer: false, bytes: req.size, last_used })
     }
 }
 
@@ -446,7 +452,7 @@ impl PooledImage {
 /// state of a newly created one; its contents are undefined until cleared.
 pub fn reuse_image(key: ImageKey, p: PooledImage) -> Image {
     let last_used = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed);
-    Image { key, image: p.image, memory: p.memory, views: p.views, gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok: p.storage_ok, usage: p.usage, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_listed: false, guest_newer: false, bytes: p.bytes, last_used }
+    Image { key, image: p.image, memory: p.memory, views: p.views, gpu_written: false, uploaded_hash: 0, validated: None, upload_batch: u64::MAX, storage_ok: p.storage_ok, usage: p.usage, tile_index: None, cpu_checked: u64::MAX, pitch: 0, guest_stale: false, stale_stamp: 0, reuse_checked: 0, edges: None, last_write: 0, last_write_frame: 0, meta: None, meta_dirty: false, meta_fill: None, meta_layers: 0, meta_layer_fill: Vec::new(), meta_listed: false, guest_newer: false, bytes: p.bytes, last_used }
 }
 
 pub fn aspect(f: vk::Format) -> vk::ImageAspectFlags {

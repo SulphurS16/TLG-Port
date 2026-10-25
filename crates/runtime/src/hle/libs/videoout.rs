@@ -21,6 +21,32 @@ const EVENT_FLIP: u64 = 6;
 const ERR_INVALID_ADDRESS: i32 = 0x8029_0001u32 as i32;
 const ERR_INVALID_VALUE: i32 = 0x8029_0002u32 as i32;
 const ERR_INVALID_EVENT: i32 = 0x8029_0005u32 as i32;
+/// SCE_VIDEO_OUT_PIXEL_FORMAT_A2R10G10B10_BT2020_PQ: the title's display
+/// buffers in its own HDR mode (update 1.01; its SDR switch-back is
+/// A2R10G10B10 sRGB, 0x88000000).
+const PIXEL_FORMAT_BT2020_PQ: u32 = 0x8874_0000;
+/// SceVideoOutDeviceCapabilityInfo: BT.2020 PQ output (bit 7; the title
+/// tests that bit once, after sceVideoOutOpen).
+const CAPABILITY_BT2020_PQ: u64 = 0x80;
+/// SceVideoOutOutputMode colorimetry BT.2020 PQ (the title's HDR switch).
+const COLORIMETRY_BT2020_PQ: u8 = 0x0C;
+
+/// The title's own HDR mode offered (`hdr = game`, or TLG_HDR_GAME=1 for a
+/// development run): only while the presenter takes HDR10 (TLG_HDR_GAME=force:
+/// regardless - its PQ frames then show wrongly in the window, screenshots
+/// convert them).
+fn game_hdr() -> bool {
+    let env = std::env::var("TLG_HDR_GAME").ok();
+    env.as_deref() == Some("force") || ((crate::config::settings().hdr == crate::config::Hdr::Game || env.is_some()) && crate::gpu::vk::present::hdr_active())
+}
+
+/// Notes whether the display buffers now hold the title's PQ output.
+fn note_pixel_format(fmt: u32) {
+    let pq = fmt == PIXEL_FORMAT_BT2020_PQ;
+    if crate::gpu::vk::present::GAME_PQ.swap(pq, std::sync::atomic::Ordering::Relaxed) != pq {
+        crate::info!("display buffers: {}", if pq { "the title's HDR output (BT.2020 PQ)" } else { "SDR" });
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BufferAttr {
@@ -363,6 +389,7 @@ sysv! {
         }
         let group = p.groups;
         p.groups += 1;
+        note_pixel_format(a.pixel_format);
         crate::info!(
             "sceVideoOutRegisterBuffers [{}..{}) {}x{} pitch {} format {:#x} tiling {} -> group {} addrs {:x?}",
             start, start + num, a.width, a.height, a.pitch, a.pixel_format, a.tiling, group,
@@ -433,7 +460,12 @@ sysv! {
     }
     fn sceVideoOutGetDeviceCapabilityInfo_(h: i32, info: *mut u64) -> i32 {
         if info.is_null() { return ERR_INVALID_ADDRESS; }
-        *info = 0; // no BT.2020 PQ (HDR) output: the title renders its SDR path
+        // BT.2020 PQ only with `hdr = game` on an HDR10 swapchain: the title
+        // then offers its HDR mode (otherwise it renders its SDR path, which
+        // `hdr = auto` converts).
+        let game = game_hdr();
+        *info = if game { CAPABILITY_BT2020_PQ } else { 0 };
+        crate::info!("sceVideoOutGetDeviceCapabilityInfo_: {}", if game { "BT.2020 PQ (the title's HDR mode)" } else { "SDR only" });
         0
     }
     fn sceVideoOutModeSetAny_(mode: *mut u8, size: u32) {
@@ -446,8 +478,10 @@ sysv! {
         if reserved != 0 || mode.is_null() { return ERR_INVALID_VALUE; }
         // Mode: {u32 size; u8 encoding, range, colorimetry, depth; u64 refresh; u64 resolution}.
         let colorimetry = *mode.add(6);
-        crate::info!("sceVideoOutConfigureOutputMode_: colorimetry {colorimetry:#x} (SDR output kept)");
-        if colorimetry != 0xFF && colorimetry != 0 { return ERR_INVALID_VALUE; }
+        // (The title traps on an error here: BT.2020 PQ is accepted; the
+        // presenter follows the display buffers' pixel format.)
+        crate::info!("sceVideoOutConfigureOutputMode_: colorimetry {colorimetry:#x}{}", if colorimetry == COLORIMETRY_BT2020_PQ { " (BT.2020 PQ)" } else { "" });
+        if colorimetry != 0xFF && colorimetry != 0 && colorimetry != COLORIMETRY_BT2020_PQ { return ERR_INVALID_VALUE; }
         0
     }
     fn sceVideoOutColorSettingsSetGamma_(settings: *mut f32, gamma: f32) -> i32 {
@@ -480,6 +514,9 @@ sysv! {
             n += 1;
         }
         crate::info!("sceVideoOutSubmitChangeBufferAttribute(group {group}): {}x{} pitch {} format {:#x} -> {n} buffers", a.width, a.height, a.pitch, a.pixel_format);
+        if n > 0 {
+            note_pixel_format(a.pixel_format);
+        }
         if n == 0 { ERR_INVALID_VALUE } else { 0 }
     }
     fn sceVideoOutUnregisterBuffers(h: i32, group: i32) -> i32 {
@@ -529,7 +566,8 @@ fn present_buffer(b: &DisplayBuffer) -> Option<(Duration, Duration, Option<crate
     // (Counted for pacing whether or not it reached the screen: a minimized
     // window presents nothing while the title keeps flipping.)
     if let Some((image, iw, ih, format)) = rendered {
-        if !crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width: iw, height: ih, format }) {
+        let pq = b.attr.pixel_format == PIXEL_FORMAT_BT2020_PQ;
+        if !crate::gpu::vk::present::present(crate::gpu::vk::present::Source::Image { image, layout: ash::vk::ImageLayout::GENERAL, width: iw, height: ih, format, pq }) {
             crate::pacing::not_displayed();
         }
         return Some((lock_wait, t1.elapsed(), prof));
@@ -577,7 +615,7 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64, frame: u64) {
         return;
     }
     let (w, h) = (b.attr.width, b.attr.height);
-    let px = crate::gpu::render::RENDERER.lock().as_mut().and_then(|r| r.capture(b.addr, w, h));
+    let px = crate::gpu::render::RENDERER.lock().as_mut().and_then(|r| r.capture(b.addr, w, h, b.attr.pixel_format == PIXEL_FORMAT_BT2020_PQ));
     let Some(px) = px else {
         crate::warn!("screenshot of flip {flip}: no rendered image for buffer {:#x}", b.addr);
         return;

@@ -322,4 +322,36 @@ mod tests {
         assert_eq!(check(&tmp).contents, Contents::Base);
         let _ = std::fs::remove_dir_all(&tmp);
     }
+
+    #[test]
+    fn eu_base_and_update_folders() {
+        // A console dump's layout: the game (01.00) and the update (01.03)
+        // in two folders, several languages.
+        let tmp = std::env::temp_dir().join(format!("tlg-launcher-eu2-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (game, update) = (tmp.join("game"), tmp.join("update"));
+        for (dir, ver, cat) in [(&game, "01.00", "gd"), (&update, "01.03", "gp")] {
+            std::fs::create_dir_all(dir.join("sce_module")).unwrap();
+            std::fs::create_dir_all(dir.join("sce_sys")).unwrap();
+            std::fs::write(dir.join("sce_sys").join("param.sfo"), sfo(&[("APP_VER", ver), ("CATEGORY", cat), ("TITLE_ID", "CUSA03745")])).unwrap();
+            for m in MODULES {
+                std::fs::write(dir.join(m), [0x7F, b'E', b'L', b'F', 2, 1]).unwrap();
+            }
+        }
+        for n in EU_BASE_ARCHIVES.iter().copied().chain(["trico_ene.psarc", "trico_ger.psarc", "trico_frf.psarc"]) {
+            std::fs::write(game.join(n), b"x").unwrap();
+        }
+        for n in EU_UPDATE_ARCHIVES.iter().copied().chain(["trico_enep.psarc", "trico_gerp.psarc", "trico_frfp.psarc"]) {
+            std::fs::write(update.join(n), b"x").unwrap();
+        }
+        assert_eq!(check(&game).contents, Contents::Base);
+        assert_eq!(check(&update).contents, Contents::Update);
+        assert_eq!(check_pair(&game, Some(&update)), Ok("The Last Guardian (EU) 01.00 with update 01.03".to_string()));
+        let langs: Vec<&str> = languages(&game).into_iter().map(|(_, c)| c).collect();
+        assert_eq!(langs, ["ene", "frf", "ger"]);
+        // The US release's update with the EU game: refused.
+        std::fs::write(update.join("sce_sys").join("param.sfo"), sfo(&[("APP_VER", "01.03"), ("CATEGORY", "gp"), ("TITLE_ID", "CUSA03627")])).unwrap();
+        assert!(check_pair(&game, Some(&update)).is_err_and(|e| e.contains("the US release's update")));
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 }

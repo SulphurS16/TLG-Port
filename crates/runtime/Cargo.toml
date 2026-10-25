@@ -49,6 +49,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_Media",
     "Win32_Devices_HumanInterfaceDevice",
+    "Win32_Devices_Display",
     "Win32_Devices_DeviceAndDriverInstallation",
     "Win32_System_IO",
 ] }

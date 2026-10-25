@@ -771,6 +771,268 @@ pub fn depth_copy_cs() -> Vec<u32> {
     b.module().assemble()
 }
 
+/// The frame for an HDR10 (ST 2084) swapchain: samples the game's frame
+/// (sRGB-encoded values) at each output pixel inside the frame's rectangle
+/// (black outside), decodes it (gamma 2.2, or the piecewise sRGB curve),
+/// scales it to the paper-white level, converts BT.709 primaries to BT.2020
+/// and PQ-encodes it, packed as A2B10G10R10 (or A2R10G10B10) into a 32-bit
+/// unsigned storage image that is then copied into the swapchain image.
+/// Bindings (set 0): 0 = the frame (combined image sampler), 1 = the output
+/// (R32 uint storage image). Push constants (8 x 32 bits): the frame's
+/// rectangle x0, y0, x1, y1 (f32, in output pixels), output width and height
+/// (u32), the scale (f32: for SDR frames the paper white in nits / 10000, for
+/// PQ frames a gain), flags (u32: bit 0 = the piecewise sRGB curve, bit 1 =
+/// red in the high bits, bit 2 = the frame is already PQ-encoded BT.2020 -
+/// the game's own HDR output - decoded, scaled by the gain and encoded
+/// again, bit 3 = 8-bit sRGB output instead, for an SDR swapchain: BT.709,
+/// the scale taking white to 1). 8x8 per workgroup.
+pub fn hdr10_cs() -> Vec<u32> {
+    let mut b = Builder::new();
+    b.set_version(1, 3);
+    b.capability(spirv::Capability::Shader);
+    let glsl = b.ext_inst_import("GLSL.std.450");
+    b.memory_model(spirv::AddressingModel::Logical, spirv::MemoryModel::GLSL450);
+    let void = b.type_void();
+    let boolt = b.type_bool();
+    let u32t = b.type_int(32, 0);
+    let i32t = b.type_int(32, 1);
+    let f32t = b.type_float(32, None);
+    let v2f = b.type_vector(f32t, 2);
+    let v2i = b.type_vector(i32t, 2);
+    let v3u = b.type_vector(u32t, 3);
+    let v3f = b.type_vector(f32t, 3);
+    let v3b = b.type_vector(boolt, 3);
+    let v4f = b.type_vector(f32t, 4);
+    let v4u = b.type_vector(u32t, 4);
+    let img_t = b.type_image(f32t, spirv::Dim::Dim2D, 0, 0, 0, 1, spirv::ImageFormat::Unknown, None);
+    let simg_t = b.type_sampled_image(img_t);
+    let st_t = b.type_image(u32t, spirv::Dim::Dim2D, 0, 0, 0, 2, spirv::ImageFormat::R32ui, None);
+    let p_simg = b.type_pointer(None, StorageClass::UniformConstant, simg_t);
+    let p_st = b.type_pointer(None, StorageClass::UniformConstant, st_t);
+    let src = global(&mut b, p_simg, StorageClass::UniformConstant);
+    let dst = global(&mut b, p_st, StorageClass::UniformConstant);
+    for (v, binding) in [(src, 0), (dst, 1)] {
+        b.decorate(v, Decoration::DescriptorSet, [Operand::LiteralBit32(0)]);
+        b.decorate(v, Decoration::Binding, [Operand::LiteralBit32(binding)]);
+    }
+    b.decorate(dst, Decoration::NonReadable, []);
+    let pcs = b.type_struct([f32t, f32t, f32t, f32t, u32t, u32t, f32t, u32t]);
+    b.decorate(pcs, Decoration::Block, []);
+    for m in 0..8 {
+        b.member_decorate(pcs, m, Decoration::Offset, [Operand::LiteralBit32(m * 4)]);
+    }
+    let p_pcs = b.type_pointer(None, StorageClass::PushConstant, pcs);
+    let p_pc_u = b.type_pointer(None, StorageClass::PushConstant, u32t);
+    let p_pc_f = b.type_pointer(None, StorageClass::PushConstant, f32t);
+    let pc = global(&mut b, p_pcs, StorageClass::PushConstant);
+    let p_in_v3 = b.type_pointer(None, StorageClass::Input, v3u);
+    let gid = global(&mut b, p_in_v3, StorageClass::Input);
+    b.decorate(gid, Decoration::BuiltIn, [Operand::BuiltIn(BuiltIn::GlobalInvocationId)]);
+
+    let fn_ty = b.type_function(void, []);
+    let func = b.begin_function(void, None, spirv::FunctionControl::NONE, fn_ty).unwrap();
+    b.begin_block(None).unwrap();
+    let ku = |b: &mut Builder, v: u32| b.constant_bit32(u32t, v);
+    let kf = |b: &mut Builder, v: f32| b.constant_bit32(f32t, v.to_bits());
+    let kf3 = |b: &mut Builder, v: [f32; 3]| {
+        let c: Vec<u32> = v.iter().map(|&x| b.constant_bit32(f32t, x.to_bits())).collect();
+        b.constant_composite(v3f, c)
+    };
+    let pcf = |b: &mut Builder, m: u32| {
+        let i = b.constant_bit32(u32t, m);
+        let p = b.access_chain(p_pc_f, None, pc, [i]).unwrap();
+        b.load(f32t, None, p, None, []).unwrap()
+    };
+    let pcu = |b: &mut Builder, m: u32| {
+        let i = b.constant_bit32(u32t, m);
+        let p = b.access_chain(p_pc_u, None, pc, [i]).unwrap();
+        b.load(u32t, None, p, None, []).unwrap()
+    };
+    let x0 = pcf(&mut b, 0);
+    let y0 = pcf(&mut b, 1);
+    let x1 = pcf(&mut b, 2);
+    let y1 = pcf(&mut b, 3);
+    let w = pcu(&mut b, 4);
+    let h = pcu(&mut b, 5);
+    let scale = pcf(&mut b, 6);
+    let flags = pcu(&mut b, 7);
+    let g = b.load(v3u, None, gid, None, []).unwrap();
+    let x = b.composite_extract(u32t, None, g, [0]).unwrap();
+    let y = b.composite_extract(u32t, None, g, [1]).unwrap();
+    let in_x = b.u_less_than(boolt, None, x, w).unwrap();
+    let in_y = b.u_less_than(boolt, None, y, h).unwrap();
+    let in_img = b.logical_and(boolt, None, in_x, in_y).unwrap();
+    let body = b.id();
+    let merge = b.id();
+    b.selection_merge(merge, spirv::SelectionControl::NONE).unwrap();
+    b.branch_conditional(in_img, body, merge, []).unwrap();
+    b.begin_block(Some(body)).unwrap();
+    // The output pixel's centre in the frame's rectangle.
+    let half = kf(&mut b, 0.5);
+    let fx = b.convert_u_to_f(f32t, None, x).unwrap();
+    let fx = b.f_add(f32t, None, fx, half).unwrap();
+    let fy = b.convert_u_to_f(f32t, None, y).unwrap();
+    let fy = b.f_add(f32t, None, fy, half).unwrap();
+    let ge_x = b.f_ord_greater_than_equal(boolt, None, fx, x0).unwrap();
+    let lt_x = b.f_ord_less_than(boolt, None, fx, x1).unwrap();
+    let ge_y = b.f_ord_greater_than_equal(boolt, None, fy, y0).unwrap();
+    let lt_y = b.f_ord_less_than(boolt, None, fy, y1).unwrap();
+    let ix = b.logical_and(boolt, None, ge_x, lt_x).unwrap();
+    let iy = b.logical_and(boolt, None, ge_y, lt_y).unwrap();
+    let inside = b.logical_and(boolt, None, ix, iy).unwrap();
+    let dx = b.f_sub(f32t, None, fx, x0).unwrap();
+    let wx = b.f_sub(f32t, None, x1, x0).unwrap();
+    let u = b.f_div(f32t, None, dx, wx).unwrap();
+    let dy = b.f_sub(f32t, None, fy, y0).unwrap();
+    let wy = b.f_sub(f32t, None, y1, y0).unwrap();
+    let v = b.f_div(f32t, None, dy, wy).unwrap();
+    let uv = b.composite_construct(v2f, None, [u, v]).unwrap();
+    let si = b.load(simg_t, None, src, None, []).unwrap();
+    let lod0 = kf(&mut b, 0.0);
+    let c4 = b.image_sample_explicit_lod(v4f, None, si, uv, spirv::ImageOperands::LOD, [Operand::IdRef(lod0)]).unwrap();
+    let c = b.vector_shuffle(v3f, None, c4, c4, [0, 1, 2]).unwrap();
+    let zero3 = kf3(&mut b, [0.0; 3]);
+    let one3 = kf3(&mut b, [1.0; 3]);
+    let c = b.ext_inst(v3f, None, glsl, 43, [Operand::IdRef(c), Operand::IdRef(zero3), Operand::IdRef(one3)]).unwrap(); // FClamp
+    // Gamma 2.2, or the piecewise sRGB curve.
+    let g22 = kf3(&mut b, [2.2; 3]);
+    let lin_g = b.ext_inst(v3f, None, glsl, 26, [Operand::IdRef(c), Operand::IdRef(g22)]).unwrap(); // Pow
+    let k1292 = kf3(&mut b, [12.92; 3]);
+    let lo = b.f_div(v3f, None, c, k1292).unwrap();
+    let k055 = kf3(&mut b, [0.055; 3]);
+    let k1055 = kf3(&mut b, [1.055; 3]);
+    let k24 = kf3(&mut b, [2.4; 3]);
+    let t = b.f_add(v3f, None, c, k055).unwrap();
+    let t = b.f_div(v3f, None, t, k1055).unwrap();
+    let hi = b.ext_inst(v3f, None, glsl, 26, [Operand::IdRef(t), Operand::IdRef(k24)]).unwrap();
+    let kcut = kf3(&mut b, [0.04045; 3]);
+    let low = b.f_ord_less_than_equal(v3b, None, c, kcut).unwrap();
+    let lin_s = b.select(v3f, None, low, lo, hi).unwrap();
+    let f1 = ku(&mut b, 1);
+    let f2 = ku(&mut b, 2);
+    let z = ku(&mut b, 0);
+    let pw = b.bitwise_and(u32t, None, flags, f1).unwrap();
+    let pw = b.i_not_equal(boolt, None, pw, z).unwrap();
+    let pw3 = b.composite_construct(v3b, None, [pw, pw, pw]).unwrap();
+    let lin = b.select(v3f, None, pw3, lin_s, lin_g).unwrap();
+    // BT.709 -> BT.2020 primaries.
+    let rows = [[0.627_404, 0.329_282, 0.043_313_6], [0.069_097, 0.919_54, 0.011_361_2], [0.016_391_6, 0.088_013_2, 0.895_595]];
+    let comps: Vec<u32> = rows
+        .iter()
+        .map(|r| {
+            let k = kf3(&mut b, *r);
+            b.dot(f32t, None, k, lin).unwrap()
+        })
+        .collect();
+    let sdr2020 = b.composite_construct(v3f, None, comps).unwrap();
+    // SMPTE ST 2084 (PQ) constants.
+    let m1 = kf3(&mut b, [0.159_301_76; 3]);
+    let m2 = kf3(&mut b, [78.843_75; 3]);
+    let c1 = kf3(&mut b, [0.835_937_5; 3]);
+    let c2 = kf3(&mut b, [18.851_562; 3]);
+    let c3 = kf3(&mut b, [18.687_5; 3]);
+    // A PQ frame decoded: e = c^(1/m2), ((e - c1)+ / (c2 - c3 e))^(1/m1).
+    let inv_m1 = kf3(&mut b, [1.0 / 0.159_301_76; 3]);
+    let inv_m2 = kf3(&mut b, [1.0 / 78.843_75; 3]);
+    let e = b.ext_inst(v3f, None, glsl, 26, [Operand::IdRef(c), Operand::IdRef(inv_m2)]).unwrap();
+    let en = b.f_sub(v3f, None, e, c1).unwrap();
+    let en = b.ext_inst(v3f, None, glsl, 40, [Operand::IdRef(en), Operand::IdRef(zero3)]).unwrap(); // FMax
+    let ed = b.f_mul(v3f, None, c3, e).unwrap();
+    let ed = b.f_sub(v3f, None, c2, ed).unwrap();
+    let eq = b.f_div(v3f, None, en, ed).unwrap();
+    let pq_lin = b.ext_inst(v3f, None, glsl, 26, [Operand::IdRef(eq), Operand::IdRef(inv_m1)]).unwrap();
+    let f4 = ku(&mut b, 4);
+    let is_pq = b.bitwise_and(u32t, None, flags, f4).unwrap();
+    let is_pq = b.i_not_equal(boolt, None, is_pq, z).unwrap();
+    let pq3 = b.composite_construct(v3b, None, [is_pq, is_pq, is_pq]).unwrap();
+    let y2020 = b.select(v3f, None, pq3, pq_lin, sdr2020).unwrap();
+    let in3 = b.composite_construct(v3b, None, [inside, inside, inside]).unwrap();
+    let y2020 = b.select(v3f, None, in3, y2020, zero3).unwrap();
+    let y_scaled = b.vector_times_scalar(v3f, None, y2020, scale).unwrap();
+    let y2020 = b.ext_inst(v3f, None, glsl, 43, [Operand::IdRef(y_scaled), Operand::IdRef(zero3), Operand::IdRef(one3)]).unwrap();
+    let ym = b.ext_inst(v3f, None, glsl, 26, [Operand::IdRef(y2020), Operand::IdRef(m1)]).unwrap();
+    let num = b.f_mul(v3f, None, c2, ym).unwrap();
+    let num = b.f_add(v3f, None, c1, num).unwrap();
+    let den = b.f_mul(v3f, None, c3, ym).unwrap();
+    let den = b.f_add(v3f, None, one3, den).unwrap();
+    let q = b.f_div(v3f, None, num, den).unwrap();
+    let pq = b.ext_inst(v3f, None, glsl, 26, [Operand::IdRef(q), Operand::IdRef(m2)]).unwrap();
+    let k1023 = kf(&mut b, 1023.0);
+    let s = b.vector_times_scalar(v3f, None, pq, k1023).unwrap();
+    let half3 = kf3(&mut b, [0.5; 3]);
+    let s = b.f_add(v3f, None, s, half3).unwrap();
+    let qu = b.convert_f_to_u(v3u, None, s).unwrap();
+    let r = b.composite_extract(u32t, None, qu, [0]).unwrap();
+    let gq = b.composite_extract(u32t, None, qu, [1]).unwrap();
+    let bq = b.composite_extract(u32t, None, qu, [2]).unwrap();
+    let sw = b.bitwise_and(u32t, None, flags, f2).unwrap();
+    let sw = b.i_not_equal(boolt, None, sw, z).unwrap();
+    let low_c = b.select(u32t, None, sw, bq, r).unwrap();
+    let high_c = b.select(u32t, None, sw, r, bq).unwrap();
+    let s10 = ku(&mut b, 10);
+    let s20 = ku(&mut b, 20);
+    let alpha = ku(&mut b, 3 << 30);
+    let gs = b.shift_left_logical(u32t, None, gq, s10).unwrap();
+    let hs = b.shift_left_logical(u32t, None, high_c, s20).unwrap();
+    let packed = b.bitwise_or(u32t, None, low_c, gs).unwrap();
+    let packed = b.bitwise_or(u32t, None, packed, hs).unwrap();
+    let packed = b.bitwise_or(u32t, None, packed, alpha).unwrap();
+    // 8-bit sRGB output (bit 3: an SDR swapchain showing PQ frames; the
+    // scale makes white 1): BT.2020 -> BT.709, the sRGB curve.
+    let rows7 = [[1.660_491, -0.587_641, -0.072_850], [-0.124_550, 1.132_9, -0.008_349], [-0.018_151, -0.100_579, 1.118_73]];
+    let comps7: Vec<u32> = rows7
+        .iter()
+        .map(|r| {
+            let k = kf3(&mut b, *r);
+            b.dot(f32t, None, k, y_scaled).unwrap()
+        })
+        .collect();
+    let s7 = b.composite_construct(v3f, None, comps7).unwrap();
+    let s7 = b.ext_inst(v3f, None, glsl, 43, [Operand::IdRef(s7), Operand::IdRef(zero3), Operand::IdRef(one3)]).unwrap();
+    let kcut_o = kf3(&mut b, [0.003_130_8; 3]);
+    let lo_o = b.f_mul(v3f, None, s7, k1292).unwrap();
+    let inv24 = kf3(&mut b, [1.0 / 2.4; 3]);
+    let hi_o = b.ext_inst(v3f, None, glsl, 26, [Operand::IdRef(s7), Operand::IdRef(inv24)]).unwrap();
+    let hi_o = b.f_mul(v3f, None, hi_o, k1055).unwrap();
+    let hi_o = b.f_sub(v3f, None, hi_o, k055).unwrap();
+    let low_o = b.f_ord_less_than_equal(v3b, None, s7, kcut_o).unwrap();
+    let enc = b.select(v3f, None, low_o, lo_o, hi_o).unwrap();
+    let k255 = kf(&mut b, 255.0);
+    let e8 = b.vector_times_scalar(v3f, None, enc, k255).unwrap();
+    let e8 = b.f_add(v3f, None, e8, half3).unwrap();
+    let q8 = b.convert_f_to_u(v3u, None, e8).unwrap();
+    let r8 = b.composite_extract(u32t, None, q8, [0]).unwrap();
+    let g8 = b.composite_extract(u32t, None, q8, [1]).unwrap();
+    let b8 = b.composite_extract(u32t, None, q8, [2]).unwrap();
+    let lo8 = b.select(u32t, None, sw, b8, r8).unwrap();
+    let hi8 = b.select(u32t, None, sw, r8, b8).unwrap();
+    let s8 = ku(&mut b, 8);
+    let s16 = ku(&mut b, 16);
+    let alpha8 = ku(&mut b, 0xFF00_0000);
+    let g8s = b.shift_left_logical(u32t, None, g8, s8).unwrap();
+    let h8s = b.shift_left_logical(u32t, None, hi8, s16).unwrap();
+    let p8 = b.bitwise_or(u32t, None, lo8, g8s).unwrap();
+    let p8 = b.bitwise_or(u32t, None, p8, h8s).unwrap();
+    let p8 = b.bitwise_or(u32t, None, p8, alpha8).unwrap();
+    let f8 = ku(&mut b, 8);
+    let is8 = b.bitwise_and(u32t, None, flags, f8).unwrap();
+    let is8 = b.i_not_equal(boolt, None, is8, z).unwrap();
+    let packed = b.select(u32t, None, is8, p8, packed).unwrap();
+    let texel = b.composite_construct(v4u, None, [packed, z, z, z]).unwrap();
+    let xi = b.bitcast(i32t, None, x).unwrap();
+    let yi = b.bitcast(i32t, None, y).unwrap();
+    let at = b.composite_construct(v2i, None, [xi, yi]).unwrap();
+    let di = b.load(st_t, None, dst, None, []).unwrap();
+    b.image_write(di, at, texel, None, []).unwrap();
+    b.branch(merge).unwrap();
+    b.begin_block(Some(merge)).unwrap();
+    b.ret().unwrap();
+    b.end_function().unwrap();
+    b.entry_point(ExecutionModel::GLCompute, func, "main", [gid]);
+    b.execution_mode(func, ExecutionMode::LocalSize, [8, 8, 1]);
+    b.module().assemble()
+}
+
 fn global(b: &mut Builder, ptr: u32, sc: StorageClass) -> u32 {
     let id = b.id();
     let inst = rspirv::dr::Instruction::new(spirv::Op::Variable, Some(ptr), Some(id), vec![Operand::StorageClass(sc)]);
@@ -824,6 +1086,16 @@ mod tests {
         if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
             let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::write(format!("{dir}/depth_copy.spv"), bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn hdr10_kernel_assembles() {
+        let w = super::hdr10_cs();
+        check_module(&w, "hdr10");
+        if let Ok(dir) = std::env::var("TLG_DUMP_KERNELS") {
+            let bytes: Vec<u8> = w.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/hdr10.spv"), bytes).unwrap();
         }
     }
 

@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.7.1
+
+- Fixed the lighting "breaking" in some places (GitHub issue #3): after the
+  statue bridge, in courtyards and halls, and by the railing after the first
+  eye window, the picture could turn bright and washed out with no shadows,
+  and come and go with a few steps. The game keeps the sun's shadows in four
+  layers; the port mixed them up, so some areas got sunlight where the PS4
+  has shade. They now look as on the PS4 (dim halls, torch-lit stairs).
+- HDR monitors (GitHub issue #5): with Windows HDR on, the game now sends a
+  real HDR picture instead of one that Windows shows dim and grey. The
+  launcher's Display page has an HDR output setting: how bright white is
+  (200 nits by default, 100-400, or as bright as Windows' SDR content), or
+  Off. Also there, experimental: "The game's own HDR" - the PS4 game's HDR
+  mode, as a PS4 with HDR shows it; the game's Options > Screen then says
+  "HDR is currently enabled" and its brightness slider sets the brightness.
+
 ## 0.7.0
 
 - Fixed the lighting being far too bright in bright places (GitHub issue

@@ -532,20 +532,22 @@ fn startup_failure(title: &str, text: &str, code: u32) -> ! {
     fatal_exit(code, title);
 }
 
-/// PGO training builds (`--cfg tlg_pgo_gen` with `-Cprofile-generate`,
-/// tools/pgo.ps1): the process ends with TerminateProcess, which skips the
-/// profiler runtime's exit handler, so the counters are written here.
-#[cfg(tlg_pgo_gen)]
+/// PGO training builds (`-Cprofile-generate`, tools/pgo.ps1, which exports
+/// the profiler runtime's `__llvm_profile_write_file`): the process ends with
+/// TerminateProcess, which skips the profiler runtime's exit handler, so the
+/// counters are written here. Looked up at run time rather than behind a cfg:
+/// the training build has to compile the same code as the player build (the
+/// cfg moved items between codegen units, and 0.7.1's first package lost the
+/// profiles of 73 functions, `gpu::shaders::prepare_tess` among them).
 fn write_pgo_profile() {
-    unsafe extern "C" {
-        fn __llvm_profile_write_file() -> i32;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    let write = unsafe { GetProcAddress(GetModuleHandleW(std::ptr::null()), c"__llvm_profile_write_file".as_ptr().cast()) };
+    if let Some(write) = write {
+        let write: unsafe extern "C" fn() -> i32 = unsafe { std::mem::transmute(write) };
+        let r = unsafe { write() };
+        info!("PGO profile written (status {r})");
     }
-    let r = unsafe { __llvm_profile_write_file() };
-    info!("PGO profile written (status {r})");
 }
-
-#[cfg(not(tlg_pgo_gen))]
-fn write_pgo_profile() {}
 
 pub fn shutdown(code: i32) -> ! {
     // A save being written finishes first.

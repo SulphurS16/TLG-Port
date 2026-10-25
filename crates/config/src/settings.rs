@@ -39,6 +39,18 @@ pub enum Filter {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Hdr {
+    /// HDR10 output where Windows HDR is on for the game's monitor (the
+    /// game's SDR picture, converted).
+    Auto,
+    /// As Auto, with the game's own HDR rendering (the PS4 game's HDR mode,
+    /// update 1.01; experimental).
+    Game,
+    /// SDR output always.
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FrameCap {
     /// The game's own limit (its flip rate: 30 fps in update 01.03).
     Game,
@@ -271,6 +283,10 @@ pub struct Settings {
     pub vsync: VSync,
     pub scaling: Scaling,
     pub filter: Filter,
+    pub hdr: Hdr,
+    /// The brightness of the game's white in HDR output (nits); 0 = Windows'
+    /// SDR content brightness for that monitor.
+    pub hdr_white: u32,
     pub frame_cap: FrameCap,
     pub new_shaders: NewShaders,
     /// "auto" or part of a GPU's name (or its index in the device list).
@@ -297,6 +313,8 @@ impl Default for Settings {
             vsync: VSync::On,
             scaling: Scaling::Fit,
             filter: Filter::Smooth,
+            hdr: Hdr::Auto,
+            hdr_white: 200,
             frame_cap: FrameCap::Game,
             new_shaders: NewShaders::Wait,
             gpu: "auto".into(),
@@ -308,6 +326,10 @@ impl Default for Settings {
         }
     }
 }
+
+/// The range of `hdr_white` (nits) besides 0.
+pub const HDR_WHITE_MIN: u32 = 80;
+pub const HDR_WHITE_MAX: u32 = 1000;
 
 /// The commented file written on first use.
 pub const TEMPLATE: &str = "\
@@ -341,6 +363,14 @@ vsync = on
 scaling = fit
 # smooth (bilinear) or sharp (nearest pixel) scaling.
 filter = smooth
+# HDR monitors: auto = HDR10 output when Windows HDR is on for the game's
+# monitor (SDR otherwise), game = the same with the game's own HDR rendering
+# (as on a PS4 with HDR; experimental), off = SDR output always (Windows then
+# shows the game at its SDR content brightness).
+hdr = auto
+# The brightness of white in HDR output, in nits (cd/m2), 80-1000: 200 is
+# about a bright SDR screen; 0 = Windows' SDR content brightness.
+hdr_white = 200
 # game = the game's own frame-rate limit (30 fps with update 01.03); 60 = up
 # to 60 fps (needs a fast PC: the game's time step follows the frame rate, so
 # its speed stays the same); off = no limit (not recommended: at 116-119,
@@ -462,6 +492,16 @@ impl Settings {
                     "sharp" | "nearest" => s.filter = Filter::Sharp,
                     _ => errs.push(bad("smooth or sharp")),
                 },
+                "hdr" => match lv.as_str() {
+                    "auto" | "on" => s.hdr = Hdr::Auto,
+                    "game" => s.hdr = Hdr::Game,
+                    "off" => s.hdr = Hdr::Off,
+                    _ => errs.push(bad("auto, game or off")),
+                },
+                "hdr_white" => match num(lv.trim_end_matches("nits").trim()).filter(|&n| n == 0 || (HDR_WHITE_MIN..=HDR_WHITE_MAX).contains(&n)) {
+                    Some(n) => s.hdr_white = n,
+                    None => errs.push(bad(&format!("a brightness in nits, {HDR_WHITE_MIN}-{HDR_WHITE_MAX}, or 0 (Windows' SDR content brightness)"))),
+                },
                 "frame_cap" => match lv.as_str() {
                     "game" | "30" => s.frame_cap = FrameCap::Game,
                     "60" => s.frame_cap = FrameCap::Fps60,
@@ -530,6 +570,12 @@ impl Settings {
             Filter::Smooth => "smooth",
             Filter::Sharp => "sharp",
         });
+        f.set("hdr", match self.hdr {
+            Hdr::Auto => "auto",
+            Hdr::Game => "game",
+            Hdr::Off => "off",
+        });
+        f.set("hdr_white", &self.hdr_white.to_string());
         f.set("frame_cap", match self.frame_cap {
             FrameCap::Game => "game",
             FrameCap::Fps60 => "60",
@@ -587,6 +633,23 @@ mod tests {
         let (s, errs) = Settings::parse("frame_cap = 60 # experimental\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(s.frame_cap, FrameCap::Fps60);
+    }
+
+    #[test]
+    fn hdr_settings() {
+        let (s, errs) = Settings::parse("hdr = off\nhdr_white = 300 nits\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!((s.hdr, s.hdr_white), (Hdr::Off, 300));
+        let (s, errs) = Settings::parse("hdr = on\nhdr_white = 0\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!((s.hdr, s.hdr_white), (Hdr::Auto, 0));
+        assert_eq!(Settings::parse("hdr = game\n").0.hdr, Hdr::Game);
+        assert_eq!(Settings::parse("hdr_white = 20\nhdr = maybe\n").1.len(), 2);
+        // Written and read back.
+        let mut f = KvFile::parse(TEMPLATE);
+        Settings { hdr: Hdr::Off, hdr_white: 250, ..Settings::default() }.store(&mut f);
+        let (s, _) = Settings::from_kv(&f);
+        assert_eq!((s.hdr, s.hdr_white), (Hdr::Off, 250));
     }
 
     #[test]

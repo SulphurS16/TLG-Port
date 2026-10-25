@@ -5290,7 +5290,7 @@ impl Renderer {
                 }
             }
             if depth_used {
-                tregs.extend_from_slice(&[regs.ctx(0xA010), regs.ctx(0xA011), regs.ctx(0xA014), regs.ctx(0xA016), regs.ctx(0xA005)]);
+                tregs.extend_from_slice(&[regs.ctx(0xA010), regs.ctx(0xA011), regs.ctx(0xA014), regs.ctx(0xA016), regs.ctx(0xA005), regs.ctx(0xA002)]);
             }
             let hit = self.cx.target_cache.as_ref().filter(|c| {
                 c.seq + 1 == self.cx.work_seq
@@ -5408,7 +5408,26 @@ impl Renderer {
             (_, true) => vk::Format::D32_SFLOAT_S8_UINT,
             _ => vk::Format::D32_SFLOAT,
         };
-        let key = ImageKey { base, width: pitch, height, layers: 1, levels: 1, format, depth: true, ty3d: false };
+        // DB_DEPTH_VIEW: SLICE_START..=SLICE_MAX of an array. The sun's
+        // shadow cascades are one 2D-array depth surface rendered slice by
+        // slice (the global shadow slices again at each light-set change)
+        // and sampled as an array; the slices live in one image, grown as
+        // higher ones appear (`tune depth_slices` 0: every slice in layer 0,
+        // as before).
+        let view = regs.ctx(0xA002);
+        let (slice, need) = if crate::tune::get(crate::tune::DEPTH_SLICES) != 0 { (view & 0x7FF, (view & 0x7FF).max((view >> 13) & 0x7FF) + 1) } else { (0, 1) };
+        let found = img!(self).by_base.get(&base).and_then(|ks| ks.iter().copied().filter(|k| k.depth && !k.ty3d && k.width == pitch && k.height == height && k.format == format).max_by_key(|k| k.layers));
+        let key = match found {
+            Some(k) if k.layers >= need => k,
+            Some(k) => self.grow_depth_layers(k, need)?,
+            None => ImageKey { base, width: pitch, height, layers: need, levels: 1, format, depth: true, ty3d: false },
+        };
+        if key.layers > 1 {
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+                crate::info!("depth target {base:#x} {pitch}x{height} {format:?}: slice {slice} of {} (DB_DEPTH_VIEW {view:#x})", key.layers);
+            }
+        }
         self.init_image(key)?;
         if img!(self).images[&key].guest_newer {
             self.refresh_from_guest(key, true)?;
@@ -5416,9 +5435,10 @@ impl Renderer {
         // DB_Z_INFO.TILE_MODE_INDEX
         let img = img!(self).images.get_mut(&key).unwrap();
         img.tile_index = Some(((zinfo >> 20) & 7) as u8);
-        // DB_Z_INFO.TILE_SURFACE_ENABLE: HTILE (one dword per 8x8 tile).
+        // DB_Z_INFO.TILE_SURFACE_ENABLE: HTILE (one dword per 8x8 tile), one
+        // surface per slice of an array.
         let htile = (regs.ctx(0xA005) as u64) << 8;
-        let meta = (zinfo & (1 << 29) != 0 && htile != 0).then(|| (htile, pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64 * 4));
+        let meta = (zinfo & (1 << 29) != 0 && htile != 0).then(|| (htile, pitch.div_ceil(8) as u64 * height.div_ceil(8) as u64 * 4 * key.layers as u64));
         if img.meta != meta {
             img.meta = meta;
             mem!(self).meta_gen += 1;
@@ -5427,7 +5447,7 @@ impl Renderer {
             img.meta_listed = true;
             mem!(self).meta_images.push(key);
         }
-        Ok(Some(Attachment { key, view_format: format, layer: 0 }))
+        Ok(Some(Attachment { key, view_format: format, layer: slice.min(key.layers - 1) }))
     }
 
     /// An existing image at the same base with the same size and format
@@ -5471,7 +5491,46 @@ impl Renderer {
         unsafe { REC.cmd_copy_image(self.cx.cmd, img!(self).images[&old].image, vk::ImageLayout::GENERAL, img!(self).images[&new].image, vk::ImageLayout::GENERAL, &regions) };
         unordered!(self);
         self.mark(|| "level grow copy".into());
-        // The new image takes over the old one's state and index entries.
+        self.adopt_image(old, new);
+        self.grown += 1;
+        if self.grown <= 20 {
+            crate::info!("image {:#x} {}x{}x{} {:?}: {} -> {} mip levels (view of level {level})", old.base, old.width, old.height, old.layers, old.format, old.levels, levels);
+        }
+        Ok(new)
+    }
+
+    /// A depth target with `layers` slices in place of `old` (fewer), which
+    /// holds the first ones: arrays rendered slice by slice (DB_DEPTH_VIEW)
+    /// start with the slices seen so far.
+    fn grow_depth_layers(&mut self, old: ImageKey, layers: u32) -> Result<ImageKey, String> {
+        let new = ImageKey { layers, ..old };
+        self.init_image(new)?;
+        self.begin();
+        self.end_rendering();
+        if self.cx.barrier_needed {
+            full_barrier!(self);
+            self.cx.barrier_needed = false;
+        }
+        let aspect = if old.format == vk::Format::D32_SFLOAT_S8_UINT { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH };
+        let sub = vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: old.layers.max(1) };
+        let region = vk::ImageCopy { src_subresource: sub, src_offset: vk::Offset3D::default(), dst_subresource: sub, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: old.width, height: old.height, depth: 1 } };
+        unsafe { REC.cmd_copy_image(self.cx.cmd, img!(self).images[&old].image, vk::ImageLayout::GENERAL, img!(self).images[&new].image, vk::ImageLayout::GENERAL, &[region]) };
+        unordered!(self);
+        self.mark(|| "depth layer grow copy".into());
+        self.adopt_image(old, new);
+        // (Its HTILE covers the new slices too: set again by `depth_target`.)
+        let n = img!(self).images.get_mut(&new).unwrap();
+        n.meta_layer_fill.resize(layers as usize, None);
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+            crate::info!("depth target {:#x} {}x{} {:?}: {} -> {} slices", old.base, old.width, old.height, old.format, old.layers, layers);
+        }
+        Ok(new)
+    }
+
+    /// `new` (just created, holding `old`'s contents) takes over `old`'s
+    /// state and index entries; `old` is retired.
+    fn adopt_image(&mut self, old: ImageKey, new: ImageKey) {
         let o = img!(self).images.remove(&old).unwrap();
         img!(self).newer_gen += 1;
         bump_base!(img!(self), old.base);
@@ -5494,6 +5553,8 @@ impl Renderer {
         n.meta = o.meta;
         n.meta_dirty = o.meta_dirty;
         n.meta_fill = o.meta_fill;
+        n.meta_layers = o.meta_layers;
+        n.meta_layer_fill = o.meta_layer_fill;
         n.meta_listed = o.meta_listed;
         n.guest_newer = o.guest_newer;
         n.last_used = o.last_used;
@@ -5523,11 +5584,6 @@ impl Renderer {
         // (Used by the batch being recorded: freed once it completes, and the
         // other renderer's.)
         self.retire_shared(self.open_seq, Retired::Image(o.image, o.memory, o.views.values().copied().collect()));
-        self.grown += 1;
-        if self.grown <= 20 {
-            crate::info!("image {:#x} {}x{}x{} {:?}: {} -> {} mip levels (view of level {level})", old.base, old.width, old.height, old.layers, old.format, old.levels, levels);
-        }
-        Ok(new)
     }
 
     /// Several images can alias one guest surface with different sizes: a
@@ -8003,6 +8059,13 @@ impl Renderer {
             let img = img!(self).images.get_mut(&src).unwrap();
             return img.view(src.format, 0, view_type, false, 0, 1);
         }
+        // Arrays (the sun's shadow cascades) with their slices in the depth
+        // target: its depth aspect as an array view.
+        let (first, count) = (t.view_base_layer(), t.layers().max(1));
+        if t.width == src.width && t.height == src.height && view_type == vk::ImageViewType::TYPE_2D_ARRAY && first + count <= src.layers {
+            let img = img!(self).images.get_mut(&src).unwrap();
+            return img.view(src.format, 0, view_type, false, first, count);
+        }
         let wgen = img!(self).write_gen.get(&src).copied().unwrap_or(0);
         let skey = (src, t.width, t.height, vfmt);
         let dst_key = ImageKey { base: t.base ^ 0x4000_0000_0000_0000, width: t.width, height: t.height, layers: 1, levels: 1, format: vfmt, depth: false, ty3d: false };
@@ -9983,7 +10046,7 @@ impl Renderer {
                 vs.addr,
                 ps.as_ref().map(|p| p.addr).unwrap_or(0),
                 colors.iter().map(|c| c.map(|a| format!("{:#x}:{}x{}:{:?}{}", a.key.base, a.key.width, a.key.height, a.view_format, if a.key.layers > 1 { format!(":layer {}/{}", a.layer, a.key.layers) } else { String::new() }))).collect::<Vec<_>>(),
-                depth.map(|d| format!("{:#x} {}x{} {:?}", d.key.base, d.key.width, d.key.height, d.key.format)),
+                depth.map(|d| format!("{:#x} {}x{} {:?}{}", d.key.base, d.key.width, d.key.height, d.key.format, if d.key.layers > 1 { format!(":layer {}/{}", d.layer, d.key.layers) } else { String::new() })),
                 regs.ctx(0xA200),
                 regs.ctx(0xA10B),
                 regs.ctx(0xA10C),
@@ -10033,6 +10096,16 @@ impl Renderer {
                     regs.ctx(0xA010),
                     (regs.ctx(0xA005) as u64) << 8
                 );
+            }
+            // A depth decompress pass (DB_RENDER_CONTROL.DEPTH/STENCIL_
+            // COMPRESS_DISABLE, nothing drawn): the expanded surface holds the
+            // fast clears its HTILE recorded, and the title samples it next
+            // (shadow slices it cleared and left empty).
+            if regs.ctx(0xA000) & 0x60 != 0 && crate::tune::get(crate::tune::DEPTH_SLICES) != 0 {
+                if let Some(d) = self.depth_target(regs)? {
+                    self.cx.draw_targets = smallvec::smallvec![d.key];
+                    self.apply_meta_clears(regs, &[], Some(d));
+                }
             }
             self.skipped += 1;
             return Ok(());
@@ -10411,9 +10484,9 @@ impl Renderer {
             } else {
                 self.trace_timing("draw");
             }
-            if let Some(p) = &ps {
-                self.dump_after(p, &colors, depth);
-            }
+            // (Draws without a pixel shader, e.g. stencil-marked light
+            // volumes: by their vertex shader.)
+            self.dump_after(ps.as_ref().unwrap_or(&vs), &colors, depth);
             // TLG_TRACE_DEPTH=<threshold, default 0.985>: how much of the depth
             // target is nearer than the threshold after each draw of the
             // traced frame (logged on change; 0.99999 counts all geometry in
@@ -10609,7 +10682,7 @@ impl Renderer {
         let depth_info = match depth {
             Some(d) => {
                 let img = img!(self).images.get_mut(&d.key).ok_or("depth image missing")?;
-                let view = img.view(d.view_format, 0, vk::ImageViewType::TYPE_2D, false, 0, 1)?;
+                let view = img.view(d.view_format, 0, vk::ImageViewType::TYPE_2D, false, d.layer, 1)?;
                 Some(vk::RenderingAttachmentInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL).load_op(vk::AttachmentLoadOp::LOAD).store_op(vk::AttachmentStoreOp::STORE))
             }
             None => None,
@@ -12569,6 +12642,20 @@ impl Renderer {
             if let Some(img) = im.images.get_mut(k) {
                 img.meta_dirty = true;
                 img.meta_fill = None;
+                if k.layers > 1 {
+                    if let Some((mbase, msize)) = img.meta {
+                        // (The slices whose HTILE the write touched.)
+                        let per = (msize / k.layers as u64).max(1);
+                        let first = base.saturating_sub(mbase) / per;
+                        let last = ((base + size).min(mbase + msize) - 1).saturating_sub(mbase) / per;
+                        for l in first..=last.min(k.layers as u64 - 1) {
+                            img.meta_layers |= 1 << l.min(63);
+                            if let Some(f) = img.meta_layer_fill.get_mut(l as usize) {
+                                *f = None;
+                            }
+                        }
+                    }
+                }
                 im.meta_dirty_gen += 1;
             }
         }
@@ -12598,6 +12685,19 @@ impl Renderer {
         for k in self.meta_overlapping(base, size, true) {
             if let Some(img) = img!(self).images.get_mut(&k) {
                 img.meta_fill = Some(pattern);
+            }
+        }
+        // Layered depth targets: the slices whose HTILE lies inside the fill.
+        for k in self.meta_overlapping(base, size, false) {
+            let Some(img) = img!(self).images.get_mut(&k).filter(|_| k.layers > 1) else { continue };
+            let Some((mbase, msize)) = img.meta else { continue };
+            let per = (msize / k.layers as u64).max(1);
+            img.meta_layer_fill.resize(k.layers as usize, None);
+            for l in 0..k.layers as u64 {
+                let lb = mbase + l * per;
+                if base <= lb && lb + per <= base + size {
+                    img.meta_layer_fill[l as usize] = Some(pattern);
+                }
             }
         }
     }
@@ -12640,6 +12740,10 @@ impl Renderer {
             }) else {
                 continue;
             };
+            if slot.is_none() && key.layers > 1 {
+                self.apply_layer_clears(regs, key, mbase, msize);
+                continue;
+            }
             // Written by GPU work not complete yet: decided on the GPU.
             if fill.is_none() {
                 match self.meta_clear_on_gpu(regs, colors, key, slot, mbase, msize) {
@@ -12763,6 +12867,79 @@ impl Renderer {
         }
         self.meta_pipes = Some((set_layout, layout, pipes[0], pipes[1]));
         Ok((set_layout, layout, pipes[0], pipes[1]))
+    }
+
+    /// `apply_meta_clears` for a layered depth target (the sun's shadow
+    /// cascades): HTILE holds one surface per slice, so each slice whose
+    /// metadata was written since it was last examined is cleared when its
+    /// own HTILE says so - the others keep what was rendered into them (this
+    /// emulation does not update HTILE when rendering, so a slice cleared
+    /// long ago still reads as cleared).
+    fn apply_layer_clears(&mut self, regs: &Regs, key: ImageKey, mbase: u64, msize: u64) {
+        let Some((bits, fills)) = img!(self).images.get_mut(&key).map(|i| (std::mem::take(&mut i.meta_layers), i.meta_layer_fill.clone())) else { return };
+        let per = msize / key.layers as u64;
+        if per < 64 {
+            return;
+        }
+        for l in 0..key.layers {
+            if bits & (1 << l.min(63)) == 0 {
+                continue;
+            }
+            let lbase = mbase + per * l as u64;
+            let fill = fills.get(l as usize).copied().flatten();
+            // (Without a known fill the metadata must have landed in guest
+            // memory: waits if needed.)
+            if fill.is_none() {
+                self.sync_guest(lbase, per);
+            }
+            let probe = |off: u64| -> Option<u32> {
+                if let Some(p) = fill {
+                    return Some(p);
+                }
+                let a = lbase + (off & !3);
+                crate::mem::is_guest(a, 4).then(|| unsafe { std::ptr::read_volatile(a as *const u32) })
+            };
+            let words: Vec<u32> = (0..16).map(|k| k * 4).chain((0..16).map(|k| ((per / 2) & !3) + k * 4)).chain((0..16).map(|k| per - 64 + k * 4)).filter_map(probe).collect();
+            if words.is_empty() {
+                continue;
+            }
+            let depth_clear = words.iter().all(|w| w & 0xF == 0);
+            let stencil_tiles = regs.ctx(0xA011) & (1 << 29) == 0 && key.format == vk::Format::D32_SFLOAT_S8_UINT;
+            let stencil_clear = stencil_tiles && words.iter().all(|w| (w >> 8) & 3 == 0);
+            let mut aspect = vk::ImageAspectFlags::empty();
+            if depth_clear {
+                aspect |= vk::ImageAspectFlags::DEPTH;
+            }
+            if stencil_clear {
+                aspect |= vk::ImageAspectFlags::STENCIL;
+            }
+            let value = vk::ClearDepthStencilValue { depth: f32r(regs.ctx(0xA00B)), stencil: regs.ctx(0xA00A) & 0xFF };
+            static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 24 {
+                crate::info!(
+                    "HTILE of depth {:#x} slice {l} of {} written ({}): {}",
+                    key.base,
+                    key.layers,
+                    if fill.is_some() { "a fill" } else { "read back" },
+                    if aspect.is_empty() { "kept".to_string() } else { format!("cleared ({aspect:?}, depth {} stencil {})", value.depth, value.stencil) }
+                );
+            }
+            if aspect.is_empty() {
+                continue;
+            }
+            self.begin();
+            self.end_rendering();
+            full_barrier!(self);
+            let range = vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: 1, base_array_layer: l, layer_count: 1 };
+            let img = img!(self).images[&key].image;
+            unsafe { REC.cmd_clear_depth_stencil_image(self.cx.cmd, img, vk::ImageLayout::GENERAL, &value, &[range]) };
+            unordered!(self);
+            // (Sampled from this image from now on, as rendered contents.)
+            let im = img!(self);
+            *im.write_gen.entry(key).or_default() += 1;
+            let i = im.images.get_mut(&key).unwrap();
+            set_gpu_written!(im, i, key.base);
+        }
     }
 
     /// `apply_meta_clears` for metadata that GPU work recorded in this batch
@@ -13269,8 +13446,9 @@ impl Renderer {
         ks.iter().copied().find(|k| !k.depth && k.width >= w && k.height >= h && im.images[k].gpu_written)
     }
 
-    /// Reads back a display image as RGBA8 (for screenshots).
-    pub fn capture(&mut self, base: u64, w: u32, h: u32) -> Option<Vec<u8>> {
+    /// Reads back a display image as RGBA8 (for screenshots); `pq`: it holds
+    /// the title's HDR output (PQ, BT.2020), shown with 100 nits as white.
+    pub fn capture(&mut self, base: u64, w: u32, h: u32, pq: bool) -> Option<Vec<u8>> {
         let k = self.display_key(base, w, h)?;
         if format_class(k.format) != 4 {
             return None;
@@ -13299,8 +13477,38 @@ impl Renderer {
             // 10-bit channels (sRGB-encoded for A2R10G10B10 sRGB display
             // buffers): their top 8 bits.
             let bgr = k.format == vk::Format::A2R10G10B10_UNORM_PACK32;
+            // PQ code -> linear (100 nits = 1), BT.2020 -> BT.709, sRGB.
+            let pq_lin = |c: u32| {
+                let e = (c as f32 / 1023.0).powf(1.0 / 78.843_75);
+                ((e - 0.835_937_5).max(0.0) / (18.851_562 - 18.687_5 * e)).powf(1.0 / 0.159_301_76) * 100.0
+            };
+            let srgb = |x: f32| {
+                let x = x.clamp(0.0, 1.0);
+                ((if x <= 0.003_130_8 { x * 12.92 } else { 1.055 * x.powf(1.0 / 2.4) - 0.055 }) * 255.0 + 0.5) as u8
+            };
+            if pq {
+                // (The frame's light levels, for the HDR white level.)
+                let mut nits: Vec<f32> = px.chunks(4).map(|p| {
+                    let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                    pq_lin(v & 0x3FF).max(pq_lin((v >> 10) & 0x3FF)).max(pq_lin((v >> 20) & 0x3FF))
+                }).collect();
+                nits.sort_by(f32::total_cmp);
+                let at = |q: f64| nits[((nits.len() - 1) as f64 * q) as usize];
+                // (pq_lin: 1 = 100 nits.)
+                crate::info!("PQ frame: brightest channel per pixel, nits: median {:.1}, 90% {:.1}, 99% {:.1}, 99.9% {:.1}, max {:.1}", at(0.5) * 100.0, at(0.9) * 100.0, at(0.99) * 100.0, at(0.999) * 100.0, at(1.0) * 100.0);
+            }
             for p in px.chunks_mut(4) {
                 let v = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                if pq {
+                    let (lo, mid, hi) = (v & 0x3FF, (v >> 10) & 0x3FF, (v >> 20) & 0x3FF);
+                    let (r, g, b) = if bgr { (hi, mid, lo) } else { (lo, mid, hi) };
+                    let (r, g, b) = (pq_lin(r), pq_lin(g), pq_lin(b));
+                    let r7 = 1.660_5 * r - 0.587_6 * g - 0.072_8 * b;
+                    let g7 = -0.124_6 * r + 1.132_9 * g - 0.008_3 * b;
+                    let b7 = -0.018_2 * r - 0.100_6 * g + 1.118_7 * b;
+                    p.copy_from_slice(&[srgb(r7), srgb(g7), srgb(b7), 255]);
+                    continue;
+                }
                 let (lo, mid, hi) = ((v >> 2) & 0xFF, (v >> 12) & 0xFF, (v >> 22) & 0xFF);
                 let (r, g, b) = if bgr { (hi, mid, lo) } else { (lo, mid, hi) };
                 p.copy_from_slice(&[r as u8, g as u8, b as u8, 255]);
@@ -13383,6 +13591,37 @@ impl Renderer {
         if std::env::var_os("TLG_DUMP_RAW").is_some() || DUMP_RAW.load(std::sync::atomic::Ordering::Relaxed) {
             let _ = std::fs::write(dir.join(format!("{name}.bin")), &raw);
         }
+        // Depth-stencil: the stencil aspect too (values counted: the
+        // stencil-marked light volumes use small counts).
+        if k.format == vk::Format::D32_SFLOAT_S8_UINT {
+            let size = (k.width * k.height) as u64;
+            self.begin();
+            full_barrier!(self);
+            let Some(off) = self.cx.ring.alloc(size) else { return };
+            let region = vk::BufferImageCopy {
+                buffer_offset: off,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::STENCIL, mip_level: 0, base_array_layer: layer, layer_count: 1 },
+                image_offset: vk::Offset3D::default(),
+                image_extent: vk::Extent3D { width: k.width, height: k.height, depth: 1 },
+            };
+            unsafe { REC.cmd_copy_image_to_buffer(self.cx.cmd, img!(self).images[&k].image, vk::ImageLayout::GENERAL, self.cx.ring.buffer, &[region]) };
+            self.flush();
+            let st = unsafe { std::slice::from_raw_parts(self.cx.ring.ptr.add(off as usize), size as usize) };
+            let mut hist = [0u64; 256];
+            for &v in st {
+                hist[v as usize] += 1;
+            }
+            let top: Vec<String> = {
+                let mut v: Vec<(usize, u64)> = hist.iter().copied().enumerate().filter(|e| e.1 > 0).collect();
+                v.sort_by_key(|e| std::cmp::Reverse(e.1));
+                v.iter().take(8).map(|(s, n)| format!("{s:#x}: {:.2}%", *n as f64 * 100.0 / size as f64)).collect()
+            };
+            crate::info!("dump {prefix}{:#x} stencil: {}", k.base, top.join(", "));
+            let px: Vec<u8> = st.iter().flat_map(|&v| { let g = if v == 0 { 0 } else { 64 + (v as u32 * 24).min(191) as u8 }; [g, g, g, 255] }).collect();
+            let _ = std::fs::write(dir.join(format!("{name}_stencil.png")), super::texdump::png(k.width, k.height, &px));
+        }
     }
 
     /// Frame trace with `TLG_DUMP_AFTER=<ps addrs>`: dumps the color targets of
@@ -13419,7 +13658,10 @@ impl Renderer {
             for k in keys {
                 if !done.contains(&k) {
                     done.push(k);
-                    self.dump_image(&dir, k, 0, &format!("{n:03}_ps{ps:x}_tex_"));
+                    // (Arrays: their first slices.)
+                    for layer in 0..if k.ty3d { 1 } else { k.layers.clamp(1, 6) } {
+                        self.dump_image(&dir, k, layer, &format!("{n:03}_ps{ps:x}_tex_"));
+                    }
                 }
             }
         }

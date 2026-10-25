@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.7.0 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.7.1 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4: US release CUSA03627 or
@@ -74,6 +74,12 @@ Keyboard and mouse (defaults; the launcher's Controls page changes them):
 In menus the left mouse button selects, the right one goes back and the
 wheel moves the selection.
 
+When the boy dies, floating symbols fill the screen until you press
+buttons: press several different ones quickly (face and shoulder buttons,
+the d-pad; on the keyboard e.g. C, E, F, Space, Q and R) and the game goes
+back to the last checkpoint. That is the PS4 game's own revive screen, not
+a hang.
+
 
 Settings, saves and logs
 ------------------------
@@ -84,6 +90,11 @@ Settings, saves and logs
   session's log folder.
 - Portable use: an empty file named portable.txt next to tlg.exe keeps
   everything in a "user" folder beside it.
+- HDR: with Windows HDR on for the game's monitor the game sends an HDR10
+  picture. The launcher's Display page sets how bright white is (200 nits by
+  default; 100-400, or as bright as Windows' SDR content) or turns it off.
+  "The game's own HDR" (experimental) uses the PS4 game's HDR mode instead:
+  set the brightness with the game's own slider (Options > Screen).
 - Language: the launcher's Game files page lists the languages your game
   files carry: in the US release English, Spanish (Latin America), French
   (Canada) and Portuguese (Brazil); in a European release its languages
@@ -101,6 +112,8 @@ Known limits
 - The title screen's music plays quieter than it should.
 - Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel
   graphics have not been tested yet.
+- HDR output has not been tested on an HDR screen yet (its conversion was
+  checked numerically).
 - The European release is tested with an English-only copy. Its other
   languages are offered when your game files carry them, but have not been
   tested. Japanese and the other Asian languages are in the game's program

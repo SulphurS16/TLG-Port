@@ -884,8 +884,13 @@ pub const WW_ROUND_LOG: usize = 150;
 /// to guest memory after the command, for the title's CPU reads
 /// (`TLG_READBACK_KIB`, 256; 0 = never: render.rs `note_readback`).
 pub const READBACK_KIB: usize = 151;
+/// Depth targets rendered slice by slice (DB_DEPTH_VIEW; the sun's shadow
+/// cascades) keep each slice in its own layer, and arrays of them are
+/// sampled as arrays (`TLG_DEPTH_SLICES`, 1; 0 = every slice in layer 0,
+/// as before 0.7.1: render.rs `depth_target`).
+pub const DEPTH_SLICES: usize = 152;
 
-const TABLE: [(&str, &str, i64); 152] = [
+const TABLE: [(&str, &str, i64); 153] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -1038,6 +1043,7 @@ const TABLE: [(&str, &str, i64); 152] = [
     ("pm4_capture", "TLG_PM4_CAPTURE", 0),
     ("ww_round_log", "TLG_WW_ROUND_LOG", 0),
     ("readback_kib", "TLG_READBACK_KIB", 256),
+    ("depth_slices", "TLG_DEPTH_SLICES", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

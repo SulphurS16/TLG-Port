@@ -1,11 +1,11 @@
 //! Display page: window mode, monitor, window size, exclusive mode and
 //! refresh rate, render resolution, vsync, frame-rate limit, new shaders,
-//! GPU, volume. (Scaling and its filter: settings.txt.)
+//! HDR output, GPU, volume. (Scaling and its filter: settings.txt.)
 
 use crate::App;
 use crate::sys::{self, Monitor};
 use crate::ui;
-use tlg_config::settings::{self, DisplayMode, FrameCap, NewShaders, VSync};
+use tlg_config::settings::{self, DisplayMode, FrameCap, Hdr, NewShaders, VSync};
 use windows_sys::Win32::Foundation::{HWND, LPARAM};
 use windows_sys::Win32::UI::Controls::TBM_SETPOS;
 use windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW;
@@ -23,6 +23,10 @@ const ID_VOLUME: i32 = 214;
 const ID_VOLUME_TEXT: i32 = 215;
 const ID_RENDER: i32 = 216;
 const ID_SHADERS: i32 = 217;
+const ID_HDR: i32 = 218;
+
+/// HDR white levels offered (nits; 0 = Windows' SDR content brightness).
+const HDR_WHITES: [u32; 7] = [0, 100, 150, 200, 250, 300, 400];
 
 /// Render resolutions offered besides the display's (16:9).
 const RENDER_SIZES: [(u32, u32); 6] = [(1280, 720), (1600, 900), (1920, 1080), (2560, 1440), (3200, 1800), (3840, 2160)];
@@ -42,6 +46,7 @@ pub struct Page {
     vsync: usize,
     cap: usize,
     shaders: usize,
+    hdr: usize,
     gpu: usize,
     gpu_note: usize,
     volume: usize,
@@ -54,6 +59,8 @@ pub struct Page {
     rates: Vec<u32>,
     /// Render resolutions offered (None = the display's).
     renders: Vec<Option<(u32, u32)>>,
+    /// HDR choices offered: off, or on with a white level.
+    hdrs: Vec<(Hdr, u32)>,
     gpus: Vec<String>,
 }
 
@@ -63,7 +70,7 @@ fn h(v: usize) -> HWND {
 
 pub fn build(app: &mut App) {
     let b = app.builder();
-    let rows: [(&str, i32); 10] = [
+    let rows: [(&str, i32); 11] = [
         ("Display mode:", ID_MODE),
         ("Monitor:", ID_MONITOR),
         ("Window size:", ID_WINDOW),
@@ -73,6 +80,7 @@ pub fn build(app: &mut App) {
         ("Vertical sync:", ID_VSYNC),
         ("Frame-rate limit:", ID_CAP),
         ("New shaders:", ID_SHADERS),
+        ("HDR output:", ID_HDR),
         ("Graphics card:", ID_GPU),
     ];
     let mut hs = Vec::new();
@@ -84,9 +92,9 @@ pub fn build(app: &mut App) {
             let r = (210, y, 330, 300);
             hs.push(app.put(1, b.combo(r, *id), r, false) as usize);
         }
-        let r = (210, 56 + 9 * 34 + 30, 554, 34);
+        let r = (210, 56 + 10 * 34 + 30, 554, 34);
         app.display.gpu_note = app.put(1, b.label("", r, ID_GPU_NOTE), r, false) as usize;
-        let y = 56 + 10 * 34 + 30;
+        let y = 56 + 11 * 34 + 30;
         let r = (32, y + 6, 170, 20);
         app.put(1, b.label("Volume:", r, -1), r, false);
         let r = (204, y, 280, 30);
@@ -97,7 +105,7 @@ pub fn build(app: &mut App) {
         app.display.volume_text = app.put(1, b.label("", r, ID_VOLUME_TEXT), r, false) as usize;
     }
     let p = &mut app.display;
-    (p.mode, p.monitor, p.window, p.res, p.hz, p.render, p.vsync, p.cap, p.shaders, p.gpu) = (hs[0], hs[1], hs[2], hs[3], hs[4], hs[5], hs[6], hs[7], hs[8], hs[9]);
+    (p.mode, p.monitor, p.window, p.res, p.hz, p.render, p.vsync, p.cap, p.shaders, p.hdr, p.gpu) = (hs[0], hs[1], hs[2], hs[3], hs[4], hs[5], hs[6], hs[7], hs[8], hs[9], hs[10]);
     p.monitors = sys::monitors();
     match sys::gpus() {
         Ok(g) => {
@@ -150,6 +158,24 @@ pub fn load(app: &mut App) {
         let caps: Vec<String> = settings::OFFERED_FRAME_CAPS.iter().map(|&c| cap_name(c).into()).collect();
         ui::combo_fill(h(p.cap), &caps, settings::OFFERED_FRAME_CAPS.iter().position(|&c| c == s.frame_cap).unwrap_or(0));
         ui::combo_fill(h(p.shaders), &["Wait for them".into(), "Draw without them meanwhile".into()], (s.new_shaders == NewShaders::Skip) as usize);
+        // HDR: used where Windows HDR is on for the game's monitor.
+        let hdrs = hdr_choices(&s);
+        let names: Vec<String> = hdrs
+            .iter()
+            .map(|&(m, w)| match (m, w) {
+                (Hdr::Off, _) => "Off (SDR output)".to_string(),
+                (Hdr::Game, _) => "The game's own HDR (experimental)".to_string(),
+                (_, 0) => "Auto, as bright as Windows' SDR content".to_string(),
+                (_, 200) => "Auto, white at 200 nits (default)".to_string(),
+                (_, w) => format!("Auto, white at {w} nits"),
+            })
+            .collect();
+        let hi = match s.hdr {
+            Hdr::Off => 0,
+            Hdr::Game => hdrs.len() - 1,
+            Hdr::Auto => hdrs.iter().position(|&x| x == (Hdr::Auto, s.hdr_white)).unwrap_or(0),
+        };
+        ui::combo_fill(h(p.hdr), &names, hi);
         let mut gpus = vec!["Automatic".to_string()];
         gpus.extend(p.gpus.iter().cloned());
         let gi = if s.gpu.eq_ignore_ascii_case("auto") { 0 } else { p.gpus.iter().position(|g| g.to_ascii_lowercase().contains(&s.gpu.to_ascii_lowercase())).map(|i| i + 1).unwrap_or(0) };
@@ -157,6 +183,7 @@ pub fn load(app: &mut App) {
         SendMessageW(h(p.volume), TBM_SETPOS, 1, s.volume as LPARAM);
         ui::set_text(h(p.volume_text), &format!("{}%", s.volume));
     }
+    app.display.hdrs = hdr_choices(&s);
     fill_monitor_lists(app);
 }
 
@@ -255,6 +282,18 @@ fn fill_render(app: &mut App) {
     unsafe { ui::combo_fill(h(p.render), &names, i) };
 }
 
+/// The HDR choices in the order `load` lists them (the game's own HDR keeps
+/// the white level set).
+fn hdr_choices(s: &settings::Settings) -> Vec<(Hdr, u32)> {
+    let mut v: Vec<(Hdr, u32)> = vec![(Hdr::Off, s.hdr_white)];
+    v.extend(HDR_WHITES.iter().map(|&w| (Hdr::Auto, w)));
+    if !HDR_WHITES.contains(&s.hdr_white) {
+        v.push((Hdr::Auto, s.hdr_white));
+    }
+    v.push((Hdr::Game, s.hdr_white));
+    v
+}
+
 pub fn command(app: &mut App, id: i32, code: u32) {
     // CBN_SELCHANGE
     if code != 1 {
@@ -292,6 +331,16 @@ pub fn command(app: &mut App, id: i32, code: u32) {
         ID_VSYNC => app.settings.vsync = [VSync::On, VSync::Off, VSync::Fast][sel(p.vsync).min(2)],
         ID_CAP => app.settings.frame_cap = settings::OFFERED_FRAME_CAPS.get(sel(p.cap)).copied().unwrap_or(FrameCap::Game),
         ID_SHADERS => app.settings.new_shaders = if sel(p.shaders) == 1 { NewShaders::Skip } else { NewShaders::Wait },
+        ID_HDR => {
+            let i = sel(p.hdr);
+            if let Some(&(m, w)) = p.hdrs.get(i) {
+                app.settings.hdr = m;
+                if m == Hdr::Auto {
+                    app.settings.hdr_white = w;
+                }
+                app.display.hdrs = hdr_choices(&app.settings);
+            }
+        }
         ID_GPU => {
             let i = sel(p.gpu);
             app.settings.gpu = if i == 0 { "auto".into() } else { p.gpus.get(i - 1).cloned().unwrap_or_else(|| "auto".into()) };
