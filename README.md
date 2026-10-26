@@ -29,7 +29,7 @@ Nothing from the game is in this repository.
 ### What you need
 
 - Windows 10 or 11, 64-bit, and a graphics card with a Vulkan 1.3 driver (NVIDIA, AMD or Intel) and about 4 GB of video memory.
-- A recent processor with high single-core speed. Tested on a Ryzen 9 5900X with an RTX 4090: 30 fps everywhere, and with the 60 fps limit 60 in nearly every area, about 51-57 at the ending's start and 42-45 in the final battle; about 25-30 fps on a 6-core laptop CPU from 2019.
+- A recent processor with high single-core speed. Tested on a Ryzen 9 5900X with an RTX 4090: 30 fps everywhere, and with the 60 fps limit 60 in nearly every area.
 - Your own copy of The Last Guardian for PS4 (US release CUSA03627 or European release CUSA03745) at version 01.00 with update 01.03, as decrypted folders. The game folder holds 'eboot.bin', 'sce_module', 'sce_sys' and the 'trico_*.psarc' archives; the update folder holds the same for 01.03, or the update is merged into the game folder.
 - About 25 GB of disk space for those files.
 
