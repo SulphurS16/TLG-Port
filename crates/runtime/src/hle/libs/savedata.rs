@@ -20,7 +20,9 @@ const MOUNT_RDONLY: u32 = 1;
 const MOUNT_CREATE: u32 = 4;
 const MOUNT_CREATE2: u32 = 32;
 
-static ROOT: OnceLock<PathBuf> = OnceLock::new();
+/// The save folder (the PC Settings pages can move it while the game runs:
+/// the next mount uses the new one).
+static ROOT: parking_lot::RwLock<Option<PathBuf>> = parking_lot::RwLock::new(None);
 static BACKUPS: OnceLock<PathBuf> = OnceLock::new();
 static MOUNTS: Mutex<[Option<PathBuf>; 16]> = Mutex::new([const { None }; 16]);
 
@@ -29,8 +31,44 @@ const BACKUP_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
 pub fn init(root: PathBuf, backups: PathBuf) {
     crate::info!("saves in {}, backups in {}", root.display(), backups.display());
-    ROOT.set(root).ok();
+    *ROOT.write() = Some(root);
     BACKUPS.set(backups).ok();
+}
+
+/// The folder saves are kept in.
+pub fn save_root() -> PathBuf {
+    ROOT.read().clone().expect("savedata root")
+}
+
+/// The save folder for a `save_folder` setting: `default` is the user
+/// folder's.
+pub fn folder_for(setting: &str) -> PathBuf {
+    match setting {
+        "" | "default" => crate::config::paths().saves(),
+        s => PathBuf::from(s),
+    }
+}
+
+/// The PC Settings pages moved the save folder: a new folder without saved
+/// games gets copies of the current ones (the old folder keeps its files);
+/// one that has some keeps them. Later mounts use the new folder.
+pub fn move_saves(_old: &str, new: &str) -> Result<(), String> {
+    let from = save_root();
+    let to = folder_for(new);
+    if to == from {
+        return Ok(());
+    }
+    std::fs::create_dir_all(&to).map_err(|e| format!("{}: {e}", to.display()))?;
+    // (A write in progress finishes first: it goes to the old folder.)
+    wait_writes(std::time::Duration::from_secs(2));
+    let has_saves = std::fs::read_dir(&to).map(|mut d| d.next().is_some()).unwrap_or(false);
+    if !has_saves && from.exists() {
+        copy_tree(&from, &to).map_err(|e| format!("copying {} to {}: {e}", from.display(), to.display()))?;
+        crate::info!("saves: copied {} to {}", from.display(), to.display());
+    }
+    *ROOT.write() = Some(to.clone());
+    crate::info!("saves in {} from now on", to.display());
+    Ok(())
 }
 
 /// Waits (up to `limit`) for a save-data memory write in progress.
@@ -40,7 +78,7 @@ pub fn wait_writes(limit: std::time::Duration) {
 
 /// Where locally recorded trophy unlocks of the running title live.
 pub fn trophy_file() -> PathBuf {
-    ROOT.get().expect("savedata root").join(format!("trophies-{}.txt", title_id()))
+    save_root().join(format!("trophies-{}.txt", title_id()))
 }
 
 fn title_id() -> String {
@@ -53,7 +91,7 @@ fn title_id() -> String {
 fn user_root(user: i32, title: *const u8) -> PathBuf {
     let t = if title.is_null() { title_id() } else { unsafe { cstr(title) }.to_string() };
     let t = if t.is_empty() { title_id() } else { t };
-    ROOT.get().expect("savedata root").join(format!("{user}")).join(t)
+    save_root().join(format!("{user}")).join(t)
 }
 
 fn valid_dir_name(s: &str) -> bool {

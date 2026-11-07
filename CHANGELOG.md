@@ -1,5 +1,69 @@
 # Changelog
 
+## 0.8.0
+
+PC features, in the game itself:
+
+- PC Settings in the game's own menus: Options > PC Settings on the title
+  screen and in the pause menu, or F10 while playing (it pauses the game).
+  The pages look and work like the game's Options pages, with a controller,
+  the keyboard or the mouse. Most settings take effect at once; the render
+  resolution, the aspect ratio and the intro logos at the next start. The
+  launcher keeps its settings too.
+- DLSS, XeSS and FSR (PC Settings > Graphics > Anti-Aliasing, live): the
+  game's SMAA, or NVIDIA DLSS (DLAA), Intel XeSS or AMD FSR as anti-aliasing
+  at the render resolution, fed the game's own motion vectors and depth.
+  With Upscaling (Quality 67%, Balanced 58%, Performance 50%, Ultra
+  Performance 33%; at the next start) the game renders below the render
+  resolution and the chosen upscaler brings it up. Only the ones your PC can
+  run are listed: DLSS needs an NVIDIA RTX graphics card; XeSS and FSR run
+  on recent graphics cards of any make (FSR 4 on AMD's newer cards, FSR 3.1
+  elsewhere). XeSS, FSR and NVIDIA Streamline come in the "upscalers"
+  folder; DLSS itself needs your own copy of NVIDIA's nvngx_dlss.dll there
+  (NVIDIA's license; see the readme).
+- Graphics beyond the PS4's, live: sharpening (0-200%), shadows (low, PS4,
+  high, ultra), texture filtering (2x-16x), ambient occlusion (off, half,
+  full resolution), screen-space reflections, volumetric fog and light
+  shafts on or off. Camera effects on or off: motion blur, depth of field,
+  bloom, chromatic aberration, vignette.
+- Wide and tall screens: 21:9, 32:9 and 16:10 (Automatic: your screen's own
+  shape). A wider picture shows more to the sides and a taller one more
+  above and below, without stretching; the menus, prompts and subtitles keep
+  the game's 16:9 place in the middle. Render sizes up to 7680 wide (at most
+  3840x2160's pixels, so 32:9 reaches 5120x1440). The fixed render
+  resolutions now name a height (1080p at 21:9 is 2560x1080).
+- Button prompts follow the device you use and switch at once: Xbox buttons
+  with an Xbox controller, the PS4's with a DUALSHOCK 4 or DualSense, and
+  with keyboard and mouse each prompt's own keys and mouse buttons - your
+  bindings, redrawn when you change them (GitHub issue #11). The keys can be
+  changed in the game: PC Settings > Controls > Key Bindings.
+- A mouse pointer in the game's menus: in the Options lists and the PC
+  Settings pages it selects what it points at; in the title and pause menus
+  the click and the wheel work on the selection.
+- The frame-rate limit (30, 60 or none) changes while you play.
+- Menu and HUD size (60-110%), an option to skip the intro logos, mouse
+  sensitivity; mouse look follows the game's own camera inversion options.
+- At the first start the port picks settings that suit the PC (from the
+  graphics card, processor and monitor): display mode, render resolution,
+  frame-rate limit, texture filtering, shadows and ambient occlusion.
+- Sound: 5.1 and 7.1 output (Automatic follows Windows' speaker set-up),
+  headphone surround through Windows Sonic for Headphones or Dolby Atmos for
+  Headphones (with spatial sound on for the device in Windows), and a choice
+  of sound device. On Windows' default device the game follows when the
+  default changes.
+- Achievements: a pop-up in the game's style when you unlock a trophy, and
+  the list of all trophies with their icons and unlock dates (PC Settings >
+  Achievements). The icons come from your game files. The names and
+  descriptions are encrypted in them: give the port the PS4 trophy key -
+  in the launcher (Game files > Trophy key) or pasted on the Achievements
+  page (Trophy Names) - and it shows them; otherwise the trophies are
+  numbered. The port does not include the key.
+- Saved games: a choice of save folder (PC Settings > Saved Games). An empty
+  new folder gets copies of your saves, and the game uses it from then on.
+- Fixed a crash in the cutscene after the cave at 3840x2160 (GitHub issue
+  #10): the game ran out of graphics memory there. Its graphics memory now
+  grows with the render resolution.
+
 ## 0.7.2
 
 - Fixed a crash on the way into the last cutscene (GitHub issue #7): the

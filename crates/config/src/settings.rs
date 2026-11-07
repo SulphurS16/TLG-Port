@@ -235,34 +235,153 @@ pub enum NewShaders {
     Skip,
 }
 
-/// Render resolutions accepted (the tested range).
+/// Render resolutions accepted (the tested range): sizes up to these sides
+/// and at most 3840x2160's pixels (so 32:9 reaches 5120x1440).
 pub const RENDER_MIN: (u32, u32) = (640, 360);
-pub const RENDER_MAX: (u32, u32) = (3840, 2160);
+pub const RENDER_MAX: (u32, u32) = (7680, 2160);
+pub const RENDER_MAX_PIXELS: u64 = 3840 * 2160;
 
 pub fn render_size_ok((w, h): (u32, u32)) -> bool {
-    (RENDER_MIN.0..=RENDER_MAX.0).contains(&w) && (RENDER_MIN.1..=RENDER_MAX.1).contains(&h)
+    (RENDER_MIN.0..=RENDER_MAX.0).contains(&w) && (RENDER_MIN.1..=RENDER_MAX.1).contains(&h) && w as u64 * h as u64 <= RENDER_MAX_PIXELS
+}
+
+/// Picture shapes the game is shown in: 4:3 to 32:9 (width / height).
+const SHAPE_MIN: f64 = 4.0 / 3.0;
+const SHAPE_MAX: f64 = 32.0 / 9.0;
+
+/// The picture's shape for PC Settings `aspect_ratio` (width, height):
+/// None for `auto`, the display area's own. (21:9 is the 2560x1080 kind,
+/// 64:27.)
+pub fn aspect_of(s: &Settings) -> Option<(u32, u32)> {
+    match s.pc.get("aspect_ratio").map(String::as_str) {
+        Some("16:9") => Some((16, 9)),
+        Some("16:10") => Some((16, 10)),
+        Some("21:9") => Some((64, 27)),
+        Some("32:9") => Some((32, 9)),
+        _ => None,
+    }
+}
+
+/// A shape's ratio within the shapes shown; an area's own shape within 1%
+/// of 16:9 counts as 16:9 (1366x768 and the like).
+fn shape_ratio(shape: Option<(u32, u32)>, area: (u32, u32)) -> f64 {
+    match shape {
+        Some((x, y)) => (x as f64 / y.max(1) as f64).clamp(SHAPE_MIN, SHAPE_MAX),
+        None => {
+            let a = area.0.max(1) as f64 / area.1.max(1) as f64;
+            if (a * 9.0 / 16.0 - 1.0).abs() < 0.01 { 16.0 / 9.0 } else { a.clamp(SHAPE_MIN, SHAPE_MAX) }
+        }
+    }
+}
+
+/// A size of ratio `a` at most `w` x `h`, in the accepted range: its width a
+/// multiple of 16 and its height even (as in all the game's own display
+/// modes); exactly 16:9 for 16:9.
+fn sized(w: f64, h: f64, a: f64) -> (u32, u32) {
+    let mut w = if w / h > a { h * a } else { w };
+    // (At most the pixels allowed: w * w / a.)
+    let max = RENDER_MAX_PIXELS as f64;
+    if w * w / a > max {
+        w = (max * a).sqrt();
+    }
+    // (1080 * 32 / 9 comes out a hair under 3840.)
+    let w = (((w + 1e-6).floor() as u32) & !15).clamp(RENDER_MIN.0, RENDER_MAX.0);
+    let h = if (a - 16.0 / 9.0).abs() < 1e-9 { w * 9 / 16 } else { (w as f64 / a).round() as u32 };
+    (w, (h & !1).clamp(RENDER_MIN.1, RENDER_MAX.1))
 }
 
 /// The render size for a display area (`render_resolution = display`): the
-/// largest 16:9 size inside it in the accepted range, its width a multiple
-/// of 16 and its height even (as in all the game's own display modes).
-pub fn render_size_for(w: u32, h: u32) -> (u32, u32) {
-    let w = (w as u64).min(h as u64 * 16 / 9) as u32;
-    let w = (w & !15).clamp(RENDER_MIN.0, RENDER_MAX.0);
-    (w, (w * 9 / 16) & !1)
+/// largest size of the picture's shape (`aspect_of`; None: the area's own)
+/// inside it.
+pub fn render_size_for(w: u32, h: u32, shape: Option<(u32, u32)>) -> (u32, u32) {
+    sized(w.max(1) as f64, h.max(1) as f64, shape_ratio(shape, (w, h)))
+}
+
+/// The render size for a fixed `render_resolution`: the 16:9 sizes the
+/// settings offer (1280x720 ... 3840x2160) name a height, the width
+/// following the picture's shape (`aspect_of`; None: the display area's);
+/// other sizes stay as written.
+pub fn render_size_fixed((w, h): (u32, u32), shape: Option<(u32, u32)>, area: (u32, u32)) -> (u32, u32) {
+    let a = shape_ratio(shape, area);
+    if w * 9 != h * 16 || (a - 16.0 / 9.0).abs() < 1e-9 {
+        return (w, h);
+    }
+    let (sw, sh) = sized(f64::MAX, h as f64, a);
+    // (The preset's own height where the pixels allow.)
+    if sw as u64 * h as u64 <= RENDER_MAX_PIXELS { (sw, h) } else { (sw, sh) }
 }
 
 /// The windowed client size on a monitor with work area `work`: the
-/// configured size (within the work area), else the largest 16:9 size
-/// within 3/4 of the work area (exactly 16:9, width a multiple of 32: the
-/// display render size is then the window's).
+/// configured size (within the work area), else the largest size of the
+/// picture's shape (16:9 unless `aspect_ratio` names one) within 3/4 of the
+/// work area (exactly 16:9, width a multiple of 32: the display render size
+/// is then the window's).
 pub fn window_size(s: &Settings, work: (u32, u32)) -> (u32, u32) {
     let (ww, wh) = work;
     if s.window_width >= 320 && s.window_height >= 180 {
         return (s.window_width.min(ww), s.window_height.min(wh));
     }
+    if let Some((x, y)) = aspect_of(s).filter(|&(x, y)| x * 9 != y * 16) {
+        let w = ((ww as u64 * 3 / 4).min(wh as u64 * 3 / 4 * x as u64 / y as u64) as u32).max(320) & !31;
+        return (w, (w as u64 * y as u64 / x as u64) as u32 & !1);
+    }
     let w = ((ww as u64 * 3 / 4).min(wh as u64 * 3 / 4 * 16 / 9) as u32).max(320) & !31;
     (w, w * 9 / 16)
+}
+
+/// The settings of the game's PC Settings pages (Options > PC Settings, or
+/// F10, while playing; the launcher shows some): name, default and the
+/// values accepted - `a|b|c`, `N-M` for a whole number in that range, or `*`
+/// for any text. They change presentation only, never the game's speed,
+/// physics or behaviour.
+pub const PC: &[(&str, &str, &str)] = &[
+    // Graphics
+    ("upscaler", "off", "off|dlss|xess|fsr"),
+    ("upscaling", "off", "off|quality|balanced|performance|ultra_performance"),
+    ("sharpening", "100", "0-200"),
+    ("shadows", "ps4", "low|ps4|high|ultra"),
+    ("texture_filtering", "4x", "2x|4x|8x|16x"),
+    ("ambient_occlusion", "half", "off|half|full"),
+    ("reflections", "on", "on|off"),
+    ("volumetric_fog", "on", "on|off"),
+    ("light_shafts", "on", "on|off"),
+    // Effects
+    ("motion_blur", "on", "on|off"),
+    ("depth_of_field", "on", "on|off"),
+    ("bloom", "on", "on|off"),
+    ("chromatic_aberration", "on", "on|off"),
+    ("vignette", "on", "on|off"),
+    // Display
+    ("aspect_ratio", "auto", "auto|16:9|16:10|21:9|32:9"),
+    // Interface
+    ("button_prompts", "auto", "auto|playstation|xbox|keyboard"),
+    ("hud_size", "100", "50-150"),
+    ("menu_pointer", "on", "on|off"),
+    ("skip_intro", "off", "on|off"),
+    // Sound
+    ("speakers", "auto", "auto|stereo|5.1|7.1|headphones"),
+    ("audio_device", "default", "*"),
+    // Saves
+    ("save_folder", "default", "*"),
+    // First start: the game picks settings that suit the PC, then `done`.
+    ("auto_settings", "pending", "pending|done"),
+];
+
+/// The PC setting's entry in `PC`.
+pub fn pc_entry(key: &str) -> Option<&'static (&'static str, &'static str, &'static str)> {
+    PC.iter().find(|e| e.0 == key)
+}
+
+/// Whether `value` is one `spec` (a `PC` entry's third field) accepts.
+pub fn pc_value_ok(spec: &str, value: &str) -> bool {
+    if spec == "*" {
+        return !value.is_empty() && !value.contains(['\r', '\n']);
+    }
+    if let Some((a, b)) = spec.split_once('-').filter(|(a, _)| a.bytes().all(|c| c.is_ascii_digit()) && !a.is_empty()) {
+        let (Ok(a), Ok(b), Ok(v)) = (a.parse::<i64>(), b.parse::<i64>(), value.parse::<i64>()) else { return false };
+        return (a..=b).contains(&v);
+    }
+    spec.split('|').any(|v| v == value)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -298,6 +417,8 @@ pub struct Settings {
     pub update_dir: Option<PathBuf>,
     /// The launcher closes when the game starts.
     pub close_launcher: bool,
+    /// The PC Settings pages' values (`PC`), every one present.
+    pub pc: std::collections::BTreeMap<&'static str, String>,
 }
 
 impl Default for Settings {
@@ -323,6 +444,7 @@ impl Default for Settings {
             game_dir: None,
             update_dir: None,
             close_launcher: false,
+            pc: PC.iter().map(|&(k, d, _)| (k, d.to_string())).collect(),
         }
     }
 }
@@ -397,6 +519,56 @@ game_dir =
 update_dir =
 # The launcher closes when the game starts (on/off).
 close_launcher = off
+
+# The game's PC Settings pages (Options > PC Settings, or F10 while
+# playing) change the settings below while the game runs.
+# Anti-aliasing: off (the game's SMAA), dlss (DLAA), xess or fsr (their
+# native anti-aliasing modes), where the PC has them.
+upscaler = off
+# Upscaling: off, or quality (67% of the render resolution), balanced (58%),
+# performance (50%) or ultra_performance (33%): the game renders below the
+# render resolution and the upscaler above brings it up (at the next start).
+upscaling = off
+# Sharpening, 0-200 (% of the game's own).
+sharpening = 100
+# Shadows: low, ps4 (as on a PS4), high or ultra.
+shadows = ps4
+# Texture filtering: 2x, 4x (as on a PS4), 8x or 16x anisotropic.
+texture_filtering = 4x
+# Ambient occlusion: off, half (as on a PS4) or full resolution.
+ambient_occlusion = half
+# Screen-space reflections, volumetric fog and light shafts (on/off).
+reflections = on
+volumetric_fog = on
+light_shafts = on
+# Camera effects (on/off).
+motion_blur = on
+depth_of_field = on
+bloom = on
+chromatic_aberration = on
+vignette = on
+# The picture's shape: auto (the display's), 16:9, 16:10, 21:9 or 32:9
+# (wider shows more to the sides; the menus and HUD keep their 16:9 place).
+aspect_ratio = auto
+# Button prompts: auto (the device in use), playstation, xbox or keyboard.
+button_prompts = auto
+# The size of the menus and HUD, 50-150 (%).
+hud_size = 100
+# A mouse pointer in the menus (on/off).
+menu_pointer = on
+# Skip the logos when the game starts (on/off).
+skip_intro = off
+# Speakers: auto (as Windows has them set up), stereo, 5.1, 7.1 or
+# headphones (surround for headphones through Windows Sonic or Dolby Atmos
+# for Headphones where Windows has one on).
+speakers = auto
+# The sound device: default (Windows' default) or a device's name.
+audio_device = default
+# Where saved games are kept: default or a folder.
+save_folder = default
+# pending: the game picks settings that suit this PC when it next starts
+# (then done).
+auto_settings = pending
 ";
 
 fn flag(v: &str) -> Option<bool> {
@@ -423,7 +595,7 @@ impl Settings {
         let mut errs = Vec::new();
         for (_, k, raw) in f.entries() {
             // (Paths are taken as written: they may contain '#'.)
-            let v = if k.ends_with("_dir") || k == "monitor" { raw } else { strip_comment(raw) };
+            let v = if k.ends_with("_dir") || k == "monitor" || pc_entry(&k).is_some_and(|e| e.2 == "*") { raw } else { strip_comment(raw) };
             let lv = v.to_ascii_lowercase();
             let bad = |what: &str| format!("settings.txt: '{k} = {v}': want {what}");
             let num = |v: &str| v.parse::<u32>().ok();
@@ -470,7 +642,7 @@ impl Settings {
                         match lv.split_once('x').and_then(|(w, h)| Some((num(w.trim())?, num(h.trim())?))).filter(|&r| render_size_ok(r)) {
                             Some(r) => s.render_resolution = Some(r),
                             None => errs.push(bad(&format!(
-                                "WIDTHxHEIGHT ({}x{} to {}x{}) or display",
+                                "WIDTHxHEIGHT ({}x{} to {}x{}, at most 3840x2160's pixels) or display",
                                 RENDER_MIN.0, RENDER_MIN.1, RENDER_MAX.0, RENDER_MAX.1
                             ))),
                         }
@@ -529,7 +701,18 @@ impl Settings {
                     Some(b) => s.close_launcher = b,
                     None => errs.push(bad("on or off")),
                 },
-                _ => errs.push(format!("settings.txt: unknown setting '{k}'")),
+                _ => match pc_entry(&k) {
+                    // (Text values as written; the others in lower case.)
+                    Some(&(name, _, spec)) => {
+                        let v = if spec == "*" { v.to_string() } else { lv.clone() };
+                        if pc_value_ok(spec, &v) {
+                            s.pc.insert(name, v);
+                        } else {
+                            errs.push(bad(&spec.replace('|', ", ")));
+                        }
+                    }
+                    None => errs.push(format!("settings.txt: unknown setting '{k}'")),
+                },
             }
         }
         (s, errs)
@@ -591,6 +774,9 @@ impl Settings {
         f.set("game_dir", &self.game_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         f.set("update_dir", &self.update_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         f.set("close_launcher", on_off(self.close_launcher));
+        for (k, v) in &self.pc {
+            f.set(k, v);
+        }
     }
 
     /// Saves into `path`, keeping the file's comments (the commented
@@ -685,21 +871,67 @@ mod tests {
         assert_eq!(s.render_resolution, Some((2560, 1440)));
         let (s, errs) = Settings::parse("render_resolution = 8000x5000\n");
         assert_eq!((s.render_resolution, errs.len()), (None, 1));
-        assert_eq!(render_size_for(1920, 1080), (1920, 1080));
-        assert_eq!(render_size_for(1440, 810), (1440, 810));
-        assert_eq!(render_size_for(1920, 1200), (1920, 1080));
-        assert_eq!(render_size_for(3440, 1440), (2560, 1440));
-        assert_eq!(render_size_for(1366, 768), (1360, 764));
-        assert_eq!(render_size_for(5120, 2880), (3840, 2160));
-        assert_eq!(render_size_for(300, 200), (640, 360));
+        let (s, errs) = Settings::parse("render_resolution = 5120x1440\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(s.render_resolution, Some((5120, 1440)));
+        let (s, errs) = Settings::parse("render_resolution = 7680x2160\n");
+        assert_eq!((s.render_resolution, errs.len()), (None, 1));
+        // The display's own shape (`aspect_ratio = auto`).
+        assert_eq!(render_size_for(1920, 1080, None), (1920, 1080));
+        assert_eq!(render_size_for(1440, 810, None), (1440, 810));
+        assert_eq!(render_size_for(1920, 1200, None), (1920, 1200));
+        assert_eq!(render_size_for(3440, 1440, None), (3440, 1440));
+        assert_eq!(render_size_for(2560, 1080, None), (2560, 1080));
+        assert_eq!(render_size_for(5120, 1440, None), (5120, 1440));
+        assert_eq!(render_size_for(1366, 768, None), (1360, 764));
+        assert_eq!(render_size_for(5120, 2880, None), (3840, 2160));
+        assert_eq!(render_size_for(300, 200, None), (640, 426));
+        // A shape chosen.
+        assert_eq!(render_size_for(1920, 1200, Some((16, 9))), (1920, 1080));
+        assert_eq!(render_size_for(3440, 1440, Some((16, 9))), (2560, 1440));
+        assert_eq!(render_size_for(2560, 1440, Some((64, 27))), (2560, 1080));
+        assert_eq!(render_size_for(2560, 1440, Some((32, 9))), (2560, 720));
+        assert_eq!(render_size_for(1920, 1080, Some((16, 10))), (1728, 1080));
+        // The 16:9 presets name a height.
+        assert_eq!(render_size_fixed((1920, 1080), None, (2560, 1440)), (1920, 1080));
+        assert_eq!(render_size_fixed((1920, 1080), Some((64, 27)), (2560, 1440)), (2560, 1080));
+        assert_eq!(render_size_fixed((1920, 1080), None, (3440, 1440)), (2576, 1080));
+        assert_eq!(render_size_fixed((1920, 1080), Some((32, 9)), (2560, 1440)), (3840, 1080));
+        assert_eq!(render_size_fixed((1920, 1080), Some((16, 10)), (2560, 1440)), (1728, 1080));
+        assert_eq!(render_size_fixed((2560, 1080), Some((16, 9)), (2560, 1440)), (2560, 1080));
+        let (w, h) = render_size_fixed((3840, 2160), Some((32, 9)), (2560, 1440));
+        assert!(render_size_ok((w, h)) && w % 16 == 0 && h % 2 == 0, "{w}x{h}");
         // Automatic windows render 1:1 (work areas of 2560x1440, 1920x1080
         // and 1366x768 screens).
-        let s = Settings::default();
+        let mut s = Settings::default();
         for work in [(2560, 1392), (1920, 1032), (1366, 728), (3840, 2112)] {
             let (w, h) = window_size(&s, work);
-            assert_eq!(render_size_for(w, h), (w, h), "{work:?}");
+            assert_eq!(render_size_for(w, h, None), (w, h), "{work:?}");
         }
         assert_eq!(window_size(&s, (2560, 1392)), (1856, 1044));
+        s.pc.insert("aspect_ratio", "21:9".into());
+        let (w, h) = window_size(&s, (2560, 1392));
+        assert_eq!((w, h), (1920, 810));
+        assert_eq!(render_size_for(w, h, aspect_of(&s)), (1920, 810));
+    }
+
+    #[test]
+    fn pc_settings() {
+        let (s, errs) = Settings::parse("sharpening = 150
+shadows = High # sharper
+audio_device = Speakers (Realtek #2)
+hud_size = 300
+speakers = 9.1
+");
+        assert_eq!(s.pc["sharpening"], "150");
+        assert_eq!(s.pc["shadows"], "high");
+        assert_eq!(s.pc["audio_device"], "Speakers (Realtek #2)");
+        assert_eq!((s.pc["hud_size"].as_str(), s.pc["speakers"].as_str()), ("100", "auto"));
+        assert_eq!(errs.len(), 2, "{errs:?}");
+        assert!(PC.iter().all(|&(_, d, spec)| pc_value_ok(spec, d)));
+        let mut f = KvFile::parse(TEMPLATE);
+        s.store(&mut f);
+        assert_eq!(Settings::from_kv(&f).0, s);
     }
 
     #[test]

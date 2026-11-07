@@ -263,7 +263,10 @@ fn fill_render(app: &mut App) {
         DisplayMode::Borderless => (m.width, m.height),
         DisplayMode::Windowed => settings::window_size(&s, m.work),
     };
-    let (dw, dh) = settings::render_size_for(area.0, area.1);
+    // (In the picture's shape: PC Settings `aspect_ratio`, automatic the
+    // display's; the 16:9 sizes name a height.)
+    let shape = settings::aspect_of(&s);
+    let (dw, dh) = settings::render_size_for(area.0, area.1, shape);
     let mut renders: Vec<Option<(u32, u32)>> = vec![None];
     renders.extend(RENDER_SIZES.iter().map(|&r| Some(r)));
     if let Some(r) = s.render_resolution.filter(|r| !RENDER_SIZES.contains(r)) {
@@ -273,7 +276,10 @@ fn fill_render(app: &mut App) {
         .iter()
         .map(|r| match *r {
             None => format!("Same as the display ({dw} x {dh})"),
-            Some((w, hh)) => format!("{w} x {hh}"),
+            Some(r) => {
+                let (w, hh) = settings::render_size_fixed(r, shape, area);
+                format!("{w} x {hh}")
+            }
         })
         .collect();
     let i = renders.iter().position(|&r| r == s.render_resolution).unwrap_or(0);

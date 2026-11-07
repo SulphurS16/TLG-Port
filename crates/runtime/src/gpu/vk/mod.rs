@@ -197,6 +197,13 @@ pub fn init() -> Result<(), String> {
         if caps2 {
             exts.push(ash::khr::get_surface_capabilities2::NAME.as_ptr());
         }
+        // (An upscaler's needs: `gpu::upscale`.)
+        let up_inst = super::upscale::instance_extensions(&inst_exts);
+        for e in &up_inst {
+            if !exts.iter().any(|&p| CStr::from_ptr(p) == e.as_c_str()) {
+                exts.push(e.as_ptr());
+            }
+        }
         let ici = vk::InstanceCreateInfo::default().application_info(&app).enabled_layer_names(&layers).enabled_extension_names(&exts);
         let instance = entry.create_instance(&ici, None).map_err(|e| format!("vkCreateInstance: {e}"))?;
         if validation {
@@ -366,7 +373,7 @@ pub fn init() -> Result<(), String> {
             && have.sparse_residency_buffer != 0
             && instance.get_physical_device_queue_family_properties(pdev)[qf as usize].queue_flags.contains(vk::QueueFlags::SPARSE_BINDING)
             && !std::env::var("TLG_SPARSE").is_ok_and(|v| v == "0");
-        let features = vk::PhysicalDeviceFeatures::default()
+        let mut features = vk::PhysicalDeviceFeatures::default()
             .sparse_binding(sparse)
             .sparse_residency_buffer(sparse)
             .occlusion_query_precise(occl_precise)
@@ -412,10 +419,24 @@ pub fn init() -> Result<(), String> {
         if checkpoints {
             dexts.push(ash::nv::device_diagnostic_checkpoints::NAME.as_ptr());
         }
+        // (An upscaler's extensions and features: `gpu::upscale`.)
+        let up_dev = super::upscale::device_needs(&instance, pdev);
+        for e in &up_dev.extensions {
+            if !dexts.iter().any(|&p| CStr::from_ptr(p) == e.as_c_str()) {
+                dexts.push(e.as_ptr());
+            }
+        }
+        if up_dev.mutable_descriptor && !dexts.iter().any(|&p| CStr::from_ptr(p) == ash::ext::mutable_descriptor_type::NAME) {
+            dexts.push(ash::ext::mutable_descriptor_type::NAME.as_ptr());
+        }
+        let mut f11 = vk::PhysicalDeviceVulkan11Features::default();
+        super::upscale::apply_features(&mut features, &mut f11, &mut f12, &mut f13, &up_dev);
+        let mut mdt = vk::PhysicalDeviceMutableDescriptorTypeFeaturesEXT::default().mutable_descriptor_type(true);
         let mut dci = vk::DeviceCreateInfo::default()
             .queue_create_infos(&qci)
             .enabled_extension_names(&dexts)
             .enabled_features(&features)
+            .push_next(&mut f11)
             .push_next(&mut f12)
             .push_next(&mut f13);
         if has_robust2 {
@@ -427,7 +448,11 @@ pub fn init() -> Result<(), String> {
         if device_fault {
             dci = dci.push_next(&mut fault_features);
         }
+        if up_dev.mutable_descriptor {
+            dci = dci.push_next(&mut mdt);
+        }
         let device = instance.create_device(pdev, &dci, None).map_err(|e| format!("vkCreateDevice: {e}"))?;
+        super::upscale::device_created(&instance, pdev, &device, qf, if two_queues { 2 } else { 1 });
         crate::info!("Vulkan diagnostics: device fault reports {device_fault}, checkpoints {checkpoints} (TLG_GPU_DIAG)");
         crate::info!(
             "Vulkan robustness: robustBufferAccess, robustness2 {} (buffer {}, image {}, null descriptors {})",

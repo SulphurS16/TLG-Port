@@ -752,7 +752,9 @@ impl Samplers {
             .address_mode_u(desc::vk_address_mode(s.clamp(0)))
             .address_mode_v(desc::vk_address_mode(s.clamp(1)))
             .address_mode_w(desc::vk_address_mode(s.clamp(2)))
-            .mip_lod_bias(s.lod_bias())
+            // (Plus the upscalers' bias while the game renders below the
+            // output: `upscale::mip_bias`, fixed for the session.)
+            .mip_lod_bias(s.lod_bias() + super::upscale::mip_bias())
             .anisotropy_enable(aniso)
             .max_anisotropy((1u32 << s.max_aniso()).min(16) as f32)
             .compare_enable(s.compare_func() != 0)

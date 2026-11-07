@@ -2579,7 +2579,12 @@ pub(super) struct BatchCtx {
     /// What `dyn_state` was made from: the context registers' generation
     /// and queue, the extent, the primitive type, a depth target
     /// (`tune same_state`).
-    dyn_key: (u64, usize, (u32, u32), u32, bool),
+    dyn_key: (u64, usize, (u32, u32), u32, bool, bool, u64),
+    /// The upscaler (`gpu::upscale`): this frame's motion-vector and depth
+    /// targets (the G-buffer's) and SMAA's blending-weight target (base).
+    up_mv: Option<ImageKey>,
+    up_depth: Option<ImageKey>,
+    up_weights: Option<u64>,
     /// Graphics pipeline bound in the current command buffer (consecutive
     /// draws mostly share one; the bind is skipped then).
     bound_gfx: vk::Pipeline,
@@ -3443,7 +3448,10 @@ fn new_batch_ctx(c: &'static super::vk::Ctx, ring_bytes: u64, dring_bytes: u64, 
                 bits_arena: (u64::MAX, 0, 0, 0),
                 unordered_line: 0,
                 dyn_state: None,
-                dyn_key: (u64::MAX, 0, (0, 0), 0, false),
+                dyn_key: (u64::MAX, 0, (0, 0), 0, false, false, 0),
+                up_mv: None,
+                up_depth: None,
+                up_weights: None,
                 bound_gfx: vk::Pipeline::null(),
                 bound_cs: vk::Pipeline::null(),
                 dring,
@@ -5346,6 +5354,14 @@ impl Renderer {
                 resources::create_image(key)?
             }
         };
+        // (The PC settings' text atlas, the prompts' picture: where the game
+        // put their texels.)
+        if key.format == vk::Format::R8G8B8A8_UNORM && key.levels <= 1 && key.layers <= 1 {
+            crate::pc_files::note_image(key.base, key.width, key.height);
+        }
+        if matches!(key.format, vk::Format::BC7_UNORM_BLOCK | vk::Format::BC7_SRGB_BLOCK) && key.width == 256 && key.height == 128 && key.layers <= 1 {
+            crate::pc_prompts::note_texture(key.base);
+        }
         if perf_on() {
             let mut g = NEW_IMAGES.lock();
             let e = g.get_or_insert_with(HashMap::new).entry((key.width, key.height, key.layers, key.levels, key.format)).or_default();
@@ -6018,6 +6034,127 @@ impl Renderer {
                     .map(|k| (k, l as u32))
             })
             .next()
+    }
+
+    /// The upscaler (`gpu::upscale`): notes the G-buffer's motion vectors
+    /// (its last target, R16G16_SFLOAT at the scene size) and depth. At the
+    /// render size it replaces the game's SMAA: SMAA's weight pass (it
+    /// samples SMAA's AreaTex 160x560 and SearchTex 64x16) is noted and its
+    /// blend - the draw sampling the weights - replaced: the scene colour
+    /// it samples in, its target out. While upscaling (the scene below the
+    /// render size) SMAA stays and the game's scaling draw is replaced - one
+    /// render-size target without depth, sampling a scene-size picture: that
+    /// picture in, the target out. True: the draw is replaced.
+    fn upscale_hook(&mut self, ps: &Prepared, colors: &Colors, depth: Option<Attachment>) -> bool {
+        let rs = super::RENDER_SIZE.load(std::sync::atomic::Ordering::Relaxed);
+        let (rw, rh) = ((rs >> 32) as u32, rs as u32);
+        if rw == 0 {
+            return false;
+        }
+        let (sw, sh) = super::scene_size();
+        let upscaling = (sw, sh) != (rw, rh);
+        let atts: smallvec::SmallVec<[Attachment; 8]> = colors.iter().flatten().copied().collect();
+        if atts.len() >= 5 {
+            if let Some(last) = atts.last() {
+                if last.key.format == vk::Format::R16G16_SFLOAT && last.key.width >= sw && last.key.height >= sh {
+                    self.cx.up_mv = Some(last.key);
+                    self.cx.up_depth = depth.map(|d| d.key);
+                }
+            }
+            return false;
+        }
+        let texs: smallvec::SmallVec<[Tsharp; 8]> = ps.resources.iter().filter_map(|r| if let ResolvedRes::Image(t) = r { Some(*t) } else { None }).collect();
+        // The picture the upscaler takes (the texture's base and the size it
+        // must have at least) and the target it writes.
+        let (color_base, out) = if upscaling {
+            if atts.len() != 1 || depth.is_some() || atts[0].key.width < rw || atts[0].key.height < rh || texs.len() != 1 || (texs[0].width, texs[0].height) != (sw, sh) {
+                return false;
+            }
+            (texs[0].base, atts[0].key)
+        } else {
+            let has = |w: u32, h: u32| texs.iter().any(|t| t.width == w && t.height == h);
+            if has(160, 560) && has(64, 16) {
+                self.cx.up_weights = atts.first().map(|a| a.key.base);
+                return false;
+            }
+            let Some(wb) = self.cx.up_weights else { return false };
+            if !texs.iter().any(|t| t.base == wb) {
+                return false;
+            }
+            self.cx.up_weights = None;
+            let Some(out) = atts.first().map(|a| a.key) else { return false };
+            // The scene colour: the other full-size texture the blend samples.
+            let Some(b) = texs.iter().find(|t| t.base != wb && t.width >= sw && t.height >= sh).map(|t| t.base) else { return false };
+            (b, out)
+        };
+        let (Some(mv), Some(dk)) = (self.cx.up_mv, self.cx.up_depth) else { return false };
+        if upscaling {
+            // (One scaling draw a frame: the next G-buffer notes them anew.)
+            self.cx.up_mv = None;
+            self.cx.up_depth = None;
+        }
+        let ck = {
+            let im = img!(self);
+            im.by_base.get(&color_base).and_then(|ks| ks.iter().copied().filter(|k| im.images.get(k).is_some_and(|i| i.gpu_written) && k.width >= sw && k.height >= sh && !k.depth).max_by_key(|k| im.images[k].last_write))
+        };
+        let Some(ck) = ck else { return false };
+        self.end_rendering();
+        let color_range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        let depth_range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::DEPTH, ..color_range };
+        let view = |s: &mut Self, k: ImageKey, storage: bool| -> Option<(vk::Image, vk::ImageView, vk::ImageUsageFlags)> {
+            let im = img!(s);
+            let i = im.images.get_mut(&k)?;
+            let v = i.view(k.format, 0, vk::ImageViewType::TYPE_2D, storage, 0, 1).ok()?;
+            Some((i.image, v, i.usage))
+        };
+        let (Some(c), Some(m), Some(d), Some(o)) = (view(self, ck, false), view(self, mv, false), view(self, dk, false), view(self, out, true)) else { return false };
+        let read = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let info = |(image, view, usage): (vk::Image, vk::ImageView, vk::ImageUsageFlags), k: ImageKey, range, layout| super::upscale::Tex { image, view, range, format: k.format, size: (k.width, k.height), usage, layout };
+        let inputs = super::upscale::Inputs {
+            color: info(c, ck, color_range, read),
+            depth: info(d, dk, depth_range, read),
+            velocity: info(m, mv, color_range, read),
+            output: info(o, out, color_range, vk::ImageLayout::GENERAL),
+            in_width: sw,
+            in_height: sh,
+            width: rw,
+            height: rh,
+            ldr: upscaling,
+        };
+        // Layouts: the inputs shader-read-only for the upscaler, all back to
+        // GENERAL after it.
+        let barrier = |s: &Self, to_read: bool| {
+            let ims: smallvec::SmallVec<[vk::ImageMemoryBarrier; 4]> = [(c.0, color_range), (m.0, color_range), (d.0, depth_range)]
+                .iter()
+                .map(|&(image, range)| {
+                    let (a, b) = if to_read { (vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) } else { (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL) };
+                    vk::ImageMemoryBarrier::default()
+                        .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::MEMORY_READ)
+                        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                        .old_layout(a)
+                        .new_layout(b)
+                        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                        .image(image)
+                        .subresource_range(range)
+                })
+                .collect();
+            let mb = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+            unsafe { REC.cmd_pipeline_barrier(s.cx.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[mb], &[], &ims) };
+        };
+        barrier(self, true);
+        let ok = super::upscale::record(self.cx.cmd, &inputs);
+        barrier(self, false);
+        // (Its own pipelines and sets were bound: nothing of ours is.)
+        self.cx.dyn_state = None;
+        self.cx.bound_gfx = vk::Pipeline::null();
+        self.cx.bound_cs = vk::Pipeline::null();
+        self.cx.barrier_gen += 1;
+        if !ok {
+            return false;
+        }
+        self.note_image_written(out);
+        true
     }
 
     /// Marks `key` as rendered now (its guest memory is stale).
@@ -10205,6 +10342,13 @@ impl Renderer {
         let (colors, blends, masks, depth) = self.draw_attachments(regs, &vs, ps.as_ref())?;
         self.cx.draw_targets = colors.iter().flatten().map(|a| a.key).chain(depth.map(|d| d.key)).collect();
         self.apply_meta_clears(regs, &colors, depth);
+        // An upscaler in place of SMAA (`gpu::upscale`): SMAA's last draw is
+        // replaced.
+        if let Some(p) = ps.as_ref() {
+            if super::upscale::active() && self.upscale_hook(p, &colors, depth) {
+                return Ok(());
+            }
+        }
         bpart(24, tt);
         if trace_frame() {
             let res: Vec<String> = std::iter::once(&vs).chain(ps.iter()).flat_map(|p| stage_res_summary(p)).collect();
@@ -10874,14 +11018,21 @@ impl Renderer {
     }
 
     unsafe fn set_dynamic_state(&mut self, regs: &Regs, extent: (u32, u32), prim: u32, has_depth: bool) {
-        // (Made from the same inputs and still in effect: nothing to do.)
-        let key = (regs.ctx_gen, self.cx.cmd_queue, extent, prim, has_depth);
+        // The game's 2D interface (menus, prompts, subtitles: triangle lists
+        // drawn into a display buffer, after its full-screen composite)
+        // goes into the interface area (`gpu::ui_area`: the menus and HUD
+        // size, a 16:9 area on wider pictures).
+        let ui = prim == 4 && !has_depth && crate::gpu::ui_area_active() && self.cx.rendering.as_ref().and_then(|r| r.colors.first().copied().flatten()).is_some_and(|a| crate::hle::libs::videoout::is_display_buffer(a.key.base));
+        // (Made from the same inputs and still in effect: nothing to do. The
+        // scene's jitter changes per frame: part of the inputs.)
+        let jitter_bits = crate::gpu::JITTER.load(std::sync::atomic::Ordering::Relaxed);
+        let key = (regs.ctx_gen, self.cx.cmd_queue, extent, prim, has_depth, ui, jitter_bits);
         if self.cx.dyn_state.is_some() && self.cx.dyn_key == key && crate::tune::get(crate::tune::SAME_STATE) != 0 {
             return;
         }
         let vte = regs.ctx(0xA206);
         let (xs, xo, ys, yo, zs, zo) = (f32r(regs.ctx(0xA10F)), f32r(regs.ctx(0xA110)), f32r(regs.ctx(0xA111)), f32r(regs.ctx(0xA112)), f32r(regs.ctx(0xA113)), f32r(regs.ctx(0xA114)));
-        let vp = if vte & 0x3F == 0x3F && xs != 0.0 {
+        let mut vp = if vte & 0x3F == 0x3F && xs != 0.0 {
             vk::Viewport { x: xo - xs, y: yo - ys, width: 2.0 * xs, height: 2.0 * ys, min_depth: zo.clamp(0.0, 1.0), max_depth: (zo + zs).clamp(0.0, 1.0) }
         } else {
             if vte & 0x3F != 0x3F {
@@ -10900,6 +11051,27 @@ impl Renderer {
             let (x0, y0, x1, y1) = scissor_rect(regs.ctx(tl), regs.ctx(br));
             if x1 > x0 && y1 > y0 {
                 s = (s.0.max(x0), s.1.max(y0), s.2.min(x1), s.3.min(y1));
+            }
+        }
+        if ui {
+            // (The draw as the game made it for the whole target, mapped
+            // into the interface area: its viewport and scissor.)
+            let (ax, ay, aw, ah) = crate::gpu::ui_area(extent.0 as f32, extent.1 as f32);
+            let (kx, ky) = (aw / extent.0 as f32, ah / extent.1 as f32);
+            vp.x = ax + vp.x * kx;
+            vp.y = ay + vp.y * ky;
+            vp.width *= kx;
+            vp.height *= ky;
+            let map = |v: i32, a: f32, k: f32| (a + v as f32 * k).round() as i32;
+            s = (map(s.0, ax, kx).max(0), map(s.1, ay, ky).max(0), map(s.2, ax, kx).min(extent.0 as i32), map(s.3, ay, ky).min(extent.1 as i32));
+        }
+        // The upscalers' sub-pixel jitter: the scene's draws shift by it
+        // (`gpu::scene_jitter`; the game's own motion vectors stay as they
+        // are). DB_DEPTH_CONTROL.Z_ENABLE marks the scene's draws.
+        if !ui && has_depth && regs.ctx(0xA200) & 2 != 0 {
+            if let Some((jx, jy)) = crate::gpu::scene_jitter(vp.width, vp.height, true) {
+                vp.x += jx;
+                vp.y += jy;
             }
         }
         let mode = regs.ctx(0xA205);

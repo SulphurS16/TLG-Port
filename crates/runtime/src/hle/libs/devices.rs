@@ -87,7 +87,7 @@ sysv! {
         let p = Port { kind, len, freq, format: param, next: Instant::now(), volume: [32768; 8] };
         let idx = match ports.iter().position(|p| p.is_none()) { Some(i) => { ports[i] = Some(p); i } None => { ports.push(Some(p)); ports.len() - 1 } };
         crate::info!("sceAudioOutOpen type {kind} len {len} freq {freq} format {:#x} ({} ch) -> port {}", param, port_channels(param), idx + 1);
-        crate::audio::open_port(idx);
+        crate::audio::open_port(idx, port_channels(param) as usize);
         idx as i32 + 1
     }
     fn sceAudioOutClose(h: i32) -> i32 {
@@ -95,13 +95,13 @@ sysv! {
         match ports.get_mut((h - 1) as usize) { Some(p @ Some(_)) => { *p = None; crate::audio::close_port((h - 1) as usize); 0 } _ => 0x8026_0004u32 as i32 }
     }
     fn sceAudioOutOutput(h: i32, ptr: *const u8) -> i32 {
-        let (frames, ch, float) = {
+        let (frames, ch, float, std) = {
             let ports = PORTS.lock();
             let Some(Some(p)) = ports.get((h - 1) as usize) else { return 0x8026_0004u32 as i32 };
-            (p.len as usize, port_channels(p.format) as usize, matches!(p.format & 0xFF, 3 | 4 | 5 | 7))
+            (p.len as usize, port_channels(p.format) as usize, matches!(p.format & 0xFF, 3 | 4 | 5 | 7), matches!(p.format & 0xFF, 6 | 7))
         };
         // Played and paced by the host device when there is one.
-        if !ptr.is_null() && crate::audio::output((h - 1) as usize, ptr, frames, ch, float) {
+        if !ptr.is_null() && crate::audio::output((h - 1) as usize, ptr, frames, ch, float, std) {
             return 0;
         }
         let wait = {
@@ -145,7 +145,11 @@ sysv! {
         let Some(Some(p)) = ports.get((h - 1) as usize) else { return 0x8026_0004u32 as i32 };
         std::ptr::write_bytes(st, 0, 32);
         *(st as *mut u16) = 1; // connected primary
-        *st.add(2) = port_channels(p.format).min(8) as u8;
+        // (Debug: TLG_AUDIO_STATE_CHANNELS=2|6|8 reports that many speakers.)
+        let reported = std::env::var("TLG_AUDIO_STATE_CHANNELS").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(port_channels(p.format));
+        static NOTED: std::sync::Once = std::sync::Once::new();
+        NOTED.call_once(|| crate::info!("sceAudioOutGetPortState: port {h} reports {reported} channels (output primary)"));
+        *st.add(2) = reported.min(8) as u8;
         *(st.add(4) as *mut i16) = 127;
         0
     }

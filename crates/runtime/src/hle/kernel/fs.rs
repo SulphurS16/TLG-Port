@@ -92,8 +92,42 @@ pub fn host_path_existing(guest: &str) -> Option<PathBuf> {
 
 pub enum Kind {
     File { file: File, writable: bool },
+    /// A file the port provides from memory (`add_virtual`), read-only.
+    Mem { data: Arc<Vec<u8>> },
     Dir { entries: Vec<(String, bool)> },
     Console(i32),
+}
+
+/// Files the port provides from memory, by normalized guest path (e.g. the
+/// port's own archive `/app0/trico_other.psarc`, which the game mounts
+/// when it exists).
+static VIRTUAL: RwLock<Vec<(String, Arc<Vec<u8>>)>> = RwLock::new(Vec::new());
+
+/// Called with (path, offset, length, destination) for each read of a
+/// virtual file (the port finds where the game put its data).
+pub type MemReadHook = fn(&str, u64, usize, u64);
+static MEM_READ_HOOK: RwLock<Option<MemReadHook>> = RwLock::new(None);
+
+fn virtual_key(guest: &str) -> Option<String> {
+    let abs = if guest.starts_with('/') { guest.to_string() } else { format!("/app0/{guest}") };
+    Some(format!("/{}", normalize(&abs)?.join("/")).to_ascii_lowercase())
+}
+
+/// Provides `data` at the guest path `path` (read-only; replaces an earlier one).
+pub fn add_virtual(path: &str, data: Arc<Vec<u8>>, hook: Option<MemReadHook>) {
+    let Some(k) = virtual_key(path) else { return };
+    let mut v = VIRTUAL.write();
+    v.retain(|(p, _)| *p != k);
+    crate::info!("virtual file {k}: {} bytes", data.len());
+    v.push((k, data));
+    if hook.is_some() {
+        *MEM_READ_HOOK.write() = hook;
+    }
+}
+
+fn virtual_file(guest: &str) -> Option<Arc<Vec<u8>>> {
+    let k = virtual_key(guest)?;
+    VIRTUAL.read().iter().find(|(p, _)| *p == k).map(|(_, d)| d.clone())
 }
 
 pub struct Fd {
@@ -161,6 +195,14 @@ fn io_errno(e: &std::io::Error) -> i32 {
 
 /// Opens a guest path. Returns fd or SCE error.
 pub fn vfs_open(path: &str, flags: i32, _mode: u32) -> i32 {
+    if let Some(data) = virtual_file(path) {
+        if flags & O_ACCMODE != 0 || flags & (O_TRUNC | O_APPEND) != 0 {
+            return sce(EROFS);
+        }
+        let fd = alloc_fd(Fd { kind: Kind::Mem { data }, pos: Mutex::new(0), path: path.to_string() });
+        crate::debug!("open '{path}' (virtual) -> fd {fd}");
+        return fd;
+    }
     let Some(r) = resolve(path) else {
         crate::warn!("open '{path}': no mount");
         return sce(ENOENT);
@@ -246,6 +288,18 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
             }
             Ok(done)
         }
+        Kind::Mem { data } => {
+            let at = (off as usize).min(data.len());
+            let n = buf.len().min(data.len() - at);
+            crate::gpu::os_access(buf.as_ptr() as u64, n as u64);
+            buf[..n].copy_from_slice(&data[at..at + n]);
+            if n > 0 {
+                if let Some(h) = *MEM_READ_HOOK.read() {
+                    h(&f.path, at as u64, n, buf.as_ptr() as u64);
+                }
+            }
+            Ok(n)
+        }
         Kind::Dir { .. } => Err(EISDIR),
         Kind::Console(_) => Ok(0),
     }
@@ -254,7 +308,7 @@ pub fn pread_fd(fd: i32, buf: &mut [u8], off: u64) -> Result<usize, i32> {
 pub fn vfs_read(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
     let f = get_fd(fd).ok_or(EBADF)?;
     match &f.kind {
-        Kind::File { .. } => {
+        Kind::File { .. } | Kind::Mem { .. } => {
             let mut pos = f.pos.lock();
             let n = pread_fd(fd, buf, *pos)?;
             *pos += n as u64;
@@ -287,6 +341,7 @@ pub fn pwrite_fd(fd: i32, data: &[u8], off: Option<u64>) -> Result<usize, i32> {
             }
             Ok(done)
         }
+        Kind::Mem { .. } => Err(EBADF),
         Kind::Dir { .. } => Err(EISDIR),
         Kind::Console(c) => {
             console_write(*c, data);
@@ -299,6 +354,7 @@ pub fn vfs_lseek(fd: i32, off: i64, whence: i32) -> i64 {
     let Some(f) = get_fd(fd) else { return sce(EBADF) as i64 };
     let size = match &f.kind {
         Kind::File { file, .. } => file.metadata().map(|m| m.len()).unwrap_or(0),
+        Kind::Mem { data } => data.len() as u64,
         Kind::Dir { entries } => entries.len() as u64,
         Kind::Console(_) => return sce(ESPIPE) as i64,
     };
@@ -369,7 +425,16 @@ fn fill_stat(md: &std::fs::Metadata) -> Stat {
     st
 }
 
+fn mem_stat(len: usize) -> Stat {
+    let size = len as i64;
+    Stat { mode: S_IFREG | 0o555, nlink: 1, size, blksize: 0x10000, blocks: (size + 511) / 512, ..Default::default() }
+}
+
 pub fn stat_path(path: &str, out: *mut Stat) -> i32 {
+    if let Some(d) = virtual_file(path) {
+        unsafe { std::ptr::write_unaligned(out, mem_stat(d.len())) };
+        return 0;
+    }
     let Some(p) = host_path_existing(path) else {
         crate::debug!("stat '{path}': not found");
         return sce(ENOENT);
@@ -390,6 +455,7 @@ pub fn fstat_fd(fd: i32, out: *mut Stat) -> i32 {
             Ok(md) => fill_stat(&md),
             Err(e) => return sce(io_errno(&e)),
         },
+        Kind::Mem { data } => mem_stat(data.len()),
         Kind::Dir { .. } => Stat { mode: S_IFDIR | 0o777, nlink: 2, blksize: 0x10000, size: 0x10000, ..Default::default() },
         Kind::Console(_) => Stat { mode: 0o020000 | 0o666, ..Default::default() },
     };

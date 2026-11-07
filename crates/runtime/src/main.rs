@@ -24,7 +24,15 @@ mod loader;
 mod mem;
 mod pacing;
 mod padhid;
+mod menu_patches;
+mod menu_pointer;
 mod patch;
+mod pc_files;
+mod achievements;
+mod pc_auto;
+mod pc_menu;
+mod pc_prompts;
+mod pc_settings;
 mod script_fixes;
 mod sse4a;
 mod thread;
@@ -275,12 +283,42 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 *hle::libs::videoout::SHOT_REQUEST.lock() = Some(name);
                 Ok(())
             }
+            "shots" => {
+                // shots <name> <n>: screenshots of n consecutive flips
+                // (shot_<name>_0.png...): frame-to-frame comparisons.
+                let name: String = parts.next().unwrap_or("x").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-').collect();
+                let n = parts.next().and_then(|v| v.parse::<u32>().ok()).unwrap_or(2).clamp(1, 16);
+                *hle::libs::videoout::SHOT_SERIES.lock() = Some((name, n, 0));
+                Ok(())
+            }
             "dump" => {
                 gpu::DUMP_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
             "report" => {
                 gpu::REPORT_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            "pcmenu" => {
+                // Opens the in-game PC settings (as F10 does).
+                pc_menu::request_open();
+                Ok(())
+            }
+            "luafile" => {
+                // luafile <path>: that file's text run as `lua` (development:
+                // the port's script reloaded while the game runs).
+                match std::fs::read_to_string(line[8..].trim()) {
+                    Ok(t) => {
+                        pc_menu::queue_lua(&t);
+                        Ok(())
+                    }
+                    Err(e) => Err(format!("luafile: {e}")),
+                }
+            }
+            "lua" => {
+                // lua <code>: run by the port's game script on its next
+                // tick (development: the engine's objects live).
+                pc_menu::queue_lua(line[3..].trim());
                 Ok(())
             }
             "trace" => {
@@ -309,6 +347,31 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // (TLG_BREAK_PEEK syntax: rbx, rsi+c24, rdi*+10).
                 *exception::BREAK_PEEK.lock() = Some(parts.collect::<Vec<_>>().join(","));
                 Ok(())
+            }
+            "jitter" => {
+                // Debug: jitter <x> <y> - the scene's sub-pixel jitter in
+                // pixels ("jitter 0 0" clears).
+                let mut n = || parts.next().and_then(|v| v.parse::<f32>().ok());
+                match (n(), n()) {
+                    (Some(x), Some(y)) => {
+                        let bits = if x == 0.0 && y == 0.0 { 0 } else { (x.to_bits() as u64) << 32 | y.to_bits() as u64 };
+                        gpu::JITTER.store(bits, std::sync::atomic::Ordering::Relaxed);
+                        gpu::JITTER_DEBUG.store(bits != 0, std::sync::atomic::Ordering::Relaxed);
+                        Ok(())
+                    }
+                    _ => Err("jitter: expected <x> <y>".into()),
+                }
+            }
+            "trophy" => {
+                // Debug: trophy <id> unlocks it as the title would (recorded, pop-up).
+                match parts.next().and_then(|v| v.parse::<i32>().ok()) {
+                    Some(id) => {
+                        let (new, plat) = achievements::unlock(id);
+                        info!("trophy {id}: {}{}", if new { "unlocked" } else { "already unlocked" }, if plat.is_some() { ", the platinum too" } else { "" });
+                        Ok(())
+                    }
+                    None => Err("trophy: expected an id".into()),
+                }
             }
             "mouse" => {
                 // mouse <dx> <dy> [ms]: raw counts as if the captured mouse moved.
@@ -364,6 +427,40 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 let names = parts.next().unwrap_or("");
                 let ms = parts.next().and_then(|h| h.parse().ok()).unwrap_or(100);
                 input::press_ms(names, ms)
+            }
+            "memsnap" => {
+                // memsnap <0|1|2> [host <addr> <len>] / memfind [width]: where a toggled value lives.
+                let slot = parts.next().and_then(|v| v.parse().ok()).unwrap_or(9);
+                let host = if parts.next() == Some("host") {
+                    let a = parts.next().and_then(|v| debug_mem::parse_addr(v).ok());
+                    let n = parts.next().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+                    a.zip(n)
+                } else {
+                    None
+                };
+                debug_mem::memsnap(slot, host)
+            }
+            "key" => {
+                // key <vk hex> [ms]: a keyboard key held (default 100 ms).
+                match parts.next().and_then(|v| u8::from_str_radix(v.trim_start_matches("0x"), 16).ok()) {
+                    Some(vk) => {
+                        gpu::vk::window::inject_key(vk, parts.next().and_then(|v| v.parse().ok()).unwrap_or(100));
+                        Ok(())
+                    }
+                    None => Err("key: expected a virtual-key code in hex".into()),
+                }
+            }
+            "mousebtn" => {
+                // mousebtn <mask> [wheel]: a PC page's mouse buttons (1 left, 2 right).
+                let mask = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                let wheel = parts.next().and_then(|v| v.parse().ok()).unwrap_or(0);
+                gpu::vk::window::inject_mouse_buttons(mask, wheel);
+                Ok(())
+            }
+            "memsearch" => debug_mem::memsearch(parts.next().unwrap_or("")),
+            "memfind" => {
+                let w = parts.next().and_then(|v| v.parse().ok()).unwrap_or(1);
+                debug_mem::memfind(w, parts.next() == Some("small"))
             }
             "peek" => {
                 // Debug: `peek <addr> [bytes]`, addr like 0x10a0, main+55404f8
@@ -624,6 +721,8 @@ fn main() {
     }
     dpi_aware();
     let cfg = parse_args();
+    // (First start: settings that suit this PC, before they are read.)
+    pc_auto::first_start(&cfg.paths, cfg.safe_mode);
     let setting_errors = config::init(cfg.paths.clone(), cfg.safe_mode, cfg.dialogs);
     if !single_instance() {
         config::user_error("The Last Guardian (tlg)", "The game is already running.");
@@ -743,11 +842,14 @@ fn main() {
     }
     hle::kernel::fs::mount("/app0", app_dirs.clone(), false);
     hle::kernel::fs::mount("/hostapp", app_dirs.clone(), false);
+    // (The port's own archive for the in-game PC settings, from memory.)
+    pc_files::init();
+    pc_settings::init();
     hle::kernel::fs::mount("/temp0", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/temp", vec![rt.join("temp0")], true);
     hle::kernel::fs::mount("/download0", vec![rt.join("download0")], true);
     hle::kernel::fs::mount("/data", vec![rt.join("data")], true);
-    hle::libs::savedata::init(paths.saves(), paths.save_backups());
+    hle::libs::savedata::init(match config::settings().pc.get("save_folder").map(String::as_str) { Some(s) if s != "default" && !config::safe_mode() => std::path::PathBuf::from(s), _ => paths.saves() }, paths.save_backups());
 
     // Modules.
     let t0 = Instant::now();

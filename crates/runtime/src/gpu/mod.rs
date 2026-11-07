@@ -1,5 +1,105 @@
 //! GPU emulation front end: submission queues, compute rings and events.
 
+/// The game's 2D interface area (menus, prompts, subtitles): its size in
+/// percent of the screen's height (PC Settings `hud_size`) and, on pictures
+/// wider than 16:9, a 16:9 area in the middle. f32 bits; 0: not set.
+static UI_SCALE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The menus and HUD size changed (percent).
+pub fn set_ui_scale(pct: u32) {
+    UI_SCALE.store((pct.clamp(50, 150) as f32 / 100.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+fn ui_scale() -> f32 {
+    match UI_SCALE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => 1.0,
+        b => f32::from_bits(b),
+    }
+}
+
+/// The game renders a picture wider or taller than 16:9 (its interface then
+/// keeps a 16:9 area).
+pub static UI_NOT_16_9: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The game's render size (width << 32 | height; 0 before the executable
+/// loads).
+pub static RENDER_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The size the game renders its scene at (width << 32 | height): the render
+/// size, or below it while upscaling (`upscale::render_scale`); 0 before the
+/// game's display mode is set (then RENDER_SIZE).
+pub static SCENE_SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The scene's size (`SCENE_SIZE`, else the render size).
+pub fn scene_size() -> (u32, u32) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let s = match SCENE_SIZE.load(Relaxed) {
+        0 => RENDER_SIZE.load(Relaxed),
+        s => s,
+    };
+    ((s >> 32) as u32, s as u32)
+}
+
+/// The scene's sub-pixel jitter for the upscalers, in pixels of the render
+/// size (x and y as f32 bits; 0: none): `scene_jitter`.
+pub static JITTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The `jitter` control command set JITTER (applied without an upscaler).
+pub static JITTER_DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The viewport offset that jitters a draw: the scene's draws only - those
+/// that test depth into a viewport of the whole render size or half of it
+/// (the game's half-size transparents), at that viewport's scale. Shadow
+/// maps, full-screen passes and the interface keep theirs. Debug:
+/// TLG_JITTER_TEST=<x>,<y> (pixels) holds a fixed offset.
+pub fn scene_jitter(vp_w: f32, vp_h: f32, depth_test: bool) -> Option<(f32, f32)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    static TEST: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+    let test = *TEST.get_or_init(|| {
+        let v = std::env::var("TLG_JITTER_TEST").ok()?;
+        let (x, y) = v.split_once(',')?;
+        Some((x.trim().parse().ok()?, y.trim().parse().ok()?))
+    });
+    let bits = JITTER.load(Relaxed);
+    let (jx, jy) = match test {
+        Some(t) => t,
+        // (No upscaler now: no jitter, whatever the last one left.)
+        None if bits == 0 || (!upscale::active() && !JITTER_DEBUG.load(Relaxed)) => return None,
+        None => (f32::from_bits((bits >> 32) as u32), f32::from_bits(bits as u32)),
+    };
+    if !depth_test {
+        return None;
+    }
+    let (rw, rh) = scene_size();
+    let (rw, rh) = (rw as f32, rh as f32);
+    if rw <= 0.0 || rh <= 0.0 {
+        return None;
+    }
+    let near = |a: f32, b: f32| (a - b).abs() <= 1.0;
+    let k = if near(vp_w, rw) && near(vp_h.abs(), rh) {
+        1.0
+    } else if near(vp_w, rw / 2.0) && near(vp_h.abs(), rh / 2.0) {
+        0.5
+    } else {
+        return None;
+    };
+    Some((jx * k, jy * k))
+}
+
+/// Whether the interface is drawn anywhere but the whole picture (a draw's
+/// target size decides the 16:9 part: `ui_area`).
+pub fn ui_area_active() -> bool {
+    ui_scale() != 1.0 || UI_NOT_16_9.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The interface area in a `w` x `h` target: x, y, width, height - the
+/// largest 16:9 area in the middle, at the menus and HUD size.
+pub fn ui_area(w: f32, h: f32) -> (f32, f32, f32, f32) {
+    let s = ui_scale();
+    let (bw, bh) = if w * 9.0 > h * 16.0 { (h * 16.0 / 9.0, h) } else { (w, w * 9.0 / 16.0) };
+    let (aw, ah) = (bw * s, bh * s);
+    ((w - aw) / 2.0, (h - ah) / 2.0, aw, ah)
+}
+
 pub mod copier;
 pub mod cp;
 pub mod cpuwatch;
@@ -16,6 +116,7 @@ pub mod suballoc;
 pub mod shaders;
 pub mod texdump;
 pub mod tiling;
+pub mod upscale;
 pub mod shader_dump;
 pub mod vk;
 pub mod wbprobe;

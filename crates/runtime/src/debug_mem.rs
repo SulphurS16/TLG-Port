@@ -11,6 +11,10 @@ fn parse_term(t: &str) -> Result<u64, String> {
     if t == "main" {
         return crate::loader::main_module().map(|m| m.base).ok_or_else(|| "no main module".to_string());
     }
+    // (The game camera object, once it has updated.)
+    if t == "cam" {
+        return Some(crate::title_patches::camera_object()).filter(|&c| c != 0).ok_or_else(|| "no camera object yet".to_string());
+    }
     u64::from_str_radix(t.trim_start_matches("0x"), 16).map_err(|_| format!("bad address term '{t}'"))
 }
 
@@ -45,6 +49,11 @@ fn host_readable(addr: u64, len: u64) -> bool {
     let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     let n = unsafe { VirtualQuery(addr as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) };
     n != 0 && mbi.State == MEM_COMMIT && mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS) == 0 && mbi.Protect & 0xEE != 0 && addr + len <= mbi.BaseAddress as u64 + mbi.RegionSize as u64
+}
+
+/// Readable guest or host memory (for the port's reads of game objects).
+pub fn host_or_guest_readable(addr: u64, len: u64) -> bool {
+    readable(addr, len) || host_readable(addr, len)
 }
 
 fn readable(addr: u64, len: u64) -> bool {
@@ -111,5 +120,106 @@ pub fn write_guest(a: u64, bytes: &[u8]) -> Result<(), String> {
         VirtualProtect(a as _, len, old, &mut tmp);
         FlushInstructionCache(GetCurrentProcess(), a as _, len);
     }
+    Ok(())
+}
+
+/// Debug (control `memsnap <0|1|2>`, then `memfind [size]`): snapshots of
+/// the guest's writable memory that is not GPU memory (module data,
+/// flexible memory) and of a host range (`memsnap <slot> host <addr>
+/// <len>`), compared: places equal in snapshots 0 and 2 but different in 1
+/// (a setting toggled and back), with their values - e.g. where the game
+/// keeps an option.
+static SNAPS: parking_lot::Mutex<[Vec<(u64, Vec<u8>)>; 3]> = parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]);
+
+pub fn memsnap(slot: usize, host: Option<(u64, u64)>) -> Result<(), String> {
+    if slot > 2 {
+        return Err("memsnap: slot 0, 1 or 2".into());
+    }
+    let mut regions = Vec::new();
+    if let Some((a, n)) = host {
+        if !host_readable(a, 1) {
+            return Err(format!("{a:#x} not readable"));
+        }
+        let mut buf = vec![0u8; n as usize];
+        unsafe { std::ptr::copy_nonoverlapping(a as *const u8, buf.as_mut_ptr(), n as usize) };
+        regions.push((a, buf));
+    } else {
+        let st = crate::mem::map_read();
+        for v in st.vmas.values() {
+            let keep = matches!(v.kind, crate::mem::VmaKind::Module | crate::mem::VmaKind::Flexible) && v.prot & 2 != 0 && v.size <= 1 << 30;
+            if !keep {
+                continue;
+            }
+            let mut buf = vec![0u8; v.size as usize];
+            unsafe { std::ptr::copy_nonoverlapping(v.start as *const u8, buf.as_mut_ptr(), v.size as usize) };
+            regions.push((v.start, buf));
+        }
+    }
+    let total: usize = regions.iter().map(|r| r.1.len()).sum();
+    crate::info!("memsnap {slot}: {} regions, {} MiB", regions.len(), total >> 20);
+    SNAPS.lock()[slot] = regions;
+    Ok(())
+}
+
+pub fn memfind(width: usize, small: bool) -> Result<(), String> {
+    let s = SNAPS.lock();
+    let w = width.clamp(1, 4);
+    // (`small`: only values under 16 in all three, e.g. a menu's cursor.)
+    let v = |b: &[u8]| b.iter().rev().fold(0u32, |a, &x| a << 8 | x as u32);
+    let mut found = 0;
+    for (a0, b0) in &s[0] {
+        let (Some((_, b1)), Some((_, b2))) = (s[1].iter().find(|r| r.0 == *a0), s[2].iter().find(|r| r.0 == *a0)) else { continue };
+        let n = b0.len().min(b1.len()).min(b2.len());
+        let mut i = 0;
+        while i + w <= n {
+            if b0[i..i + w] == b2[i..i + w] && b0[i..i + w] != b1[i..i + w] && (!small || (v(&b0[i..i + w]) < 16 && v(&b1[i..i + w]) < 16)) {
+                if found < 80 {
+                    crate::info!("memfind: {:#x}: {:02x?} -> {:02x?} -> back", a0 + i as u64, &b0[i..i + w], &b1[i..i + w]);
+                }
+                found += 1;
+            }
+            i += w;
+        }
+    }
+    crate::info!("memfind: {found} places (width {w})");
+    Ok(())
+}
+
+/// Debug (control `memsearch <hex bytes>`): where the byte pattern is in
+/// the process's committed, writable private memory (the guest's and the
+/// host heap the title's objects live in); up to 64 places logged.
+pub fn memsearch(hex: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_GUARD, PAGE_READWRITE, VirtualQuery};
+    let pat: Vec<u8> = (0..hex.len() / 2).filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok()).collect();
+    if pat.len() < 4 {
+        return Err("memsearch: at least 4 bytes of hex".into());
+    }
+    let mut addr = 0x10000u64;
+    let mut hits = 0;
+    let mut scanned = 0u64;
+    loop {
+        let mut mbi: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { VirtualQuery(addr as _, &mut mbi, std::mem::size_of::<MEMORY_BASIC_INFORMATION>()) } == 0 {
+            break;
+        }
+        let (base, size) = (mbi.BaseAddress as u64, mbi.RegionSize as u64);
+        if mbi.State == MEM_COMMIT && (mbi.Type == MEM_PRIVATE || mbi.Type == MEM_MAPPED) && mbi.Protect == PAGE_READWRITE && mbi.Protect & PAGE_GUARD == 0 && size < (4 << 30) {
+            let s = unsafe { std::slice::from_raw_parts(base as *const u8, size as usize) };
+            scanned += size;
+            for (i, w) in s.windows(pat.len()).enumerate() {
+                if w == &pat[..] {
+                    if hits < 64 {
+                        crate::info!("memsearch: {:#x}", base + i as u64);
+                    }
+                    hits += 1;
+                }
+            }
+        }
+        addr = base + size;
+        if addr >= 0x7fff_ffff_0000 {
+            break;
+        }
+    }
+    crate::info!("memsearch: {hits} places in {} MiB", scanned >> 20);
     Ok(())
 }

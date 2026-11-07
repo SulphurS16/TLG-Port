@@ -12,11 +12,16 @@
 # of those paths, the user profile or the user name is still found in them.
 # Only the files listed here go in (an allowlist): nothing of the game, no keys,
 # saves, caches or logs.
-#   .\tools\package.ps1 [-NoBuild] [-Offline] [-Pgo <profile>]
+#   .\tools\package.ps1 [-NoBuild] [-Offline] [-Pgo <profile>] [-NoUpscalers]
 # -Pgo: tlg.exe built with that profile (profile-guided optimization, made
 # with tools\pgo.ps1 and tools\pgo_train.sh from this source; the launcher
 # without it).
-param([switch]$NoBuild, [switch]$Offline, [string]$Pgo)
+# The "upscalers" folder: DLSS (Streamline), XeSS and FSR as their makers ship
+# them, with their license texts, from local\upscalers (tools\upscalers.ps1);
+# each DLL must carry a valid signature. -NoUpscalers leaves it out;
+# -Upscalers <dir> takes them from another folder (in the release repository:
+# the development checkout's local\upscalers).
+param([switch]$NoBuild, [switch]$Offline, [string]$Pgo, [switch]$NoUpscalers, [string]$Upscalers)
 $root = Split-Path -Parent $PSScriptRoot
 . (Join-Path $PSScriptRoot 'env.ps1')
 $ver = (Select-String -Path (Join-Path $root 'Cargo.toml') -Pattern '^version = "(.+)"').Matches[0].Groups[1].Value
@@ -69,6 +74,26 @@ foreach ($f in 'tlg.exe', 'tlg-launcher.exe') {
   Copy-Item $src $out -ErrorAction Stop
   if ((Get-FileHash $src).Hash -ne (Get-FileHash (Join-Path $out $f)).Hash) { Write-Host "$f was not copied whole"; exit 1 }
 }
+# The upscalers' libraries and their licenses (an allowlist of names). DLSS
+# itself, nvngx_dlss.dll, is not one of them: it is under NVIDIA's own license
+# (its marks, with NVIDIA's approval), so players add their own copy (README;
+# user decision 2026-11-07).
+$upNames = @(
+  'libxess.dll', 'libxess.license.txt', 'libxess.third-party-programs.txt',
+  'sl.interposer.dll', 'sl.common.dll', 'sl.dlss.dll', 'streamline.license.txt', 'streamline.3rd-party-licenses.md',
+  'amd_fidelityfx_loader_vk.dll', 'amd_fidelityfx_upscaler_vk.dll', 'fidelityfx.license.md'
+)
+if (-not $NoUpscalers) {
+  $upSrc = if ($Upscalers) { $Upscalers } else { Join-Path $root 'local\upscalers' }
+  $upOut = Join-Path $out 'upscalers'
+  New-Item -ItemType Directory -Force $upOut | Out-Null
+  foreach ($f in $upNames) {
+    $src = Join-Path $upSrc $f
+    if (-not (Test-Path $src)) { Write-Host "missing $src (run tools\upscalers.ps1)"; exit 1 }
+    Copy-Item $src $upOut -ErrorAction Stop
+    if ($f.EndsWith('.dll') -and (Get-AuthenticodeSignature (Join-Path $upOut $f)).Status -ne 'Valid') { Write-Host "$f has no valid signature; not packaged"; exit 1 }
+  }
+}
 # Paths of this machine must not be in the executables.
 $needles = @($root, $root.Replace('\', '/'), $env:CARGO_HOME, $env:USERPROFILE) | Where-Object { $_ }
 if ($env:USERNAME -and $env:USERNAME.Length -ge 4) { $needles += "\$($env:USERNAME)\" }
@@ -87,14 +112,14 @@ $rule = '=' * 78
 $readme = (& $read (Join-Path $root 'docs\PLAYER_README.txt')) + "`n`n`n$rule`nThird-party notices`n$rule`n`n" + (& $read (Join-Path $root 'THIRD_PARTY_NOTICES.txt')) + "`n`n`n$rule`nLicense: GNU General Public License, version 3`n$rule`n`n" + (& $read (Join-Path $root 'LICENSE')) + "`n"
 [IO.File]::WriteAllText((Join-Path $out 'README.txt'), $readme.Replace("`n", "`r`n"), (New-Object Text.UTF8Encoding $true))
 # Allowlist: nothing else may be in the package.
-$allowed = 'tlg.exe', 'tlg-launcher.exe', 'README.txt'
-$extra = @(Get-ChildItem -Recurse -File $out | Where-Object { $allowed -notcontains $_.Name })
+$allowed = @('tlg.exe', 'tlg-launcher.exe', 'README.txt') + @($upNames | ForEach-Object { "upscalers\$_" })
+$extra = @(Get-ChildItem -Recurse -File $out | Where-Object { $allowed -notcontains $_.FullName.Substring($out.Length + 1) })
 if ($extra.Count -gt 0) { Write-Host "unexpected files in the package: $($extra.FullName -join ', ')"; exit 1 }
 $zip = Join-Path $dist "$name.zip"
 if (Test-Path $zip) { Remove-Item -Force $zip }
 Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip
-$size = (Get-ChildItem -File $out | Measure-Object Length -Sum).Sum
-$count = (Get-ChildItem -File $out).Count
+$size = (Get-ChildItem -Recurse -File $out | Measure-Object Length -Sum).Sum
+$count = (Get-ChildItem -Recurse -File $out).Count
 # The staged files become dist\TLG-Port-<version> unless the earlier folder is
 # in use (renaming it fails while a program from it runs): then they stay staged.
 if (Test-Path $final) {

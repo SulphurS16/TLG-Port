@@ -15,7 +15,8 @@ in a crate used while building).
 | parking_lot, smallvec | synchronization primitives, inline vectors | MIT OR Apache-2.0 |
 | ash | Vulkan bindings (loads `vulkan-1.dll` at run time; the runtime and the launcher's GPU list) | MIT OR Apache-2.0 |
 | rspirv / spirv | SPIR-V module builder for the GCN shader translator | Apache-2.0 |
-| miniz_oxide / adler2 | zlib for PNG screenshots | MIT OR Zlib OR Apache-2.0 / 0BSD OR MIT OR Apache-2.0 |
+| miniz_oxide / adler2 | zlib for PNG screenshots and the trophy icons | MIT OR Zlib OR Apache-2.0 / 0BSD OR MIT OR Apache-2.0 |
+| aes (RustCrypto; with cipher, inout, crypto-common, generic-array, typenum, cpufeatures) | AES-128 for the trophy set's encrypted names, with the player's own key (and the package key chain in tlg-prep) | MIT OR Apache-2.0 (generic-array: MIT) |
 | cc (build dependency) | compiles the vendored LibAtrac9 C sources | MIT OR Apache-2.0 |
 
 Their dependencies are MIT and/or Apache-2.0, except libloading (ISC; it loads `vulkan-1.dll`
@@ -71,6 +72,27 @@ LLVM-exception) and the mingw-w64 runtime startup code. Their notices are in
 `THIRD_PARTY_NOTICES.txt` (the crates, LibAtrac9, vgmstream, LLVM, the mingw-w64 runtime and
 the Rust standard library; made by `tools/notices.py`), and the player package's `README.txt`
 carries them after the player instructions, followed by the text of the GPL.
+
+## Shipped beside the programs (the player package's `upscalers` folder)
+
+Loaded by `tlg.exe` at run time for the Anti-Aliasing setting, unmodified, from the vendors'
+release archives (`tools\upscalers.ps1`, docs/PROVENANCE.md). They are not under the GPL:
+the port's license adds a section 7 permission to link with and ship them under their own
+terms (README, License).
+
+| Component | Files | License (shipped beside them) |
+| --- | --- | --- |
+| Intel XeSS 3.0.2 | libxess.dll | Intel Simplified Software License (libxess.license.txt; its third-party notices in libxess.third-party-programs.txt) |
+| NVIDIA Streamline 2.14.16 | sl.interposer.dll, sl.common.dll, sl.dlss.dll | MIT (streamline.license.txt; its third-party notices in streamline.3rd-party-licenses.md) |
+| AMD FSR SDK 2.4.0 (FSR 3.1.6, FSR 4.1.2) | amd_fidelityfx_loader_vk.dll, amd_fidelityfx_upscaler_vk.dll | MIT (fidelityfx.license.md, which lists the files under each license) |
+
+Not shipped: NVIDIA DLSS itself (`nvngx_dlss.dll`, under NVIDIA's RTX SDKs license). Players
+who want DLSS put their own copy in the folder; `tlg.exe` uses it through Streamline after
+checking that it carries NVIDIA's signature. The section 7 permission covers linking with it.
+
+NVIDIA DLSS and NVIDIA Streamline are trademarks and/or registered trademarks of NVIDIA
+Corporation; Intel XeSS is a trademark of Intel Corporation; AMD FSR and FidelityFX are
+trademarks of Advanced Micro Devices, Inc.
 
 ## Used from Windows at run time (not redistributed)
 

@@ -10,6 +10,7 @@ pub mod kv;
 pub mod paths;
 pub mod saves;
 pub mod settings;
+pub mod trophy;
 
 /// The release version (workspace version).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

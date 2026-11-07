@@ -65,7 +65,9 @@ static FIXES: &[ScriptFix] = &[
             // TLG frame weight: each frame, before the user ticks, TLG_W = the frame's real time x 30 = dt / game speed x 30
             // (the scripts' own real time, missionscript.lua UpdateTimer_Sub; >= 0.97 -> 1, as are 30 fps and slower frames;
             // edt runs ~10% above the frame time); logs once at tick 300
-            Edit { at: 5788, old: "", new: r#" local tlg_s = (MS and MS.GetGameSpeed) and MS.GetGameSpeed() or 1 if dt and dt > 0 and tlg_s and tlg_s > 0 then local tlg_t = dt / tlg_s * 30 if tlg_t >= 0.97 then tlg_t = 1 end TLG_W = tlg_t end if TLG_W_N and TLG_W_N < 300 then TLG_W_N = TLG_W_N + 1 if TLG_W_N == 300 and GaPrint then GaPrint("TLG_W " .. tostring(TLG_W) .. " dt " .. tostring(dt) .. " edt " .. tostring(edt)) end end"# },
+            // (TLG_W30 - the port's script sets it while the frame-rate limit is the game's 30 - keeps it at 1:
+            // every update one 30 Hz frame, as the game has it.)
+            Edit { at: 5788, old: "", new: r#" local tlg_s = (MS and MS.GetGameSpeed) and MS.GetGameSpeed() or 1 if TLG_W30 then TLG_W = 1 elseif dt and dt > 0 and tlg_s and tlg_s > 0 then local tlg_t = dt / tlg_s * 30 if tlg_t >= 0.97 then tlg_t = 1 end TLG_W = tlg_t end if TLG_W_N and TLG_W_N < 300 then TLG_W_N = TLG_W_N + 1 if TLG_W_N == 300 and GaPrint then GaPrint("TLG_W " .. tostring(TLG_W) .. " dt " .. tostring(dt) .. " edt " .. tostring(edt)) end end"# },
         ],
     },
     ScriptFix {
@@ -535,9 +537,61 @@ pub fn load(l: u64, chunk: &str, text: &[u8]) -> Option<Vec<u8>> {
     if log_loads() {
         crate::info!("script load: {chunk} ({} bytes, fnv {hash:016x}, state {l:#x})", text.len());
     }
-    if crate::hle::libs::videoout::frame_cap() == crate::config::FrameCap::Game {
-        return None;
+    // (The menus' part table: where their items are, for the menu pointer.)
+    if hash == ALWAYS[0].hash {
+        crate::menu_pointer::note_part_table(text);
     }
+    // (The port's own additions, at any frame rate.)
+    if let Some(f) = ALWAYS.iter().find(|f| f.hash == hash) {
+        return match apply(&[f], text) {
+            Ok(out) => {
+                crate::info!("scripts: {}: the port's {} additions ({} -> {} bytes)", f.chunk, f.edits.len(), text.len(), out.len());
+                Some(out)
+            }
+            Err(e) => {
+                crate::warn!("scripts: {}: {e}; left as the game has it", f.chunk);
+                None
+            }
+        };
+    }
+    let fixed = frame_fixes(hash, text);
+    // The global tick's script also carries the port's own script
+    // (`crate::pc_menu`), at any frame rate.
+    if hash != UTILS_HASH {
+        return fixed;
+    }
+    let mut out = fixed.unwrap_or_else(|| text.to_vec());
+    out.extend_from_slice(b"\n");
+    out.extend_from_slice(crate::pc_menu::lua_module().as_bytes());
+    crate::info!("scripts: system/scripts/utils.lua: the port's script appended ({} -> {} bytes)", text.len(), out.len());
+    Some(out)
+}
+
+/// system/scripts/utils.lua (the global `Tick`), as 01.03 has it.
+const UTILS_HASH: u64 = 0x3fb910d48c91fd3c;
+
+/// The port's additions to the game's scripts (at any frame rate; none of
+/// these scripts has frame-rate fixes): the Options lists' "PC Settings"
+/// items as parts of the menus' part table (`menu_patches`; the object the
+/// game's unused "Exit Game" label, `pc_files`), with places of their own:
+/// below Copyright on the title screen, above Back in the pause menu (in
+/// Treasure's row while the list has no Treasure).
+static ALWAYS: &[ScriptFix] = &[ScriptFix {
+    chunk: "game/scripts/common/gamemenusetting.lua",
+    hash: 0xe8671be506b746c3,
+    // (On the line of the title screen's Back item, line numbers unchanged.)
+    edits: &[Edit {
+        at: 5888,
+        old: "",
+        new: " {\"option\", \"UseSc2Layout\", \"OptionMenu_ITEM_PC2\", \"game/objects/ui/gamemenu/model/SYS_EXITGAME\", \"game/objects/ui/gamemenu/model/SYS_OPTION2_ITEM_PCSETTING_model_pos\" }, {\"option\", \"UseSc2Layout\", \"OptionMenu_ITEM_PC\", \"game/objects/ui/gamemenu/model/SYS_EXITGAME\", \"game/objects/ui/gamemenu/model/SYS_OPTION_ITEM_PCSETTING_model_pos\" }, {\"option\", \"UseSc2Layout\", \"OptionMenu_ITEM_PC3\", \"game/objects/ui/gamemenu/model/SYS_EXITGAME\", \"game/objects/ui/gamemenu/model/SYS_OPTION_ITEM_PCSETTNG3_model_pos\" },",
+    }],
+}];
+
+/// The frame-counted timers' fixes of the script with this hash. They are
+/// in every script at any frame-rate limit (the limit can change while the
+/// game runs); while it is the game's 30 fps, TLG_W stays 1 and they do
+/// what the game's own code does.
+fn frame_fixes(hash: u64, text: &[u8]) -> Option<Vec<u8>> {
     // (Debug: TLG_SCRIPT_FIXES=0 keeps the game's scripts above 30 fps too.)
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     if *OFF.get_or_init(|| std::env::var("TLG_SCRIPT_FIXES").is_ok_and(|v| v == "0")) {
@@ -611,6 +665,12 @@ mod tests {
             return;
         }
         let lines = |b: &[u8]| b.iter().filter(|&&c| c == b'\n').count();
+        for fix in ALWAYS {
+            let text = std::fs::read(root.join(fix.chunk)).unwrap_or_else(|e| panic!("{}: {e}", fix.chunk));
+            assert_eq!(fnv(&text), fix.hash, "{}: the hash", fix.chunk);
+            let out = apply(&[fix], &text).unwrap_or_else(|e| panic!("{}: {e}", fix.chunk));
+            assert_eq!(lines(&text), lines(&out), "{}: line count changed", fix.chunk);
+        }
         for fix in FIXES.iter().chain(PROBES) {
             let text = std::fs::read(root.join(fix.chunk)).unwrap_or_else(|e| panic!("{}: {e}", fix.chunk));
             assert_eq!(fnv(&text), fix.hash, "{}: the hash", fix.chunk);

@@ -221,7 +221,7 @@ fn hdr_wanted() -> Option<f32> {
         // (The title renders PQ: HDR10 regardless.)
         _ if GAME_PQ.load(std::sync::atomic::Ordering::Relaxed) => {}
         _ => {
-            if s.hdr == crate::config::Hdr::Off || !disp.as_ref().is_some_and(|d| d.enabled) {
+            if hdr_setting() == crate::config::Hdr::Off || !disp.as_ref().is_some_and(|d| d.enabled) {
                 return None;
             }
         }
@@ -303,13 +303,65 @@ unsafe fn hdr_check(c: &super::Ctx, cmd: vk::CommandBuffer, out: vk::Image, w: u
     });
 }
 
+/// The PC Settings pages' changes of settings.txt's `vsync`, `hdr` and
+/// `filter` while the game runs (0: as settings.txt; else the value + 1).
+static VSYNC: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static HDR: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+static FILTER: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn vsync() -> crate::config::VSync {
+    use crate::config::VSync;
+    match VSYNC.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => VSync::On,
+        2 => VSync::Off,
+        3 => VSync::Fast,
+        _ => crate::config::settings().vsync,
+    }
+}
+
+fn hdr_setting() -> crate::config::Hdr {
+    use crate::config::Hdr;
+    match HDR.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Hdr::Auto,
+        2 => Hdr::Off,
+        3 => Hdr::Game,
+        _ => crate::config::settings().hdr,
+    }
+}
+
+fn filter() -> crate::config::Filter {
+    use crate::config::Filter;
+    match FILTER.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Filter::Smooth,
+        2 => Filter::Sharp,
+        _ => crate::config::settings().filter,
+    }
+}
+
+/// `vsync` changed while the game runs (on, off, fast): a new swapchain.
+pub fn set_vsync(v: &str) {
+    VSYNC.store(match v { "off" => 2, "fast" => 3, _ => 1 }, std::sync::atomic::Ordering::Relaxed);
+    window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `hdr` changed while the game runs (auto, off, game): a new swapchain.
+pub fn set_hdr(v: &str) {
+    HDR.store(match v { "off" => 2, "game" => 3, _ => 1 }, std::sync::atomic::Ordering::Relaxed);
+    window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// `filter` changed while the game runs (smooth, sharp): from the next frame.
+pub fn set_filter(v: &str) {
+    FILTER.store(if v == "sharp" { 2 } else { 1 }, std::sync::atomic::Ordering::Relaxed);
+}
+
 fn present_mode(surface: vk::SurfaceKHR) -> vk::PresentModeKHR {
     use crate::config::VSync;
     let want = match std::env::var("TLG_PRESENT").as_deref() {
         Ok("mailbox") => vk::PresentModeKHR::MAILBOX,
         Ok("immediate") => vk::PresentModeKHR::IMMEDIATE,
         Ok("fifo") => vk::PresentModeKHR::FIFO,
-        _ => match crate::config::settings().vsync {
+        _ => match vsync() {
             VSync::On => vk::PresentModeKHR::FIFO,
             VSync::Off => vk::PresentModeKHR::IMMEDIATE,
             VSync::Fast => vk::PresentModeKHR::MAILBOX,
@@ -549,7 +601,7 @@ pub fn present(src: Source) -> bool {
         c.device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).ok();
         let dst = p.images[idx as usize];
         let (dx0, dy0, dx1, dy1) = dst_rect(sw, sh, p.extent.width, p.extent.height);
-        let filter = match crate::config::settings().filter {
+        let filter = match filter() {
             crate::config::Filter::Smooth => vk::Filter::LINEAR,
             crate::config::Filter::Sharp => vk::Filter::NEAREST,
         };
@@ -616,7 +668,17 @@ pub fn present(src: Source) -> bool {
         let waits = [done];
         let pi = vk::PresentInfoKHR::default().wait_semaphores(&waits).swapchains(&scs).image_indices(&idxs);
         let q = queue.lock();
-        match c.swapchain_d.queue_present(*q, &pi) {
+        // (Through Streamline's present once DLSS is ready: its per-frame
+        // bookkeeping, `gpu::upscale`.)
+        let presented = match crate::gpu::upscale::present_hook() {
+            Some(hook) => match hook(*q, &pi) {
+                vk::Result::SUCCESS => Ok(false),
+                vk::Result::SUBOPTIMAL_KHR => Ok(true),
+                e => Err(e),
+            },
+            None => c.swapchain_d.queue_present(*q, &pi),
+        };
+        match presented {
             Ok(false) => {}
             Ok(true) | Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => window::RESIZED.store(true, std::sync::atomic::Ordering::SeqCst),
             Err(e) => crate::error!("present: {e}"),

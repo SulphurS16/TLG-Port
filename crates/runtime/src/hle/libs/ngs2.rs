@@ -597,7 +597,12 @@ unsafe fn control(s: &mut State, vh: u64, mut p: *const u8) -> i32 {
                         }
                         if trace_voices() && v.matrices.get(&mid) != Some(&l) {
                             let nz: Vec<String> = l.iter().enumerate().filter(|(_, x)| **x != 0.0).map(|(i, x)| format!("{i}:{x:.3}")).collect();
-                            crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): matrix {mid}, {n} levels, nonzero [{}]", v.kind, v.channels, nz.join(" "));
+                            crate::info!("NGS2 voice {vh:#x} ({:?} {}ch): matrix {mid}, {n} levels at {levels:p}, nonzero [{}]; called from {}", v.kind, v.channels, nz.join(" "), debug_callers());
+                            // (What follows the levels, e.g. a fixed 8-wide layout.)
+                            if n < 64 {
+                                let more: Vec<String> = (n..64).map(|i| unsafe { *levels.add(i) }).enumerate().filter(|(_, x)| *x != 0.0 && x.is_finite() && x.abs() < 100.0).map(|(i, x)| format!("{}:{x:.3}", i + n)).collect();
+                                crate::info!("NGS2 voice {vh:#x}: after the levels: nonzero [{}]", more.join(" "));
+                            }
                         }
                         if v.matrices.get(&mid) != Some(&l) {
                             v.levels_gen += 1;
@@ -1020,6 +1025,9 @@ fn decode_more(sm: &mut Sampler) -> bool {
                             let mut fr = [0f32; MAX_CH];
                             for c in 0..dch.min(MAX_CH).min(ch.max(1)) {
                                 fr[c] = pcm16[f * dch + c] as f32 / 32768.0;
+                            }
+                            if dch >= 4 {
+                                debug_voice_dump(sm.config, dch, &fr[..dch.min(MAX_CH)]);
                             }
                             sm.pcm.push_back(fr);
                             sm.decoded_samples += 1;
@@ -2421,4 +2429,51 @@ mod tests {
         render(&mut s, 1, 256, 48000, false, false);
         assert!(s.voices[&bus].input.iter().all(|f| f[0] == 0.25));
     }
+}
+
+/// Debug (TLG_NGS2_VOICE_DUMP=<dir>): the decoded samples of multichannel
+/// ATRAC9 streams, all channels, to `<dir>/at9-<config>-<n>ch.f32`
+/// (interleaved little-endian float32).
+fn debug_voice_dump(config: u32, ch: usize, frame: &[f32]) {
+    use std::io::Write;
+    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    static FILES: parking_lot::Mutex<Vec<(u32, std::fs::File)>> = parking_lot::Mutex::new(Vec::new());
+    let Some(dir) = DIR.get_or_init(|| std::env::var_os("TLG_NGS2_VOICE_DUMP").map(std::path::PathBuf::from)) else { return };
+    let mut files = FILES.lock();
+    if !files.iter().any(|(c, _)| *c == config) {
+        let _ = std::fs::create_dir_all(dir);
+        match std::fs::File::create(dir.join(format!("at9-{config:08x}-{ch}ch.f32"))) {
+            Ok(f) => files.push((config, f)),
+            Err(_) => return,
+        }
+    }
+    if let Some((_, f)) = files.iter_mut().find(|(c, _)| *c == config) {
+        let bytes: Vec<u8> = frame.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let _ = f.write_all(&bytes);
+    }
+}
+
+/// Debug (trace lines): the game code addresses found on the stack above
+/// this call (module offsets in its sound code, 0x100000-0x300000; the
+/// first is normally the call's return address).
+#[inline(never)]
+fn debug_callers() -> String {
+    let Some(base) = crate::loader::main_module().map(|m| m.base) else { return String::new() };
+    let sp: u64;
+    unsafe { std::arch::asm!("mov {}, rsp", out(reg) sp) };
+    let mut out = Vec::new();
+    for i in 0..1024u64 {
+        let a = sp + i * 8;
+        if !crate::debug_mem::host_or_guest_readable(a, 8) {
+            break;
+        }
+        let v = unsafe { std::ptr::read_volatile(a as *const u64) };
+        if (base + 0x10_0000..base + 0x30_0000).contains(&v) {
+            out.push(format!("+{:#x}", v - base));
+            if out.len() >= 6 {
+                break;
+            }
+        }
+    }
+    out.join(" ")
 }

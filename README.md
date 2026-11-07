@@ -10,10 +10,16 @@ Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, ge
 ## Highlights
 
 - No CPU emulation: the game's own x86-64 code runs directly on your processor.
-- Windowed, borderless or fullscreen, with a render resolution from 1280x720 to 3840x2160.
+- PC Settings inside the game's own menus (Options > PC Settings, or F10 while playing), most of them taking effect at once.
+- Windowed, borderless or fullscreen; 16:9, 16:10, 21:9 and 32:9 without stretching (wider shows more to the sides), with the menus and HUD in their place; render resolutions up to 3840x2160 or 5120x1440.
 - 30 fps (the game's own limit), 60 fps or uncapped, at the game's normal speed: its timers count time, not frames.
+- NVIDIA DLSS, Intel XeSS and AMD FSR as anti-aliasing or upscaling, switched while you play, fed the game's own motion vectors (DLSS with your own copy of NVIDIA's DLSS file).
+- Graphics beyond the PS4's: sharpening, shadows, texture filtering, ambient occlusion, reflections, fog and light shafts, and each camera effect on or off.
+- Button prompts for the device you use: your keyboard and mouse bindings, an Xbox pad's buttons or the PS4's, switching at once.
+- Mouse camera with raw input, a mouse pointer in the menus; every keyboard and mouse control can be changed, in the game too.
+- 5.1 and 7.1 sound, headphone surround with Windows Sonic or Dolby Atmos for Headphones, a choice of sound device.
+- Achievements with a pop-up in the game's style and a list of all trophies.
 - The languages your copy of the game carries: the US release's English, Spanish, French and Portuguese, or a European release's.
-- Mouse camera with raw input; every keyboard and mouse control can be changed.
 - DUALSHOCK 4, DualSense and Xbox controllers.
 
 ## How it works
@@ -73,14 +79,18 @@ Keyboard and mouse (defaults):
 | D-pad | Arrow keys |
 | Pause menu, back in menus | Escape |
 | Options / touchpad | Tab / T |
+| PC Settings (pauses the game) | F10 |
 | Free the mouse | F1 |
 | Fullscreen | F11 or Alt+Enter |
 
-In menus the left mouse button selects, the right one goes back and the wheel moves the selection. All controls can be changed in the launcher.
+In menus the mouse pointer selects what it points at (the Options lists and PC Settings), the left button confirms, the right one goes back and the wheel moves the selection. All controls can be changed in the launcher or in the game (PC Settings > Controls > Key Bindings).
 
 ## Settings and saves
 
-- Display mode, resolution, frame-rate limit, graphics card, volume and language are set in the launcher and apply the next time the game starts.
+- In the game: Options > PC Settings on the title screen and in the pause menu, or F10 while playing - display, graphics, camera effects, sound, controls, interface, saved games and achievements. Most settings take effect at once.
+- Anti-aliasing and upscaling (PC Settings > Graphics): the game's SMAA, or DLSS (DLAA; NVIDIA RTX cards), XeSS or FSR (FSR 4 on the AMD cards it supports, FSR 3.1 on others) - the ones your PC can run are listed, and the choice changes at once. Upscaling (Quality 67%, Balanced 58%, Performance 50%, Ultra Performance 33%; at the next start) renders below the render resolution and lets that choice bring it up. XeSS, FSR and NVIDIA Streamline ship in the 'upscalers' folder with their licenses, loaded only after their makers' digital signatures check out. DLSS itself, NVIDIA's 'nvngx_dlss.dll', is under NVIDIA's own license and not included: copy your own into the 'upscalers' folder (games with DLSS have it in their installation folder; NVIDIA's DLSS SDK at github.com/NVIDIA/DLSS has it in 'lib/Windows_x86_64/rel'), and DLSS appears in the list at the next start. NVIDIA, DLSS and RTX are trademarks of NVIDIA Corporation; Intel and XeSS of Intel Corporation; AMD and FSR of Advanced Micro Devices, Inc.
+- In the launcher: display mode, resolution, frame-rate limit, graphics card, volume and language, for the next start.
+- Trophy names: the trophies' names and descriptions are encrypted in the game files. Give the port the PS4 trophy key (32 hexadecimal digits) to see them: in the launcher (Game files > Trophy key, then Save key), or copy it and choose Trophy Names at the top of the Achievements page in the game. The key is checked against your game's trophies and kept in 'trophy-key.txt' in '%APPDATA%\TLG'; the port does not include it. Without it the trophies are numbered (icons, pop-ups and dates work the same).
 - Settings and saves are in '%APPDATA%\TLG'. Before each new save, the previous one is copied to 'save-backups' there (the newest 20).
 - An empty file named 'portable.txt' next to 'tlg.exe' keeps everything in a 'user' folder beside it.
 
@@ -88,8 +98,11 @@ In menus the left mouse button selects, the right one goes back and the wheel mo
 
 - At 60 fps the game's timers and effects keep their normal speed, but the game has not been played through at 60 fps yet.
 - Uncapped is not recommended: at 116-119, 156-179 and 237-359 fps the game runs slower than real time.
-- No mouse pointer in the game's menus.
-- The title screen's music plays quieter than it should.
+- DLSS, XeSS and FSR were tested on an NVIDIA RTX card; FSR 4 and XeSS on Intel or AMD graphics have not been tested. Upscaling was checked for its picture; its frame-rate gain on slower graphics cards has not been measured yet. The first switch to DLSS or FSR in a session pauses the picture for a moment (up to about a second).
+- Outdoors the grass may sway faster than on the PS4 ([#9](https://github.com/SulphurS16/TLG-Port/issues/9)), likely with the 60 fps limit. Being looked into.
+- In the title and pause menus the mouse pointer does not move the selection (click and wheel work there).
+- The title screen's music may be quieter than on the PS4; it has not been compared with a PS4 recording.
+- Headphone surround has been tested only without spatial sound turned on in Windows.
 - Tested with NVIDIA graphics (a laptop and a desktop). AMD and Intel graphics have not been tested yet.
 - The European release is tested with an English-only copy. Its other languages are offered when your game files carry them, but have not been tested. Japanese and the other Asian languages are in the game's program but need a copy that carries them.
 - Now and then the game closes with an error just after an area starts loading (seen with the 60 fps limit and with none). Start it again and choose Continue: the game goes on from its last checkpoint.
@@ -102,7 +115,9 @@ Run `tools\bootstrap.ps1` once. It downloads the pinned Rust and llvm-mingw tool
 
 Copyright (C) 2026 SulphurS16 and The Last Guardian unofficial PC port contributors.
 
-The port is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version (SPDX: GPL-3.0-or-later). It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text. Releases up to 0.5.1 were MIT licensed.
+The port is free software: you can redistribute it and/or modify it under the terms of the GNU General Public License as published by the Free Software Foundation, either version 3 of the License, or (at your option) any later version (SPDX: GPL-3.0-or-later, with the additional permission below). It is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See [LICENSE](LICENSE) for the full text. Releases up to 0.5.1 were MIT licensed.
+
+Additional permission under GNU GPL version 3 section 7: If you modify this program, or any covered work, by linking or combining it with NVIDIA DLSS (the NGX runtime nvngx_dlss.dll and the NVIDIA Streamline libraries) or Intel XeSS (libxess.dll), or modified versions of those libraries, containing parts covered by the terms of their own licenses, the licensors of this program grant you additional permission to convey the resulting work. The Corresponding Source for a non-source form of such a combination need not include the source code of those libraries.
 
 The license covers this project's code only. It grants nothing for The Last Guardian or any other game data, keys or system software, which you must supply yourself. Third-party components keep their own licenses, all compatible with the GPL version 3: see [THIRD_PARTY.md](THIRD_PARTY.md) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 

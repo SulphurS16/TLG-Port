@@ -282,9 +282,29 @@ fn xinput(st: &mut PadState) {
     st.ry = axis(g.sThumbRY, true);
 }
 
-/// The keyboard and mouse bindings: input.txt over the defaults (safe mode:
-/// the defaults, the file left alone).
+/// Bindings changed while the game runs (the PC Settings' Key Bindings
+/// page): each change a new, never freed copy (changes are few).
+static LIVE_BINDINGS: std::sync::atomic::AtomicPtr<Bindings> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The keyboard and mouse bindings in force.
 fn settings() -> &'static Bindings {
+    let p = LIVE_BINDINGS.load(std::sync::atomic::Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: a leaked Box (`set_bindings`), never freed.
+        return unsafe { &*p };
+    }
+    initial_settings()
+}
+
+/// New bindings from now on (written to input.txt by the caller).
+pub fn set_bindings(b: Bindings) {
+    crate::gpu::vk::window::RELEASE_KEY.store(b.release_key as u32, std::sync::atomic::Ordering::Relaxed);
+    LIVE_BINDINGS.store(Box::leak(Box::new(b)), std::sync::atomic::Ordering::Release);
+}
+
+/// The keyboard and mouse bindings at start: input.txt over the defaults
+/// (safe mode: the defaults, the file left alone).
+fn initial_settings() -> &'static Bindings {
     static S: OnceLock<Bindings> = OnceLock::new();
     S.get_or_init(|| {
         let s = match crate::config::try_paths() {
@@ -314,6 +334,47 @@ fn settings() -> &'static Bindings {
     })
 }
 
+/// The keyboard and mouse bindings in force.
+pub fn bindings() -> &'static Bindings {
+    settings()
+}
+
+/// The mouse sensitivity changed while the game runs (both axes; f32 bits,
+/// 0: input.txt's).
+static SENSITIVITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+pub fn set_mouse_sensitivity(v: f32) {
+    SENSITIVITY.store(v.clamp(0.01, 100.0).to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The sensitivity per axis in force, with the inversions.
+fn mouse_scale(s: &Bindings) -> (f32, f32) {
+    let (bx, by) = match SENSITIVITY.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => (s.sensitivity_x, s.sensitivity_y),
+        b => (f32::from_bits(b), f32::from_bits(b)),
+    };
+    let (ix, iy) = crate::pc_menu::camera_inverted();
+    (if s.invert_x != ix { -bx } else { bx }, if s.invert_y != iy { -by } else { by })
+}
+
+/// Rewrites one line of input.txt (not in safe mode).
+pub fn persist_binding(key: &str, value: &str) {
+    if crate::config::safe_mode() {
+        return;
+    }
+    let Some(p) = crate::config::try_paths() else { return };
+    let file = p.input_file();
+    match tlg_config::kv::KvFile::load(&file) {
+        Ok(mut f) => {
+            f.set(key, value);
+            if let Err(e) = f.save(&file) {
+                crate::warn!("input: writing {}: {e}", file.display());
+            }
+        }
+        Err(e) => crate::warn!("input: reading {}: {e}", file.display()),
+    }
+}
+
 /// Whether a click captures the mouse (mouse look, menu mouse or a mouse
 /// button bound).
 pub fn mouse_capture_enabled() -> bool {
@@ -340,10 +401,12 @@ struct MouseState {
     prev_buttons: u32,
     /// The button `pause_back` gave when it went down (held until released).
     pause_latch: Option<u32>,
+    /// The game buttons the left button gives in a menu (`menu_pointer::click`).
+    left_click: u32,
 }
 
 static MOUSE: parking_lot::Mutex<MouseState> =
-    parking_lot::Mutex::new(MouseState { last: 0.0, rs: (0.0, 0.0), wheel_up_until: 0.0, wheel_down_until: 0.0, wheel_menu: false, menu_buttons: 0, prev_buttons: 0, pause_latch: None });
+    parking_lot::Mutex::new(MouseState { last: 0.0, rs: (0.0, 0.0), wheel_up_until: 0.0, wheel_down_until: 0.0, wheel_menu: false, menu_buttons: 0, prev_buttons: 0, pause_latch: None, left_click: 0 });
 
 /// Raw counts per second that give a full right-stick deflection at
 /// sensitivity 1 (mouse look where the game camera hook does not apply).
@@ -364,8 +427,8 @@ fn mouse_sample(s: &Bindings, m: &mut MouseState, in_menu: bool) -> ((f32, f32),
     if dt >= 4.0 || !captured {
         let (dx, dy, wheel) = window::take_mouse();
         m.last = now;
-        let sx = if s.invert_x { -1.0 } else { 1.0 } * s.sensitivity_x;
-        let sy = if s.invert_y { -1.0 } else { 1.0 } * s.sensitivity_y;
+        let (dx, dy) = if in_menu && captured && (dx != 0 || dy != 0) && crate::menu_pointer::moved(dx, dy) { (0, 0) } else { (dx, dy) };
+        let (sx, sy) = mouse_scale(s);
         let rad = DEG_PER_COUNT.to_radians();
         m.rs = (0.0, 0.0);
         if !captured || !s.mouse_look {
@@ -401,6 +464,13 @@ fn mouse_sample(s: &Bindings, m: &mut MouseState, in_menu: bool) -> ((f32, f32),
 /// waited a frame more - up to 33 ms at 30 fps. False: the motion is for
 /// the pad read (no camera hook: the right stick; `tune mouse_direct 0`).
 pub fn mouse_motion(dx: i64, dy: i64) -> bool {
+    if dx.abs() + dy.abs() > 2 {
+        crate::pc_prompts::used(crate::pc_prompts::Style::Keyboard);
+    }
+    // (In menus the motion moves the menu pointer.)
+    if crate::title_patches::in_menu() == Some(true) && crate::menu_pointer::moved(dx, dy) {
+        return true;
+    }
     if crate::tune::get(crate::tune::MOUSE_DIRECT) == 0 || !crate::title_patches::camera_hooked() {
         return false;
     }
@@ -408,8 +478,7 @@ pub fn mouse_motion(dx: i64, dy: i64) -> bool {
     if !s.mouse_look || (dx == 0 && dy == 0) {
         return true;
     }
-    let sx = if s.invert_x { -1.0 } else { 1.0 } * s.sensitivity_x;
-    let sy = if s.invert_y { -1.0 } else { 1.0 } * s.sensitivity_y;
+    let (sx, sy) = mouse_scale(s);
     let rad = DEG_PER_COUNT.to_radians();
     // (Right: turn right; forward: look up. The motion is dropped while the
     // game camera is not updating - menus, other camera modes.)
@@ -456,13 +525,19 @@ fn keyboard_mouse(st: &mut PadState) {
     // buttons held from play stay play input).
     m.menu_buttons &= buttons;
     if s.menu_mouse && in_menu {
-        m.menu_buttons |= buttons & !m.prev_buttons;
+        let new = buttons & !m.prev_buttons;
+        // (A left click's buttons are chosen as it goes down: by the menu
+        // pointer's place.)
+        if new & 1 != 0 {
+            m.left_click = crate::menu_pointer::click();
+        }
+        m.menu_buttons |= new;
     }
     m.prev_buttons = buttons;
     let menu_buttons = m.menu_buttons;
     let wheel_menu = m.wheel_menu;
     if menu_buttons & 1 != 0 {
-        st.buttons |= BTN_CROSS;
+        st.buttons |= m.left_click;
     }
     if menu_buttons & 2 != 0 {
         st.buttons |= BTN_CIRCLE;
@@ -540,11 +615,34 @@ fn hid(st: &mut PadState) {
 }
 
 /// Current combined pad state.
+/// A pad source's read made a difference: a button went down, a stick or
+/// trigger moved well away from rest (the prompts follow the device in use).
+fn source_active(before: &PadState, after: &PadState) -> bool {
+    let off = |v: u8| (v as i32 - 0x80).abs() > 0x40;
+    let moved = |a: u8, b: u8| off(b) && (a as i32 - b as i32).abs() > 8;
+    after.buttons & !before.buttons != 0 || moved(before.lx, after.lx) || moved(before.ly, after.ly) || moved(before.rx, after.rx) || moved(before.ry, after.ry) || (after.l2 > 60 && before.l2 <= 60) || (after.r2 > 60 && before.r2 <= 60)
+}
+
 pub fn pad_state() -> PadState {
+    use crate::pc_prompts::{Style, used};
     let mut st = PadState::default();
+    let a = st;
     xinput(&mut st);
+    if source_active(&a, &st) {
+        used(Style::Xbox);
+    }
+    // (A DualShock 4 or DualSense read over HID after XInput: a pad that a
+    // wrapper also presents as XInput counts as itself.)
+    let a = st;
     hid(&mut st);
+    if source_active(&a, &st) {
+        used(Style::PlayStation);
+    }
+    let a = st;
     keyboard_mouse(&mut st);
+    if st.buttons != a.buttons || st.lx != a.lx || st.ly != a.ly || st.rx != a.rx || st.ry != a.ry {
+        used(Style::Keyboard);
+    }
     scripted(&mut st, crate::gpu::FRAMES.load(std::sync::atomic::Ordering::Relaxed));
     if st.l2 > 30 {
         st.buttons |= BTN_L2;
@@ -558,7 +656,11 @@ pub fn pad_state() -> PadState {
     if st.buttons & BTN_R2 != 0 {
         st.r2 = st.r2.max(255);
     }
-    st
+    // (The prompts' glow places follow the device: written here, between
+    // the game's frames.)
+    crate::pc_prompts::tick();
+    // (An open PC settings page takes the input; the game sees no buttons.)
+    crate::pc_menu::take_pad(st)
 }
 
 #[cfg(test)]

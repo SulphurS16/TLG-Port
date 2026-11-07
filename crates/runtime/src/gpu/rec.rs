@@ -802,6 +802,15 @@ impl Rec {
         });
     }
 
+    /// Work an outside library records into `cb` (an upscaler), in order
+    /// with the rest.
+    pub unsafe fn cmd_external(&self, f: impl FnOnce(&ash::Device) + Send + 'static) {
+        if deferred() {
+            return thunk(f);
+        }
+        f(&ctx().device)
+    }
+
     pub unsafe fn cmd_end_rendering(&self, cb: vk::CommandBuffer) {
         if deferred() {
             return push(Op::EndRendering(cb), false);

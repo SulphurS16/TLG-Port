@@ -909,8 +909,16 @@ pub const SURFACE_BLOCKS: usize = 153;
 pub const BATCH_DEEP_SPAN: usize = 154;
 pub const BATCH_MAX_DEEP: usize = 155;
 pub const BATCH_IDLE_DEEP: usize = 156;
+/// The signs of the jitter handed to an upscaler (`gpu::upscale`;
+/// `TLG_UP_JITTER`, 0): 0 as rendered, 1 both negated, 2 y negated, 3 x
+/// negated - an in-session A/B of the convention.
+pub const UP_JITTER: usize = 157;
+/// A constant jitter in thousandths of a pixel on both axes instead of the
+/// Halton sequence (`TLG_UP_JITTER_FIXED`, 0 = the sequence): the output of
+/// an upscaler told the right jitter lines up with the unjittered picture.
+pub const UP_JITTER_FIXED: usize = 158;
 
-const TABLE: [(&str, &str, i64); 157] = [
+const TABLE: [(&str, &str, i64); 159] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -1068,6 +1076,8 @@ const TABLE: [(&str, &str, i64); 157] = [
     ("batch_deep_span", "TLG_BATCH_DEEP_SPAN", 32),
     ("batch_max_deep", "TLG_BATCH_MAX_DEEP", 256),
     ("batch_idle_deep", "TLG_BATCH_IDLE_DEEP", 128),
+    ("up_jitter", "TLG_UP_JITTER", 0),
+    ("up_jitter_fixed", "TLG_UP_JITTER_FIXED", 0),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

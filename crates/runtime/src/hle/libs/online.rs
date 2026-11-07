@@ -20,51 +20,13 @@ fn next_id() -> i32 {
 
 static NET_ERRNO: AtomicI32 = AtomicI32::new(0);
 
-// ---- Locally recorded trophies (one unlocked id per line; no PSN sync).
-static TROPHY_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
-
+// ---- Trophies: recorded locally by the port (achievements.rs; no PSN sync).
 fn trophy_unlocked() -> Vec<i32> {
-    let _g = TROPHY_LOCK.lock();
-    std::fs::read_to_string(super::savedata::trophy_file())
-        .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
-        .unwrap_or_default()
+    crate::achievements::unlocked().into_iter().map(|(i, _)| i).collect()
 }
 
-/// Records an unlock; false when it was already recorded.
-fn trophy_unlock(id: i32) -> bool {
-    let mut ids = trophy_unlocked();
-    if ids.contains(&id) {
-        return false;
-    }
-    ids.push(id);
-    ids.sort();
-    let _g = TROPHY_LOCK.lock();
-    let text: String = ids.iter().map(|i| format!("{i}\n")).collect();
-    let f = super::savedata::trophy_file();
-    let tmp = f.with_extension("tmp");
-    if std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, &f)).is_err() {
-        crate::warn!("trophy {id}: could not record the unlock in {}", f.display());
-    }
-    true
-}
-
-/// Trophies in the title's set: the TROPnnn.PNG icon entries of the plain
-/// trophy00.trp entry table (magic dca24d00, count @0x10, 0x40-byte entries @0x60).
 fn trophy_count() -> u32 {
-    static N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        let Some(p) = crate::hle::kernel::fs::host_path_existing("/app0/sce_sys/trophy/trophy00.trp") else { return 0 };
-        let Ok(b) = std::fs::read(&p) else { return 0 };
-        if b.len() < 0x60 || b[0..4] != [0xdc, 0xa2, 0x4d, 0x00] { return 0; }
-        let n = u32::from_be_bytes(b[0x10..0x14].try_into().unwrap()) as usize;
-        let count = (0..n)
-            .filter_map(|i| b.get(0x60 + i * 0x40..0x60 + i * 0x40 + 32))
-            .map(|name| String::from_utf8_lossy(name.split(|&c| c == 0).next().unwrap_or(&[])).to_string())
-            .filter(|s| s.starts_with("TROP") && s.ends_with(".PNG") && s[4..s.len() - 4].chars().all(|c| c.is_ascii_digit()))
-            .count() as u32;
-        crate::info!("trophy set: {count} trophies ({})", p.display());
-        count
-    })
+    crate::achievements::count()
 }
 
 sysv! {
@@ -114,9 +76,9 @@ sysv! {
         0
     }
     fn sceNpTrophyUnlockTrophy(ctx: i32, h: i32, trophy: i32, platinum: *mut i32) -> i32 {
-        let first = trophy_unlock(trophy);
-        crate::info!("trophy {trophy} unlocked{} (recorded locally only)", if first { "" } else { " again" });
-        if !platinum.is_null() { *platinum = -1; }
+        let (first, plat) = crate::achievements::unlock(trophy);
+        crate::info!("trophy {trophy} unlocked{}{} (recorded locally only)", if first { "" } else { " again" }, if plat.is_some() { "; the set is complete: the platinum too" } else { "" });
+        if !platinum.is_null() { *platinum = plat.unwrap_or(-1); }
         0
     }
     /// SceNpTrophyFlagArray (128 bits) of the locally recorded unlocks; `count`

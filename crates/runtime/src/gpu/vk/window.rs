@@ -85,6 +85,44 @@ pub fn request_mode(m: Option<DisplayMode>) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows' folder picker over the game's window (the PC Settings pages'
+/// save folder); None when cancelled. Exclusive full screen gives way to
+/// borderless meanwhile. The caller waits until it is closed.
+pub fn pick_folder(title: &str) -> Option<std::path::PathBuf> {
+    let owner = WINDOW.get()?.hwnd;
+    let full = current_mode() == DisplayMode::Fullscreen;
+    if full {
+        let _ = request_mode(Some(DisplayMode::Borderless));
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    let title = title.to_string();
+    // (On a thread of its own: the dialog wants a single-threaded COM apartment.)
+    let r = std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Com::*;
+        use windows::Win32::UI::Shell::*;
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let r = (|| -> windows::core::Result<std::path::PathBuf> {
+            let dlg: IFileOpenDialog = CoCreateInstance(&FileOpenDialog, None, CLSCTX_INPROC_SERVER)?;
+            dlg.SetOptions(dlg.GetOptions()? | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST)?;
+            dlg.SetTitle(&windows::core::HSTRING::from(title.as_str()))?;
+            dlg.Show(Some(windows::Win32::Foundation::HWND(owner as _)))?;
+            let p = dlg.GetResult()?.GetDisplayName(SIGDN_FILESYSPATH)?;
+            let s = p.to_string().unwrap_or_default();
+            CoTaskMemFree(Some(p.0 as _));
+            Ok(std::path::PathBuf::from(s))
+        })();
+        CoUninitialize();
+        r.ok().filter(|p| p.is_absolute())
+    })
+    .join()
+    .ok()
+    .flatten();
+    if full {
+        let _ = request_mode(Some(DisplayMode::Fullscreen));
+    }
+    r
+}
+
 /// The monitor whose display mode was switched (device name, NUL-terminated).
 static SWITCHED: Mutex<Option<Vec<u16>>> = Mutex::new(None);
 
@@ -118,7 +156,9 @@ pub fn inject_mouse(dx: i64, dy: i64, ms: u64) {
         let (mut sx, mut sy) = (0i64, 0i64);
         for i in 1..=steps {
             let (tx, ty) = (dx * i / steps, dy * i / steps);
-            if !crate::input::mouse_motion(tx - sx, ty - sy) {
+            if crate::pc_menu::is_open() {
+                crate::pc_menu::mouse(tx - sx, ty - sy, PC_BUTTONS.load(Ordering::Relaxed), 0);
+            } else if !crate::input::mouse_motion(tx - sx, ty - sy) {
                 MOUSE_DX.fetch_add(tx - sx, Ordering::Relaxed);
                 MOUSE_DY.fetch_add(ty - sy, Ordering::Relaxed);
             }
@@ -130,6 +170,25 @@ pub fn inject_mouse(dx: i64, dy: i64, ms: u64) {
     });
 }
 
+/// Debug (control `mousebtn <mask> [wheel]`): a PC page's mouse buttons
+/// held (bit 0 left, 1 right) and wheel notches, as if the mouse did that.
+pub fn inject_mouse_buttons(mask: u32, wheel: i32) {
+    if crate::pc_menu::is_open() {
+        PC_BUTTONS.store(mask, Ordering::Relaxed);
+        crate::pc_menu::mouse(0, 0, mask, wheel);
+    } else {
+        // (The game's: its menus and bindings.)
+        MOUSE_BUTTONS.store(mask, Ordering::Relaxed);
+        INJECTED_UNTIL.store(crate::log::elapsed_ms() as i64 + 1000, Ordering::Relaxed);
+        if wheel != 0 {
+            WHEEL.fetch_add(wheel, Ordering::Relaxed);
+        }
+    }
+}
+
+/// The mouse buttons a PC settings page has seen held (bit 0 left, 1 right).
+static PC_BUTTONS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
 /// Mouse input is live: captured, or injected motion pending.
 pub fn mouse_live() -> bool {
     CAPTURED.load(Ordering::Relaxed) || crate::log::elapsed_ms() as i64 <= INJECTED_UNTIL.load(Ordering::Relaxed)
@@ -140,6 +199,7 @@ const VK_CONTROL: usize = 0x11;
 const VK_MENU: usize = 0x12;
 const VK_RETURN: u32 = 0x0D;
 const VK_F4: u32 = 0x73;
+const VK_F10: u32 = 0x79;
 const VK_F11: u32 = 0x7A;
 
 /// The left/right-specific key of a key message (Shift by scan code, Ctrl
@@ -169,6 +229,16 @@ fn specific_vk(wp: WPARAM, lp: LPARAM) -> usize {
         }
         v => v,
     }
+}
+
+/// Debug (control `key <vk hex> [ms]`): a keyboard key held for `ms`
+/// (default 100), as if pressed in the window.
+pub fn inject_key(vk: u8, ms: u64) {
+    KEYS[vk as usize].store(true, Ordering::Relaxed);
+    let _ = std::thread::Builder::new().name("key-inject".into()).spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(ms.max(1)));
+        KEYS[vk as usize].store(false, Ordering::Relaxed);
+    });
 }
 
 fn set_key(wp: WPARAM, lp: LPARAM, down: bool) {
@@ -241,6 +311,26 @@ unsafe fn raw_input(lp: LPARAM) {
         return;
     }
     let m = unsafe { ri.data.mouse };
+    let flags = unsafe { m.Anonymous.Anonymous.usButtonFlags } as u32;
+    let data = unsafe { m.Anonymous.Anonymous.usButtonData } as i16;
+    // (A PC settings page takes the mouse whole: its pointer, buttons, wheel.)
+    if crate::pc_menu::is_open() {
+        let (dx, dy) = if m.usFlags & 1 == 0 { (m.lLastX as i64, m.lLastY as i64) } else { (0, 0) };
+        let mut held = PC_BUTTONS.load(Ordering::Relaxed);
+        for b in 0..2 {
+            if flags & (1 << (2 * b)) != 0 {
+                held |= 1 << b;
+            }
+            if flags & (2 << (2 * b)) != 0 {
+                held &= !(1 << b);
+            }
+        }
+        PC_BUTTONS.store(held, Ordering::Relaxed);
+        let wheel = if flags & RI_MOUSE_WHEEL as u32 != 0 { data as i32 / 120 } else { 0 };
+        crate::pc_menu::mouse(dx, dy, held, wheel);
+        return;
+    }
+    PC_BUTTONS.store(0, Ordering::Relaxed);
     // (Absolute-position devices such as tablets and remote desktops are not
     // raw counts: MOUSE_MOVE_ABSOLUTE.)
     // (Into the game camera at once - `input::mouse_motion` - or kept for
@@ -249,8 +339,6 @@ unsafe fn raw_input(lp: LPARAM) {
         MOUSE_DX.fetch_add(m.lLastX as i64, Ordering::Relaxed);
         MOUSE_DY.fetch_add(m.lLastY as i64, Ordering::Relaxed);
     }
-    let flags = unsafe { m.Anonymous.Anonymous.usButtonFlags } as u32;
-    let data = unsafe { m.Anonymous.Anonymous.usButtonData } as i16;
     for b in 0..5 {
         let (down, up) = (1u32 << (2 * b), 2u32 << (2 * b));
         if flags & down != 0 {
@@ -398,12 +486,14 @@ fn windowed_client(m: &Monitor) -> (i32, i32) {
     (w as i32, h as i32)
 }
 
-/// The size the game renders at (fixed when its executable loads): the
-/// setting `render_resolution` (development override TLG_RENDER_SIZE), or
-/// 16:9 within the display - the exclusive mode, the monitor (borderless)
-/// or the window's client area (windowed).
+/// The size the game renders at (fixed when its executable loads; asked
+/// once): the setting `render_resolution` (development override
+/// TLG_RENDER_SIZE) in the picture's shape (`aspect_ratio`; automatic: the
+/// display's), or that shape's largest size within the display - the
+/// exclusive mode, the monitor (borderless) or the window's client area
+/// (windowed).
 pub fn render_size() -> (u32, u32) {
-    use tlg_config::settings::{render_size_for, render_size_ok};
+    use tlg_config::settings::{aspect_of, render_size_fixed, render_size_for, render_size_ok};
     let dev = std::env::var("TLG_RENDER_SIZE").ok().and_then(|v| {
         let (w, h) = v.split_once('x')?;
         Some((w.trim().parse().ok()?, h.trim().parse().ok()?))
@@ -412,20 +502,25 @@ pub fn render_size() -> (u32, u32) {
         return r;
     }
     let s = crate::config::settings();
-    if let Some(r) = s.render_resolution {
-        return r;
-    }
-    let Some(m) = (unsafe { find_monitor(&s.monitor) }) else { return (1920, 1080) };
-    let full = ((m.rect.right - m.rect.left).max(0) as u32, (m.rect.bottom - m.rect.top).max(0) as u32);
-    let (w, h) = match s.display_mode {
-        DisplayMode::Fullscreen => s.resolution.unwrap_or(full),
-        DisplayMode::Borderless => full,
-        DisplayMode::Windowed => {
-            let (w, h) = windowed_client(&m);
-            (w as u32, h as u32)
+    let shape = aspect_of(s);
+    let area = match unsafe { find_monitor(&s.monitor) } {
+        Some(m) => {
+            let full = ((m.rect.right - m.rect.left).max(0) as u32, (m.rect.bottom - m.rect.top).max(0) as u32);
+            match s.display_mode {
+                DisplayMode::Fullscreen => s.resolution.unwrap_or(full),
+                DisplayMode::Borderless => full,
+                DisplayMode::Windowed => {
+                    let (w, h) = windowed_client(&m);
+                    (w as u32, h as u32)
+                }
+            }
         }
+        None => (1920, 1080),
     };
-    render_size_for(w, h)
+    match s.render_resolution {
+        Some(r) => render_size_fixed(r, shape, area),
+        None => render_size_for(area.0, area.1, shape),
+    }
 }
 
 /// Switches the monitor to the exclusive mode (only what differs from its
@@ -659,6 +754,13 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             if (vk == VK_RETURN && alt) || vk == VK_F11 {
                 if !repeat {
                     unsafe { toggle_full(hwnd) };
+                }
+                return 0;
+            }
+            // F10 opens the PC settings (not game input).
+            if vk == VK_F10 {
+                if !repeat {
+                    crate::pc_menu::request_open();
                 }
                 return 0;
             }

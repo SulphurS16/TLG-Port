@@ -115,29 +115,43 @@ const LOADBUFFER_CALLS: [usize; 3] = [0xd4fe8e, 0xe7e37f, 0xec24bc];
 
 pub fn apply(p: &mut Patcher, name: &str) {
     patch_gaprint(p, name);
-    // (Script loads pass through tlg where scripts are fixed for frame rates
-    // above the game's own, or logged: at the game's 30 fps nothing changes.)
-    let fixes = crate::hle::libs::videoout::frame_cap() != crate::config::FrameCap::Game;
-    if fixes || crate::script_fixes::log_loads() {
-        match patch_script_loads(p) {
-            Ok(()) => crate::info!("scripts: loads at {name}+{LOADBUFFER:#x} pass through tlg ({})", if fixes { "frame-counted timers made time-based" } else { "logged" }),
-            Err(e) => crate::warn!("scripts: {name}: {e}; the scripts' frame-counted timers stay frame-counted"),
-        }
+    // (Script loads pass through tlg: the port's own script joins the game's
+    // utils.lua, and the scripts' frame-counted timers get their fixes for
+    // frame rates above 30, idle while the limit is the game's 30 fps - the
+    // limit can change while the game runs.)
+    set_frame_steps(crate::hle::libs::videoout::frame_cap() != crate::config::FrameCap::Game);
+    match patch_script_loads(p) {
+        Ok(()) => crate::info!("scripts: loads at {name}+{LOADBUFFER:#x} pass through tlg (the port's script; frame-counted timers time-based above 30 fps)"),
+        Err(e) => crate::warn!("scripts: {name}: {e}; no PC settings in the game, and the scripts' frame-counted timers stay frame-counted"),
     }
     // (Debug: TLG_FRAME_STEPS=0 keeps them at 1/30 s per frame.)
-    if fixes && !std::env::var("TLG_FRAME_STEPS").is_ok_and(|v| v == "0") {
+    if !std::env::var("TLG_FRAME_STEPS").is_ok_and(|v| v == "0") {
         match patch_frame_steps(p) {
-            Ok(()) => crate::info!("frame steps: the environment shaders' phases ({name}+{:#x}) and particle emission (+{:#x}) advance by the frame's time, not 1/30 s per frame", ENV_PHASE.0, PARTICLE_EMIT.0),
+            Ok(()) => crate::info!("frame steps: above 30 fps the environment shaders' phases ({name}+{:#x}) and particle emission (+{:#x}) advance by the frame's time, not 1/30 s per frame", ENV_PHASE.0, PARTICLE_EMIT.0),
             Err(e) => crate::warn!("frame steps: {name}: {e}; they advance 1/30 s per frame"),
         }
     }
     let (w, h) = crate::gpu::vk::window::render_size();
+    // (A picture wider or taller than 16:9: the game's interface keeps a
+    // 16:9 area in its middle.)
+    crate::gpu::UI_NOT_16_9.store(w * 9 != h * 16, Ordering::Relaxed);
+    crate::gpu::RENDER_SIZE.store((w as u64) << 32 | h as u64, Ordering::Relaxed);
     match patch_render_size(p, w, h) {
         Ok(heap) => {
-            let more = if heap { "; graphics heap +512 MB (the PS4 Pro's)" } else { "" };
+            let more = heap.map_or(String::new(), |s| format!("; graphics heap {} MB (+{} MB; the PS4 Pro's {} MB)", s >> 20, (s - HEAP_BASE) >> 20, HEAP_PRO >> 20));
             crate::info!("render resolution: {w}x{h} (the game's display mode, {name}+{MODE_TABLE:#x}){more}");
         }
         Err(e) => crate::warn!("render resolution: {name}: {e}; the game renders 1920x1080"),
+    }
+    // (At 16:9 too: the hook also notes the render camera for the
+    // upscalers, `render_camera`.)
+    if !std::env::var("TLG_VIEW_SHAPE").is_ok_and(|v| v == "0") {
+        match patch_view_shape(p, w, h) {
+            Ok((fx, fy)) if w * 9 != h * 16 => crate::info!("view shape: {w}x{h} shows the game's 16:9 views whole (projection at {name}+{:#x}: horizontal x{fx:.4}, vertical x{fy:.4})", PROJ_SITE.0),
+            Ok(_) => crate::info!("view shape: 16:9 (the projection hook at {name}+{:#x} notes the render camera only)", PROJ_SITE.0),
+            Err(e) if w * 9 != h * 16 => crate::warn!("view shape: {name}: {e}; the 16:9 views are stretched to {w}x{h}"),
+            Err(e) => crate::warn!("view shape: {name}: {e}; no render camera for the upscalers"),
+        }
     }
     match patch_kick_wait(p) {
         Ok(()) => crate::info!("render-kick wait: busy loop at {name}+{KICK_SITE:#x} detoured to a polling wait"),
@@ -161,6 +175,14 @@ pub fn apply(p: &mut Patcher, name: &str) {
         }
         Err(e) if sixty => crate::warn!("time step: {name}: {e}; 60 fps unavailable (the game's own limit applies)"),
         Err(e) => crate::info!("time step: {name}: {e} (60 fps would be unavailable)"),
+    }
+    crate::menu_patches::apply(p, name);
+    crate::pc_prompts::apply(p, name);
+    if crate::config::settings().pc.get("skip_intro").is_some_and(|v| v == "on") {
+        match patch_logos(p) {
+            Ok(()) => crate::info!("intro: the SIE and Japan Studio logos skipped (PC Settings; {name}+{LOGO_SITE:#x})"),
+            Err(e) => crate::warn!("intro: {name}: {e}; the logos show"),
+        }
     }
     if !std::env::var("TLG_MOUSE_CAMERA").is_ok_and(|v| v == "0") {
         match patch_mouse_camera(p) {
@@ -191,16 +213,142 @@ const HEAP_SITES: [(usize, [u8; 4]); 5] = [
     (0xdd3bf7, [0x4D, 0x0F, 0x44, 0xEF]),
     (0xdd3c22, [0x49, 0x0F, 0x44, 0xCF]),
 ];
-const HEAP_EXTRA: u64 = 0x2000_0000;
+/// The Neo size: `lea r13, [r15 + 0x20000000]` (eboot 0xdd3a8c), the base
+/// size in r15 plus this displacement.
+const HEAP_NEO_LEA: usize = 0xdd3a8c;
+const HEAP_NEO_LEA_BYTES: [u8; 7] = [0x4D, 0x8D, 0xAF, 0x00, 0x00, 0x00, 0x20];
+const HEAP_BASE: u64 = 0xb000_0000;
+const HEAP_PRO: u64 = 0xd000_0000;
+/// The largest heap given (4,032 MB, what 3840x2160 needs; the Pro's size
+/// already exceeds a signed 32-bit size, so the game's arithmetic takes
+/// sizes below 4 GiB).
+const HEAP_MAX: u64 = 0xfc00_0000;
+/// Graphics-heap bytes the game's render targets take per pixel of its
+/// render size: at boot 466 MB at 1920x1080 and 1,138 MB at 3840x2160
+/// (runs 20261015-162327, 20261106-114511), ~108 bytes per pixel.
+const TARGET_BYTES_PER_PIXEL: u64 = 108;
+
+/// The heap for a display mode of `pixels`: the PS4 Pro's size plus the
+/// render targets' growth above 1080p, so the game keeps the headroom a
+/// 1080p Pro has. At 3840x2160 the Pro's own size left less than the base
+/// PS4 had at 1080p: 91% of it in use after loading the Canyon's start
+/// from a save (run 20261106-114931); played out of the cave, with the
+/// cave still loaded, a texture's creation failed and the game crashed on
+/// its own error path (GitHub issue #10: launch_tricom+0x20654b in
+/// JsCreateTextureFromFile, the texture pointer null + 0x70).
+fn heap_size(pixels: u64) -> u64 {
+    let more = pixels.saturating_sub(1920 * 1080) * TARGET_BYTES_PER_PIXEL;
+    (HEAP_PRO + more.div_ceil(64 << 20) * (64 << 20)).min(HEAP_MAX)
+}
+
+/// The cameras' projection (eboot 0xde04fd: the perspective path of the
+/// camera's matrix update, every view's): m00 = 1 / tan(fov / 2) - the
+/// field of view ([cam+0x400], degrees) is horizontal - and m11 = m00 *
+/// aspect ([cam+0x414], 16:9 for the game's views). Here m00 is in xmm10
+/// and m11 in xmm8, both stored next (m00 here and again at 0xde0604, m11
+/// at 0xde059d and, plus the lens shift, at 0xde0650); the view-projection
+/// matrices and the culling planes follow from them.
+const PROJ_SITE: (usize, &[u8]) = (0xde058d, &[0xC5, 0x7A, 0x11, 0x93, 0x40, 0x02, 0x00, 0x00]); // vmovss [rbx+240h],xmm10
+/// m11 = m00 * aspect, just before (the aspect from [rsp+160h]).
+const PROJ_M11: (usize, &[u8]) = (0xde0584, &[0xC5, 0x2A, 0x59, 0x84, 0x24, 0x60, 0x01, 0x00, 0x00]); // vmulss xmm8,xmm10,[rsp+160h]
+/// The game's 16:9 views: aspect 1.7777778 (f32 0x3FE38E39); any between
+/// 1.76 and 1.80 counts (positive floats order as their bits).
+const ASPECT_LOW: u32 = 0x3FE1_47AE;
+const ASPECT_HIGH: u32 = 0x3FE6_6666;
+
+/// The scales of the projection's horizontal and vertical terms for a
+/// `w` x `h` picture: the game's 16:9 view fits inside it - a wider picture
+/// shows more to the sides (the height seen stays), a taller one more above
+/// and below (the width seen stays). (1, 1) at 16:9.
+pub fn view_scales(w: u32, h: u32) -> (f32, f32) {
+    let (a, base) = (w as f64 / h.max(1) as f64, 16.0 / 9.0);
+    if w * 9 == h * 16 {
+        (1.0, 1.0)
+    } else if a > base {
+        ((base / a) as f32, 1.0)
+    } else {
+        (1.0, (a / base) as f32)
+    }
+}
+
+/// The data slot of the projection hook (`patch_view_shape`): the scales,
+/// then the render camera of the last 16:9 view built (0 before).
+static RENDER_CAM: AtomicU64 = AtomicU64::new(0);
+
+/// The game's render camera of its last 16:9 view, as the upscalers want
+/// it: near and far plane and the vertical field of view (radians). Err:
+/// why not (before the first view, without the hook, unexpected values).
+pub fn render_camera() -> Result<(f32, f32, f32), String> {
+    let slot = RENDER_CAM.load(Ordering::Relaxed);
+    if slot == 0 {
+        return Err("no projection hook".into());
+    }
+    // SAFETY: the hook's data slot (16 bytes, the pointer at +8) and the
+    // camera object in guest memory (checked).
+    let cam = unsafe { std::ptr::read_volatile((slot + 8) as *const u64) };
+    if cam == 0 || !crate::mem::is_guest(cam + 0x400, 0x20) {
+        return Err(format!("no render camera yet ({cam:#x})"));
+    }
+    let f = |o: u64| unsafe { std::ptr::read_volatile((cam + o) as *const f32) };
+    // (+0x400 the horizontal field of view in degrees - 70 in the cave -,
+    // +0x414 the aspect, +0x418 and +0x41c the near and far planes - 0.1
+    // and 2000 there: the projection builder's inputs.)
+    let (hfov, aspect, near, far) = (f(0x400), f(0x414), f(0x418), f(0x41c));
+    if !(hfov > 1.0 && hfov < 179.0 && aspect > 0.1 && near > 0.0 && far > near) {
+        return Err(format!("unexpected values at {cam:#x}: field of view {hfov}, aspect {aspect}, near {near}, far {far}"));
+    }
+    Ok((near, far, 2.0 * ((hfov.to_radians() * 0.5).tan() / aspect).atan()))
+}
+
+/// Pictures that are not 16:9 (PC Settings `aspect_ratio`): each 16:9
+/// view's projection (camera aspect 16:9: the game's own views; others,
+/// such as square shadow views, stay) scaled by `view_scales`. The game's
+/// fields of view, aspect and focal lengths stay as they are, so its
+/// scripts, depth of field and level of detail see the PS4's values. At
+/// 16:9 the scales are 1; either way the hook keeps the render camera of
+/// the last 16:9 view (`render_camera`).
+fn patch_view_shape(p: &mut Patcher, w: u32, h: u32) -> Result<(f32, f32), String> {
+    use iced_x86::code_asm::*;
+    let (fx, fy) = view_scales(w, h);
+    if p.image.get(PROJ_M11.0..PROJ_M11.0 + PROJ_M11.1.len()) != Some(PROJ_M11.1) {
+        return Err(format!("unexpected code at +{:#x} (not update 01.03?)", PROJ_M11.0));
+    }
+    let data: Vec<u8> = [&fx.to_le_bytes()[..], &fy.to_le_bytes()[..], &0u64.to_le_bytes()[..]].concat();
+    let slot = p.alloc_data(&data).ok_or("no data space")?;
+    let next = p.base + (PROJ_SITE.0 + PROJ_SITE.1.len()) as u64;
+    // (Flags are dead here: the next use follows a compare at 0xde06a1.)
+    p.detour(PROJ_SITE.0, PROJ_SITE.1, |a, ins| {
+        let mut skip = a.create_label();
+        a.lea(rsp, ptr(rsp - 128))?;
+        a.push(rax)?;
+        a.mov(eax, dword_ptr(rbx + 0x414))?;
+        a.sub(eax, ASPECT_LOW as i32)?;
+        a.cmp(eax, (ASPECT_HIGH - ASPECT_LOW) as i32)?;
+        a.ja(skip)?;
+        a.mov(rax, slot)?;
+        a.mov(qword_ptr(rax + 8), rbx)?;
+        a.vmulss(xmm10, xmm10, dword_ptr(rax))?;
+        a.vmulss(xmm8, xmm8, dword_ptr(rax + 4))?;
+        a.set_label(&mut skip)?;
+        a.pop(rax)?;
+        a.lea(rsp, ptr(rsp + 128))?;
+        a.add_instruction(*ins)?;
+        a.jmp(next)
+    })?;
+    RENDER_CAM.store(slot, Ordering::Relaxed);
+    Ok((fx, fy))
+}
 
 /// Sets the game's display mode to render and show `w` x `h`, and gives it
-/// the PS4 Pro's graphics heap, as a PS4 Pro does at any output: the base
-/// size ran out where the game, played into the ending's last cutscene,
-/// loads it over the area before (Gomalloc "Garlic: Out of Memory", "vram
-/// allocation failed! wait for 10 secs...", then a crash in its loader at
-/// launch_tricom+0x1476321; GitHub issue #7: all 2816 MB in use). Returns
-/// whether the heap grew (`TLG_PRO_HEAP=0` keeps the base size).
-fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<bool, String> {
+/// at least the PS4 Pro's graphics heap, as a PS4 Pro does at any output:
+/// the base size ran out where the game, played into the ending's last
+/// cutscene, loads it over the area before (Gomalloc "Garlic: Out of
+/// Memory", "vram allocation failed! wait for 10 secs...", then a crash in
+/// its loader at launch_tricom+0x1476321; GitHub issue #7: all 2816 MB in
+/// use); above 1080p it grows with the render targets (`heap_size`).
+/// Returns the heap's size in bytes when it grew (`TLG_PRO_HEAP=0` keeps
+/// the base size).
+fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<Option<u64>, String> {
     if !(64..=8192).contains(&w) || !(64..=8192).contains(&h) {
         return Err(format!("{w}x{h} is out of range"));
     }
@@ -208,19 +356,40 @@ fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<bool, String> {
         return Err("not the expected executable (display-mode table differs)".into());
     }
     let heap = !std::env::var("TLG_PRO_HEAP").is_ok_and(|v| v == "0");
-    if heap && HEAP_SITES.iter().any(|(off, b)| p.image.get(*off..*off + 4) != Some(&b[..])) {
+    if heap && (HEAP_SITES.iter().any(|(off, b)| p.image.get(*off..*off + 4) != Some(&b[..])) || p.image.get(HEAP_NEO_LEA..HEAP_NEO_LEA + 7) != Some(&HEAP_NEO_LEA_BYTES[..])) {
         return Err("not the expected executable (graphics heap code differs)".into());
     }
     let v = (w | h << 16).to_le_bytes();
-    p.image[MODE_TABLE..MODE_TABLE + 4].copy_from_slice(&v);
-    p.image[MODE_TABLE + 4..MODE_TABLE + 8].copy_from_slice(&v);
-    if heap {
-        for (off, _) in HEAP_SITES {
-            p.image[off..off + 4].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]); // nop: the Neo size stays
-        }
-        crate::mem::add_dmem(HEAP_EXTRA);
+    // The game's inner render size: upscaling (`upscale::render_scale`) or
+    // TLG_INNER_SIZE=WxH; the game then scales its finished picture up to the
+    // output in one draw (the upscaler's place: render.rs `upscale_hook`).
+    let scale = crate::gpu::upscale::render_scale();
+    let inner = std::env::var("TLG_INNER_SIZE")
+        .ok()
+        .and_then(|s| {
+            let (a, b) = s.split_once('x')?;
+            Some((a.trim().parse::<u32>().ok()?, b.trim().parse::<u32>().ok()?))
+        })
+        .or_else(|| (scale < 1.0).then(|| (((w as f32 * scale / 2.0).round() as u32 * 2).max(64), ((h as f32 * scale / 2.0).round() as u32 * 2).max(64))));
+    if let Some((iw, ih)) = inner {
+        crate::gpu::SCENE_SIZE.store((iw as u64) << 32 | ih as u64, Ordering::Relaxed);
+        crate::info!("upscaling: the game renders {iw}x{ih} and scales it to {w}x{h} (render scale {:.2}, texture LOD bias {:.2})", iw as f32 / w as f32, crate::gpu::upscale::mip_bias());
     }
-    Ok(heap)
+    let r = inner.map_or(v, |(iw, ih)| (iw | ih << 16).to_le_bytes());
+    p.image[MODE_TABLE..MODE_TABLE + 4].copy_from_slice(&r);
+    p.image[MODE_TABLE + 4..MODE_TABLE + 8].copy_from_slice(&v);
+    if !heap {
+        return Ok(None);
+    }
+    for (off, _) in HEAP_SITES {
+        p.image[off..off + 4].copy_from_slice(&[0x0F, 0x1F, 0x40, 0x00]); // nop: the Neo size stays
+    }
+    let px = |b: [u8; 4]| u32::from_le_bytes(b) as u64 & 0xffff;
+    let pixels = (px(r) * (u32::from_le_bytes(r) as u64 >> 16)).max(px(v) * (u32::from_le_bytes(v) as u64 >> 16));
+    let size = heap_size(pixels);
+    p.image[HEAP_NEO_LEA + 3..HEAP_NEO_LEA + 7].copy_from_slice(&((size - HEAP_BASE) as u32).to_le_bytes());
+    crate::mem::add_dmem(size - HEAP_BASE);
+    Ok(Some(size))
 }
 
 /// The title's frame time step (eboot 0xd16480, called by the frame update
@@ -735,6 +904,24 @@ fn patch_foot_pins(p: &mut Patcher) -> Result<(), String> {
     Ok(())
 }
 
+/// The game's symbol table: 32-byte entries, the name's pointer first.
+const SYMBOLS: u64 = 0x1716230;
+
+/// A symbol's name (the game's symbol table).
+pub fn symbol_name(id: u32) -> String {
+    let b = BASE.load(Ordering::Relaxed);
+    if b == 0 || id == 0 || id > 0x10_0000 {
+        return format!("#{id}");
+    }
+    let e = b + SYMBOLS + id as u64 * 32;
+    if !crate::mem::is_guest(e, 8) {
+        return format!("#{id}");
+    }
+    // SAFETY: the symbol table's entry (guest memory checked).
+    let s = unsafe { *(e as *const u64) };
+    if s == 0 { format!("#{id}") } else { unsafe { cstr(s, 128) } }
+}
+
 /// Foot-pin lookups that found no skeleton (`patch_foot_pins`), if patched.
 pub fn foot_pin_misses() -> Option<u64> {
     let slot = PINS_COUNT.load(Ordering::Relaxed);
@@ -754,6 +941,16 @@ const APP_STEP: i32 = 0x19c;
 const ENV_PHASE: (usize, &[u8], usize) = (0xe0f07b, &[0xC5, 0xF2, 0x59, 0x0D, 0xC9, 0x2A, 0x6E, 0x00], 0x14f1b4c); // vmulss xmm1,xmm1,[1/30]
 const PARTICLE_EMIT: (usize, &[u8], usize) = (0xbcb5c9, &[0xC5, 0xFA, 0x10, 0x05, 0xCB, 0x5A, 0x92, 0x00], 0x14f109c); // vmovss xmm0,[1/30]
 
+/// Whether the frame-step detours take the frame's step (1) or the game's
+/// 1/30 s (0: the frame-rate limit is the game's own).
+static FRAME_STEPS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// The frame-rate limit changed: above 30 fps the environment phases and
+/// particle emission follow the frame's time, at 30 the game's 1/30 s.
+pub fn set_frame_steps(on: bool) {
+    FRAME_STEPS.store(on as u8, Ordering::Relaxed);
+}
+
 fn patch_frame_steps(p: &mut Patcher) -> Result<(), String> {
     use iced_x86::code_asm::*;
     let third = (1.0f32 / 30.0).to_le_bytes();
@@ -771,6 +968,9 @@ fn patch_frame_steps(p: &mut Patcher) -> Result<(), String> {
         a.lea(rsp, ptr(rsp - 128))?;
         a.pushfq()?;
         a.push(rax)?;
+        a.mov(rax, &FRAME_STEPS as *const _ as u64)?;
+        a.cmp(byte_ptr(rax), 0)?;
+        a.je(none)?;
         a.mov(rax, base + APP_PTR)?;
         a.mov(rax, qword_ptr(rax))?;
         a.test(rax, rax)?;
@@ -788,6 +988,28 @@ fn patch_frame_steps(p: &mut Patcher) -> Result<(), String> {
     };
     p.detour(ENV_PHASE.0, ENV_PHASE.1, |a, _| with_step(a, ENV_PHASE, &|a, m| a.vmulss(xmm1, xmm1, m)))?;
     p.detour(PARTICLE_EMIT.0, PARTICLE_EMIT.1, |a, _| with_step(a, PARTICLE_EMIT, &|a, m| a.vmovss(xmm0, m)))?;
+    Ok(())
+}
+
+/// The boot sequence's logo loop (eboot 0x231f21, `lea r13, [rsp+5F8h]`,
+/// right after its table of logos is built on the stack: entries of 0x1C
+/// bytes from rsp+0x6F0, each starting with its "shown" flag - the SIE
+/// logo's at rsp+0x728, Japan Studio's at rsp+0x744).
+const LOGO_SITE: usize = 0x231f21;
+const LOGO_BYTES: [u8; 8] = [0x4C, 0x8D, 0xAC, 0x24, 0xF8, 0x05, 0x00, 0x00];
+
+/// PC Settings `skip_intro`: the boot sequence shows neither logo (the
+/// title screen and the game's own boot steps stay).
+fn patch_logos(p: &mut Patcher) -> Result<(), String> {
+    use iced_x86::code_asm::*;
+    let base = p.base;
+    p.detour(LOGO_SITE, &LOGO_BYTES, |a, ins| {
+        // (Flags are set again after the site; rsp as the code has it.)
+        a.mov(dword_ptr(rsp + 0x728), 0)?;
+        a.mov(dword_ptr(rsp + 0x744), 0)?;
+        a.add_instruction(*ins)?;
+        a.jmp(base + (LOGO_SITE + LOGO_BYTES.len()) as u64)
+    })?;
     Ok(())
 }
 
@@ -851,21 +1073,47 @@ unsafe fn cstr(p: u64, max: usize) -> String {
     String::from_utf8_lossy(&v).into_owned()
 }
 
-/// Logs the string forms of the call's arguments.
-unsafe fn lua_print(l: u64) {
+/// Havok Script's `lua_pushlstring(lua_State*, const char*, size_t)` (as
+/// the game's `GameMenu_GetResult` binding uses it) and its prologue.
+const PUSHLSTRING: u64 = 0xd505e0;
+const PUSHLSTRING_BYTES: [u8; 8] = [0x55, 0x48, 0x89, 0xE5, 0x41, 0x56, 0x53, 0x48];
+
+/// Logs the string forms of the call's arguments; a request of the port's
+/// script (`pc_menu::MARKER` first) is answered instead: the answers joined
+/// by U+001F into one string, pushed once (pc_menu.lua's `call` splits it).
+/// One push only: a C function may use just the few stack slots Lua
+/// guarantees it, and pushing each answer (a page's rows are 180 values)
+/// ran past the script stack into the heap - the Achievements page with
+/// the trophies' names crashed the game in a table lookup.
+unsafe fn lua_print(l: u64) -> i32 {
     let base_mod = BASE.load(Ordering::Relaxed);
     if base_mod == 0 || !crate::mem::is_guest(l, 0x60) {
-        return;
+        return 0;
     }
     // lua_State: stack top at +0x48, the call's first argument at +0x50; 16-byte TValues.
     let (top, base) = unsafe { (*((l + 0x48) as *const u64), *((l + 0x50) as *const u64)) };
     if top < base || top - base > 32 * 16 || !crate::mem::is_guest(base, (top - base).max(1)) {
-        return;
+        return 0;
     }
     let mut parts = Vec::new();
     for i in 0..(top - base) / 16 {
         let s = unsafe { crate::hle::call_guest(base_mod + TOLSTRING, &[l, base + i * 16, 0]) };
         parts.push(if s != 0 { unsafe { cstr(s, 2048) } } else { "<?>".to_string() });
+    }
+    if parts.first().is_some_and(|p| p == crate::pc_menu::MARKER) {
+        static PUSH_OK: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        // SAFETY: the module's code (read-only image).
+        let ok = *PUSH_OK.get_or_init(|| unsafe { std::slice::from_raw_parts((base_mod + PUSHLSTRING) as *const u8, 8) } == PUSHLSTRING_BYTES);
+        if !ok {
+            return 0;
+        }
+        let answers = crate::pc_menu::call(&parts[1..]);
+        if answers.is_empty() {
+            return 0;
+        }
+        let joined = join_answers(&answers);
+        unsafe { crate::hle::call_guest(base_mod + PUSHLSTRING, &[l, joined.as_ptr() as u64, joined.len() as u64]) };
+        return 1;
     }
     let text = parts.join(" ");
     note_script(&text);
@@ -873,12 +1121,18 @@ unsafe fn lua_print(l: u64) {
     if *LOG.get_or_init(|| std::env::var("TLG_LUA_LOG").is_ok_and(|v| v == "1")) {
         crate::info!("lua: {text}");
     }
+    0
+}
+
+/// The answers as one string, joined by U+001F (a separator inside an
+/// answer becomes a space).
+fn join_answers(answers: &[String]) -> String {
+    answers.iter().map(|a| a.replace('\u{1f}', " ")).collect::<Vec<_>>().join("\u{1f}")
 }
 
 sysv! {
     fn tlg_lua_print(l: u64) -> i32 {
-        lua_print(l);
-        0
+        lua_print(l)
     }
     fn tlg_lua_loadbuffer(l: u64, opts: u64, text: u64, size: u64, chunk: u64) -> i32 {
         lua_loadbuffer(l, opts, text, size, chunk)
@@ -893,6 +1147,27 @@ sysv! {
 mod tests {
     use super::*;
     use iced_x86::{Decoder, DecoderOptions, FlowControl};
+
+    #[test]
+    fn answers_join() {
+        let a = ["x".to_string(), String::new(), "a\u{1f}b".to_string()];
+        assert_eq!(join_answers(&a), "x\u{1f}\u{1f}a b");
+        assert_eq!(join_answers(&["".to_string()]), "");
+    }
+
+    #[test]
+    fn heap_grows_with_the_render_size() {
+        assert_eq!(heap_size(1280 * 720), HEAP_PRO);
+        assert_eq!(heap_size(1920 * 1080), HEAP_PRO);
+        // 2560x1440: +175 MB of targets, in 64 MB steps.
+        assert_eq!(heap_size(2560 * 1440), HEAP_PRO + (192 << 20));
+        // 3840x2160: +641 MiB -> +704 MiB, the cap.
+        assert_eq!(heap_size(3840 * 2160), HEAP_PRO + (704 << 20));
+        assert_eq!(heap_size(3840 * 2160), HEAP_MAX);
+        assert_eq!(heap_size(7680 * 4320), HEAP_MAX);
+        // The Neo displacement stays a positive 32-bit value.
+        assert!(HEAP_MAX - HEAP_BASE < 0x8000_0000);
+    }
 
     /// Decodes the trampoline a site's `jmp rel32` leads to, up to and
     /// including its final unconditional jump.
@@ -980,6 +1255,45 @@ mod tests {
         let mut p = Patcher { image: &mut image2, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp2, tramp_used: 0, data_used: 0 };
         assert!(patch_frame_steps(&mut p).is_err());
         assert_eq!(p.image[ENV_PHASE.0], 0xC5);
+    }
+
+    #[test]
+    fn view_shape_stub() {
+        assert_eq!(view_scales(1920, 1080), (1.0, 1.0));
+        assert_eq!(view_scales(1360, 764).1, 1.0);
+        let (fx, fy) = view_scales(2560, 1080);
+        assert!((fx - 0.75).abs() < 1e-6 && fy == 1.0, "{fx} {fy}");
+        let (fx, fy) = view_scales(1920, 1200);
+        assert!(fx == 1.0 && (fy - 0.9).abs() < 1e-6, "{fx} {fy}");
+        let base = 0x6000_0000u64;
+        let mut image = vec![0x90u8; 0xe0_0000];
+        for (off, b) in [PROJ_SITE, PROJ_M11] {
+            image[off..off + b.len()].copy_from_slice(b);
+        }
+        let mut tramp = vec![0u8; 0x1_0000];
+        let tbase = base + 0x100_0000;
+        {
+            let mut p = Patcher { image: &mut image, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp, tramp_used: 0, data_used: 0 };
+            assert_eq!(patch_view_shape(&mut p, 2560, 1080).unwrap(), view_scales(2560, 1080));
+        }
+        let v = stub(&image, &tramp, base, tbase, PROJ_SITE.0);
+        // The original store last, then back after it; the stack balanced.
+        let last = v.last().unwrap();
+        assert_eq!(last.near_branch_target(), base + (PROJ_SITE.0 + PROJ_SITE.1.len()) as u64);
+        let store = &v[v.len() - 2];
+        assert_eq!(&tramp[(store.ip() - tbase) as usize..][..store.len()], PROJ_SITE.1);
+        let count = |m| v.iter().filter(|i| i.mnemonic() == m).count();
+        assert_eq!(count(iced_x86::Mnemonic::Push), count(iced_x86::Mnemonic::Pop));
+        // Only views of about the game's 16:9 aspect, both terms scaled.
+        let load = v.iter().find(|i| i.mnemonic() == iced_x86::Mnemonic::Mov && i.op1_kind() == iced_x86::OpKind::Memory).unwrap();
+        assert_eq!((load.memory_base(), load.memory_displacement64()), (iced_x86::Register::RBX, 0x414));
+        assert!(ASPECT_LOW < 0x3FE3_8E39 && 0x3FE3_8E39 < ASPECT_HIGH);
+        assert_eq!((f32::from_bits(ASPECT_LOW), f32::from_bits(ASPECT_HIGH)), (1.76, 1.8));
+        assert_eq!(count(iced_x86::Mnemonic::Vmulss), 2);
+        // A different executable: refused.
+        image[PROJ_M11.0] = 0x90;
+        let mut p = Patcher { image: &mut image, base, tls_slot_disp: 0, tramp_base: tbase, tramp: &mut tramp, tramp_used: 0, data_used: 0 };
+        assert!(patch_view_shape(&mut p, 2560, 1080).is_err());
     }
 
     #[test]

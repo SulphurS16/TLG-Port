@@ -140,6 +140,8 @@ pub fn frame_cap() -> crate::config::FrameCap {
 fn flip_rate_in_force(rate: u32) -> Option<u32> {
     use crate::config::FrameCap;
     let cap = frame_cap();
+    // (Above 30 fps the frame-step detours follow the frame's time.)
+    crate::title_patches::set_frame_steps(cap != FrameCap::Game);
     let sixty = cap == FrameCap::Fps60 && crate::title_patches::set_step_60(true);
     if !sixty {
         crate::title_patches::set_step_60(false);
@@ -322,6 +324,14 @@ pub fn wait_flip_done(handle: i32, index: i32) {
     }
 }
 
+/// The display buffers' addresses (for the renderer: draws into them are
+/// the picture's last steps and the game's 2D interface).
+static DISPLAY_ADDRS: [std::sync::atomic::AtomicU64; 16] = [const { std::sync::atomic::AtomicU64::new(0) }; 16];
+
+pub fn is_display_buffer(addr: u64) -> bool {
+    addr != 0 && DISPLAY_ADDRS.iter().any(|a| a.load(std::sync::atomic::Ordering::Relaxed) == addr)
+}
+
 pub fn display_buffer(index: i32) -> Option<DisplayBuffer> {
     PORT.lock().as_ref().and_then(|p| p.buffers.get(index as usize).copied().flatten())
 }
@@ -386,6 +396,7 @@ sysv! {
         };
         for i in 0..num as usize {
             p.buffers[start as usize + i] = Some(DisplayBuffer { addr: *addrs.add(i), attr: a, group: p.groups as i32 });
+            DISPLAY_ADDRS[start as usize + i].store(*addrs.add(i), std::sync::atomic::Ordering::Relaxed);
         }
         let group = p.groups;
         p.groups += 1;
@@ -591,6 +602,9 @@ fn present_buffer(b: &DisplayBuffer) -> Option<(Duration, Duration, Option<crate
 /// TLG_SCREENSHOT=n1,n2,... writes the displayed image of those flips as PNG.
 /// Screenshot requested through the control channel (file name stem).
 pub static SHOT_REQUEST: Mutex<Option<String>> = Mutex::new(None);
+/// A series of screenshots of consecutive flips (`shots <name> <n>`): file
+/// name stem, shots left, the next one's number.
+pub static SHOT_SERIES: Mutex<Option<(String, u32, u32)>> = Mutex::new(None);
 /// Screenshot of the image a given GPU frame displays (`traceshot`): frame
 /// number (as tagged on its flip) and file name stem.
 pub static SHOT_FRAME: Mutex<Option<(u64, String)>> = Mutex::new(None);
@@ -609,7 +623,18 @@ fn maybe_screenshot(b: &DisplayBuffer, flip: u64, frame: u64) {
             _ => None,
         }
     }
-    .or_else(|| SHOT_REQUEST.lock().take());
+    .or_else(|| SHOT_REQUEST.lock().take())
+    .or_else(|| {
+        let mut g = SHOT_SERIES.lock();
+        let (name, left, next) = g.as_mut()?;
+        let n = format!("{name}_{next}");
+        *left -= 1;
+        *next += 1;
+        if *left == 0 {
+            *g = None;
+        }
+        Some(n)
+    });
     let listed = std::env::var("TLG_SCREENSHOT").is_ok_and(|list| list.split(',').any(|s| s.trim().parse::<u64>().ok() == Some(flip)));
     if requested.is_none() && !listed {
         return;

@@ -1,7 +1,9 @@
 //! Game files page: the game folder (01.00) and the update folder (01.03),
 //! checked when chosen; the settings keep them once they pass. Folders inside
 //! another version's folder (they would go with it) can move into this
-//! version's (Move here). The game's language.
+//! version's (Move here). The game's language. The player's PS4 trophy key
+//! (optional: the trophies' names in the game), checked against the game's
+//! trophy file and kept in trophy-key.txt (tlg_config::trophy).
 
 use crate::files;
 use crate::ui::{self, Builder};
@@ -19,6 +21,8 @@ const ID_UPDATE_DIR: i32 = 132;
 const ID_CHECK: i32 = 140;
 const ID_MOVE: i32 = 141;
 const ID_LANGUAGE: i32 = 150;
+const ID_TROPHY_KEY: i32 = 160;
+const ID_TROPHY_SAVE: i32 = 161;
 
 #[derive(Default)]
 pub struct Page {
@@ -29,6 +33,7 @@ pub struct Page {
     /// The languages the combo lists, in its order.
     languages: Vec<Language>,
     move_here: usize,
+    trophy_key: usize,
     /// Whether the folders in the settings passed the check.
     pub ok: bool,
     /// Another version's folder that holds the game folders.
@@ -76,6 +81,17 @@ pub fn build(app: &mut App) {
         app.put(0, b.label("Language:", r, -1), r, false);
         let r = (140, 440, 260, 200);
         app.game.language = app.put(0, b.combo(r, ID_LANGUAGE), r, false) as usize;
+        let r = (16, 481, 120, 20);
+        app.put(0, b.label("Trophy key:", r, -1), r, false);
+        let key = tlg_config::trophy::read_key(&app.paths.user).map(|k| tlg_config::trophy::key_text(&k)).unwrap_or_default();
+        let r = (140, 478, 520, 24);
+        let e = app.put(0, b.edit(&key, r, ID_TROPHY_KEY), r, false);
+        app.game.trophy_key = e as usize;
+        // (EM_SETCUEBANNER: the hint while the field is empty.)
+        let hint = ui::wide("Optional: your PS4 trophy key (32 hex digits) shows the trophies' names");
+        windows_sys::Win32::UI::WindowsAndMessaging::SendMessageW(e, 0x1501, 0, hint.as_ptr() as isize);
+        let r = (668, 477, 96, 26);
+        app.put(0, b.button("Save key", r, ID_TROPHY_SAVE), r, false);
     }
     fill_languages(app, g.as_deref());
     match g {
@@ -201,9 +217,49 @@ fn check_fields(app: &mut App) {
     check(app, Path::new(&game), update.as_deref(), true);
 }
 
+/// Saves the trophy key in the field (an empty field removes it), after a
+/// check against the trophy file in the game folders when they are set.
+fn save_trophy_key(app: &mut App) {
+    use tlg_config::trophy;
+    let text = unsafe { ui::get_text(h(app.game.trophy_key)) };
+    if text.trim().is_empty() {
+        let p = trophy::key_path(&app.paths.user);
+        if p.is_file() && std::fs::remove_file(&p).is_ok() {
+            app.set_status("Trophy key removed: the game numbers the trophies.");
+        } else {
+            app.set_status("Paste your PS4 trophy key (32 hexadecimal digits), then click Save key.");
+        }
+        return;
+    }
+    let Some(key) = trophy::parse_key(&text) else {
+        app.set_status("That is not a trophy key: it is 32 hexadecimal digits (0-9, A-F).");
+        return;
+    };
+    // (The folders in the settings, else the default ones the game also
+    // looks in - the update folder first.)
+    let dirs: Vec<PathBuf> = match &app.settings.game_dir {
+        Some(g) => [app.settings.update_dir.clone(), Some(g.clone())].into_iter().flatten().collect(),
+        None => [app.paths.default_update(), app.paths.default_base()].into_iter().filter(|d| d.join("eboot.bin").is_file()).collect(),
+    };
+    let dirs: Vec<&Path> = dirs.iter().map(PathBuf::as_path).collect();
+    let checked = if dirs.is_empty() { Ok(None) } else { trophy::check_key(&dirs, &key).map(Some) };
+    match checked.and_then(|id| trophy::write_key(&app.paths.user, &key).map(|_| id).map_err(|e| format!("Could not save it: {e}"))) {
+        Ok(Some(_)) => {
+            unsafe { ui::set_text(h(app.game.trophy_key), &trophy::key_text(&key)) };
+            app.set_status("Trophy key saved: the trophies have their names in the game (PC Settings > Achievements).");
+        }
+        Ok(None) => {
+            unsafe { ui::set_text(h(app.game.trophy_key), &trophy::key_text(&key)) };
+            app.set_status("Trophy key saved; the game checks it against its trophies when it starts.");
+        }
+        Err(e) => app.set_status(&format!("Trophy key not saved: {e}")),
+    }
+}
+
 pub fn command(app: &mut App, id: i32, code: u32) {
     match (id, code) {
         (ID_CHECK, 0) => check_fields(app),
+        (ID_TROPHY_SAVE, 0) => save_trophy_key(app),
         (ID_MOVE, 0) => move_here(app),
         // (CBN_SELCHANGE)
         (ID_LANGUAGE, 1) => {
