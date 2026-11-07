@@ -339,7 +339,7 @@ pub const PC: &[(&str, &str, &str)] = &[
     ("upscaler", "off", "off|dlss|xess|fsr"),
     ("upscaling", "off", "off|quality|balanced|performance|ultra_performance"),
     ("sharpening", "100", "0-200"),
-    ("shadows", "ps4", "low|ps4|high|ultra"),
+    ("shadows", "ps4", "low|ps4|high"),
     ("texture_filtering", "4x", "2x|4x|8x|16x"),
     ("ambient_occlusion", "half", "off|half|full"),
     ("reflections", "on", "on|off"),
@@ -531,7 +531,7 @@ upscaler = off
 upscaling = off
 # Sharpening, 0-200 (% of the game's own).
 sharpening = 100
-# Shadows: low, ps4 (as on a PS4), high or ultra.
+# Shadows: low, ps4 (as on a PS4) or high (at the next start).
 shadows = ps4
 # Texture filtering: 2x, 4x (as on a PS4), 8x or 16x anisotropic.
 texture_filtering = 4x
@@ -702,9 +702,12 @@ impl Settings {
                     None => errs.push(bad("on or off")),
                 },
                 _ => match pc_entry(&k) {
-                    // (Text values as written; the others in lower case.)
+                    // (Text values as written; the others in lower case.
+                    // 0.8.0's Ultra shadows are High: its map did not fit
+                    // the game's graphics memory - GitHub issue #12.)
                     Some(&(name, _, spec)) => {
                         let v = if spec == "*" { v.to_string() } else { lv.clone() };
+                        let v = if name == "shadows" && v == "ultra" { "high".to_string() } else { v };
                         if pc_value_ok(spec, &v) {
                             s.pc.insert(name, v);
                         } else {
@@ -925,6 +928,7 @@ speakers = 9.1
 ");
         assert_eq!(s.pc["sharpening"], "150");
         assert_eq!(s.pc["shadows"], "high");
+        assert_eq!(Settings::parse("shadows = Ultra").0.pc["shadows"], "high");
         assert_eq!(s.pc["audio_device"], "Speakers (Realtek #2)");
         assert_eq!((s.pc["hud_size"].as_str(), s.pc["speakers"].as_str()), ("100", "auto"));
         assert_eq!(errs.len(), 2, "{errs:?}");

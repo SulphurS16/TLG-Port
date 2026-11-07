@@ -82,7 +82,7 @@
 
 use crate::patch::Patcher;
 use crate::sysv;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// The title's own measured frame time, where a patch exposes it.
 pub fn guest_frame_ms() -> Option<f32> {
@@ -241,6 +241,43 @@ fn heap_size(pixels: u64) -> u64 {
     (HEAP_PRO + more.div_ceil(64 << 20) * (64 << 20)).min(HEAP_MAX)
 }
 
+/// The Shadows setting's shadow map size (the game's `_rcfg.shadowMapSize`:
+/// one 32-bit depth map, 2048 on the PS4). 0.8.0's Ultra (8192, a 256 MB
+/// map) is gone: the game's allocator (Gomalloc's Garlic heap, ~44 KB
+/// chunks) seldom keeps a free run that long - resized in play it failed
+/// with 82 MB the largest block, set at start a 64 MB load of the cave
+/// failed after it (largest block 58 MB with 40% of the heap in use), and
+/// either way the game crashed at launch_tricom+0x1476321 after its 10 s
+/// of retries (GitHub issue #12; #7's crash). A setting of `ultra` is High.
+pub fn shadow_map_size(setting: &str) -> u32 {
+    match setting {
+        "low" => 1024,
+        "high" | "ultra" => 4096,
+        _ => 2048,
+    }
+}
+
+/// The graphics heap a shadow map of `size` needs beyond the PS4's (in
+/// 64 MB steps): +64 MB for 4096.
+fn shadow_heap(size: u32) -> u64 {
+    let (s, base) = (size as u64, 2048u64);
+    if s <= base { 0 } else { ((s * s - base * base) * 4).div_ceil(64 << 20) * (64 << 20) }
+}
+
+/// The shadow map size for this run, decided at start with the graphics
+/// heap (`patch_render_size`; 0: the game's own). A changed setting waits
+/// for the next start: the map is resized at the title, while the heap is
+/// still nearly empty - resized in play the game may find no block that
+/// large any more (GitHub issue #12).
+pub static SHADOW_MAP: AtomicU32 = AtomicU32::new(0);
+
+/// The graphics heap with room for a shadow map of `size` beside a heap of
+/// `heap` bytes, up to the largest heap (at 3840x2160 the heap is at its
+/// largest already: High's map then takes 48 MB of the game's headroom).
+fn heap_with_shadows(heap: u64, size: u32) -> u64 {
+    (heap + shadow_heap(size)).min(HEAP_MAX.max(heap))
+}
+
 /// The cameras' projection (eboot 0xde04fd: the perspective path of the
 /// camera's matrix update, every view's): m00 = 1 / tan(fov / 2) - the
 /// field of view ([cam+0x400], degrees) is horizontal - and m11 = m00 *
@@ -378,7 +415,10 @@ fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<Option<u64>, Str
     let r = inner.map_or(v, |(iw, ih)| (iw | ih << 16).to_le_bytes());
     p.image[MODE_TABLE..MODE_TABLE + 4].copy_from_slice(&r);
     p.image[MODE_TABLE + 4..MODE_TABLE + 8].copy_from_slice(&v);
+    let wanted = shadow_map_size(crate::config::settings().pc.get("shadows").map_or("ps4", String::as_str));
     if !heap {
+        // (The base heap: no room for larger shadow maps.)
+        SHADOW_MAP.store(wanted.min(2048), Ordering::Relaxed);
         return Ok(None);
     }
     for (off, _) in HEAP_SITES {
@@ -387,6 +427,13 @@ fn patch_render_size(p: &mut Patcher, w: u32, h: u32) -> Result<Option<u64>, Str
     let px = |b: [u8; 4]| u32::from_le_bytes(b) as u64 & 0xffff;
     let pixels = (px(r) * (u32::from_le_bytes(r) as u64 >> 16)).max(px(v) * (u32::from_le_bytes(v) as u64 >> 16));
     let size = heap_size(pixels);
+    // (The Shadows setting's map, with the heap it needs on top.)
+    SHADOW_MAP.store(wanted, Ordering::Relaxed);
+    let with = heap_with_shadows(size, wanted);
+    if wanted != 2048 {
+        crate::info!("shadows: {wanted}x{wanted} shadow map (the PS4's 2048x2048){}", if with > size { format!(", graphics heap +{} MB for it", (with - size) >> 20) } else { String::new() });
+    }
+    let size = with;
     p.image[HEAP_NEO_LEA + 3..HEAP_NEO_LEA + 7].copy_from_slice(&((size - HEAP_BASE) as u32).to_le_bytes());
     crate::mem::add_dmem(size - HEAP_BASE);
     Ok(Some(size))
@@ -1153,6 +1200,20 @@ mod tests {
         let a = ["x".to_string(), String::new(), "a\u{1f}b".to_string()];
         assert_eq!(join_answers(&a), "x\u{1f}\u{1f}a b");
         assert_eq!(join_answers(&["".to_string()]), "");
+    }
+
+    #[test]
+    fn shadow_maps_and_the_heap() {
+        assert_eq!((shadow_map_size("low"), shadow_map_size("ps4"), shadow_map_size("high"), shadow_map_size("ultra")), (1024, 2048, 4096, 4096));
+        assert_eq!(shadow_heap(1024), 0);
+        assert_eq!(shadow_heap(2048), 0);
+        assert_eq!(shadow_heap(4096), 64 << 20);
+        // 1080p and 1440p: +64 MB for High's map.
+        assert_eq!(heap_with_shadows(heap_size(1920 * 1080), 4096), HEAP_PRO + (64 << 20));
+        assert_eq!(heap_with_shadows(heap_size(2560 * 1440), 4096), heap_size(2560 * 1440) + (64 << 20));
+        // 3840x2160: the heap is at its largest already.
+        assert_eq!(heap_with_shadows(heap_size(3840 * 2160), 4096), HEAP_MAX);
+        assert_eq!(heap_with_shadows(heap_size(1920 * 1080), 2048), HEAP_PRO);
     }
 
     #[test]

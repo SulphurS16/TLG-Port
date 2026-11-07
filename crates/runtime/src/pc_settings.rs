@@ -85,7 +85,7 @@ pub static PAGES: &[Page] = &[
             item("upscaler", "Anti-Aliasing", "The game's SMAA, or DLSS, XeSS or FSR: steadier edges, finer detail. Lists what this PC can run (DLSS: your own nvngx_dlss.dll in the upscalers folder, see the readme).", Kind::Choice(&[("off", "SMAA (the game's)")])),
             item("upscaling", "Upscaling", "Renders below the render resolution and lets the Anti-Aliasing choice (DLSS, XeSS or FSR) bring it up: faster on weaker graphics. Off: their native anti-aliasing.", Kind::Choice(&[("off", "Off"), ("quality", "Quality (67%)"), ("balanced", "Balanced (58%)"), ("performance", "Performance (50%)"), ("ultra_performance", "Ultra Performance (33%)")])),
             item("sharpening", "Sharpening", "The game's sharpening filter: 100 is the game's own.", Kind::Slider(0, 200, 10, "")),
-            item("shadows", "Shadows", "Shadow detail. PS4 is the game's own.", Kind::Choice(&[("low", "Low"), ("ps4", "PS4"), ("high", "High"), ("ultra", "Ultra")])),
+            item("shadows", "Shadows", "Shadow detail: Low, the PS4's, or High (sharper; more graphics memory). Applies at the next start.", Kind::Choice(&[("low", "Low"), ("ps4", "PS4"), ("high", "High")])),
             item("texture_filtering", "Texture Filtering", "Anisotropic filtering: textures stay sharp at an angle. 4x is the PS4's.", Kind::Choice(&[("2x", "2x"), ("4x", "4x"), ("8x", "8x"), ("16x", "16x")])),
             item("ambient_occlusion", "Ambient Occlusion", "Soft shadowing where surfaces meet. Half is the PS4's.", Kind::Choice(&[("off", "Off"), ("half", "Half"), ("full", "Full")])),
             item("reflections", "Reflections", "Screen-space reflections on water and wet surfaces.", Kind::Choice(ON_OFF)),
@@ -145,7 +145,7 @@ pub static PAGES: &[Page] = &[
 ];
 
 /// Settings that take effect when the game next starts.
-const AT_START: &[&str] = &["aspect_ratio", "render_resolution", "skip_intro", "upscaling"];
+const AT_START: &[&str] = &["aspect_ratio", "render_resolution", "skip_intro", "upscaling", "shadows"];
 
 pub fn page(id: &str) -> Option<&'static Page> {
     PAGES.iter().find(|p| p.id == id)
@@ -547,11 +547,12 @@ pub fn engine_overrides() -> Vec<String> {
             ov(PP, "sharpenScale", "mul", format!("{}", p as f32 / 100.0));
         }
     }
-    match v("shadows").as_str() {
-        "low" => ov(RC, "shadowMapSize", "set", "1024".into()),
-        "high" => ov(RC, "shadowMapSize", "set", "4096".into()),
-        "ultra" => ov(RC, "shadowMapSize", "set", "8192".into()),
-        _ => {}
+    // (The shadow map's size as decided at start with the graphics heap:
+    // title_patches::SHADOW_MAP. Resized in play, the game found no block
+    // that large and crashed - GitHub issue #12.)
+    match crate::title_patches::SHADOW_MAP.load(Ordering::Relaxed) {
+        0 | 2048 => {}
+        n => ov(RC, "shadowMapSize", "set", n.to_string()),
     }
     let aniso = match v("texture_filtering").as_str() {
         "2x" => Some("2"),

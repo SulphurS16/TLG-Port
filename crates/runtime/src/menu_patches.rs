@@ -21,6 +21,14 @@
 //!   "reqShow" of its cursor is dropped (`menu_request`); after they close,
 //!   the next request first shows the list again (its title "reqShow", its
 //!   items "reqSelect", as the game's pages do on their way back).
+//! - Leaving the list (Back or cancel): the game sends every item
+//!   "reqCancel" (0x9286c7), then waits each frame until every item's part
+//!   has played it out (0x92b07c: the part's animation component). The PC
+//!   item's part - the unused Exit Game label's - never reads as done, so
+//!   the menus stayed locked there (GitHub issues #12, #13). From the first
+//!   "reqCancel" on, the list is the game's own again (`leaving`) and the
+//!   PC item is hidden by the port; the title's next "reqShow" (the list
+//!   opened or shown again) ends it.
 //!   TLG_MENU_TRACE=1 also logs every request with its callers.
 //!
 //! Applied only when every site holds the expected bytes.
@@ -28,7 +36,7 @@
 use crate::patch::Patcher;
 use crate::sysv;
 use parking_lot::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// `mov [rbp-1060h], r14`, right after the list and its count are set.
 const LIST_SITE: usize = 0x92756c;
@@ -105,9 +113,17 @@ struct State {
     from_list: bool,
     /// The PC settings closed: show the list again at the next request.
     show_pending: bool,
+    /// The list is being left (its items got "reqCancel"): the game's own
+    /// list until the title is shown again.
+    leaving: bool,
+    /// The PC item's part to hide (from the next list pick, outside the
+    /// request function).
+    hide_pc: u32,
+    /// When the Options update last picked a list (process ms).
+    last_pick: u64,
 }
 
-static STATE: Mutex<State> = Mutex::new(State { syms: None, seen_mgr: 0, extending: false, lists: Vec::new(), mgr: 0, items: Vec::new(), title: false, row: 0.0, from_list: false, show_pending: false });
+static STATE: Mutex<State> = Mutex::new(State { syms: None, seen_mgr: 0, extending: false, lists: Vec::new(), mgr: 0, items: Vec::new(), title: false, row: 0.0, from_list: false, show_pending: false, leaving: false, hide_pc: 0, last_pick: 0 });
 
 /// Whether the menu manager `mgr` has a part with the key symbol `key`
 /// (its parts: [mgr+0x148], [mgr+0x150] of them, 48-byte entries, the
@@ -337,6 +353,21 @@ fn options_list(list_var: u64, count_var: u64, mgr: u64) {
     }
     let mut st = STATE.lock();
     let s = syms(&mut st);
+    // (A pick after a pause: the Options update starts again - a list left
+    // before is over.)
+    let now = crate::log::elapsed_ms() as u64;
+    if now.saturating_sub(std::mem::replace(&mut st.last_pick, now)) > 500 {
+        st.leaving = false;
+    }
+    if st.leaving {
+        // (The list is being left: the game's own, its PC item hidden.)
+        let hide = std::mem::take(&mut st.hide_pc);
+        drop(st);
+        if hide != 0 {
+            send(mgr, hide, global_u32(REQ_HIDE));
+        }
+        return;
+    }
     // (The pause menu's list without Treasure: the item in Treasure's row.)
     let (pc, row) = if title {
         (s[0], -0.1164f32)
@@ -506,6 +537,19 @@ pub fn closed() {
     }
 }
 
+/// The request the game sends every item of a list as the list is left
+/// (Back or cancel), then waits for each to play it out.
+fn req_cancel() -> u32 {
+    static SYM: AtomicU32 = AtomicU32::new(0);
+    let s = SYM.load(Ordering::Relaxed);
+    if s != 0 {
+        return s;
+    }
+    let s = intern("reqCancel");
+    SYM.store(s, Ordering::Relaxed);
+    s
+}
+
 /// A part request while the filter is on: whether to drop it (answer slot).
 fn menu_request(mgr: u64, part: u32, req: u32, rbp: u64) {
     let mut drop = false;
@@ -513,15 +557,32 @@ fn menu_request(mgr: u64, part: u32, req: u32, rbp: u64) {
         trace(mgr, part, req, rbp);
     }
     if !OWN.with(|o| o.get()) {
-        let (show, from_list, cursor, items, title_sym, first) = {
+        let cancel = req == req_cancel();
+        let (show, from_list, cursor, items, title_sym, first, pc) = {
             let mut st = STATE.lock();
             let first = st.seen_mgr == 0;
             st.seen_mgr = mgr;
             let s = syms(&mut st);
+            let pc = [s[0], s[1], s[5]];
+            let title_sym = if st.title { s[3] } else { s[2] };
+            if cancel && st.extending && st.items.contains(&part) && !st.leaving {
+                // (The list is being left: from the next pick on the game's
+                // own list, and the PC item hidden by the port.)
+                st.leaving = true;
+                st.extending = false;
+                st.hide_pc = st.items.iter().copied().find(|i| pc.contains(i)).unwrap_or(0);
+                crate::info!("pc settings: the Options list is being left; its PC item hidden");
+            }
+            if req == global_u32(REQ_SHOW) && (part == s[2] || part == s[3]) {
+                st.leaving = false;
+            }
             let show = std::mem::take(&mut st.show_pending);
-            (show, st.from_list, s[4], st.items.clone(), if st.title { s[3] } else { s[2] }, first)
+            (show, st.from_list, s[4], st.items.clone(), title_sym, first, pc)
         };
-        if show {
+        if cancel && pc.contains(&part) {
+            // (Its cancel would never read as done: the item is hidden.)
+            drop = true;
+        } else if show {
             send(mgr, title_sym, global_u32(REQ_SHOW));
             for &i in &items {
                 send(mgr, i, global_u32(REQ_SELECT));

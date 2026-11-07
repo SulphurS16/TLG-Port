@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.8.0 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.8.1 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4: US release CUSA03627 or
@@ -119,7 +119,7 @@ while playing, opens the port's settings in the game's own menus:
   folder). The port does not include the key. Without it the trophies are
   numbered; everything else works the same.
 Most settings take effect at once; the render resolution, the aspect ratio,
-upscaling and the intro logos at the next start (the page says so).
+upscaling, shadows and the intro logos at the next start (the page says so).
 
 XeSS and FSR: their libraries are in the "upscalers" folder beside tlg.exe,
 as their makers ship them (each checked for its maker's digital signature

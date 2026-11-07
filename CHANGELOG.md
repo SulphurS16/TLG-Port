@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.1
+
+- Fixed: leaving the game's Options menu (Back or cancel) locked the menus,
+  on the title screen and in the pause menu, also after changing a setting
+  there (GitHub issues #12 and #13). The PC Settings item in the list never
+  finished the list's closing; the port now takes it out of the list as the
+  list closes.
+- Fixed: changing Shadows to High or Ultra while playing crashed the game a
+  few seconds later (GitHub issue #12): the larger shadow map no longer fit
+  the game's graphics memory by then. Shadows now change at the next start,
+  and High gets the graphics memory it needs on top. Ultra is gone: its map
+  is too large for the game's memory system (a setting of Ultra is High).
+
 ## 0.8.0
 
 PC features, in the game itself:
