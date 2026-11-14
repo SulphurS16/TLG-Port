@@ -78,7 +78,7 @@ pub const CONTROLS: &[ControlInfo] = &[
     ci("ls_down", Control::Stick(Stick::LDown), "Move back", "Movement"),
     ci("ls_left", Control::Stick(Stick::LLeft), "Move left", "Movement"),
     ci("ls_right", Control::Stick(Stick::LRight), "Move right", "Movement"),
-    ci("walk", Control::Walk, "Walk (half speed while held)", "Movement"),
+    ci("walk", Control::Walk, "Walk (hold)", "Movement"),
     ci("triangle", Control::Button(BTN_TRIANGLE), "Jump (Triangle)", "Actions"),
     ci("circle", Control::Button(BTN_CIRCLE), "Pick up / grab (Circle)", "Actions"),
     ci("cross", Control::Button(BTN_CROSS), "Crouch / confirm (Cross)", "Actions"),
@@ -97,7 +97,7 @@ pub const CONTROLS: &[ControlInfo] = &[
     ci("rs_down", Control::Stick(Stick::RDown), "Camera down", "Camera"),
     ci("rs_left", Control::Stick(Stick::RLeft), "Camera left", "Camera"),
     ci("rs_right", Control::Stick(Stick::RRight), "Camera right", "Camera"),
-    ci("pause_back", Control::PauseBack, "Pause / back (Options in play, Circle in menus)", "Menus"),
+    ci("pause_back", Control::PauseBack, "Pause / back", "Menus"),
     ci("options", Control::Button(BTN_OPTIONS), "Options (pause menu)", "Menus"),
     ci("touchpad", Control::Button(BTN_TOUCHPAD), "Touchpad", "Menus"),
 ];
@@ -105,22 +105,21 @@ pub const CONTROLS: &[ControlInfo] = &[
 /// The commented file written on first use (also the defaults).
 pub const DEFAULTS: &str = "\
 # The Last Guardian (tlg): keyboard and mouse settings. The launcher's
-# Controls page edits this file; changes apply the next time the game starts.
-# Delete the file to get the defaults back.
+# Controls page edits this file. Changes apply at the next start. Delete the
+# file for defaults.
 #
 # Bindings: <control> = <input>[, <input>...], or none. Controls are the
 # DualShock 4's: cross circle square triangle up down left right (d-pad) l1
 # r1 l2 r2 l3 r3 options touchpad, stick directions ls_up ls_down ls_left
-# ls_right rs_up rs_down rs_left rs_right, walk (left stick at half
-# deflection while held) and pause_back (Options while playing, Circle - back -
-# in menus).
+# ls_right rs_up rs_down rs_left rs_right, walk (half speed while held) and
+# pause_back (Options while playing, Circle in menus).
 # Inputs: A-Z, 0-9, F1-F24, Space, Enter, Escape, Tab, Backspace, Shift,
 # LShift, RShift, Ctrl, LCtrl, RCtrl, Alt, LAlt, RAlt, Up, Down, Left, Right,
 # Insert, Delete, Home, End, PageUp, PageDown, Numpad0-Numpad9, Minus, Equals,
 # LBracket, RBracket, Semicolon, Quote, Comma, Period, Slash, Backslash,
-# Grave, CapsLock, vkXX (any virtual-key code in hex); mouse: MouseLeft,
-# MouseRight, MouseMiddle, Mouse4, Mouse5, WheelUp, WheelDown (mouse inputs
-# count while the mouse is captured).
+# Grave, CapsLock, vkXX (a virtual-key code in hex). Mouse: MouseLeft,
+# MouseRight, MouseMiddle, Mouse4, Mouse5, WheelUp, WheelDown (while the
+# mouse is captured).
 
 ls_up = W
 ls_down = S
@@ -149,20 +148,18 @@ pause_back = Escape
 options = Tab
 touchpad = T
 
-# Mouse: a click into the window captures the mouse; release_mouse (or
-# switching away from the window) frees it. Mouse look turns the game camera
-# directly by the raw motion (no acceleration, smoothing or dead zone;
-# sensitivity 1.0 is 0.04 degrees per count, separately for x and y); it is
-# never turned into right-stick input.
+# Mouse: a click in the window captures the mouse. release_mouse (or leaving
+# the window) frees it. Mouse look turns the game camera by the raw motion
+# (no acceleration, smoothing or dead zone). Sensitivity 1.0 is 0.04 degrees
+# per count, for x and y separately.
 mouse_look = on
 mouse_sensitivity_x = 1.0
 mouse_sensitivity_y = 1.0
 mouse_invert_x = off
 mouse_invert_y = off
 release_mouse = F1
-# In menus (the title screen and main menu, the pause menu, loading
-# screens, most cutscenes) the left button selects (Cross), the right button
-# goes back (Circle) and the wheel moves the selection (d-pad up/down),
+# In menus, cutscenes and loading screens the left button selects (Cross),
+# the right button goes back (Circle) and the wheel moves the selection,
 # whatever the bindings above.
 menu_mouse = on
 ";

@@ -182,6 +182,30 @@ pub struct Spec {
     /// of its own, ~1.2x the unmarked shaders' compile time against ~2x
     /// with 1.
     pub page_marks: u8,
+    /// Fragment shaders: the pixel position inputs (POS_X/Y_FLOAT) scaled
+    /// (see `PosScale`).
+    pub ps_pos_scale: PosScale,
+}
+
+/// Factors (f32 bits, 0: none) for a fragment shader's x and y pixel
+/// position inputs: a shader that copies a texture texel for texel into a
+/// target of another size then covers the target. Hashes to nothing when
+/// unset, so other translations keep their keys.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PosScale(pub [u32; 2]);
+
+impl PosScale {
+    pub fn is_set(&self) -> bool {
+        self.0 != [0, 0]
+    }
+}
+
+impl std::hash::Hash for PosScale {
+    fn hash<H: std::hash::Hasher>(&self, h: &mut H) {
+        if self.is_set() {
+            self.0.hash(h);
+        }
+    }
 }
 
 /// Clip/cull distances of a vertex shader's extra position exports
@@ -1627,6 +1651,7 @@ mod tests {
             binding_base: 0,
             debug_capture: Vec::new(),
             page_marks: 1,
+            ps_pos_scale: PosScale::default(),
         }
     }
 

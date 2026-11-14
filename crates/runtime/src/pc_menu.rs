@@ -254,6 +254,8 @@ pub fn call(args: &[String]) -> Vec<String> {
         // object, field, mode, value per override
         "engine_gen" => vec![crate::pc_settings::engine_gen().to_string()],
         "engine" => crate::pc_settings::engine_overrides(),
+        // extras -> per Extras setting its global and "1" when on (else "")
+        "extras" => crate::pc_settings::extras(),
         other => {
             crate::warn!("pc menu: unknown request {other:?}");
             vec![]

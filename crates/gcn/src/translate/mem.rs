@@ -54,6 +54,14 @@ pub fn stage_inputs(tr: &mut T) -> R<()> {
                     let val = match bit {
                         8..=10 => {
                             let c = e(tr.b.composite_extract(tr.t.f32, None, fcv, [(bit - 8) as u32]))?;
+                            // (`Spec::ps_pos_scale`: x and y scaled.)
+                            let c = match tr.spec.ps_pos_scale.0.get(bit - 8).copied().filter(|&s| s != 0) {
+                                Some(s) => {
+                                    let k = tr.f(f32::from_bits(s));
+                                    e(tr.b.f_mul(tr.t.f32, None, c, k))?
+                                }
+                                None => c,
+                            };
                             tr.to_u(c)?
                         }
                         11 => {

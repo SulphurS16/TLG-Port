@@ -131,6 +131,13 @@ pub fn apply(p: &mut Patcher, name: &str) {
             Err(e) => crate::warn!("frame steps: {name}: {e}; they advance 1/30 s per frame"),
         }
     }
+    // (Debug: TLG_SLOW_STEPS=0 keeps the game's rounding of slowed steps.)
+    if !std::env::var("TLG_SLOW_STEPS").is_ok_and(|v| v == "0") {
+        match patch_slow_steps(p) {
+            Ok(()) => crate::info!("slow motion: above 30 fps slowed steps are rounded as at 30 fps ({name}+{ROUND_SITE:#x})"),
+            Err(e) => crate::warn!("slow motion: {name}: {e}; above 30 fps slowed steps keep the game's rounding"),
+        }
+    }
     let (w, h) = crate::gpu::vk::window::render_size();
     // (A picture wider or taller than 16:9: the game's interface keeps a
     // 16:9 area in its middle.)
@@ -180,7 +187,7 @@ pub fn apply(p: &mut Patcher, name: &str) {
     crate::pc_prompts::apply(p, name);
     if crate::config::settings().pc.get("skip_intro").is_some_and(|v| v == "on") {
         match patch_logos(p) {
-            Ok(()) => crate::info!("intro: the SIE and Japan Studio logos skipped (PC Settings; {name}+{LOGO_SITE:#x})"),
+            Ok(()) => crate::info!("intro: the lead-in, SIE and Japan Studio logos skipped (PC Settings; {name}+{LOGO_SITE:#x})"),
             Err(e) => crate::warn!("intro: {name}: {e}; the logos show"),
         }
     }
@@ -1038,20 +1045,96 @@ fn patch_frame_steps(p: &mut Patcher) -> Result<(), String> {
     Ok(())
 }
 
+/// The world step's rounding in the title's frame step (eboot 0xd1664a,
+/// after the snap and the filter: floor(t x 360 + 0.1) / 360 into the
+/// world's [39c] and the app's [19c]). Slowed by a game speed s, the step at
+/// 30 fps is s/30, rounded to floor(12 s + 0.1) / 360: the PS4's slow motion
+/// runs at floor(12 s + 0.1) / 12 of real time (s = 0.1: 1/12). Above 30 fps
+/// the same 1/360 s rounds the shorter step further down: at 60 fps s = 0.1
+/// gives floor(0.7) = 0 and the game stops (the collapsing bridge, issues
+/// #17 and #22), slow motion at 0.15-0.3 ran slower than on a PS4. With
+/// `FRAME_STEPS` on (a limit other than the game's) and s below 1 the step
+/// is t x floor(12 s + 0.1) / (12 s): the PS4's rate at any frame rate (at
+/// an exact 30 fps the same value). At full speed, and at the game's own
+/// limit, the game's rounding.
+const ROUND_SITE: usize = 0xd1664a;
+const ROUND_BYTES: [u8; 30] = [
+    0xC5, 0xFA, 0x59, 0x05, 0xBE, 0xB1, 0x7D, 0x00, // vmulss xmm0,xmm0,[14F1810h] (360)
+    0xC5, 0xFA, 0x58, 0x05, 0xBA, 0xB1, 0x7D, 0x00, // vaddss xmm0,xmm0,[14F1814h] (0.1)
+    0xC4, 0xE3, 0x79, 0x0A, 0xC0, 0x09, // vroundss xmm0,xmm0,xmm0,9 (floor)
+    0xC5, 0xFA, 0x59, 0x05, 0xB0, 0xB1, 0x7D, 0x00, // vmulss xmm0,xmm0,[14F1818h] (1/360)
+];
+const ROUND_CONSTS: usize = 0x14f1810;
+/// The app object's game speed (1.0 unless slowed).
+const APP_SPEED: i32 = 0x1b8;
+
+fn patch_slow_steps(p: &mut Patcher) -> Result<(), String> {
+    use iced_x86::code_asm::*;
+    if p.image.get(ROUND_SITE..ROUND_SITE + ROUND_BYTES.len()) != Some(&ROUND_BYTES[..]) {
+        return Err(format!("unexpected code at +{ROUND_SITE:#x} (not update 01.03?)"));
+    }
+    let consts = [360.0f32, 0.1, 1.0 / 360.0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+    if p.image.get(ROUND_CONSTS..ROUND_CONSTS + 12) != Some(&consts[..]) {
+        return Err(format!("unexpected rounding constants at +{ROUND_CONSTS:#x}"));
+    }
+    let base = p.base;
+    let back = base + (ROUND_SITE + ROUND_BYTES.len()) as u64;
+    p.detour(ROUND_SITE, &ROUND_BYTES[..8], |a, _| {
+        // xmm0: the filtered step; rdi: the app object; rax: the world.
+        // xmm1-xmm3, rcx and the flags are written before they are read
+        // again after the site.
+        let mut game = a.create_label();
+        a.mov(rcx, &FRAME_STEPS as *const _ as u64)?;
+        a.cmp(byte_ptr(rcx), 0)?;
+        a.je(game)?;
+        a.vmovss(xmm1, dword_ptr(rdi + APP_SPEED))?;
+        a.mov(ecx, 1.0f32.to_bits())?;
+        a.vmovd(xmm2, ecx)?;
+        a.vcomiss(xmm1, xmm2)?;
+        a.jae(game)?;
+        a.vxorps(xmm2, xmm2, xmm2)?;
+        a.vcomiss(xmm1, xmm2)?;
+        // (s <= 0, or not a number.)
+        a.jbe(game)?;
+        a.mov(ecx, 12.0f32.to_bits())?;
+        a.vmovd(xmm2, ecx)?;
+        a.vmulss(xmm1, xmm1, xmm2)?;
+        a.mov(ecx, 0.1f32.to_bits())?;
+        a.vmovd(xmm2, ecx)?;
+        a.vaddss(xmm2, xmm1, xmm2)?;
+        a.vroundss(xmm2, xmm2, xmm2, 9)?;
+        a.vdivss(xmm2, xmm2, xmm1)?;
+        a.vmulss(xmm0, xmm0, xmm2)?;
+        a.jmp(back)?;
+        a.set_label(&mut game)?;
+        a.mov(rcx, base + ROUND_CONSTS as u64)?;
+        a.vmulss(xmm0, xmm0, dword_ptr(rcx))?;
+        a.vaddss(xmm0, xmm0, dword_ptr(rcx + 4))?;
+        a.vroundss(xmm0, xmm0, xmm0, 9)?;
+        a.vmulss(xmm0, xmm0, dword_ptr(rcx + 8))?;
+        a.jmp(back)
+    })?;
+    Ok(())
+}
+
 /// The boot sequence's logo loop (eboot 0x231f21, `lea r13, [rsp+5F8h]`,
 /// right after its table of logos is built on the stack: entries of 0x1C
-/// bytes from rsp+0x6F0, each starting with its "shown" flag - the SIE
-/// logo's at rsp+0x728, Japan Studio's at rsp+0x744).
+/// bytes from rsp+0x6F0, each starting with its "shown" flag - the black
+/// lead-in's at rsp+0x6F0, the SIE logo's at rsp+0x728, Japan Studio's at
+/// rsp+0x744; the lead-in as in tabnul's port, issue #15).
 const LOGO_SITE: usize = 0x231f21;
 const LOGO_BYTES: [u8; 8] = [0x4C, 0x8D, 0xAC, 0x24, 0xF8, 0x05, 0x00, 0x00];
 
-/// PC Settings `skip_intro`: the boot sequence shows neither logo (the
-/// title screen and the game's own boot steps stay).
+/// PC Settings `skip_intro`: the boot sequence shows neither logo nor the
+/// black lead-in (the title screen and the game's own boot steps stay).
 fn patch_logos(p: &mut Patcher) -> Result<(), String> {
     use iced_x86::code_asm::*;
     let base = p.base;
     p.detour(LOGO_SITE, &LOGO_BYTES, |a, ins| {
         // (Flags are set again after the site; rsp as the code has it.)
+        // The table's entries (0x1c bytes, an enabled flag first): the black
+        // lead-in, China's health notice, SIE, Japan Studio.
+        a.mov(dword_ptr(rsp + 0x6f0), 0)?;
         a.mov(dword_ptr(rsp + 0x728), 0)?;
         a.mov(dword_ptr(rsp + 0x744), 0)?;
         a.add_instruction(*ins)?;

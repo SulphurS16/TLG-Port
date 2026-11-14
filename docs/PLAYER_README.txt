@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.8.1 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.8.2 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4: US release CUSA03627 or
@@ -118,6 +118,11 @@ while playing, opens the port's settings in the game's own menus:
   keeps it in trophy-key.txt in %APPDATA%\TLG (portable use: in the "user"
   folder). The port does not include the key. Without it the trophies are
   numbered; everything else works the same.
+- Extras: things cut from the game that its files still hold, all off at
+  first. Trico's drool (when he smells the smell pots), cut narration
+  (narrator hints removed shortly before release, not counted for the hints
+  trophy), the E3 demo's slow motion at the collapsing bridge jump, and
+  Trico playing with the boy (now and then he sniffs and paws him).
 Most settings take effect at once; the render resolution, the aspect ratio,
 upscaling, shadows and the intro logos at the next start (the page says so).
 
@@ -153,6 +158,10 @@ Settings, saves and logs
   session's log folder.
 - Portable use: an empty file named portable.txt next to tlg.exe keeps
   everything in a "user" folder beside it.
+- Overlays: other programs' overlays and recording hooks load into the game
+  as Vulkan layers. If one of them crashes the game, the launcher's error
+  message names it and offers to start without them (settings.txt:
+  overlays = off; on brings them back).
 - HDR: with Windows HDR on for the game's monitor the game sends an HDR10
   picture. The launcher's Display page sets how bright white is (200 nits by
   default; 100-400, or as bright as Windows' SDR content) or turns it off.
@@ -194,6 +203,9 @@ Known limits
   languages are offered when your game files carry them, but have not been
   tested. Japanese and the other Asian languages are in the game's program
   but need a copy that carries them.
+- Extras: E3 Slow Motion has not been played through yet. The game accepts
+  the changed script, but the bridge jump itself has not been tested with
+  it.
 - Now and then the game closes with an error just after an area starts
   loading (seen with the 60 fps limit and with none). Start it again and
   choose Continue: the game goes on from its last checkpoint.

@@ -212,7 +212,7 @@ pub fn check_pair(game: &Path, update: Option<&Path>) -> Result<String, String> 
         (Contents::Empty, _) => problems.insert(0, "Game folder: no game files".into()),
         (Contents::Merged, None) | (Contents::Base, Some(_)) => {}
         (Contents::Base, None) => problems.push(format!("Update {UPDATE_VERSION}: choose its folder")),
-        (Contents::Update, _) => problems.push(format!("Game folder: holds update {UPDATE_VERSION}; choose version {BASE_VERSION} here")),
+        (Contents::Update, _) => problems.push(format!("Game folder: holds update {UPDATE_VERSION}. Choose version {BASE_VERSION} here")),
         (Contents::Merged, Some(_)) => problems.push("Update folder: leave it empty (the game folder already holds the update)".into()),
         (Contents::Other(_), _) => {}
     }
@@ -222,12 +222,12 @@ pub fn check_pair(game: &Path, update: Option<&Path>) -> Result<String, String> 
         match ur.contents {
             Contents::Update => {}
             Contents::Empty => problems.push("Update folder: no game files".into()),
-            Contents::Base | Contents::Merged => problems.push(format!("Update folder: holds the game; choose update {UPDATE_VERSION} here")),
+            Contents::Base | Contents::Merged => problems.push(format!("Update folder: holds the game. Choose update {UPDATE_VERSION} here")),
             Contents::Other(_) => {}
         }
         if let (Some(a), Some(b)) = (g.region, ur.region) {
             if a != b {
-                problems.push(format!("Update folder: the {} release's update; the game folder holds the {} release", b.name(), a.name()));
+                problems.push(format!("Update folder: the {} release's update. The game folder holds the {} release", b.name(), a.name()));
             }
         }
     }

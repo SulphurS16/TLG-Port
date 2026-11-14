@@ -96,7 +96,7 @@ pub struct Gpu {
 pub fn gpus() -> Result<Vec<Gpu>, String> {
     use ash::vk;
     unsafe {
-        let entry = ash::Entry::load().map_err(|e| format!("Vulkan is not available ({e}); install or update the graphics driver"))?;
+        let entry = ash::Entry::load().map_err(|e| format!("Vulkan is not available ({e}). Install or update the graphics driver"))?;
         let app = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         let instance = entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None).map_err(|e| format!("Vulkan: {e}"))?;
         let mut out = Vec::new();

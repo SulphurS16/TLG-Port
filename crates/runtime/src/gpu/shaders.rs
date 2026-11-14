@@ -102,6 +102,16 @@ fn program_words(addr: u64) -> Option<Vec<u32>> {
     Some(super::shader_dump::code_slice(addr)?.get(..len)?.to_vec())
 }
 
+/// The title's texel-for-texel depth copy (s_mov_b32 vcc_hi, 8;
+/// v_cvt_i32_f32 v0, v2; v_cvt_i32_f32 v1, v3; v_mov_b32 v2, 0;
+/// image_load_mip v0, v[0:2], s[0:7]; v_mov_b32 v1, 0; s_waitcnt;
+/// exp mrtz v0; s_endpgm): its code hash.
+fn depth_copy_hash() -> u64 {
+    const CODE: [u32; 12] = [0xBEEB_03FF, 0x0000_0008, 0x7E00_1102, 0x7E02_1103, 0x7E04_0280, 0xF004_0100, 0x0000_0000, 0x7E02_0280, 0xBF8C_0F70, 0xF800_1881, 0x0101_0100, 0xBF81_0000];
+    static H: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *H.get_or_init(|| hash_words(&CODE))
+}
+
 /// Content hash of shader code (checked on every use of a cached program).
 fn hash_words(w: &[u32]) -> u64 {
     let bytes = unsafe { std::slice::from_raw_parts(w.as_ptr() as *const u8, w.len() * 4) };
@@ -1128,6 +1138,7 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
         // (Set below, once the rest of the key is known.)
         debug_capture: Vec::new(),
         page_marks: crate::tune::get(crate::tune::PAGE_MARKS).clamp(0, 3) as u8,
+        ps_pos_scale: Default::default(),
     };
     match sr.stage {
         Stage::Fragment => {
@@ -1148,6 +1159,26 @@ pub fn prepare_tess(sr: &StageRegs, mut tess: TessSpec) -> Result<Prepared, Stri
                 let info = r.ctx(0xA31C + m * 0xF);
                 let nt = (info >> 8) & 7;
                 spec.mrt[m as usize] = MrtSpec { export_format: ((col >> (m * 4)) & 0xF) as u8, class: match nt { 4 => 2, 5 => 1, _ => 0 } };
+            }
+            // The sun's global shadow maps (2048x2048 textures) are copied
+            // into the shadow map's array slices texel for texel, at each
+            // pixel's position: in a larger shadow map (Shadows High, 4096)
+            // they filled a quarter of the slice and the rest read as lit
+            // (issue #21), in a smaller one (Low) a quarter of the map filled
+            // the slice. That copy's pixel position is scaled by the texture's
+            // size over the depth target's (whole multiples only).
+            if code_hash == depth_copy_hash() {
+                let size = r.ctx(0xA016);
+                let (dw, dh) = (((size & 0x7FF) + 1) * 8, (((size >> 11) & 0x7FF) + 1) * 8);
+                let (tw, th) = ((user[2] & 0x3FFF) + 1, ((user[2] >> 14) & 0x3FFF) + 1);
+                let whole = |a: u32, b: u32| a % b == 0 || b % a == 0;
+                if (tw, th) != (dw, dh) && whole(tw, dw) && whole(th, dh) && tw as u64 * dh as u64 == th as u64 * dw as u64 {
+                    spec.ps_pos_scale = translate::PosScale([(tw as f32 / dw as f32).to_bits(), (th as f32 / dh as f32).to_bits()]);
+                    static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                    if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 4 {
+                        crate::info!("shadows: a {tw}x{th} global shadow map copied into a {dw}x{dh} shadow map, scaled to fill it (pixel shader {addr:#x})");
+                    }
+                }
             }
         }
         Stage::Compute => match tess.role {

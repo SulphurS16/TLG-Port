@@ -287,10 +287,11 @@ fn replay_one(kind: u8, recs: &[Arc<StageRec>], key: &[u8]) {
 }
 
 /// A translation made this session (`shaders::prepare`): kept until a
-/// pipeline uses it. Translations with debug captures are not recorded.
+/// pipeline uses it. Translations with debug captures or a position scale
+/// (`Spec::ps_pos_scale`, which the record does not hold) are not recorded.
 #[allow(clippy::too_many_arguments)]
 pub fn note_stage(code_hash: u64, key_hash: u64, addr: u64, user_sgprs: u16, main: Vec<u32>, fetch: Vec<u32>, spec: &Spec) {
-    if !on() || !spec.debug_capture.is_empty() || spec.debug_pos_store || main.len() > MAX_CODE || fetch.len() > MAX_CODE {
+    if !on() || !spec.debug_capture.is_empty() || spec.debug_pos_store || spec.ps_pos_scale.is_set() || main.len() > MAX_CODE || fetch.len() > MAX_CODE {
         return;
     }
     let mut g = STATE.lock();
@@ -395,6 +396,7 @@ mod tests {
             binding_base: 0,
             debug_capture: Vec::new(),
             page_marks: 3,
+            ps_pos_scale: Default::default(),
         };
         let rec = StageRec { code_hash: 7, key_hash: 9, addr: 0x1130_0000, user_sgprs: 4, main: vec![0xBF81_0000], fetch: Vec::new(), spec: spec.clone() };
         let mut file = Vec::new();

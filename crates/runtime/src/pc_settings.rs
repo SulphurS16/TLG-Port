@@ -55,40 +55,41 @@ pub static PAGES: &[Page] = &[
         id: "main",
         title: "PC Settings",
         items: &[
-            item("display", "Display", "Window, picture shape, resolution and frame rate.", Kind::Page("display")),
-            item("graphics", "Graphics", "Anti-aliasing, sharpening, shadows, textures and lighting.", Kind::Page("graphics")),
+            item("display", "Display", "Window, resolution and frame rate.", Kind::Page("display")),
+            item("graphics", "Graphics", "Anti-aliasing, upscaling, shadows and lighting.", Kind::Page("graphics")),
             item("effects", "Camera Effects", "Motion blur, depth of field, bloom and lens effects.", Kind::Page("effects")),
-            item("sound", "Sound", "Speakers, headphone surround and the sound device.", Kind::Page("sound")),
-            item("controls", "Controls", "Button prompts and the mouse.", Kind::Page("controls")),
-            item("interface", "Interface", "Menu and HUD size, the mouse pointer, the intro logos.", Kind::Page("interface")),
-            item("saves", "Saved Games", "Where the game keeps its saved games.", Kind::Page("saves")),
-            item("achievements", "Achievements", "The trophies, and which you have.", Kind::Page("achievements")),
+            item("sound", "Sound", "Speakers, headphones and sound device.", Kind::Page("sound")),
+            item("controls", "Controls", "Button prompts, mouse and keys.", Kind::Page("controls")),
+            item("interface", "Interface", "Menu size, mouse pointer and intro logos.", Kind::Page("interface")),
+            item("saves", "Saved Games", "Where saved games are kept.", Kind::Page("saves")),
+            item("achievements", "Achievements", "Trophies and which you have.", Kind::Page("achievements")),
+            item("extras", "Extras", "Cut content still in the game files.", Kind::Page("extras")),
         ],
     },
     Page {
         id: "display",
         title: "Display",
         items: &[
-            item("display_mode", "Display Mode", "Windowed, borderless full screen, or exclusive full screen.", Kind::Choice(&[("windowed", "Windowed"), ("borderless", "Borderless"), ("fullscreen", "Full Screen")])),
-            item("aspect_ratio", "Aspect Ratio", "Automatic: the screen's. Wider shows more to the sides, taller more above and below; menus and HUD keep their place.", Kind::Choice(&[("auto", "Automatic"), ("16:9", "16:9"), ("16:10", "16:10"), ("21:9", "21:9"), ("32:9", "32:9")])),
-            item("render_resolution", "Render Resolution", "The height the game renders at, its width from the aspect ratio (Display: the screen's size).", Kind::Choice(&[("display", "Display"), ("1280x720", "720p"), ("1600x900", "900p"), ("1920x1080", "1080p"), ("2560x1440", "1440p"), ("3840x2160", "2160p")])),
-            item("frame_cap", "Frame Rate Limit", "30 (the game's own), 60, or no limit. The game's speed stays the same.", Kind::Choice(&[("game", "30"), ("60", "60"), ("off", "None")])),
-            item("vsync", "Vertical Sync", "On: no tearing. Fast: no tearing, newest frame. Off: lowest latency.", Kind::Choice(&[("on", "On"), ("fast", "Fast"), ("off", "Off")])),
-            item("hdr", "HDR", "HDR output where Windows HDR is on for this display.", Kind::Choice(&[("auto", "Automatic"), ("off", "Off")])),
-            item("filter", "Scaling Filter", "How the picture is scaled to the window: smooth or sharp pixels.", Kind::Choice(&[("smooth", "Smooth"), ("sharp", "Sharp")])),
+            item("display_mode", "Display Mode", "Windowed, borderless or exclusive full screen.", Kind::Choice(&[("windowed", "Windowed"), ("borderless", "Borderless"), ("fullscreen", "Full Screen")])),
+            item("aspect_ratio", "Aspect Ratio", "Automatic matches the screen. Wider shows more to the sides.", Kind::Choice(&[("auto", "Automatic"), ("16:9", "16:9"), ("16:10", "16:10"), ("21:9", "21:9"), ("32:9", "32:9")])),
+            item("render_resolution", "Render Resolution", "The game's render height. Display uses the screen's.", Kind::Choice(&[("display", "Display"), ("1280x720", "720p"), ("1600x900", "900p"), ("1920x1080", "1080p"), ("2560x1440", "1440p"), ("3840x2160", "2160p")])),
+            item("frame_cap", "Frame Rate Limit", "30 is the game's own. Game speed stays the same.", Kind::Choice(&[("game", "30"), ("60", "60"), ("off", "None")])),
+            item("vsync", "Vertical Sync", "On: no tearing. Fast: no tearing, less lag. Off: least lag.", Kind::Choice(&[("on", "On"), ("fast", "Fast"), ("off", "Off")])),
+            item("hdr", "HDR", "HDR when Windows HDR is on.", Kind::Choice(&[("auto", "Automatic"), ("off", "Off")])),
+            item("filter", "Scaling Filter", "Smooth or sharp scaling to the window.", Kind::Choice(&[("smooth", "Smooth"), ("sharp", "Sharp")])),
         ],
     },
     Page {
         id: "graphics",
         title: "Graphics",
         items: &[
-            item("upscaler", "Anti-Aliasing", "The game's SMAA, or DLSS, XeSS or FSR: steadier edges, finer detail. Lists what this PC can run (DLSS: your own nvngx_dlss.dll in the upscalers folder, see the readme).", Kind::Choice(&[("off", "SMAA (the game's)")])),
-            item("upscaling", "Upscaling", "Renders below the render resolution and lets the Anti-Aliasing choice (DLSS, XeSS or FSR) bring it up: faster on weaker graphics. Off: their native anti-aliasing.", Kind::Choice(&[("off", "Off"), ("quality", "Quality (67%)"), ("balanced", "Balanced (58%)"), ("performance", "Performance (50%)"), ("ultra_performance", "Ultra Performance (33%)")])),
-            item("sharpening", "Sharpening", "The game's sharpening filter: 100 is the game's own.", Kind::Slider(0, 200, 10, "")),
-            item("shadows", "Shadows", "Shadow detail: Low, the PS4's, or High (sharper; more graphics memory). Applies at the next start.", Kind::Choice(&[("low", "Low"), ("ps4", "PS4"), ("high", "High")])),
-            item("texture_filtering", "Texture Filtering", "Anisotropic filtering: textures stay sharp at an angle. 4x is the PS4's.", Kind::Choice(&[("2x", "2x"), ("4x", "4x"), ("8x", "8x"), ("16x", "16x")])),
+            item("upscaler", "Anti-Aliasing", "SMAA is the game's own. DLSS needs your nvngx_dlss.dll (see the readme).", Kind::Choice(&[("off", "SMAA (the game's)")])),
+            item("upscaling", "Upscaling", "DLSS, XeSS or FSR render lower and scale up. Faster on weaker graphics.", Kind::Choice(&[("off", "Off"), ("quality", "Quality (67%)"), ("balanced", "Balanced (58%)"), ("performance", "Performance (50%)"), ("ultra_performance", "Ultra Performance (33%)")])),
+            item("sharpening", "Sharpening", "100 is the game's own.", Kind::Slider(0, 200, 10, "")),
+            item("shadows", "Shadows", "PS4 is the game's own. High is sharper and uses more video memory.", Kind::Choice(&[("low", "Low"), ("ps4", "PS4"), ("high", "High")])),
+            item("texture_filtering", "Texture Filtering", "Keeps textures sharp at an angle. 4x is the PS4's.", Kind::Choice(&[("2x", "2x"), ("4x", "4x"), ("8x", "8x"), ("16x", "16x")])),
             item("ambient_occlusion", "Ambient Occlusion", "Soft shadowing where surfaces meet. Half is the PS4's.", Kind::Choice(&[("off", "Off"), ("half", "Half"), ("full", "Full")])),
-            item("reflections", "Reflections", "Screen-space reflections on water and wet surfaces.", Kind::Choice(ON_OFF)),
+            item("reflections", "Reflections", "Reflections on water and wet surfaces.", Kind::Choice(ON_OFF)),
             item("volumetric_fog", "Volumetric Fog", "Fog that light shines through.", Kind::Choice(ON_OFF)),
             item("light_shafts", "Light Shafts", "Rays of light through openings and foliage.", Kind::Choice(ON_OFF)),
         ],
@@ -108,9 +109,9 @@ pub static PAGES: &[Page] = &[
         id: "sound",
         title: "Sound",
         items: &[
-            item("speakers", "Speakers", "Automatic follows Windows. Headphones: surround with Windows Sonic or Dolby Atmos.", Kind::Choice(&[("auto", "Automatic"), ("stereo", "Stereo"), ("5.1", "5.1"), ("7.1", "7.1"), ("headphones", "Headphones")])),
+            item("speakers", "Speakers", "Automatic follows Windows. Headphones uses Windows Sonic or Dolby Atmos.", Kind::Choice(&[("auto", "Automatic"), ("stereo", "Stereo"), ("5.1", "5.1"), ("7.1", "7.1"), ("headphones", "Headphones")])),
             item("audio_device", "Sound Device", "The device the game plays on.", Kind::Choice(&[])),
-            item("volume", "Master Volume", "The game's overall volume (its own Audio page sets voices, music and effects).", Kind::Slider(0, 100, 5, "")),
+            item("volume", "Master Volume", "Overall volume. The game's Audio page sets the rest.", Kind::Slider(0, 100, 5, "")),
         ],
     },
     Page {
@@ -118,8 +119,8 @@ pub static PAGES: &[Page] = &[
         title: "Controls",
         items: &[
             item("button_prompts", "Button Prompts", "Automatic shows the device you last used.", Kind::Choice(&[("auto", "Automatic"), ("playstation", "PlayStation"), ("xbox", "Xbox"), ("keyboard", "Keyboard")])),
-            item("mouse_sensitivity", "Mouse Sensitivity", "Camera turn per mouse count (the game's Camera options set the direction).", Kind::Slider(10, 300, 10, "")),
-            item("keys", "Key Bindings", "The keys and mouse buttons for each control.", Kind::Page("keys")),
+            item("mouse_sensitivity", "Mouse Sensitivity", "How fast the mouse turns the camera.", Kind::Slider(10, 300, 10, "")),
+            item("keys", "Key Bindings", "Keys and mouse buttons for each control.", Kind::Page("keys")),
         ],
     },
     // (Its rows: `keys_rows`, one per control of input.txt.)
@@ -128,8 +129,8 @@ pub static PAGES: &[Page] = &[
         id: "interface",
         title: "Interface",
         items: &[
-            item("hud_size", "Menu and HUD Size", "The size of menus, prompts and subtitles (from the middle of the screen).", Kind::Slider(60, 110, 5, "%")),
-            item("menu_pointer", "Mouse Pointer", "A pointer in the menus to point and click with.", Kind::Choice(ON_OFF)),
+            item("hud_size", "Menu and HUD Size", "Size of menus, prompts and subtitles.", Kind::Slider(60, 110, 5, "%")),
+            item("menu_pointer", "Mouse Pointer", "Point and click in the menus.", Kind::Choice(ON_OFF)),
             item("skip_intro", "Skip Intro Logos", "Start at the title screen.", Kind::Choice(&[("off", "Off"), ("on", "On")])),
         ],
     },
@@ -142,7 +143,29 @@ pub static PAGES: &[Page] = &[
             item("open_folder", "Open the Folder", "Shows the save folder in Explorer.", Kind::Action),
         ],
     },
+    // (What each one switches on: script_fixes' EXTRAS.)
+    Page {
+        id: "extras",
+        title: "Extras",
+        items: &[
+            item("trico_drool", "Trico's Drool", "Trico drools over the smell pots. Cut before release.", Kind::Choice(OFF_ON)),
+            item("cut_hints", "Cut Narration", "Narrator hints cut shortly before release. They don't count for the hints trophy.", Kind::Choice(OFF_ON)),
+            item("e3_slow_motion", "E3 Slow Motion", "The jump at the collapsing bridge slows down as in the E3 demo.", Kind::Choice(OFF_ON)),
+            item("trico_play", "Trico Plays", "Trico now and then sniffs and paws the boy. Cut before release.", Kind::Choice(OFF_ON)),
+        ],
+    },
 ];
+
+const OFF_ON: &[(&str, &str)] = &[("off", "Off"), ("on", "On")];
+
+/// The Extras page's settings and the globals that switch them on in the
+/// game's scripts (script_fixes' EXTRAS).
+const EXTRAS: &[(&str, &str)] = &[("trico_drool", "TLG_X_DROOL"), ("cut_hints", "TLG_X_HINTS"), ("e3_slow_motion", "TLG_X_E3"), ("trico_play", "TLG_X_PLAY")];
+
+/// For the script: per Extras setting its global and whether it is on.
+pub fn extras() -> Vec<String> {
+    EXTRAS.iter().flat_map(|&(k, g)| [g.to_string(), if get(k) == "on" { "1".to_string() } else { String::new() }]).collect()
+}
 
 /// Settings that take effect when the game next starts.
 const AT_START: &[&str] = &["aspect_ratio", "render_resolution", "skip_intro", "upscaling", "shadows"];
@@ -263,7 +286,7 @@ fn keys_rows() -> Vec<String> {
     for info in tlg_config::bindings::CONTROLS {
         let v: Vec<String> = b.inputs(info.control).iter().map(|&i| input_short(i)).collect();
         let value = if v.is_empty() { "-".to_string() } else { v.join(", ") };
-        out.extend(["bind".to_string(), format!("bind:{}", info.name), info.label.to_string(), value, String::new(), crate::pc_menu::tr("Cross or click, then press the key or mouse button. Backspace clears.").to_string(), String::new()]);
+        out.extend(["bind".to_string(), format!("bind:{}", info.name), info.label.to_string(), value, String::new(), crate::pc_menu::tr("Select, then press a key or mouse button. Backspace clears.").to_string(), String::new()]);
     }
     out
 }
@@ -298,7 +321,7 @@ pub fn bind_poll() -> String {
         Some(0x08) => None,
         Some(k) if k == 0x79 || k == 0x7A => {
             *cap = None;
-            return crate::pc_menu::tr("F10 and F11 are the game's own (PC Settings, full screen).").to_string();
+            return crate::pc_menu::tr("F10 and F11 are taken (PC Settings, full screen).").to_string();
         }
         Some(k) => Some(Input::Key(k as u8)),
         None if mouse & 1 != 0 => Some(Input::Mouse(0)),
@@ -472,7 +495,7 @@ fn apply(key: &str, value: &str, old: &str) -> Option<String> {
         }
         _ => {}
     }
-    if engine_keys().contains(&key) {
+    if engine_keys().contains(&key) || EXTRAS.iter().any(|&(k, _)| k == key) {
         ENGINE_GEN.fetch_add(1, Ordering::Relaxed);
     }
     None

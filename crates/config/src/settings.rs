@@ -363,6 +363,11 @@ pub const PC: &[(&str, &str, &str)] = &[
     ("audio_device", "default", "*"),
     // Saves
     ("save_folder", "default", "*"),
+    // Extras: content cut from the game that its files still hold
+    ("trico_drool", "off", "on|off"),
+    ("cut_hints", "off", "on|off"),
+    ("e3_slow_motion", "off", "on|off"),
+    ("trico_play", "off", "on|off"),
     // First start: the game picks settings that suit the PC, then `done`.
     ("auto_settings", "pending", "pending|done"),
 ];
@@ -417,6 +422,9 @@ pub struct Settings {
     pub update_dir: Option<PathBuf>,
     /// The launcher closes when the game starts.
     pub close_launcher: bool,
+    /// Other programs' implicit Vulkan layers (overlays, capture hooks) load
+    /// into the game (off: VK_LOADER_LAYERS_DISABLE=~implicit~).
+    pub overlays: bool,
     /// The PC Settings pages' values (`PC`), every one present.
     pub pc: std::collections::BTreeMap<&'static str, String>,
 }
@@ -444,6 +452,7 @@ impl Default for Settings {
             game_dir: None,
             update_dir: None,
             close_launcher: false,
+            overlays: true,
             pc: PC.iter().map(|&(k, d, _)| (k, d.to_string())).collect(),
         }
     }
@@ -456,88 +465,74 @@ pub const HDR_WHITE_MAX: u32 = 1000;
 /// The commented file written on first use.
 pub const TEMPLATE: &str = "\
 # The Last Guardian (tlg): display and game settings. The launcher edits
-# this file; changes apply the next time the game starts. Delete the file to
-# get the defaults back.
+# this file. Changes apply at the next start. Delete the file for defaults.
 
-# windowed, borderless (the whole monitor, no mode change) or fullscreen
-# (exclusive: the monitor switches to `resolution` and `refresh_rate`).
-# Alt+Enter or F11 switches between windowed and full screen while playing.
+# windowed, borderless (whole monitor, no mode change) or fullscreen
+# (exclusive, uses resolution and refresh_rate). Alt+Enter or F11 switches.
 display_mode = windowed
 # primary, or a monitor's device name such as \\\\.\\DISPLAY2.
 monitor = primary
-# Window client size in pixels; 0 = automatic (16:9, about 3/4 of the screen).
+# Window size in pixels. 0 = automatic (16:9, about 3/4 of the screen).
 window_width = 0
 window_height = 0
 # Exclusive fullscreen: WIDTHxHEIGHT and Hz, or desktop (the current mode).
 resolution = desktop
 refresh_rate = desktop
-# The resolution the game renders at (set when it starts): display = the
-# screen's (the fullscreen resolution, the monitor's for borderless, the
-# window's size for windowed; 16:9 within it), or WIDTHxHEIGHT, e.g.
-# 1280x720 (faster) or 3840x2160 (sharper, slower).
+# The game's render size: display (the screen's or window's) or
+# WIDTHxHEIGHT, e.g. 1280x720 (faster) or 3840x2160 (sharper).
 render_resolution = display
-# on (no tearing), off (lowest latency, may tear) or fast (no tearing, no
-# waiting; where the driver offers it).
+# on (no tearing), fast (no tearing, less lag) or off (least lag, may tear).
 vsync = on
-# Where the window's size differs from the rendered frame's: fit keeps the
-# frame's 16:9 shape (black bars where the window's shape differs), stretch
-# fills the window.
+# fit keeps the picture's shape (black bars), stretch fills the window.
 scaling = fit
 # smooth (bilinear) or sharp (nearest pixel) scaling.
 filter = smooth
-# HDR monitors: auto = HDR10 output when Windows HDR is on for the game's
-# monitor (SDR otherwise), game = the same with the game's own HDR rendering
-# (as on a PS4 with HDR; experimental), off = SDR output always (Windows then
-# shows the game at its SDR content brightness).
+# auto = HDR10 when Windows HDR is on, game = also the game's own HDR
+# rendering (experimental), off = always SDR.
 hdr = auto
-# The brightness of white in HDR output, in nits (cd/m2), 80-1000: 200 is
-# about a bright SDR screen; 0 = Windows' SDR content brightness.
+# HDR white in nits, 80-1000 (200 is a bright SDR screen). 0 = Windows' SDR
+# content brightness.
 hdr_white = 200
-# game = the game's own frame-rate limit (30 fps with update 01.03); 60 = up
-# to 60 fps (needs a fast PC: the game's time step follows the frame rate, so
-# its speed stays the same); off = no limit (not recommended: at 116-119,
-# 156-179 and 237-359 fps the game runs slower than real time).
+# game = the game's own 30 fps, 60 = up to 60 fps (needs a fast PC, game
+# speed stays the same), off = no limit (not recommended, the game runs
+# slow at 116-119, 156-179 and 237-359 fps).
 frame_cap = game
-# The first time the game shows an effect, its shader is compiled: wait =
-# the game pauses for a moment until it is ready; skip = the frame is drawn
-# without that effect meanwhile (no pause, the effect may be missing for a
-# moment; effects whose results the game reads are always waited for).
+# Effects compile their shaders on first use. wait = a short pause, skip =
+# no pause (the effect may be missing for a moment).
 new_shaders = wait
 # auto (a discrete GPU first) or part of the graphics card's name.
 gpu = auto
 # Master volume, 0-100.
 volume = 100
-# The game's language (menus, subtitles, voices), one the game files hold:
-# english, spanish, french, portuguese (in the US release: Latin American
-# Spanish, Canadian French, Brazilian Portuguese; in European ones the
-# European variants), german, italian, dutch, russian, polish, finnish,
-# swedish, danish, norwegian, turkish, arabic, japanese, korean,
-# chinese-traditional or chinese-simplified.
+# The game's language (one the game files hold): english, spanish, french,
+# portuguese, german, italian, dutch, russian, polish, finnish, swedish,
+# danish, norwegian, turkish, arabic, japanese, korean, chinese-traditional
+# or chinese-simplified.
 language = english
 # The game folders (the launcher sets these).
 game_dir =
 update_dir =
 # The launcher closes when the game starts (on/off).
 close_launcher = off
+# Other programs' overlays and capture hooks (Vulkan layers): on, or off if
+# one of them crashes the game.
+overlays = on
 
-# The game's PC Settings pages (Options > PC Settings, or F10 while
-# playing) change the settings below while the game runs.
-# Anti-aliasing: off (the game's SMAA), dlss (DLAA), xess or fsr (their
-# native anti-aliasing modes), where the PC has them.
+# The game's PC Settings (Options > PC Settings, or F10) change these.
+# Anti-aliasing: off (the game's SMAA), dlss, xess or fsr.
 upscaler = off
-# Upscaling: off, or quality (67% of the render resolution), balanced (58%),
-# performance (50%) or ultra_performance (33%): the game renders below the
-# render resolution and the upscaler above brings it up (at the next start).
+# Upscaling (at the next start): off, quality (67%), balanced (58%),
+# performance (50%) or ultra_performance (33%).
 upscaling = off
-# Sharpening, 0-200 (% of the game's own).
+# Sharpening, 0-200 (100 is the game's own).
 sharpening = 100
-# Shadows: low, ps4 (as on a PS4) or high (at the next start).
+# Shadows (at the next start): low, ps4 or high.
 shadows = ps4
-# Texture filtering: 2x, 4x (as on a PS4), 8x or 16x anisotropic.
+# Texture filtering: 2x, 4x (PS4), 8x or 16x.
 texture_filtering = 4x
-# Ambient occlusion: off, half (as on a PS4) or full resolution.
+# Ambient occlusion: off, half (PS4) or full.
 ambient_occlusion = half
-# Screen-space reflections, volumetric fog and light shafts (on/off).
+# Reflections, volumetric fog and light shafts (on/off).
 reflections = on
 volumetric_fog = on
 light_shafts = on
@@ -547,27 +542,31 @@ depth_of_field = on
 bloom = on
 chromatic_aberration = on
 vignette = on
-# The picture's shape: auto (the display's), 16:9, 16:10, 21:9 or 32:9
-# (wider shows more to the sides; the menus and HUD keep their 16:9 place).
+# Aspect ratio: auto (the display's), 16:9, 16:10, 21:9 or 32:9.
 aspect_ratio = auto
 # Button prompts: auto (the device in use), playstation, xbox or keyboard.
 button_prompts = auto
-# The size of the menus and HUD, 50-150 (%).
+# Menu and HUD size, 50-150 (%).
 hud_size = 100
 # A mouse pointer in the menus (on/off).
 menu_pointer = on
-# Skip the logos when the game starts (on/off).
+# Skip the intro logos (on/off).
 skip_intro = off
-# Speakers: auto (as Windows has them set up), stereo, 5.1, 7.1 or
-# headphones (surround for headphones through Windows Sonic or Dolby Atmos
-# for Headphones where Windows has one on).
+# Speakers: auto (as in Windows), stereo, 5.1, 7.1 or headphones (Windows
+# Sonic or Dolby Atmos for Headphones).
 speakers = auto
-# The sound device: default (Windows' default) or a device's name.
+# Sound device: default or a device's name.
 audio_device = default
-# Where saved games are kept: default or a folder.
+# Saved games folder: default or a folder.
 save_folder = default
-# pending: the game picks settings that suit this PC when it next starts
-# (then done).
+# Extras, cut from the game but still in its files (on/off): Trico's drool,
+# cut narrator lines, the E3 demo's slow motion at the bridge jump, and
+# Trico playing with the boy.
+trico_drool = off
+cut_hints = off
+e3_slow_motion = off
+trico_play = off
+# pending: the game picks settings for this PC at the next start (then done).
 auto_settings = pending
 ";
 
@@ -701,6 +700,10 @@ impl Settings {
                     Some(b) => s.close_launcher = b,
                     None => errs.push(bad("on or off")),
                 },
+                "overlays" => match flag(v) {
+                    Some(b) => s.overlays = b,
+                    None => errs.push(bad("on or off")),
+                },
                 _ => match pc_entry(&k) {
                     // (Text values as written; the others in lower case.
                     // 0.8.0's Ultra shadows are High: its map did not fit
@@ -777,6 +780,7 @@ impl Settings {
         f.set("game_dir", &self.game_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         f.set("update_dir", &self.update_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default());
         f.set("close_launcher", on_off(self.close_launcher));
+        f.set("overlays", on_off(self.overlays));
         for (k, v) in &self.pc {
             f.set(k, v);
         }
@@ -952,6 +956,7 @@ speakers = 9.1
             new_shaders: NewShaders::Skip,
             game_dir: Some(PathBuf::from(r"E:\TLG\CUSA03627")),
             close_launcher: true,
+            overlays: false,
             ..Settings::default()
         };
         let mut f = KvFile::parse(TEMPLATE);

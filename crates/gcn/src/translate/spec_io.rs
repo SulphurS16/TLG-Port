@@ -264,6 +264,9 @@ impl Spec {
             binding_base,
             debug_capture,
             page_marks,
+            // (Not recorded: translations with a position scale stay out of
+            // the pipeline manifest.)
+            ps_pos_scale: Default::default(),
         })
     }
 }
@@ -293,6 +296,7 @@ mod tests {
             binding_base: 32,
             debug_capture: vec![(5, 2, true)],
             page_marks: 3,
+            ps_pos_scale: Default::default(),
         };
         let mut b = Vec::new();
         spec.encode(&mut b);

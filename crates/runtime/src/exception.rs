@@ -638,6 +638,14 @@ unsafe extern "system" fn veh(info: *mut EXCEPTION_POINTERS) -> i32 {
                     crate::log::Level::Warn,
                     format_args!("first-chance exception {:#010x} at {name}+{:#x}{what} [{}] (passed on)", code, rip.wrapping_sub(base), crate::log::thread_name()),
                 );
+                // (Another program's Vulkan layer: named for the launcher's
+                // error message, which shows the log's errors.)
+                if let Some(l) = crate::gpu::vk::layers::layer_of(&name) {
+                    crate::log::write(
+                        crate::log::Level::Error,
+                        format_args!("{name} is another program's overlay ({}, {}). If the game closed, close that program or set overlays = off in settings.txt.", l.name, l.library),
+                    );
+                }
             }
             return EXCEPTION_CONTINUE_SEARCH;
         }

@@ -158,7 +158,7 @@ fn esfm_decrypter(entries: &[(String, Vec<u8>)], tk: &[u8; 16]) -> Option<([u8; 
 /// and the names shown at once. Returns "reload" or what went wrong.
 pub fn paste_key() -> String {
     let Some(text) = clipboard_text() else {
-        return crate::pc_menu::tr("The clipboard holds no text. Copy the trophy key (32 hexadecimal digits) first.").to_string();
+        return crate::pc_menu::tr("The clipboard is empty. Copy the trophy key first.").to_string();
     };
     match set_key(&text) {
         Ok(n) => {
@@ -174,13 +174,13 @@ pub fn paste_key() -> String {
 /// named, or what went wrong.
 pub fn set_key(text: &str) -> Result<usize, String> {
     let Some(key) = trophy::parse_key(text) else {
-        return Err(crate::pc_menu::tr("No trophy key in the clipboard: it is 32 hexadecimal digits (0-9, A-F).").to_string());
+        return Err(crate::pc_menu::tr("No trophy key in the clipboard (32 hex digits).").to_string());
     };
     let Some(s) = set() else { return Err(crate::pc_menu::tr("No trophy file in the game files.").to_string()) };
     // (A key that opens nothing leaves the names as they were.)
     let (n, how) = s.load_texts(Some(key));
     if n == 0 {
-        return Err(crate::pc_menu::tr("That key does not open this game's trophies.").to_string());
+        return Err(crate::pc_menu::tr("That key does not fit this game's trophies.").to_string());
     }
     crate::info!("achievements: {how}");
     if let Err(e) = trophy::write_key(&crate::config::paths().user, &key) {
@@ -361,9 +361,9 @@ pub fn page_rows() -> Vec<String> {
     let mut out = vec![title, (list.len() + 1).to_string()];
     let named = list.iter().any(|t| t.name.is_some());
     let (value, help) = if named {
-        ("Shown", "The names come from your PS4 trophy key. To use another key, copy it and choose this.")
+        ("Shown", "Names from your PS4 trophy key. Copy another key and choose this to change it.")
     } else {
-        ("Paste Key", "Copy the PS4 trophy key (32 hexadecimal digits), then choose this to show the trophies' names. The port does not include the key.")
+        ("Paste Key", "Copy your PS4 trophy key (32 hex digits), then choose this to show trophy names.")
     };
     out.extend(["action".to_string(), "trophy_key".into(), crate::pc_menu::tr("Trophy Names").into(), crate::pc_menu::tr(value).into(), String::new(), crate::pc_menu::tr(help).into(), String::new()]);
     for t in list.iter() {
@@ -377,7 +377,7 @@ pub fn page_rows() -> Vec<String> {
         let label = if hidden { crate::pc_menu::tr("Hidden trophy").to_string() } else { name_of(t) };
         let mut help = if hidden { String::new() } else { t.detail.clone().unwrap_or_default() };
         if t.name.is_none() {
-            help = crate::pc_menu::tr("Names and descriptions need the PS4 trophy key: see Trophy Names at the top of this page.").to_string();
+            help = crate::pc_menu::tr("Names need the PS4 trophy key (see Trophy Names above).").to_string();
         }
         let grade = grade_of(t);
         if !grade.is_empty() {

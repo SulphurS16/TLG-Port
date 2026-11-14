@@ -5604,6 +5604,16 @@ impl Renderer {
                 crate::info!("depth target {base:#x} {pitch}x{height} {format:?}: slice {slice} of {} (DB_DEPTH_VIEW {view:#x})", key.layers);
             }
         }
+        // (Debug, TLG_SLICE_LOG=1: draws into slices 2 and up - the sun's
+        // global shadow maps - with their viewport and pixel shader.)
+        static SLICE_LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if slice >= 2 && *SLICE_LOG.get_or_init(|| std::env::var_os("TLG_SLICE_LOG").is_some()) {
+            let f = |r: u32| f32::from_bits(regs.ctx(r));
+            let ps = ((regs.sh(0x2C08) as u64) | ((regs.sh(0x2C09) as u64 & 0xFF) << 32)) << 8;
+            let ud: Vec<String> = (0..8).map(|i| format!("{:08x}", regs.sh(0x2C0C + i))).collect();
+            let code: Vec<String> = if crate::mem::is_guest(ps, 48) { (0..12).map(|i| format!("{:08x}", unsafe { std::ptr::read_unaligned((ps + i * 4) as *const u32) })).collect() } else { Vec::new() };
+            crate::info!("slice draw: depth {base:#x} {pitch}x{height} slice {slice}: viewport x {}/{} y {}/{}, scissor {:#x}..{:#x}, ps {ps:#x} user [{}] code [{}]", f(0xA10F), f(0xA110), f(0xA111), f(0xA112), regs.ctx(0xA00C), regs.ctx(0xA00D), ud.join(" "), code.join(" "));
+        }
         self.init_image(key)?;
         if img!(self).images[&key].guest_newer {
             self.refresh_from_guest(key, true)?;

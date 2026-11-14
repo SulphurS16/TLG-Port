@@ -63,11 +63,12 @@ static FIXES: &[ScriptFix] = &[
             // TLG frame weight: TLG_W = 1 at load (one update = one 30 Hz frame)
             Edit { at: 5702, old: "", new: " TLG_W = 1 TLG_W_N = 0" },
             // TLG frame weight: each frame, before the user ticks, TLG_W = the frame's real time x 30 = dt / game speed x 30
+            // (a slowed speed s as the step has it above 30 fps: floor(12 s + 0.1) / 12, title_patches' slow-motion rounding)
             // (the scripts' own real time, missionscript.lua UpdateTimer_Sub; >= 0.97 -> 1, as are 30 fps and slower frames;
             // edt runs ~10% above the frame time); logs once at tick 300
             // (TLG_W30 - the port's script sets it while the frame-rate limit is the game's 30 - keeps it at 1:
             // every update one 30 Hz frame, as the game has it.)
-            Edit { at: 5788, old: "", new: r#" local tlg_s = (MS and MS.GetGameSpeed) and MS.GetGameSpeed() or 1 if TLG_W30 then TLG_W = 1 elseif dt and dt > 0 and tlg_s and tlg_s > 0 then local tlg_t = dt / tlg_s * 30 if tlg_t >= 0.97 then tlg_t = 1 end TLG_W = tlg_t end if TLG_W_N and TLG_W_N < 300 then TLG_W_N = TLG_W_N + 1 if TLG_W_N == 300 and GaPrint then GaPrint("TLG_W " .. tostring(TLG_W) .. " dt " .. tostring(dt) .. " edt " .. tostring(edt)) end end"# },
+            Edit { at: 5788, old: "", new: r#" local tlg_s = (MS and MS.GetGameSpeed) and MS.GetGameSpeed() or 1 if tlg_s and tlg_s > 0 and tlg_s < 1 then local tlg_f = math.floor(12 * tlg_s + 0.1) if tlg_f > 0 then tlg_s = tlg_f / 12 end end if TLG_W30 then TLG_W = 1 elseif dt and dt > 0 and tlg_s and tlg_s > 0 then local tlg_t = dt / tlg_s * 30 if tlg_t >= 0.97 then tlg_t = 1 end TLG_W = tlg_t end if TLG_W_N and TLG_W_N < 300 then TLG_W_N = TLG_W_N + 1 if TLG_W_N == 300 and GaPrint then GaPrint("TLG_W " .. tostring(TLG_W) .. " dt " .. tostring(dt) .. " edt " .. tostring(edt)) end end"# },
         ],
     },
     ScriptFix {
@@ -403,6 +404,8 @@ static FIXES: &[ScriptFix] = &[
             Edit { at: 30670, old: "", new: " * (TLG_W or 1)" },
             // Guidance to the pit after 1 s riding Trico
             Edit { at: 61122, old: "", new: " * (TLG_W or 1)" },
+            // The shields hint's 180 s timer adds 1/30 s per update (its hint is one of the Extras page's cut lines)
+            Edit { at: 106556, old: "", new: " * (TLG_W or 1)" },
         ],
     },
     ScriptFix {
@@ -505,6 +508,177 @@ static FIXES: &[ScriptFix] = &[
     },
 ];
 
+/// The PC Settings' Extras page: content the game's scripts still hold but
+/// switch off, back while a global the port's script sets is true
+/// (`TLG_X_DROOL`, `TLG_X_HINTS`, `TLG_X_E3`, `TLG_X_PLAY`: pc_settings'
+/// `extras`). Every edit is in the scripts at any setting (so a change
+/// applies at once): with its global unset a script does what the game's
+/// own does. The cut lines are the hint table's "cut at genDESIGN's
+/// request" (2016-09-20, common/hintlist.lua) whose triggers still run
+/// (their voice and subtitles ship); left out are those whose trigger was
+/// removed with them. They stay out of the hint table (the hints trophy
+/// counts its entries).
+static EXTRAS: &[ScriptFix] = &[
+    ScriptFix {
+        chunk: "game/scripts/ai2/condor/condorcommonslaver.lua",
+        hash: 0x2473fa1d37827bc4,
+        edits: &[
+            // Drool: the step that shows the drool mesh, skipped since 2016 ("remove the drool for now"), runs while TLG_X_DROOL is set (the mesh hidden again when it is cleared)
+            Edit { at: 3182, old: "do return end", new: r#"if not (TLG_X_DROOL and param.sknMeshSlaver) then if param.TLG_Drool then param.TLG_Drool = nil if param.sknMeshSlaver then param.sknMeshSlaver.renderableFlags = "|Hidden" end end return end param.TLG_Drool = true"# },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/ai2/interestactprobability/condor/intactprobabilitycondor_player.lua",
+        hash: 0x9be3c971e6e3c4f9,
+        edits: &[
+            // Trico plays (sniffs, then paws the boy): sealed ("for now"), valid while TLG_X_PLAY is set and the boy is clear of ledges (the cheek rubs' check)
+            Edit { at: 1225, old: "false", new: "TLG_X_PLAY == true and ActHierarchy_CheekActCheck(props)" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s06_fallingbridge/missionscript.lua",
+        hash: 0xe8085537552a5989,
+        edits: &[
+            // E3 slow motion: the jump to Trico at the falling bridge slows to 0.15 in 0.25 s (the commented "original E3" call) while TLG_X_E3 is set
+            Edit { at: 66391, old: "", new: "if TLG_X_E3 then MS.SetGameSpeed(0.15, 0.25) else " },
+            Edit { at: 66426, old: "", new: " end" },
+            // Cut hint S06_FB_HNT_V_0040 (wheel door)
+            Edit { at: 225038, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 225087, old: "", new: " end" },
+            // Cut hint S06_FB_HNT_V_0080 (stained glass)
+            Edit { at: 228349, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 228398, old: "", new: " end" },
+            // Cut hint S06_FB_HNT_V_0092 (the jump)
+            Edit { at: 230809, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 230858, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s03_canyon/missionscript.lua",
+        hash: 0x70e0ece551af112c,
+        edits: &[
+            // Cut hint S03_CA_HNT_V_0021 (the lake)
+            Edit { at: 32832, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 32879, old: "", new: " end" },
+            // Cut hint S03_CA_HNT_V_0110 (the chain room)
+            Edit { at: 66712, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 66760, old: "", new: " end" },
+            // Cut hint S03_CA_HNT_V_0120 (over the wall)
+            Edit { at: 80154, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 80201, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s07_alone/missionscript.lua",
+        hash: 0x841b7b6675bfdb24,
+        edits: &[
+            // Cut hint S07_AL_HNT_V_0050 (stained glass, once on entering)
+            Edit { at: 28800, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 28847, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s08_largetower/missionscript.lua",
+        hash: 0x46402f2c71566e54,
+        edits: &[
+            // Cut hint S08_LT_HNT_V_0031 (along the tail)
+            Edit { at: 83301, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 83330, old: "", new: " end" },
+            Edit { at: 83461, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 83509, old: "", new: " end" },
+            // Cut hint S08_LT_HNT_V_0040 (a wall to climb)
+            Edit { at: 84668, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 84698, old: "", new: " end" },
+            Edit { at: 84777, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 84828, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s09_fallingbridge2/missionscript.lua",
+        hash: 0x60980f9554fe454a,
+        edits: &[
+            // Cut hint S09_FB2_HNT_V_0060 (the soldiers' shields)
+            Edit { at: 106799, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 106848, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s10_pit/missionscript.lua",
+        hash: 0x249d50b65643093d,
+        edits: &[
+            // Cut hint S10_PI_HNT_V_0030 (the collapsed corridor)
+            Edit { at: 107397, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 107426, old: "", new: " end" },
+            Edit { at: 107539, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 107590, old: "", new: " end" },
+            // Cut line S10_PI_MRY_V_0040 (no way on without Trico)
+            Edit { at: 108784, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 108813, old: "", new: " end" },
+            Edit { at: 108926, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 108977, old: "", new: " end" },
+            // Cut line S10_PI_MRY_V_0060 (the smell pots' scent)
+            Edit { at: 111441, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 111470, old: "", new: " end" },
+            Edit { at: 111583, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 111634, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s11_columncorridor/missionscript.lua",
+        hash: 0x6e734c7628175a51,
+        edits: &[
+            // Cut hint S11_CC_HNT_V_0020 (the cart)
+            Edit { at: 170186, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 170230, old: "", new: " end" },
+            // Cut hint S11_CC_HNT_V_0051 (diving)
+            Edit { at: 172422, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 172466, old: "", new: " end" },
+            // Cut hint S11_CC_HNT_V_0060 (the wave)
+            Edit { at: 174631, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 174675, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s13_firstflight/missionscript.lua",
+        hash: 0x39724e7346a90ad8,
+        edits: &[
+            // Cut hint S13_FF_HNT_V_0001 (along the cliff)
+            Edit { at: 314521, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 314565, old: "", new: " end" },
+            // Cut hint S13_FF_HNT_V_0033 (back to Trico)
+            Edit { at: 321034, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 321078, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s14_condorclash/missionscript.lua",
+        hash: 0xfe23675803a3adef,
+        edits: &[
+            // Cut hint S14_CH_HNT_V_0140 (drop the cart)
+            Edit { at: 175680, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 175727, old: "", new: " end" },
+            // Cut hint S14_CH_HNT_V_0120 (upwards again)
+            Edit { at: 186732, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 186779, old: "", new: " end" },
+            // Cut hint S14_CH_HNT_V_0130 (the shield and the soldier)
+            Edit { at: 187554, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 187601, old: "", new: " end" },
+        ],
+    },
+    ScriptFix {
+        chunk: "game/scripts/stages/s15_secondflight/missionscript.lua",
+        hash: 0x663d8a3745ee2d44,
+        edits: &[
+            // Cut hint S15_SF_HNT_V_0030 (over the roofs)
+            Edit { at: 8449, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 8492, old: "", new: " end" },
+            // Cut hint S15_SF_HNT_V_0040 (Trico's beam)
+            Edit { at: 11140, old: "--", new: "if TLG_X_HINTS then " },
+            Edit { at: 11183, old: "", new: " end" },
+        ],
+    },
+];
+
 /// TLG_SCRIPT_PROBE=1 (a test): the weight as the AI and mission scripts see
 /// it, printed once each (logged with TLG_LUA_LOG=1).
 static PROBES: &[ScriptFix] = &[
@@ -587,27 +761,34 @@ static ALWAYS: &[ScriptFix] = &[ScriptFix {
     }],
 }];
 
-/// The frame-counted timers' fixes of the script with this hash. They are
-/// in every script at any frame-rate limit (the limit can change while the
-/// game runs); while it is the game's 30 fps, TLG_W stays 1 and they do
-/// what the game's own code does.
+/// The frame-counted timers' fixes and the Extras page's edits of the
+/// script with this hash. They are in every script at any frame-rate limit
+/// and setting (both can change while the game runs): while the limit is
+/// the game's 30 fps, TLG_W stays 1, and with the Extras off their globals
+/// are unset, so the scripts do what the game's own code does.
 fn frame_fixes(hash: u64, text: &[u8]) -> Option<Vec<u8>> {
     // (Debug: TLG_SCRIPT_FIXES=0 keeps the game's scripts above 30 fps too.)
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if *OFF.get_or_init(|| std::env::var("TLG_SCRIPT_FIXES").is_ok_and(|v| v == "0")) {
-        return None;
-    }
+    let off = *OFF.get_or_init(|| std::env::var("TLG_SCRIPT_FIXES").is_ok_and(|v| v == "0"));
     static PROBE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     let probe = *PROBE.get_or_init(|| std::env::var("TLG_SCRIPT_PROBE").is_ok_and(|v| v == "1"));
-    let fixes: Vec<&ScriptFix> = FIXES.iter().chain(if probe { PROBES } else { &[] }).filter(|f| f.hash == hash).collect();
+    let frame: Vec<&ScriptFix> = if off { vec![] } else { FIXES.iter().chain(if probe { PROBES } else { &[] }).filter(|f| f.hash == hash).collect() };
+    let extras: Vec<&ScriptFix> = EXTRAS.iter().filter(|f| f.hash == hash).collect();
+    let fixes: Vec<&ScriptFix> = frame.iter().chain(&extras).copied().collect();
     if fixes.is_empty() {
         return None;
     }
     match apply(&fixes, text) {
         Ok(out) => {
             LOADS[1].fetch_add(1, Ordering::Relaxed);
-            let n: usize = fixes.iter().map(|f| f.edits.len()).sum();
-            crate::info!("scripts: {}: {n} changes for frame-counted timers ({} -> {} bytes)", fixes[0].chunk, text.len(), out.len());
+            let count = |v: &[&ScriptFix]| v.iter().map(|f| f.edits.len()).sum::<usize>();
+            let (n, x) = (count(&frame), count(&extras));
+            let what = match (n, x) {
+                (_, 0) => format!("{n} changes for frame-counted timers"),
+                (0, _) => format!("{x} changes for the Extras page"),
+                _ => format!("{n} changes for frame-counted timers, {x} for the Extras page"),
+            };
+            crate::info!("scripts: {}: {what} ({} -> {} bytes)", fixes[0].chunk, text.len(), out.len());
             Some(out)
         }
         Err(e) => {
@@ -671,15 +852,41 @@ mod tests {
             let out = apply(&[fix], &text).unwrap_or_else(|e| panic!("{}: {e}", fix.chunk));
             assert_eq!(lines(&text), lines(&out), "{}: line count changed", fix.chunk);
         }
-        for fix in FIXES.iter().chain(PROBES) {
+        for fix in FIXES.iter().chain(PROBES).chain(EXTRAS) {
             let text = std::fs::read(root.join(fix.chunk)).unwrap_or_else(|e| panic!("{}: {e}", fix.chunk));
             assert_eq!(fnv(&text), fix.hash, "{}: the hash", fix.chunk);
-            // Alone, and with everything else for the same text (a fix and its probe).
-            let all: Vec<&ScriptFix> = FIXES.iter().chain(PROBES).filter(|f| f.hash == fix.hash).collect();
+            // Alone, and with everything else for the same text (a fix, its
+            // probe and the Extras page's edits).
+            let all: Vec<&ScriptFix> = FIXES.iter().chain(PROBES).chain(EXTRAS).filter(|f| f.hash == fix.hash).collect();
             for set in [vec![fix], all] {
                 let out = apply(&set, &text).unwrap_or_else(|e| panic!("{}: {e}", fix.chunk));
                 assert_eq!(lines(&text), lines(&out), "{}: line count changed", fix.chunk);
             }
         }
+    }
+
+    /// Writes local/research/script-check.lua: every changed script (the
+    /// frame fixes and the Extras page's edits, as the game gets them) in a
+    /// `loadstring`, for the game's own compiler: the control command
+    /// `luafile local/research/script-check.lua` (it answers in the log,
+    /// `lua> ... => true <name>=ok ...`). Run with `--ignored`.
+    #[test]
+    #[ignore]
+    fn write_compile_check() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../local/research");
+        let mut hashes: Vec<(u64, &str)> = FIXES.iter().chain(EXTRAS).map(|f| (f.hash, f.chunk)).collect();
+        hashes.sort();
+        hashes.dedup();
+        let mut lua = String::from("local r = {}\n");
+        for (hash, chunk) in hashes {
+            let text = std::fs::read(root.join("scripts-all").join(chunk)).unwrap();
+            let set: Vec<&ScriptFix> = FIXES.iter().chain(EXTRAS).filter(|f| f.hash == hash).collect();
+            let out = String::from_utf8(apply(&set, &text).unwrap()).unwrap();
+            let eq = (1..).map(|n| "=".repeat(n)).find(|q| !out.contains(&format!("]{q}]"))).unwrap();
+            let name = chunk.rsplit('/').take(2).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("/");
+            lua += &format!("do local f, e = loadstring([{eq}[\n{out}]{eq}], \"{name}\") r[#r + 1] = \"{name}=\" .. (f and \"ok\" or tostring(e)) end\n");
+        }
+        lua += "return table.concat(r, \" \")\n";
+        std::fs::write(root.join("script-check.lua"), lua).unwrap();
     }
 }

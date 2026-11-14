@@ -32,6 +32,15 @@ pub fn init() {
         let ok = unsafe { SetProcessInformation(GetCurrentProcess(), ProcessPowerThrottling, &st as *const _ as *const core::ffi::c_void, std::mem::size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) };
         crate::info!("power throttling opt-out (execution speed, timer resolution) -> {ok}");
     }
+    // A controller's input does not reset Windows' idle timers: the display
+    // turned off or the screen saver started during cutscenes and controller
+    // play (issue #19). The main thread, which calls this and lives as long as
+    // the process, keeps the display and the system on while the game runs.
+    {
+        use windows_sys::Win32::System::Power::{SetThreadExecutionState, ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED};
+        let prev = unsafe { SetThreadExecutionState(ES_CONTINUOUS | ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED) };
+        crate::info!("display and system kept on while running -> {}", if prev != 0 { "ok" } else { "failed" });
+    }
     CLOCK.get_or_init(|| {
         let t0 = Instant::now();
         let c0 = unsafe { core::arch::x86_64::_rdtsc() };

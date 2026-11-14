@@ -216,6 +216,8 @@ fn game_exited(app: &mut App, code: i32) {
         }
     }
     app.set_status(&format!("The game stopped with an error (exit code {code:#x})."));
+    // (Another program's Vulkan layer faulted: offered below.)
+    let overlay_fault = details.contains("another program's overlay");
     let text = format!(
         "The game stopped with an error (exit code {code:#x}).\n\n{}\n\nThe log is in:\n{}\n\nOpen the log folder?",
         if details.is_empty() { "No details were recorded.".to_string() } else { details },
@@ -223,6 +225,18 @@ fn game_exited(app: &mut App, code: i32) {
     );
     if unsafe { ui::message(app.hwnd, &text, TITLE, MB_ICONERROR | MB_YESNO) } == IDYES {
         ui::open_path(&log.unwrap_or_else(|| app.paths.logs()));
+    }
+    // (Another program's Vulkan layer faulted: the game can start without
+    // them, settings.txt `overlays = off`.)
+    if overlay_fault && app.settings.overlays {
+        let ask = "Another program's overlay or capture hook was running in the game when it stopped.
+
+Start the game without other programs' overlays from now on?";
+        if unsafe { ui::message(app.hwnd, ask, TITLE, MB_ICONQUESTION | MB_YESNO) } == IDYES {
+            app.settings.overlays = false;
+            app.save_settings();
+            app.set_status("Overlays off. Set overlays = on in settings.txt to undo.");
+        }
     }
 }
 
@@ -442,6 +456,6 @@ fn startup_status(app: &mut App) {
         app.update_play();
         app.set_status("The game is running.");
     } else {
-        app.set_status("The previous session did not end normally; Open logs shows its log.");
+        app.set_status("The last session did not end normally. Open logs shows its log.");
     }
 }

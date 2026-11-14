@@ -1,5 +1,34 @@
 # Changelog
 
+## 0.8.2
+
+- Fixed: slow-motion scenes froze at the 60 fps limit or without a limit,
+  e.g. the collapsing bridge (GitHub issues #17 and #22). Above 30 fps the
+  game rounded its slowed time step down to nothing; slow motion now runs
+  at the PS4's speed at any frame rate (other slow scenes ran slower than
+  on a PS4 before).
+- Fixed: with Shadows High (and Low) some areas were lit by the sun as if
+  in the open, e.g. after the fallen-pillar chasm and in the chain room
+  (GitHub issue #21, and #3's comment). The game copies its prepared sun
+  shadow maps texel for texel, so a larger shadow map got only a quarter of
+  them; the copy now fills the whole map.
+- Skip Intro Logos also skips the black screen before the title (GitHub
+  issue #15): the title comes after about 7 seconds instead of 26.
+- The display and the PC no longer go to sleep and the screen saver no
+  longer starts while the game runs, also when you play with a controller
+  (GitHub issue #19).
+- Overlays: other programs' overlays and capture hooks that load into the
+  game as Vulkan layers are listed in the log. If one of them crashes the
+  game, the launcher's error message names it and offers to start without
+  them (settings.txt: overlays = off).
+- New PC Settings page, Extras: content cut from the game that its files
+  still hold, each off until you turn it on (GitHub issue #20). Trico's
+  drool when he smells the smell pots, 23 narrator hints cut shortly before
+  release (they don't count for the hints trophy), the E3 demo's slow
+  motion at the collapsing bridge jump, and Trico now and then sniffing and
+  pawing the boy.
+- Shorter texts in PC Settings, the launcher and the settings files.
+
 ## 0.8.1
 
 - Fixed: leaving the game's Options menu (Back or cancel) locked the menus,

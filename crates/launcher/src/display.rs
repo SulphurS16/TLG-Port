@@ -113,7 +113,7 @@ pub fn build(app: &mut App) {
             // (Only a problem is shown: no card the game can use.)
             if g.iter().all(|x| x.problem.is_some()) {
                 let notes: Vec<String> = g.iter().filter_map(|x| x.problem.as_ref().map(|e| format!("{}: {e}", x.name))).collect();
-                unsafe { ui::set_text(h(p.gpu_note), &format!("No usable graphics card. {}", notes.join("; "))) };
+                unsafe { ui::set_text(h(p.gpu_note), &format!("No usable graphics card. {}", notes.join(". "))) };
             }
         }
         Err(e) => unsafe { ui::set_text(h(p.gpu_note), &e) },
@@ -354,7 +354,7 @@ pub fn command(app: &mut App, id: i32, code: u32) {
         _ => return,
     }
     app.save_settings();
-    app.set_status("Saved; applies the next time the game starts.");
+    app.set_status("Saved. Applies at the next start.");
 }
 
 /// The volume slider moved.

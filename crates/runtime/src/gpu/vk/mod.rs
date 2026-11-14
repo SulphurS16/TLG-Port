@@ -1,5 +1,6 @@
 //! Vulkan device context shared by the renderer and the presenter.
 
+pub mod layers;
 pub mod present;
 pub mod requirements;
 pub mod window;
@@ -167,6 +168,7 @@ pub fn init() -> Result<(), String> {
     if CTX.get().is_some() {
         return Ok(());
     }
+    layers::prepare(crate::config::settings().overlays);
     unsafe {
         let entry = ash::Entry::load().map_err(|e| format!("loading Vulkan: {e}"))?;
         let app_name = c"tlg";

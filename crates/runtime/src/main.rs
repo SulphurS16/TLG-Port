@@ -304,6 +304,14 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 pc_menu::request_open();
                 Ok(())
             }
+            "pcset" => {
+                // pcset <key> <value>: a PC setting changed as its page
+                // changes it (testing; persisted like the page's changes).
+                let (k, v) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let r = pc_settings::set(k, v);
+                info!("pcset {k} {v} -> {r}");
+                Ok(())
+            }
             "luafile" => {
                 // luafile <path>: that file's text run as `lua` (development:
                 // the port's script reloaded while the game runs).

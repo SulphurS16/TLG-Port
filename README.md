@@ -19,6 +19,7 @@ Not affiliated with, endorsed or sponsored by Sony Interactive Entertainment, ge
 - Mouse camera with raw input, a mouse pointer in the menus; every keyboard and mouse control can be changed, in the game too.
 - 5.1 and 7.1 sound, headphone surround with Windows Sonic or Dolby Atmos for Headphones, a choice of sound device.
 - Achievements with a pop-up in the game's style and a list of all trophies.
+- Extras: content cut from the game that its files still hold, such as Trico's drool and cut narrator hints, each off until you turn it on.
 - The languages your copy of the game carries: the US release's English, Spanish, French and Portuguese, or a European release's.
 - DUALSHOCK 4, DualSense and Xbox controllers.
 
@@ -87,7 +88,7 @@ In menus the mouse pointer selects what it points at (the Options lists and PC S
 
 ## Settings and saves
 
-- In the game: Options > PC Settings on the title screen and in the pause menu, or F10 while playing - display, graphics, camera effects, sound, controls, interface, saved games and achievements. Most settings take effect at once.
+- In the game: Options > PC Settings on the title screen and in the pause menu, or F10 while playing - display, graphics, camera effects, sound, controls, interface, saved games, achievements and extras. Most settings take effect at once.
 - Shadows (Low, PS4, High) change at the next start, like the render resolution, the aspect ratio and upscaling.
 - Anti-aliasing and upscaling (PC Settings > Graphics): the game's SMAA, or DLSS (DLAA; NVIDIA RTX cards), XeSS or FSR (FSR 4 on the AMD cards it supports, FSR 3.1 on others) - the ones your PC can run are listed, and the choice changes at once. Upscaling (Quality 67%, Balanced 58%, Performance 50%, Ultra Performance 33%; at the next start) renders below the render resolution and lets that choice bring it up. XeSS, FSR and NVIDIA Streamline ship in the 'upscalers' folder with their licenses, loaded only after their makers' digital signatures check out. DLSS itself, NVIDIA's 'nvngx_dlss.dll', is under NVIDIA's own license and not included: copy your own into the 'upscalers' folder (games with DLSS have it in their installation folder; NVIDIA's DLSS SDK at github.com/NVIDIA/DLSS has it in 'lib/Windows_x86_64/rel'), and DLSS appears in the list at the next start. NVIDIA, DLSS and RTX are trademarks of NVIDIA Corporation; Intel and XeSS of Intel Corporation; AMD and FSR of Advanced Micro Devices, Inc.
 - In the launcher: display mode, resolution, frame-rate limit, graphics card, volume and language, for the next start.

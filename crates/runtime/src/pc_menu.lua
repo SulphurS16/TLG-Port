@@ -204,10 +204,10 @@ local function set_value(row, v)
   local r = call("set", row.key, v)
   if r == "ok" or r == "start" then
     row.value = v
-    if r == "start" then P.note = "Takes effect the next time the game starts." else P.note = nil end
+    if r == "start" then P.note = "Applies at the next start." else P.note = nil end
     P.engine_gen = nil
   elseif r == "failed" then
-    P.note = "This setting could not be changed now."
+    P.note = "Can't be changed right now."
   else
     P.log("set", row.key, v, "->", r)
   end
@@ -601,7 +601,7 @@ local function draw_page()
   if not help and P.sel <= n and pg.rows[P.sel] then
     local row = pg.rows[P.sel]
     help = row.help
-    if string.find(row.flags, "p", 1, true) then help = "Takes effect the next time the game starts." end
+    if string.find(row.flags, "p", 1, true) then help = "Applies at the next start." end
   end
   if help and help ~= "" then
     -- (A long one on up to three lines around the help line, clear of the
@@ -711,6 +711,12 @@ local function engine_tick()
   local gen = call("engine_gen")
   if gen ~= P.engine_gen then
     P.engine_gen = gen
+    -- The Extras page: globals the game's changed scripts test
+    -- (script_fixes.rs EXTRAS), true while a setting is on.
+    local x = pack(call("extras"))
+    for i = 1, x.n - 1, 2 do
+      if x[i] and x[i] ~= "" then _G[x[i]] = x[i + 1] == "1" end
+    end
     local r = pack(call("engine"))
     local new = {}
     local n = tonumber(r[1]) or 0
@@ -803,7 +809,8 @@ local function console()
       if not f then
         call("log", "lua error: " .. tostring(err))
       else
-        call("log", "lua> " .. code .. " => " .. show(pack(pcall(f))))
+        local echo = #code > 200 and (string.sub(code, 1, 200) .. "...") or code
+        call("log", "lua> " .. echo .. " => " .. show(pack(pcall(f))))
       end
     end
   end

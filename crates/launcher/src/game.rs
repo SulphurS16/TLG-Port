@@ -227,12 +227,12 @@ fn save_trophy_key(app: &mut App) {
         if p.is_file() && std::fs::remove_file(&p).is_ok() {
             app.set_status("Trophy key removed: the game numbers the trophies.");
         } else {
-            app.set_status("Paste your PS4 trophy key (32 hexadecimal digits), then click Save key.");
+            app.set_status("Paste your PS4 trophy key (32 hex digits), then click Save key.");
         }
         return;
     }
     let Some(key) = trophy::parse_key(&text) else {
-        app.set_status("That is not a trophy key: it is 32 hexadecimal digits (0-9, A-F).");
+        app.set_status("That is not a trophy key (32 hex digits).");
         return;
     };
     // (The folders in the settings, else the default ones the game also
@@ -246,11 +246,11 @@ fn save_trophy_key(app: &mut App) {
     match checked.and_then(|id| trophy::write_key(&app.paths.user, &key).map(|_| id).map_err(|e| format!("Could not save it: {e}"))) {
         Ok(Some(_)) => {
             unsafe { ui::set_text(h(app.game.trophy_key), &trophy::key_text(&key)) };
-            app.set_status("Trophy key saved: the trophies have their names in the game (PC Settings > Achievements).");
+            app.set_status("Trophy key saved. Trophy names show in the game.");
         }
         Ok(None) => {
             unsafe { ui::set_text(h(app.game.trophy_key), &trophy::key_text(&key)) };
-            app.set_status("Trophy key saved; the game checks it against its trophies when it starts.");
+            app.set_status("Trophy key saved. The game checks it at the next start.");
         }
         Err(e) => app.set_status(&format!("Trophy key not saved: {e}")),
     }
@@ -266,7 +266,7 @@ pub fn command(app: &mut App, id: i32, code: u32) {
             let i = unsafe { ui::combo_sel(h(app.game.language)) };
             app.settings.language = app.game.languages.get(i).copied().unwrap_or(Language::English);
             app.save_settings();
-            app.set_status("Saved; applies the next time the game starts.");
+            app.set_status("Saved. Applies at the next start.");
         }
         (x, 0) if x == ID_GAME_DIR + 1 || x == ID_UPDATE_DIR + 1 => {
             let (edit, title) = if x == ID_GAME_DIR + 1 { (app.game.game_dir, "Game folder (version 01.00)") } else { (app.game.update_dir, "Update folder (01.03)") };
