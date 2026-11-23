@@ -34,14 +34,18 @@ thread_local! {
 }
 
 pub fn init_slot() -> Result<u32, String> {
+    // (TLG_FAIL_TLS=1: fails as under Proton might, to test the report.)
+    if std::env::var_os("TLG_FAIL_TLS").is_some() {
+        return Err("TlsAlloc returned 70, a direct TEB slot below 64 is needed (forced by TLG_FAIL_TLS)".into());
+    }
     let s = unsafe { TlsAlloc() };
     if s == u32::MAX || s >= 64 {
-        return Err(format!("TlsAlloc returned {s}; need a direct TEB slot (<64)"));
+        return Err(format!("TlsAlloc returned {s}, a direct TEB slot below 64 is needed"));
     }
     SLOT.store(s, Ordering::SeqCst);
     let r = unsafe { TlsAlloc() };
     if r == u32::MAX || r >= 64 {
-        return Err(format!("TlsAlloc returned {r}; need a direct TEB slot (<64)"));
+        return Err(format!("TlsAlloc returned {r}, a direct TEB slot below 64 is needed"));
     }
     HLE_RET_SLOT.store(r, Ordering::SeqCst);
     Ok(s)

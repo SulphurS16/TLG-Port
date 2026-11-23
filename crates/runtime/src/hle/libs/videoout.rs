@@ -128,6 +128,7 @@ pub fn frame_cap() -> crate::config::FrameCap {
         -1 => crate::config::settings().frame_cap,
         0 => FrameCap::Off,
         60 => FrameCap::Fps60,
+        n if u16::try_from(n).is_ok_and(|n| tlg_config::settings::HIGH_FRAME_CAPS.contains(&n)) => FrameCap::Fps(n as u16),
         _ => FrameCap::Game,
     }
 }
@@ -137,24 +138,63 @@ pub fn frame_cap() -> crate::config::FrameCap {
 /// title's time step then snapped to 1/60 s instead of 1/30 s
 /// (`title_patches::set_step_60`; where that is not possible the title's
 /// rate stays). None: no limit (`frame_cap = off`, `tune frame_cap 0`).
+/// Above 30 fps slow motion keeps it at or below the game's slowed ticks.
 fn flip_rate_in_force(rate: u32) -> Option<u32> {
     use crate::config::FrameCap;
     let cap = frame_cap();
-    // (Above 30 fps the frame-step detours follow the frame's time.)
-    crate::title_patches::set_frame_steps(cap != FrameCap::Game);
-    let sixty = cap == FrameCap::Fps60 && crate::title_patches::set_step_60(true);
+    // In slow motion no more frames than the game's slowed ticks, so that
+    // each frame takes one (`title_patches::slowed_tick_rate`): 30 fps below
+    // a speed of 0.158 (Trico's catches), at most 60 without a limit.
+    let ticks = if cap == FrameCap::Game { None } else { crate::title_patches::slowed_tick_rate() };
+    let thirty = ticks.is_some_and(|t| t < 60);
+    // (Above 30 fps the frame-step detours follow the frame's time; at 30
+    // in slow motion the game's own steps run, as on a PS4.)
+    crate::title_patches::set_frame_steps(cap != FrameCap::Game && !thirty);
+    {
+        // (Logged as it changes: 0 none, 30, 60.)
+        static LAST: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let now = ticks.map_or(0, |t| if thirty { 30 } else { t.min(60) });
+        if LAST.swap(now, std::sync::atomic::Ordering::Relaxed) != now {
+            match now {
+                0 => crate::info!("slow motion over: the frame-rate limit as set"),
+                n => crate::info!("slow motion ({} ticks a second): at most {n} fps", ticks.unwrap_or(0)),
+            }
+        }
+    }
+    let sixty = !thirty && (cap == FrameCap::Fps60 || ticks.is_some()) && crate::title_patches::set_step_60(true);
     if !sixty {
         crate::title_patches::set_step_60(false);
     }
-    (cap != FrameCap::Off).then_some(if sixty { 0 } else { rate })
+    if thirty {
+        return Some(1);
+    }
+    // (A limit above 60 is no limit for the title's flip rate: its flips are
+    // paced by `flip_interval`, its steps follow real time.)
+    let unlimited = matches!(cap, FrameCap::Off | FrameCap::Fps(_));
+    (!unlimited || sixty).then_some(if sixty { 0 } else { rate })
 }
 
 /// The frame-rate limit of immediate flips: flips no closer than the flip
 /// rate in force allows, as the console's vblank-timed flips. On a fixed
 /// schedule, so their average interval is exact (the title's time step
-/// snaps to it); a late frame restarts the schedule. None: no limit.
+/// snaps to it); a late frame restarts the schedule. Without a limit at most
+/// 360 fps: the game moves in ticks of 1/360 s, and a frame without one loses
+/// a press that starts on it (`title_patches::slowed_tick_rate`). A limit
+/// above 60 (`FrameCap::Fps`) sets its rate. For tests, `TLG_FPS_LIMIT=<n>`
+/// sets n fps when there is no limit.
 fn flip_interval(rate: u32) -> Option<Duration> {
-    flip_rate_in_force(rate).map(|r| Duration::from_nanos(16_666_667 * (r as u64 + 1)))
+    static TEST: std::sync::OnceLock<Option<f64>> = std::sync::OnceLock::new();
+    match flip_rate_in_force(rate) {
+        Some(r) => Some(Duration::from_nanos(16_666_667 * (r as u64 + 1))),
+        None => {
+            let fps = match frame_cap() {
+                crate::config::FrameCap::Fps(n) => n as f64,
+                _ => TEST.get_or_init(|| std::env::var("TLG_FPS_LIMIT").ok().and_then(|v| v.parse::<f64>().ok()).filter(|&f| f >= 10.0)).unwrap_or(360.0),
+            }
+            .min(360.0);
+            Some(Duration::from_secs_f64(1.0 / fps))
+        }
+    }
 }
 
 /// How late a flip may be and still keep the schedule (the next one then

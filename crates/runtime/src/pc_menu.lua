@@ -167,6 +167,9 @@ local function fetch(id)
       row.min, row.max, row.step, row.unit = tonumber(o[1]) or 0, tonumber(o[2]) or 100, tonumber(o[3]) or 1, o[4] or ""
     elseif row.kind == "page" then
       row.to = o[1]
+    elseif row.kind == "action" then
+      -- (A question to ask first, if any.)
+      if o[1] and o[1] ~= "" then row.ask = o[1] end
     elseif row.kind == "trophy" then
       row.uv = { tonumber(o[1]) or 0, tonumber(o[2]) or 0, tonumber(o[3]) or 0, tonumber(o[4]) or 0 }
     end
@@ -234,6 +237,10 @@ local function activate(row)
     P.stack[#P.stack + 1] = { id = P.page.id, sel = P.sel, scroll = P.scroll }
     open_page(row.to)
   elseif row.kind == "action" then
+    if row.ask then
+      P.confirm = { yes = false, q = row.ask, key = row.key }
+      return
+    end
     local r = call("act", row.key)
     if r == "reload" then open_page(P.page.id, true) elseif r ~= "ok" then P.note = r end
   elseif row.kind == "choice" then
@@ -437,7 +444,13 @@ local function confirm_input(dirs, pressed, mx, my, mp, moved)
   end
   local click = has(mp, 1) and my > y - 30 and my < y + 30 and mx >= yes_x - 20 and mx < no_x + 120
   if has(pressed, CROSS) or click then
-    if c.yes then call("reset", P.page.id); open_page(P.page.id, true) end
+    -- (An action's question, or Reset's.)
+    if c.yes and c.key then
+      local r = call("act", c.key)
+      if r ~= "ok" then P.note = r end
+    elseif c.yes then
+      call("reset", P.page.id); open_page(P.page.id, true)
+    end
     P.confirm = nil
   elseif has(pressed, CIRCLE) or has(mp, 2) then
     P.confirm = nil
@@ -612,9 +625,9 @@ local function draw_page()
       draw_text(lines[i], L.help_x, L.help_y + floor((i - (nl + 1) / 2) * L.help_dy), L.help_px, floor(a * 0.75))
     end
   end
-  -- Back and Reset, or the reset question.
+  -- Back and Reset, or a question (an action's or Reset's).
   if P.confirm then
-    draw_text("Restore this page's defaults?", L.back_x, L.bottom_y, L.row_px, a)
+    draw_text(P.confirm.q or "Restore this page's defaults?", L.back_x, L.bottom_y, L.row_px, a)
     local yes_x, no_x = 700, 860
     draw_text("Yes", yes_x, L.bottom_y, L.row_px, a)
     draw_text("No", no_x, L.bottom_y, L.row_px, a)

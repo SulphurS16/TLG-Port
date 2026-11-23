@@ -885,7 +885,7 @@ fn gfx_thread() {
             crate::info!("gfx: submission {} done; busy {:.1}s of {:.1}s; queued {}; stats {:?}", n, busy.as_secs_f64(), started.elapsed().as_secs_f64(), q.pending.lock().len(), cp.stats);
             if let Some(r) = render::RENDERER.lock().as_mut() {
                 let images = r.image_count();
-                crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}; color shadows: copies {}, texel-load lookups {} ({} served by the target)", r.draws, r.dispatches, r.skipped, images, r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed));
+                crate::info!("renderer: draws {} dispatches {} skipped {} images {} pipelines {}; write-backs skipped for reused memory {}; reused render targets sampled from guest memory {}; texture validations settled by edge pages {}; large zero textures cleared {}; depth views: cropped copies {} ({} by compute), direct for texel loads {}; color shadows: copies {}, texel-load lookups {} ({} served by the target)", r.draws, r.dispatches, r.skipped, images, r.pipeline_count(), r.reused_skips(), r.reused_targets(), r.edge_skips(), r.zero_textures(), render::DEPTH_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed), render::DEPTH_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[0].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[1].load(std::sync::atomic::Ordering::Relaxed), render::SHADOW_VIEWS[2].load(std::sync::atomic::Ordering::Relaxed));
                 let ub = r.upload_bytes;
                 crate::info!("buffer copies: written {} MiB, misaligned {} MiB, pending writes {} MiB, indices {} MiB; read-only copies reused {} times ({} MiB; {} made by an earlier batch); read-only copies into the BAR ring {} ({} MiB; {} to the host ring for want of room); index data from the mirror {} draws ({} MiB)", ub[0] >> 20, ub[1] >> 20, ub[2] >> 20, ub[3] >> 20, r.upload_reused.0, r.upload_reused.1 >> 20, r.upload_xreused, r.bar_uploads.0, r.bar_uploads.1 >> 20, r.bar_uploads.2, r.index_mirrored.0, r.index_mirrored.1 >> 20);
                 crate::info!("render targets (de)tiled on the GPU: reloads {}, write-backs {}; linear images written back for CPU reads {} ({} on the CPU); textures detiled on the GPU {}; ring-full retries {}", r.gpu_remaps[0], r.gpu_remaps[1], r.readbacks()[0] + r.readbacks()[1], r.readbacks()[0], r.gpu_tex_uploads, r.ring_retries);
@@ -1627,7 +1627,19 @@ fn perf_log(prev: &mut Option<PerfSnap>) {
             let k = (copier::COPIES.load(Ordering::Relaxed), copier::WAITS.load(Ordering::Relaxed), copier::WAIT_NS.load(Ordering::Relaxed));
             let pk = std::mem::replace(&mut *LAST_CP.lock(), k);
             if k.0 > pk.0 {
-                recorder.push_str(&format!("; ring copies {} by the copy thread ({} by the CPs while it slept, {} woke it), {} waits for them ({} ms)", k.0 - pk.0, copier::INLINE.swap(0, Ordering::Relaxed), copier::WAKES.swap(0, Ordering::Relaxed), k.1 - pk.1, (k.2 - pk.2) / 1_000_000));
+                let (bytes, big, bign, ns) = (copier::BYTES.swap(0, Ordering::Relaxed), copier::BIG_BYTES.swap(0, Ordering::Relaxed), copier::BIG_COPIES.swap(0, Ordering::Relaxed), copier::COPY_NS.swap(0, Ordering::Relaxed));
+                recorder.push_str(&format!(
+                    "; ring copies {} by the copy thread ({} MiB in {} ms; {} of 1 MiB+, {} MiB) ({} by the CPs while it slept, {} woke it), {} waits for them ({} ms)",
+                    k.0 - pk.0,
+                    bytes >> 20,
+                    ns / 1_000_000,
+                    bign,
+                    big >> 20,
+                    copier::INLINE.swap(0, Ordering::Relaxed),
+                    copier::WAKES.swap(0, Ordering::Relaxed),
+                    k.1 - pk.1,
+                    (k.2 - pk.2) / 1_000_000
+                ));
             }
             // (Shader stages prepared ahead: used, none made, invalid.)
             let pa: [u64; 15] = std::array::from_fn(|i| prepahead::STATS[i].swap(0, Ordering::Relaxed));

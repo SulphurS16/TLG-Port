@@ -64,6 +64,7 @@ pub static PAGES: &[Page] = &[
             item("saves", "Saved Games", "Where saved games are kept.", Kind::Page("saves")),
             item("achievements", "Achievements", "Trophies and which you have.", Kind::Page("achievements")),
             item("extras", "Extras", "Cut content still in the game files.", Kind::Page("extras")),
+            item("quit_game", "Quit Game", "Closes the game. Progress is kept up to the last checkpoint.", Kind::Action),
         ],
     },
     Page {
@@ -73,7 +74,7 @@ pub static PAGES: &[Page] = &[
             item("display_mode", "Display Mode", "Windowed, borderless or exclusive full screen.", Kind::Choice(&[("windowed", "Windowed"), ("borderless", "Borderless"), ("fullscreen", "Full Screen")])),
             item("aspect_ratio", "Aspect Ratio", "Automatic matches the screen. Wider shows more to the sides.", Kind::Choice(&[("auto", "Automatic"), ("16:9", "16:9"), ("16:10", "16:10"), ("21:9", "21:9"), ("32:9", "32:9")])),
             item("render_resolution", "Render Resolution", "The game's render height. Display uses the screen's.", Kind::Choice(&[("display", "Display"), ("1280x720", "720p"), ("1600x900", "900p"), ("1920x1080", "1080p"), ("2560x1440", "1440p"), ("3840x2160", "2160p")])),
-            item("frame_cap", "Frame Rate Limit", "30 is the game's own. Game speed stays the same.", Kind::Choice(&[("game", "30"), ("60", "60"), ("off", "None")])),
+            item("frame_cap", "Frame Rate Limit", "30 is the game's own. Game speed stays the same.", Kind::Choice(&[("game", "30"), ("60", "60"), ("90", "90"), ("120", "120"), ("144", "144"), ("off", "None")])),
             item("vsync", "Vertical Sync", "On: no tearing. Fast: no tearing, less lag. Off: least lag.", Kind::Choice(&[("on", "On"), ("fast", "Fast"), ("off", "Off")])),
             item("hdr", "HDR", "HDR when Windows HDR is on.", Kind::Choice(&[("auto", "Automatic"), ("off", "Off")])),
             item("filter", "Scaling Filter", "Smooth or sharp scaling to the window.", Kind::Choice(&[("smooth", "Smooth"), ("sharp", "Sharp")])),
@@ -396,7 +397,8 @@ pub fn page_rows(id: &str) -> Vec<String> {
             }
             Kind::Slider(a, b, s, u) => ("slider", format!("{a}\t{b}\t{s}\t{u}")),
             Kind::Page(to) => ("page", to.to_string()),
-            Kind::Action => ("action", String::new()),
+            // (The question asked first, Yes or No, if any.)
+            Kind::Action => ("action", ASKS.iter().find(|&&(k, _)| k == it.key).map_or(String::new(), |&(_, q)| crate::pc_menu::tr(q).to_string())),
             Kind::Bind => ("bind", String::new()),
         };
         let mut flags = String::new();
@@ -470,8 +472,9 @@ fn apply(key: &str, value: &str, old: &str) -> Option<String> {
             }
         }
         "frame_cap" => {
+            // (The tune's values: 1 the game's 30, 60, a limit above 60, 0 none.)
             let n = match value {
-                "60" => "60",
+                "60" | "90" | "120" | "144" => value,
                 "off" => "0",
                 _ => "1",
             };
@@ -503,8 +506,18 @@ fn apply(key: &str, value: &str, old: &str) -> Option<String> {
 
 /// Runs a page action. Returns what the page shows next: "ok", "reload"
 /// (the page's values changed) or a message.
+/// Actions that ask first (Yes or No on the page's bottom row).
+const ASKS: &[(&str, &str)] = &[("quit_game", "Quit the game?")];
+
 pub fn act(key: &str) -> String {
     match key {
+        // (As the window's close: the main loop shuts down, a save being
+        // written finishing first. GitHub issue #23.)
+        "quit_game" => {
+            crate::info!("pc settings: Quit Game");
+            crate::gpu::vk::window::CLOSED.store(true, std::sync::atomic::Ordering::SeqCst);
+            "ok".into()
+        }
         "choose_folder" => match crate::gpu::vk::window::pick_folder("Choose a folder for saved games") {
             Some(dir) => {
                 let r = set("save_folder", &dir.display().to_string());

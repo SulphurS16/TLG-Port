@@ -132,6 +132,12 @@ pub fn write_guest(a: u64, bytes: &[u8]) -> Result<(), String> {
 static SNAPS: parking_lot::Mutex<[Vec<(u64, Vec<u8>)>; 3]> = parking_lot::Mutex::new([Vec::new(), Vec::new(), Vec::new()]);
 
 pub fn memsnap(slot: usize, host: Option<(u64, u64)>) -> Result<(), String> {
+    memsnap_with(slot, host, false)
+}
+
+/// `memsnap <slot> direct`: also direct memory mappings up to 512 MiB (the
+/// title's CPU heap; not the multi-GiB graphics heap).
+pub fn memsnap_with(slot: usize, host: Option<(u64, u64)>, direct: bool) -> Result<(), String> {
     if slot > 2 {
         return Err("memsnap: slot 0, 1 or 2".into());
     }
@@ -146,7 +152,8 @@ pub fn memsnap(slot: usize, host: Option<(u64, u64)>) -> Result<(), String> {
     } else {
         let st = crate::mem::map_read();
         for v in st.vmas.values() {
-            let keep = matches!(v.kind, crate::mem::VmaKind::Module | crate::mem::VmaKind::Flexible) && v.prot & 2 != 0 && v.size <= 1 << 30;
+            let keep = (matches!(v.kind, crate::mem::VmaKind::Module | crate::mem::VmaKind::Flexible) && v.prot & 2 != 0 && v.size <= 1 << 30)
+                || (direct && matches!(v.kind, crate::mem::VmaKind::Direct) && v.size <= 512 << 20 && readable(v.start, v.size));
             if !keep {
                 continue;
             }
@@ -162,9 +169,15 @@ pub fn memsnap(slot: usize, host: Option<(u64, u64)>) -> Result<(), String> {
 }
 
 pub fn memfind(width: usize, small: bool) -> Result<(), String> {
+    memfind_mode(width, if small { "small" } else { "" })
+}
+
+/// `memfind <width> vals <a> <b> <c>`: places holding exactly a, b and c in
+/// snapshots 0, 1 and 2 (e.g. the symbol ids of the items a menu's cursor
+/// was on).
+pub fn memfind_values(width: usize, vals: [u32; 3]) -> Result<(), String> {
     let s = SNAPS.lock();
     let w = width.clamp(1, 4);
-    // (`small`: only values under 16 in all three, e.g. a menu's cursor.)
     let v = |b: &[u8]| b.iter().rev().fold(0u32, |a, &x| a << 8 | x as u32);
     let mut found = 0;
     for (a0, b0) in &s[0] {
@@ -172,16 +185,52 @@ pub fn memfind(width: usize, small: bool) -> Result<(), String> {
         let n = b0.len().min(b1.len()).min(b2.len());
         let mut i = 0;
         while i + w <= n {
-            if b0[i..i + w] == b2[i..i + w] && b0[i..i + w] != b1[i..i + w] && (!small || (v(&b0[i..i + w]) < 16 && v(&b1[i..i + w]) < 16)) {
+            if v(&b0[i..i + w]) == vals[0] && v(&b1[i..i + w]) == vals[1] && v(&b2[i..i + w]) == vals[2] {
                 if found < 80 {
-                    crate::info!("memfind: {:#x}: {:02x?} -> {:02x?} -> back", a0 + i as u64, &b0[i..i + w], &b1[i..i + w]);
+                    crate::info!("memfind: {:#x}: {} -> {} -> {}", a0 + i as u64, vals[0], vals[1], vals[2]);
                 }
                 found += 1;
             }
             i += w;
         }
     }
-    crate::info!("memfind: {found} places (width {w})");
+    crate::info!("memfind: {found} places (width {w}, values {:?})", vals);
+    Ok(())
+}
+
+/// `memfind <width> [small|step]`: `small` - places that changed in snapshot
+/// 1 and are back in 2, values under 16 (a toggled cursor); `step` - places
+/// that moved by the same small nonzero amount from 0 to 1 and from 1 to 2
+/// (a cursor moved down twice: 0 -> 1 -> 2).
+pub fn memfind_mode(width: usize, mode: &str) -> Result<(), String> {
+    let s = SNAPS.lock();
+    let w = width.clamp(1, 4);
+    let small = mode == "small";
+    let step = mode == "step";
+    let v = |b: &[u8]| b.iter().rev().fold(0u32, |a, &x| a << 8 | x as u32);
+    let mut found = 0;
+    for (a0, b0) in &s[0] {
+        let (Some((_, b1)), Some((_, b2))) = (s[1].iter().find(|r| r.0 == *a0), s[2].iter().find(|r| r.0 == *a0)) else { continue };
+        let n = b0.len().min(b1.len()).min(b2.len());
+        let mut i = 0;
+        while i + w <= n {
+            let (x0, x1, x2) = (v(&b0[i..i + w]) as i64, v(&b1[i..i + w]) as i64, v(&b2[i..i + w]) as i64);
+            let hit = if step {
+                let d = x1 - x0;
+                d != 0 && d.abs() <= 16 && x2 - x1 == d && x0.abs() < 4096
+            } else {
+                b0[i..i + w] == b2[i..i + w] && b0[i..i + w] != b1[i..i + w] && (!small || (x0 < 16 && x1 < 16))
+            };
+            if hit {
+                if found < 80 {
+                    crate::info!("memfind: {:#x}: {:02x?} -> {:02x?} -> {:02x?}", a0 + i as u64, &b0[i..i + w], &b1[i..i + w], &b2[i..i + w]);
+                }
+                found += 1;
+            }
+            i += w;
+        }
+    }
+    crate::info!("memfind: {found} places (width {w}{})", if mode.is_empty() { String::new() } else { format!(", {mode}") });
     Ok(())
 }
 

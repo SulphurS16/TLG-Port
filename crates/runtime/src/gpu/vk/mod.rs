@@ -362,7 +362,13 @@ pub fn init() -> Result<(), String> {
             let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut p13);
             instance.get_physical_device_properties2(pdev, &mut p2);
             crate::info!("Vulkan subgroups: {}-{} wide, size control {} (stages {:?})", p13.min_subgroup_size, p13.max_subgroup_size, s13.subgroup_size_control, p13.required_subgroup_size_stages);
-            s13.subgroup_size_control != 0 && p13.min_subgroup_size <= 64 && p13.max_subgroup_size >= 64 && p13.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
+            // (TLG_NO_WAVE64=1: the device's own choice, as on 32-wide
+            // devices - a test for AMD-only looks, GitHub issue #18.)
+            let off = std::env::var("TLG_NO_WAVE64").is_ok_and(|v| v == "1");
+            if off {
+                crate::info!("TLG_NO_WAVE64=1: no 64-wide compute subgroups asked for");
+            }
+            !off && s13.subgroup_size_control != 0 && p13.min_subgroup_size <= 64 && p13.max_subgroup_size >= 64 && p13.required_subgroup_size_stages.contains(vk::ShaderStageFlags::COMPUTE)
         };
         let mirror_clamp = {
             let mut s12 = vk::PhysicalDeviceVulkan12Features::default();
@@ -556,6 +562,20 @@ impl Ctx {
                 used += b.heap_usage[i];
                 budget += b.heap_budget[i];
             }
+        }
+        // TLG_VRAM_BUDGET_MIB=<n>: a smaller budget for tests (the pressure
+        // levels and eviction of a smaller card; the driver still has all of
+        // this card's memory).
+        static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let cap = *CAP.get_or_init(|| {
+            let mib = std::env::var("TLG_VRAM_BUDGET_MIB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(0);
+            if mib > 0 {
+                crate::info!("VRAM budget capped at {mib} MiB for this run (TLG_VRAM_BUDGET_MIB)");
+            }
+            mib << 20
+        });
+        if cap > 0 {
+            budget = budget.min(cap);
         }
         Some((used, budget))
     }

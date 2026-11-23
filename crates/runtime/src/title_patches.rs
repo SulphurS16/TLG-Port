@@ -185,6 +185,7 @@ pub fn apply(p: &mut Patcher, name: &str) {
     }
     crate::menu_patches::apply(p, name);
     crate::pc_prompts::apply(p, name);
+    crate::readback_guard::apply(p, name);
     if crate::config::settings().pc.get("skip_intro").is_some_and(|v| v == "on") {
         match patch_logos(p) {
             Ok(()) => crate::info!("intro: the lead-in, SIE and Japan Studio logos skipped (PC Settings; {name}+{LOGO_SITE:#x})"),
@@ -976,6 +977,37 @@ pub fn symbol_name(id: u32) -> String {
     if s == 0 { format!("#{id}") } else { unsafe { cstr(s, 128) } }
 }
 
+/// Debug (control `symfind <name>`): the ids whose name is `name` in the
+/// game's symbol table (interned at run time, so ids differ between boots
+/// only if the order of interning does).
+pub fn symbol_ids(name: &str) -> Vec<u32> {
+    let b = BASE.load(Ordering::Relaxed);
+    let mut out = Vec::new();
+    if b == 0 {
+        return out;
+    }
+    // (Mapped memory only: past the table's end the guest range is reserved
+    // but not committed - the first version read on and crashed, run
+    // 20261122-000608.)
+    for id in 1..0x10_0000u32 {
+        let e = b + SYMBOLS + id as u64 * 32;
+        if !crate::debug_mem::host_or_guest_readable(e, 8) {
+            break;
+        }
+        // SAFETY: the symbol table's entry (mapped memory checked).
+        let s = unsafe { *(e as *const u64) };
+        let n = name.len();
+        if s != 0 && crate::debug_mem::host_or_guest_readable(s, n as u64 + 1) {
+            // SAFETY: n + 1 bytes at `s`, mapped memory checked.
+            let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, n + 1) };
+            if &bytes[..n] == name.as_bytes() && bytes[n] == 0 {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
 /// Foot-pin lookups that found no skeleton (`patch_foot_pins`), if patched.
 pub fn foot_pin_misses() -> Option<u64> {
     let slot = PINS_COUNT.load(Ordering::Relaxed);
@@ -1054,9 +1086,23 @@ fn patch_frame_steps(p: &mut Patcher) -> Result<(), String> {
 /// gives floor(0.7) = 0 and the game stops (the collapsing bridge, issues
 /// #17 and #22), slow motion at 0.15-0.3 ran slower than on a PS4. With
 /// `FRAME_STEPS` on (a limit other than the game's) and s below 1 the step
-/// is t x floor(12 s + 0.1) / (12 s): the PS4's rate at any frame rate (at
-/// an exact 30 fps the same value). At full speed, and at the game's own
-/// limit, the game's rounding.
+/// runs at t x floor(12 s + 0.1) / (12 s): the PS4's rate at any frame rate
+/// (at an exact 30 fps the same value). It stays whole 1/360 s ticks, as
+/// every step of the game's is: the remainder carries to the next frame
+/// (`SLOW_STATE`; s = 0.25 at 60 fps: 1 and 2 ticks in turn). The boy's
+/// physics needs whole ticks: with 1/720 s steps (0.8.2) his jump in slow
+/// motion rose a quarter as high and Trico missed him at the Pit's
+/// collapsing passage (#17). Frames without a tick lose presses that start
+/// on them, so the frame-rate limit stays at or below the slowed ticks
+/// (`slowed_tick_rate`): below s = 0.158 it is 30 fps and the game's own
+/// steps run (`FRAME_STEPS` off). A frame without a tick (a limit's change
+/// takes a frame) adds its intended step to the game's catch-up sum (the
+/// app's +1a4) as the game's own update after the site does on the others
+/// (it skips steps of 0). At full speed above 30 fps the step is carried in
+/// whole ticks the same way: rounding each frame down lost up to a tick a
+/// frame, more than the game's catch-up (1.25x at most) can win back, so
+/// without a limit at 116-119, 156-179 and 237-359 fps the game ran slower
+/// than real time. At the game's own limit, the game's rounding.
 const ROUND_SITE: usize = 0xd1664a;
 const ROUND_BYTES: [u8; 30] = [
     0xC5, 0xFA, 0x59, 0x05, 0xBE, 0xB1, 0x7D, 0x00, // vmulss xmm0,xmm0,[14F1810h] (360)
@@ -1067,6 +1113,75 @@ const ROUND_BYTES: [u8; 30] = [
 const ROUND_CONSTS: usize = 0x14f1810;
 /// The app object's game speed (1.0 unless slowed).
 const APP_SPEED: i32 = 0x1b8;
+/// The app object's frame time (the measured one, before the speed), its
+/// scale, and the catch-up sum the step function keeps of the intended
+/// steps less the steps taken (clamped to -1..1).
+const APP_DT: i32 = 0x190;
+const APP_SCALE: i32 = 0x1b0;
+const APP_CATCH_UP: i32 = 0x1a4;
+/// The app object's pointer (absolute) once the slowed steps are patched.
+static SLOW_APP_PTR: AtomicU64 = AtomicU64::new(0);
+
+/// In slow motion above 30 fps the game's ticks a second (30 x floor(12 s +
+/// 0.1), as on the PS4; s = 0.1: 30), None at full speed or before the game
+/// runs. The frame-rate limit stays at or below it
+/// (`videoout::flip_rate_in_force`): with fewer ticks than frames some
+/// frames take none, and a press that starts on such a frame is lost (the
+/// boy did not jump; on a PS4 every frame takes a tick).
+pub fn slowed_tick_rate() -> Option<u32> {
+    if SLOW_APP_PTR.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let s = app_f32(APP_SPEED)?;
+    (s > 0.0 && s < 1.0).then(|| 30 * (12.0 * s + 0.1).floor().max(1.0) as u32)
+}
+
+/// The game's step of its latest frame (seconds of game time; the
+/// frame-time CSV's `step_ms`).
+pub fn frame_step() -> Option<f32> {
+    app_f32(APP_STEP)
+}
+
+/// A float of the game's app object (once the module is patched).
+fn app_f32(off: i32) -> Option<f32> {
+    // (The app object last found readable: the game makes it once.)
+    static APP: AtomicU64 = AtomicU64::new(0);
+    let at = match SLOW_APP_PTR.load(Ordering::Relaxed) {
+        0 => match BASE.load(Ordering::Relaxed) {
+            0 => return None,
+            b => b + APP_PTR,
+        },
+        a => a,
+    };
+    // SAFETY: the module's data (the patched image's).
+    let app = unsafe { std::ptr::read_volatile(at as *const u64) };
+    if app == 0 {
+        return None;
+    }
+    if APP.load(Ordering::Relaxed) != app {
+        // (The game's heap: not always in the guest ranges. Its fields here
+        // lie within 0x200 bytes.)
+        if !crate::debug_mem::host_or_guest_readable(app, 0x200) {
+            return None;
+        }
+        APP.store(app, Ordering::Relaxed);
+    }
+    // SAFETY: the game's app object (checked readable; kept for the
+    // process's life).
+    Some(unsafe { std::ptr::read_volatile((app + off as u64) as *const f32) })
+}
+
+/// The slowed step's carried fraction of a 1/360 s tick, then the constants
+/// the detour reads: 360, 0.001 (a whole tick despite float error), 1/360,
+/// 1, -1.
+static SLOW_STATE: [AtomicU32; 6] = [
+    AtomicU32::new(0),
+    AtomicU32::new(360.0f32.to_bits()),
+    AtomicU32::new(0.001f32.to_bits()),
+    AtomicU32::new((1.0f32 / 360.0).to_bits()),
+    AtomicU32::new(1.0f32.to_bits()),
+    AtomicU32::new((-1.0f32).to_bits()),
+];
 
 fn patch_slow_steps(p: &mut Patcher) -> Result<(), String> {
     use iced_x86::code_asm::*;
@@ -1084,18 +1199,20 @@ fn patch_slow_steps(p: &mut Patcher) -> Result<(), String> {
         // xmm1-xmm3, rcx and the flags are written before they are read
         // again after the site.
         let mut game = a.create_label();
+        let mut whole = a.create_label();
         a.mov(rcx, &FRAME_STEPS as *const _ as u64)?;
         a.cmp(byte_ptr(rcx), 0)?;
         a.je(game)?;
         a.vmovss(xmm1, dword_ptr(rdi + APP_SPEED))?;
-        a.mov(ecx, 1.0f32.to_bits())?;
-        a.vmovd(xmm2, ecx)?;
-        a.vcomiss(xmm1, xmm2)?;
-        a.jae(game)?;
         a.vxorps(xmm2, xmm2, xmm2)?;
         a.vcomiss(xmm1, xmm2)?;
         // (s <= 0, or not a number.)
         a.jbe(game)?;
+        // (Full speed: the step as it is, in whole ticks.)
+        a.mov(ecx, 1.0f32.to_bits())?;
+        a.vmovd(xmm2, ecx)?;
+        a.vcomiss(xmm1, xmm2)?;
+        a.jae(whole)?;
         a.mov(ecx, 12.0f32.to_bits())?;
         a.vmovd(xmm2, ecx)?;
         a.vmulss(xmm1, xmm1, xmm2)?;
@@ -1105,8 +1222,37 @@ fn patch_slow_steps(p: &mut Patcher) -> Result<(), String> {
         a.vroundss(xmm2, xmm2, xmm2, 9)?;
         a.vdivss(xmm2, xmm2, xmm1)?;
         a.vmulss(xmm0, xmm0, xmm2)?;
+        // Whole ticks: the step and the carried fraction in ticks, rounded
+        // down; what is left carries over.
+        a.set_label(&mut whole)?;
+        a.mov(rcx, SLOW_STATE.as_ptr() as u64)?;
+        a.vmulss(xmm0, xmm0, dword_ptr(rcx + 4))?;
+        a.vaddss(xmm0, xmm0, dword_ptr(rcx))?;
+        a.vaddss(xmm2, xmm0, dword_ptr(rcx + 8))?;
+        a.vroundss(xmm2, xmm2, xmm2, 9)?;
+        a.vsubss(xmm3, xmm0, xmm2)?;
+        a.vmovss(dword_ptr(rcx), xmm3)?;
+        a.vmulss(xmm0, xmm2, dword_ptr(rcx + 12))?;
+        // No tick this frame: the game's catch-up update skips a step of 0,
+        // so it is made here as the game makes it (the sum less the step,
+        // here 0, plus the intended one; only below a frame time of 1 s).
+        a.vxorps(xmm1, xmm1, xmm1)?;
+        a.vcomiss(xmm2, xmm1)?;
+        a.ja(back)?;
+        a.vmovss(xmm1, dword_ptr(rdi + APP_DT))?;
+        a.vcomiss(xmm1, dword_ptr(rcx + 16))?;
+        a.jae(back)?;
+        a.vmulss(xmm1, xmm1, dword_ptr(rdi + APP_SCALE))?;
+        a.vmulss(xmm1, xmm1, dword_ptr(rdi + APP_SPEED))?;
+        a.vaddss(xmm1, xmm1, dword_ptr(rdi + APP_CATCH_UP))?;
+        a.vminss(xmm1, xmm1, dword_ptr(rcx + 16))?;
+        a.vmaxss(xmm1, xmm1, dword_ptr(rcx + 20))?;
+        a.vmovss(dword_ptr(rdi + APP_CATCH_UP), xmm1)?;
         a.jmp(back)?;
         a.set_label(&mut game)?;
+        // (The game's own limit: nothing carries over.)
+        a.mov(rcx, SLOW_STATE.as_ptr() as u64)?;
+        a.mov(dword_ptr(rcx), 0)?;
         a.mov(rcx, base + ROUND_CONSTS as u64)?;
         a.vmulss(xmm0, xmm0, dword_ptr(rcx))?;
         a.vaddss(xmm0, xmm0, dword_ptr(rcx + 4))?;
@@ -1114,6 +1260,7 @@ fn patch_slow_steps(p: &mut Patcher) -> Result<(), String> {
         a.vmulss(xmm0, xmm0, dword_ptr(rcx + 8))?;
         a.jmp(back)
     })?;
+    SLOW_APP_PTR.store(base + APP_PTR, Ordering::Relaxed);
     Ok(())
 }
 

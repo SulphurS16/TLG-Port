@@ -33,6 +33,7 @@ mod pc_auto;
 mod pc_menu;
 mod pc_prompts;
 mod pc_settings;
+mod readback_guard;
 mod script_fixes;
 mod sse4a;
 mod thread;
@@ -64,7 +65,22 @@ pub struct Config {
     /// Player-facing message boxes (off with `--no-dialogs` and in scripted
     /// or development runs).
     pub dialogs: bool,
+    /// `--reboot`: the title's own restart (`restart_game`): the title gets
+    /// "-reboot" as its argument, as from a PS4's LoadExec.
+    pub reboot: bool,
+    /// `--wait-for <pid>`: the process that started this one for the title's
+    /// restart, waited for before this one starts.
+    pub wait_for: Option<u32>,
 }
+
+/// Exit status of a run that started the game again for the title's own
+/// restart (`restart_game`): the launcher then follows the new process,
+/// named in the running marker.
+pub const RESTARTED: i32 = tlg_config::GAME_RESTARTED;
+
+/// This run's `--launcher` and `--reboot` (`restart_game`, the title's argv).
+static LAUNCHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static REBOOT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 pub static RUN_DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
@@ -110,6 +126,8 @@ fn parse_args() -> Config {
     let mut safe_mode = false;
     let mut launcher = false;
     let mut no_dialogs = false;
+    let mut reboot = false;
+    let mut wait_for = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
@@ -146,6 +164,8 @@ fn parse_args() -> Config {
             "--safe-mode" => safe_mode = true,
             "--launcher" => launcher = true,
             "--no-dialogs" => no_dialogs = true,
+            "--reboot" => reboot = true,
+            "--wait-for" => wait_for = args.next().and_then(|s| s.parse().ok()),
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
@@ -153,7 +173,84 @@ fn parse_args() -> Config {
         }
     }
     let dialogs = !no_dialogs && !headless && control.is_none() && seconds.is_none() && paths.layout != config::Layout::Dev;
-    Config { paths, game, update, no_update, seconds, trace, lenient, debug, headless, control, safe_mode, launcher, dialogs }
+    LAUNCHED.store(launcher, std::sync::atomic::Ordering::Relaxed);
+    REBOOT.store(reboot, std::sync::atomic::Ordering::Relaxed);
+    Config { paths, game, update, no_update, seconds, trace, lenient, debug, headless, control, safe_mode, launcher, dialogs, reboot, wait_for }
+}
+
+/// Waits (at most 30 s) for the process that started this one for the
+/// title's restart to exit: it holds the single-instance mutex and the saves
+/// until then.
+fn wait_for_process(pid: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE, 0, pid);
+        if !h.is_null() {
+            WaitForSingleObject(h, 30_000);
+            CloseHandle(h);
+        }
+    }
+}
+
+/// The title's own restart: after its engine exits it asks to start itself
+/// again (sceSystemServiceLoadExec of its own executable with "-reboot", the
+/// way back to the title screen after the ending; LOG: The ending's
+/// restart). A PS4 starts the application again; here this executable starts
+/// again with the same arguments plus `--reboot` and `--wait-for` this
+/// process, and this one shuts down (status `RESTARTED` for the launcher,
+/// which follows the new process). Player runs only (dialogs on: not
+/// development or scripted runs), and not within a minute of the start (a
+/// title that keeps asking at once would loop). False: not restarted.
+pub fn restart_game() -> bool {
+    // (TLG_RESTART_TEST=1: in development and scripted runs too, for tests.)
+    if !config::dialogs() && !std::env::var("TLG_RESTART_TEST").is_ok_and(|v| v == "1") {
+        info!("restart: the title asked to start again (not done in development and scripted runs)");
+        return false;
+    }
+    let up_ms = crate::log::elapsed_ms();
+    if up_ms < 60_000.0 {
+        warn!("restart: the title asked to start again {:.0} s after the start (not restarted: it would loop)", up_ms / 1000.0);
+        return false;
+    }
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(e) => {
+            warn!("restart: this executable's path: {e}");
+            return false;
+        }
+    };
+    let mut args: Vec<String> = Vec::new();
+    let mut it = std::env::args().skip(1);
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--reboot" => {}
+            "--wait-for" => {
+                it.next();
+            }
+            _ => args.push(a),
+        }
+    }
+    args.push("--reboot".into());
+    args.push("--wait-for".into());
+    args.push(std::process::id().to_string());
+    let dir = exe.parent().map(Path::to_path_buf).unwrap_or_default();
+    match std::process::Command::new(&exe).args(&args).current_dir(dir).spawn() {
+        Ok(child) => {
+            info!("restart: the title asked to start again; started process {} ({})", child.id(), args.join(" "));
+            true
+        }
+        Err(e) => {
+            warn!("restart: could not start {}: {e}", exe.display());
+            false
+        }
+    }
+}
+
+/// Ends this run after `restart_game` started the next one: as a normal
+/// exit, with `RESTARTED` for the launcher when it started this run.
+pub fn restart_exit() -> ! {
+    shutdown(if LAUNCHED.load(std::sync::atomic::Ordering::Relaxed) { RESTARTED } else { 0 })
 }
 
 /// The folders mounted at /app0, highest priority first: the update (01.03)
@@ -299,6 +396,15 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 gpu::REPORT_REQUEST.store(true, std::sync::atomic::Ordering::Relaxed);
                 Ok(())
             }
+            "restart" => {
+                // restart: what the title's own restart does
+                // (sceSystemServiceLoadExec, `restart_game`; scripted runs
+                // need TLG_RESTART_TEST=1).
+                if restart_game() {
+                    restart_exit();
+                }
+                Err("restart: not started (see the log)".into())
+            }
             "pcmenu" => {
                 // Opens the in-game PC settings (as F10 does).
                 pc_menu::request_open();
@@ -438,15 +544,22 @@ fn poll_control(path: &Path, offset: &mut u64) {
             }
             "memsnap" => {
                 // memsnap <0|1|2> [host <addr> <len>] / memfind [width]: where a toggled value lives.
+                // (`memsnap <slot> direct`: with the title's CPU heap.)
                 let slot = parts.next().and_then(|v| v.parse().ok()).unwrap_or(9);
-                let host = if parts.next() == Some("host") {
-                    let a = parts.next().and_then(|v| debug_mem::parse_addr(v).ok());
-                    let n = parts.next().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
-                    a.zip(n)
-                } else {
-                    None
+                let mut direct = false;
+                let host = match parts.next() {
+                    Some("host") => {
+                        let a = parts.next().and_then(|v| debug_mem::parse_addr(v).ok());
+                        let n = parts.next().and_then(|v| u64::from_str_radix(v.trim_start_matches("0x"), 16).ok());
+                        a.zip(n)
+                    }
+                    Some("direct") => {
+                        direct = true;
+                        None
+                    }
+                    _ => None,
                 };
-                debug_mem::memsnap(slot, host)
+                debug_mem::memsnap_with(slot, host, direct)
             }
             "key" => {
                 // key <vk hex> [ms]: a keyboard key held (default 100 ms).
@@ -467,8 +580,22 @@ fn poll_control(path: &Path, offset: &mut u64) {
             }
             "memsearch" => debug_mem::memsearch(parts.next().unwrap_or("")),
             "memfind" => {
+                // memfind <width> [small|step] (debug_mem::memfind_mode), or
+                // memfind <width> vals <a> <b> <c> (debug_mem::memfind_values).
                 let w = parts.next().and_then(|v| v.parse().ok()).unwrap_or(1);
-                debug_mem::memfind(w, parts.next() == Some("small"))
+                match parts.next() {
+                    Some("vals") => {
+                        let n: Vec<u32> = parts.by_ref().take(3).filter_map(|v| v.parse().ok()).collect();
+                        if n.len() == 3 { debug_mem::memfind_values(w, [n[0], n[1], n[2]]) } else { Err("memfind <width> vals <a> <b> <c>".into()) }
+                    }
+                    m => debug_mem::memfind_mode(w, m.unwrap_or("")),
+                }
+            }
+            "symfind" => {
+                // symfind <name>: the game's symbol ids with that name.
+                let name = parts.next().unwrap_or("");
+                info!("symfind {name}: {:?}", title_patches::symbol_ids(name));
+                Ok(())
             }
             "peek" => {
                 // Debug: `peek <addr> [bytes]`, addr like 0x10a0, main+55404f8
@@ -555,6 +682,24 @@ fn poll_control(path: &Path, offset: &mut u64) {
                 // skipps <ps,...>: skip draws with these pixel (or vertex) shaders ("skipps -" clears).
                 *gpu::render::SKIP_PS.lock() = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
                 gpu::render::SKIP_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            "cscount" => {
+                // cscount <cs,...>: count these compute shaders' dispatches
+                // from now; cscount alone: log the counts since then.
+                static SINCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let now = log::elapsed_ms() as u64;
+                let list = gpu::render::parse_hex_list(parts.next().unwrap_or(""));
+                let mut g = gpu::render::COUNT_CS.lock();
+                if list.is_empty() {
+                    let ms = now.saturating_sub(SINCE.load(std::sync::atomic::Ordering::Relaxed)).max(1);
+                    let c: Vec<String> = g.iter().map(|(a, n)| format!("{a:#x} {n} ({:.1}/s)", *n as f64 * 1000.0 / ms as f64)).collect();
+                    info!("cscount over {ms} ms (flip {flip}): {}", c.join(", "));
+                } else {
+                    *g = list.into_iter().map(|a| (a, 0)).collect();
+                    SINCE.store(now, std::sync::atomic::Ordering::Relaxed);
+                    gpu::render::SKIP_ANY.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 Ok(())
             }
             "skipcs" => {
@@ -658,7 +803,7 @@ pub fn shutdown(code: i32) -> ! {
     // A save being written finishes first.
     hle::libs::savedata::wait_writes(Duration::from_secs(3));
     gpu::vk::window::restore_display();
-    if code == 0 {
+    if code == 0 || code == RESTARTED {
         // (Pipelines compiling on workers go into the cache too.)
         gpu::pcompile::idle(Duration::from_secs(3));
         gpu::render::save_pipeline_cache(Duration::ZERO);
@@ -712,16 +857,20 @@ fn read_proc_param(m: &loader::LoadedModule) -> (u64, String, i32) {
 }
 
 fn main() {
-    // The guest address range must be reserved before the process grows.
+    // The guest address range must be reserved before the process grows, and
+    // the TLS slots taken first. A failure is reported once the log exists
+    // (GitHub #14: under Proton the launcher saw exit code 2 and no log).
+    let mut early_error: Option<String> = None;
     if let Err(e) = mem::reserve_guest_range() {
         eprintln!("{e}");
-        std::process::exit(2);
+        early_error = Some(format!("the game's memory range could not be reserved ({e})"));
     }
     let slot = match tls::init_slot() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("{e}");
-            std::process::exit(2);
+            early_error.get_or_insert_with(|| format!("no usable thread-local storage slot ({e})"));
+            0
         }
     };
     if std::env::args().any(|a| a == "--decode-at9" || a == "--probe-media") {
@@ -732,6 +881,11 @@ fn main() {
     // (First start: settings that suit this PC, before they are read.)
     pc_auto::first_start(&cfg.paths, cfg.safe_mode);
     let setting_errors = config::init(cfg.paths.clone(), cfg.safe_mode, cfg.dialogs);
+    if let Some(pid) = cfg.wait_for {
+        // (The run that started this one for the title's restart: its saves
+        // written and its single-instance mutex released first.)
+        wait_for_process(pid);
+    }
     if !single_instance() {
         config::user_error("The Last Guardian (tlg)", "The game is already running.");
         std::process::exit(1);
@@ -746,6 +900,9 @@ fn main() {
     }
     RUN_DIR.set(run_dir.clone()).ok();
     log::set_thread_name("host");
+    if let Some(e) = early_error {
+        startup_failure("The Last Guardian (tlg)", &format!("The game could not start on this system: {e}. Wine and Proton (Linux, Steam Deck) are not supported yet."), 2);
+    }
     // (Left behind if this run does not exit cleanly: the launcher offers safe mode.)
     let _ = std::fs::write(paths.running_marker(), format!("pid {}\nrun {}\n", std::process::id(), run_dir.display()));
     let app_dirs = app_dirs(&cfg, config::settings());
@@ -930,6 +1087,13 @@ fn main() {
             unsafe {
                 *(params as *mut u32) = 1;
                 *((params + 8) as *mut u64) = mem::arena_cstr("eboot.bin");
+                // (The title's own restart passes "-reboot": `restart_game`.)
+                if REBOOT.load(std::sync::atomic::Ordering::Relaxed) {
+                    *(params as *mut u32) = 2;
+                    *((params + 16) as *mut u64) = mem::arena_cstr("-reboot");
+                    *((params + 24) as *mut u64) = 0;
+                    info!("the title starts with \"-reboot\" (its own restart)");
+                }
             }
             if let Ok(list) = std::env::var("TLG_BREAK") {
                 for tok in list.split(',').map(str::trim).filter(|t| !t.is_empty()) {
@@ -952,8 +1116,14 @@ fn main() {
     .expect("spawn main thread");
 
     let start = Instant::now();
-    let mut control = cfg.control.clone().map(|p| (p, 0u64));
+    // (A run the title's restart started reads only commands sent after it
+    // started, not those the run before it obeyed.)
+    let mut control = cfg.control.clone().map(|p| {
+        let at = if cfg.reboot { std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0) } else { 0 };
+        (p, at)
+    });
     let mut ticks = 0u64;
+    let mut restart_after: Option<u64> = std::env::var("TLG_RESTART_AFTER").ok().and_then(|v| v.trim().parse().ok());
     // Hang report: once flips have started, a 10 s gap logs what every thread is in.
     let (mut last_flip, mut last_flip_at, mut hang_reported) = (0u64, Instant::now(), false);
     loop {
@@ -985,6 +1155,16 @@ fn main() {
             if start.elapsed() >= Duration::from_secs(s) {
                 info!("time limit of {s}s reached");
                 shutdown(0);
+            }
+        }
+        // TLG_RESTART_AFTER=<s> (test, tools/restart_e2e.ps1): the title's own
+        // restart once, s seconds after the start (not again in the run it
+        // starts).
+        if let Some(s) = restart_after.filter(|s| !cfg.reboot && start.elapsed() >= Duration::from_secs(*s)) {
+            restart_after = None;
+            info!("TLG_RESTART_AFTER: the title's restart after {s} s (test)");
+            if restart_game() {
+                restart_exit();
             }
         }
     }

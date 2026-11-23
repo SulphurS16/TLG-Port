@@ -58,10 +58,17 @@ pub enum FrameCap {
     /// to 1/60 s near that rate instead of 1/30 s, so game speed stays real
     /// time (not yet played through at 60 fps).
     Fps60,
-    /// No limit (not recommended: at 116-119, 156-179 and 237-359 fps the
-    /// game's own time step falls behind real time).
+    /// Up to n fps, above 60 (`HIGH_FRAME_CAPS`): flips no closer than 1/n s,
+    /// the game's step in whole 1/360 s ticks as without a limit (real time
+    /// at any rate).
+    Fps(u16),
+    /// No limit (at most 360 fps; the game's step keeps real time at any
+    /// rate).
     Off,
 }
+
+/// The limits above 60 fps offered (`FrameCap::Fps`).
+pub const HIGH_FRAME_CAPS: &[u16] = &[90, 120, 144];
 
 /// The game's language: the system language the game is told. It loads that
 /// language's archive (`trico_<code>.psarc`: menus, subtitles, voices); the
@@ -221,7 +228,7 @@ pub fn variant_label(code: &str) -> &'static str {
 }
 
 /// Frame caps the launcher offers, in its order.
-pub const OFFERED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game, FrameCap::Fps60, FrameCap::Off];
+pub const OFFERED_FRAME_CAPS: &[FrameCap] = &[FrameCap::Game, FrameCap::Fps60, FrameCap::Fps(90), FrameCap::Fps(120), FrameCap::Fps(144), FrameCap::Off];
 
 /// What a frame does with an effect whose shader is still being compiled
 /// (the first time the game shows it).
@@ -493,9 +500,9 @@ hdr = auto
 # HDR white in nits, 80-1000 (200 is a bright SDR screen). 0 = Windows' SDR
 # content brightness.
 hdr_white = 200
-# game = the game's own 30 fps, 60 = up to 60 fps (needs a fast PC, game
-# speed stays the same), off = no limit (not recommended, the game runs
-# slow at 116-119, 156-179 and 237-359 fps).
+# game = the game's own 30 fps, 60, 90, 120 or 144 = up to that many fps
+# (needs a fast PC, game speed stays the same), off = no limit (up to 360
+# fps, played far less that way).
 frame_cap = game
 # Effects compile their shaders on first use. wait = a short pause, skip =
 # no pause (the effect may be missing for a moment).
@@ -677,7 +684,10 @@ impl Settings {
                     "game" | "30" => s.frame_cap = FrameCap::Game,
                     "60" => s.frame_cap = FrameCap::Fps60,
                     "off" | "uncapped" | "0" => s.frame_cap = FrameCap::Off,
-                    _ => errs.push(bad("game or 60 (other limits are not tested yet)")),
+                    v => match v.parse::<u16>().ok().filter(|n| HIGH_FRAME_CAPS.contains(n)) {
+                        Some(n) => s.frame_cap = FrameCap::Fps(n),
+                        None => errs.push(bad("game, 60, 90, 120, 144 or off")),
+                    },
                 },
                 "new_shaders" => match lv.as_str() {
                     "wait" => s.new_shaders = NewShaders::Wait,
@@ -765,10 +775,11 @@ impl Settings {
             Hdr::Off => "off",
         });
         f.set("hdr_white", &self.hdr_white.to_string());
-        f.set("frame_cap", match self.frame_cap {
-            FrameCap::Game => "game",
-            FrameCap::Fps60 => "60",
-            FrameCap::Off => "off",
+        f.set("frame_cap", &match self.frame_cap {
+            FrameCap::Game => "game".to_string(),
+            FrameCap::Fps60 => "60".to_string(),
+            FrameCap::Fps(n) => n.to_string(),
+            FrameCap::Off => "off".to_string(),
         });
         f.set("new_shaders", match self.new_shaders {
             NewShaders::Wait => "wait",
@@ -826,6 +837,12 @@ mod tests {
         let (s, errs) = Settings::parse("frame_cap = 60 # experimental\n");
         assert!(errs.is_empty(), "{errs:?}");
         assert_eq!(s.frame_cap, FrameCap::Fps60);
+        // The limits above 60 offered; others are refused (the default stays).
+        let (s, errs) = Settings::parse("frame_cap = 120\n");
+        assert!(errs.is_empty(), "{errs:?}");
+        assert_eq!(s.frame_cap, FrameCap::Fps(120));
+        let (s, errs) = Settings::parse("frame_cap = 165\n");
+        assert_eq!((s.frame_cap, errs.len()), (FrameCap::Game, 1));
     }
 
     #[test]

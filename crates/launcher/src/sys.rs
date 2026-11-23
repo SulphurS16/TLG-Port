@@ -119,6 +119,42 @@ pub fn gpus() -> Result<Vec<Gpu>, String> {
     }
 }
 
+/// The game process named in the running marker once it is another than
+/// `old` (a game run that restarts the game, `tlg_config::GAME_RESTARTED`,
+/// leaves the marker to the next run, which writes its id as it starts);
+/// None after `limit`.
+pub fn next_game_pid(marker: &std::path::Path, old: u32, limit: std::time::Duration) -> Option<u32> {
+    let t0 = std::time::Instant::now();
+    while t0.elapsed() < limit {
+        if let Ok(t) = std::fs::read_to_string(marker) {
+            let pid = t.lines().find_map(|l| l.strip_prefix("pid ")).and_then(|p| p.trim().parse::<u32>().ok());
+            if let Some(p) = pid.filter(|&p| p != old && process_alive(p)) {
+                return Some(p);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    None
+}
+
+/// Waits for process `pid` to exit: its exit status (-1 if it cannot be
+/// opened or read).
+pub fn wait_process(pid: u32) -> i32 {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, INFINITE, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, WaitForSingleObject};
+    unsafe {
+        let h = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return -1;
+        }
+        WaitForSingleObject(h, INFINITE);
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(h, &mut code) != 0;
+        CloseHandle(h);
+        if ok { code as i32 } else { -1 }
+    }
+}
+
 pub fn process_alive(pid: u32) -> bool {
     use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
     use windows_sys::Win32::System::Threading::{GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};

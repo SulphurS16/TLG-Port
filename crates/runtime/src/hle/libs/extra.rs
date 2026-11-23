@@ -210,11 +210,28 @@ sysv! {
         0
     }
     fn sceSystemServiceLoadExec(path: *const u8, argv: *const u64) -> i32 {
-        crate::error!("sceSystemServiceLoadExec('{}'): launching another executable is not supported", cstr(path));
-        // (The title asks for it after an error it cannot continue from, e.g.
-        // memory it could not map.)
+        // The title's engine restarts itself this way once it has exited
+        // (eboot+0xdd3f50: its own executable, "/app0/<main thread name>",
+        // with "-reboot"): after the ending, on the way back to the title
+        // screen (GitHub #25: right after the ending's trophies), and after an
+        // error it cannot continue from, e.g. memory it could not map.
+        let mut args = Vec::new();
+        if !argv.is_null() {
+            for i in 0..8 {
+                let p = *argv.add(i);
+                if p == 0 {
+                    break;
+                }
+                args.push(cstr(p as *const u8));
+            }
+        }
+        crate::info!("sceSystemServiceLoadExec('{}', {:?})", cstr(path), args);
         let log = crate::RUN_DIR.get().map_or(String::new(), |d| format!("\n\nThe log is in {}.", d.display()));
         let refused = crate::mem::COMMIT_REFUSED.load(Ordering::Relaxed);
+        if refused == 0 && crate::restart_game() {
+            crate::restart_exit();
+        }
+        crate::error!("sceSystemServiceLoadExec('{}'): the title asked to start again (not restarted)", cstr(path));
         if refused != 0 {
             crate::config::user_error(
                 "Not enough memory",

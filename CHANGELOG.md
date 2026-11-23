@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.8.3
+
+- Fixed: at the 60 fps limit or without one, Trico could miss the boy at
+  the Pit's collapsing passage and the boy fell (GitHub issue #17). 0.8.2
+  kept slow motion moving with half steps, but the game's physics moves in
+  whole steps of 1/360 s, so the boy's jump went wrong. Slow motion now
+  moves in whole steps as the game does. In the deepest slow motion
+  (Trico's catches) the frame rate drops to 30 for its few seconds, as on
+  a PS4, so no press is lost.
+- PC Settings > Quit Game closes the game after a Yes (GitHub issue #23).
+- Frame Rate Limit (PC Settings and the launcher) also offers 90, 120 and
+  144. Game speed stays the same at each.
+- Fixed: without a frame-rate limit the game ran slower than real time at
+  some rates (116-119, 156-179 and 237-359 fps). It now keeps its normal
+  speed at any rate up to 360 fps, the most it shows without a limit.
+- Fixed: on graphics cards with less video memory (such as 8 GB) the game
+  could start to stutter and lose frames after a while of playing, until a
+  restart (GitHub issue #25). The port kept the textures of every area
+  visited in video memory. Once it was full, Windows moved video memory out
+  to system memory and every frame slowed down. Textures the game no longer
+  uses are now released from video memory.
+- Fixed: after the ending the game closed with "The game stopped" (GitHub
+  issue #25). There the game restarts itself to go back to the title
+  screen, as on a PS4, and the port now starts it again.
+- The mouse pointer also selects in the title screen and the pause menu and
+  in their Yes/No questions: point at an item and click it.
+- PC Settings > Anti-Aliasing names DLSS, XeSS and FSR by what they do in
+  the session: "DLSS (DLAA)" with Upscaling Off, "DLSS" when the game
+  started with an Upscaling mode (GitHub issue #27). An Upscaling mode
+  applies at the next start.
+- Fixed: with Shadows High, part of a frame's work was skipped while an
+  area loaded its larger shadow maps, and the load paused longer than
+  needed (GitHub issue #25).
+- Fixed: with Shadows High, the title screen paused for 2 to 4 seconds as
+  it loaded. The port read a still empty 256 MB shadow map from game memory
+  again in each of those frames. It now clears it on the graphics card.
+- If the game cannot start on a system at all (for example under Wine or
+  Proton), the log and a message now say why (GitHub issue #14). Before,
+  the launcher saw only an exit code and no log.
+
 ## 0.8.2
 
 - Fixed: slow-motion scenes froze at the 60 fps limit or without a limit,

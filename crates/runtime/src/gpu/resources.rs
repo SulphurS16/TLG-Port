@@ -592,6 +592,13 @@ pub fn texture_layout(t: &Tsharp, layers: u32) -> Vec<tiling::MipLevel> {
 
 /// Linearizes a texture's levels (`texture_levels`, all layers each) from
 /// guest memory: per level, per layer, tightly packed rows of elements.
+/// The size of what `read_texture` returns for `layers` layers: every level
+/// with all its layers, detiled and packed.
+pub fn linear_bytes(t: &Tsharp, layers: u32) -> u64 {
+    let eb = element_bits(t.dfmt).0 as u64 / 8;
+    texture_layout(t, layers).iter().map(|l| l.width as u64 * l.height as u64 * eb * layers as u64).sum()
+}
+
 pub fn read_texture(t: &Tsharp, layers: u32) -> Vec<u8> {
     let (bpp, _) = element_bits(t.dfmt);
     let eb = bpp as usize / 8;
@@ -631,6 +638,63 @@ pub fn read_texture(t: &Tsharp, layers: u32) -> Vec<u8> {
 
 /// Hash of guest memory [addr, addr+n) (at most 64 MiB), read in place
 /// (unmapped bytes count as zeros) for texture change detection.
+/// The 32-bit value every aligned word of the guest range [addr, addr+n)
+/// holds, when they all hold the same one and the whole range is mapped
+/// memory (n a multiple of 4, addr 4-aligned); None otherwise. Stops at the
+/// first word that differs.
+pub fn guest_uniform(addr: u64, n: u64) -> Option<u32> {
+    let end = addr.checked_add(n)?;
+    if n < 4 || n % 4 != 0 || addr % 4 != 0 || !crate::mem::is_guest(addr, n) {
+        return None;
+    }
+    let st = crate::mem::map_read();
+    if st.find(addr).is_none_or(|v| v.kind == crate::mem::VmaKind::Reserved) {
+        return None;
+    }
+    let first = unsafe { (addr as *const u32).read_unaligned() };
+    // (256 words spread over the range first: most textures that are not
+    // uniform are found out without reading the whole range.)
+    let step = (n / 256) & !3;
+    if step >= 4 {
+        for k in 1..256u64 {
+            let p = addr + k * step;
+            if st.find(p).is_some_and(|v| v.kind != crate::mem::VmaKind::Reserved) && unsafe { (p as *const u32).read() } != first {
+                return None;
+            }
+        }
+    }
+    let pat = first as u64 | (first as u64) << 32;
+    let mut a = addr;
+    while a < end {
+        let v = st.find(a)?;
+        if v.kind == crate::mem::VmaKind::Reserved {
+            return None;
+        }
+        let e = v.end().min(end);
+        let mut p = a;
+        // (Words up to an 8-byte boundary, then 8 bytes at a time.)
+        while p < e && p % 8 != 0 {
+            if unsafe { (p as *const u32).read() } != first {
+                return None;
+            }
+            p += 4;
+        }
+        let words = unsafe { std::slice::from_raw_parts(p as *const u64, ((e - p) / 8) as usize) };
+        if !words.iter().all(|&w| w == pat) {
+            return None;
+        }
+        p += words.len() as u64 * 8;
+        while p < e {
+            if unsafe { (p as *const u32).read() } != first {
+                return None;
+            }
+            p += 4;
+        }
+        a = e;
+    }
+    Some(first)
+}
+
 pub fn hash_guest(addr: u64, n: u64) -> u64 {
     let n = n.min(64 << 20);
     let end = addr.saturating_add(n);

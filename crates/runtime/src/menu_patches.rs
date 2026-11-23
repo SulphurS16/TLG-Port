@@ -30,6 +30,16 @@
 //!   PC item is hidden by the port; the title's next "reqShow" (the list
 //!   opened or shown again) ends it.
 //!   TLG_MENU_TRACE=1 also logs every request with its callers.
+//! - The title screen's and the pause menu's own lists (not the list
+//!   helper's): the title menu's update (eboot 0x91de00..) keeps its cursor
+//!   at [menu+0E8h] (state 0x190: New Game, Continue, Options - indices into
+//!   a table at [rbp-0A0h] of the title's symbols at 0x5887400, their count
+//!   at [rbp-0C8h]), the pause menu's (0x942fa0..) at [[rbp-0E8h]+184h]
+//!   (its 4 items' symbols at 0x5887a30); their Yes/No questions use the
+//!   same fields. Right after each list's or question's own moves
+//!   (`main_list`) a selection the mouse pointer chose is put there, as a
+//!   move of the game's (its select requests, its cursor sound "cursol"),
+//!   before it reads Cross.
 //!
 //! Applied only when every site holds the expected bytes.
 
@@ -75,6 +85,44 @@ const REQ_EPILOGUE_BYTES: [u8; 15] = [0x48, 0x83, 0xC4, 0x08, 0x5B, 0x41, 0x5C, 
 const REQ_SHOW: u64 = 0x588742c;
 const REQ_HIDE: u64 = 0x588743c;
 const REQ_SELECT: u64 = 0x5887440;
+/// The title menu's list state after its moves: `movsxd rax, [r12+0E8h]`
+/// (r12 the menu; the item table and count in its frame).
+const TITLE_SITE: usize = 0x91f82f;
+const TITLE_BYTES: [u8; 8] = [0x49, 0x63, 0x84, 0x24, 0xE8, 0x00, 0x00, 0x00];
+const TITLE_TABLE_VAR: u64 = 0xa0;
+const TITLE_COUNT_VAR: u64 = 0xc8;
+const TITLE_CURSOR: u64 = 0xe8;
+/// The title's symbols (11: Press Any Key, the first-start New Game and
+/// Options, New Game, Continue, Options, the New Game question's three, the
+/// cursor's two).
+const TITLE_SYMS: u64 = 0x5887400;
+/// The pause menu's list state after its moves: `mov rax, [rbp-0E8h]` (the
+/// menu), its cursor and its 4 items' symbols.
+const PAUSE_SITE: usize = 0x9452e0;
+const PAUSE_BYTES: [u8; 7] = [0x48, 0x8B, 0x85, 0x18, 0xFF, 0xFF, 0xFF];
+const PAUSE_MENU_VAR: i32 = -0xe8;
+const PAUSE_CURSOR: u64 = 0x184;
+const PAUSE_SYMS: u64 = 0x5887a30;
+/// Their Yes/No questions after their moves (Left/Right over the same
+/// cursor fields): the title's (New Game over a save; Yes and No its
+/// symbols 7 and 8) at `test eax, 20000h`, the pause menu's at `mov rbx,
+/// [rbp-0E8h]`; which of the pause menu's three it is follows from its
+/// state ([[rbp-100h]], in hundreds: 300 the second, 400 the third, else
+/// the first), each with its Yes and No symbols (the game's table at
+/// 0x16db790).
+const TITLE_ASK_SITE: usize = 0x91eadd;
+const TITLE_ASK_BYTES: [u8; 5] = [0xA9, 0x00, 0x00, 0x02, 0x00];
+const PAUSE_ASK_SITE: usize = 0x944ee0;
+const PAUSE_ASK_BYTES: [u8; 7] = [0x48, 0x8B, 0x9D, 0x18, 0xFF, 0xFF, 0xFF];
+const PAUSE_STATE_VAR: u64 = 0x100;
+const PAUSE_ASK_SYMS: [u64; 3] = [0x5887a58, 0x5887a78, 0x5887a98];
+/// The menus' sound function and the cursor sound's name, as both lists
+/// call it on a move (`lea rdi, [name]` at +0x91f806, the call at
+/// +0x91f81d).
+const SOUND_FN: u64 = 0x9224a0;
+const SOUND_CURSOR: u64 = 0x157a35b;
+const SOUND_LEA: (usize, [u8; 7]) = (0x91f806, [0x48, 0x8D, 0x3D, 0x4E, 0xAB, 0xC5, 0x00]);
+const SOUND_CALL: (usize, [u8; 5]) = (0x91f81d, [0xE8, 0x7E, 0x2C, 0x00, 0x00]);
 /// The game's symbol functions: a name's hash, and its symbol
 /// (name, hash, length, flags).
 const SYM_HASH: u64 = 0xe45080;
@@ -175,7 +223,9 @@ pub fn apply(p: &mut Patcher, name: &str) {
 
 fn patch(p: &mut Patcher) -> Result<(), String> {
     use iced_x86::code_asm::*;
-    let checks: [(usize, &[u8]); 7] = [
+    let checks: [(usize, &[u8]); 13] = [
+        (TITLE_ASK_SITE, &TITLE_ASK_BYTES),
+        (PAUSE_ASK_SITE, &PAUSE_ASK_BYTES),
         (REQ_EPILOGUE as usize, &REQ_EPILOGUE_BYTES),
         (SYM_HASH as usize, &SYM_HASH_BYTES),
         (SYM_INTERN as usize, &SYM_INTERN_BYTES),
@@ -183,6 +233,10 @@ fn patch(p: &mut Patcher) -> Result<(), String> {
         (CHOICE_SITE, &CHOICE_BYTES),
         (HELPER_SITE, &HELPER_BYTES),
         (PLACE_SITE, &PLACE_BYTES),
+        (TITLE_SITE, &TITLE_BYTES),
+        (PAUSE_SITE, &PAUSE_BYTES),
+        (SOUND_LEA.0, &SOUND_LEA.1),
+        (SOUND_CALL.0, &SOUND_CALL.1),
     ];
     for (off, b) in checks {
         if p.image.get(off..off + b.len()) != Some(b) {
@@ -247,6 +301,43 @@ fn patch(p: &mut Patcher) -> Result<(), String> {
         a.add_instruction(*ins)?;
         a.jmp(base + (PLACE_SITE + PLACE_BYTES.len()) as u64)
     })?;
+    // The title's and the pause menu's lists and questions after their
+    // moves: the pointer's selection, with the game's cursor sound when it
+    // moved.
+    let main_fn = tlg_main_list as *const () as usize as u64;
+    let sites: [(usize, &[u8], u32); 4] = [
+        (TITLE_SITE, &TITLE_BYTES, KIND_TITLE),
+        (PAUSE_SITE, &PAUSE_BYTES, KIND_PAUSE),
+        (TITLE_ASK_SITE, &TITLE_ASK_BYTES, KIND_TITLE_ASK),
+        (PAUSE_ASK_SITE, &PAUSE_ASK_BYTES, KIND_PAUSE_ASK),
+    ];
+    for (site, bytes, kind) in sites {
+        p.detour(site, bytes, |a, ins| {
+            let mut quiet = a.create_label();
+            // (The stack is 16-aligned at these sites: inside the function
+            // bodies, between their calls. The title's menu is r12 there,
+            // the pause menu's in its frame.)
+            save(a)?;
+            if kind == KIND_PAUSE || kind == KIND_PAUSE_ASK {
+                a.mov(rdi, qword_ptr(rbp + PAUSE_MENU_VAR))?;
+            } else {
+                a.mov(rdi, r12)?;
+            }
+            a.mov(rsi, rbp)?;
+            a.mov(edx, kind)?;
+            a.mov(rax, main_fn)?;
+            a.call(rax)?;
+            a.test(eax, eax)?;
+            a.je(quiet)?;
+            a.mov(rdi, base + SOUND_CURSOR)?;
+            a.mov(rax, base + SOUND_FN)?;
+            a.call(rax)?;
+            a.set_label(&mut quiet)?;
+            restore(a)?;
+            a.add_instruction(*ins)?;
+            a.jmp(base + (site + bytes.len()) as u64)
+        })?;
+    }
     p.detour(CHOICE_SITE, &CHOICE_BYTES, |a, ins| {
         let mut ours = a.create_label();
         // (r11 holds the helper's item count: kept.)
@@ -509,6 +600,103 @@ fn list_helper(_ctx: u64, items: u64, count: u32, cursor: u64) {
     }
 }
 
+/// The title screen's or the pause menu's own list, while its update runs
+/// (each frame it is the active list): its items (symbols), its cursor's
+/// address, when (ms).
+pub struct MainList {
+    pub items: Vec<u32>,
+    pub cursor: u64,
+    pub at: u64,
+}
+
+pub static MAIN_LIST: Mutex<Option<MainList>> = Mutex::new(None);
+
+/// A selection the mouse pointer chose for the main list (index + 1 in the
+/// low byte, when in ms above it; 0 none): put in by the list's next update.
+static MAIN_PENDING: AtomicU64 = AtomicU64::new(0);
+/// The first item's symbol of the list that choice was made over: a list
+/// and its question share one cursor field, so only that list takes it.
+static MAIN_PENDING_LIST: AtomicU32 = AtomicU32::new(0);
+
+/// Asks the main list whose first item is `first` to select item `i` at its
+/// next update.
+pub fn select_main(i: usize, first: u32) {
+    let now = crate::log::elapsed_ms() as u64;
+    MAIN_PENDING_LIST.store(first, Ordering::Relaxed);
+    MAIN_PENDING.store(now << 8 | (i as u64 + 1).min(255), Ordering::Relaxed);
+}
+
+/// Which of the menus' own lists a `main_list` call is for.
+const KIND_TITLE: u32 = 0;
+const KIND_PAUSE: u32 = 1;
+const KIND_TITLE_ASK: u32 = 2;
+const KIND_PAUSE_ASK: u32 = 3;
+
+/// A main list's or question's update after its own moves (`menu` the
+/// title's or the pause menu's object, `rbp` its frame): notes the list,
+/// puts in the pointer's selection; nonzero when that moved the cursor (the
+/// game's cursor sound follows).
+fn main_list(menu: u64, rbp: u64, kind: u32) -> i32 {
+    let b = BASE.load(Ordering::Relaxed);
+    if menu == 0 || b == 0 {
+        return 0;
+    }
+    let title_sym = |i: u64| global_u32(TITLE_SYMS + 4 * i);
+    let (items, cursor) = match kind {
+        KIND_PAUSE => ((0..4).map(|i| global_u32(PAUSE_SYMS + 4 * i)).collect::<Vec<u32>>(), menu + PAUSE_CURSOR),
+        KIND_TITLE_ASK => (vec![title_sym(7), title_sym(8)], menu + TITLE_CURSOR),
+        KIND_PAUSE_ASK => {
+            // SAFETY: the pause menu update's frame: a pointer to its state.
+            let state = unsafe { *(*((rbp - PAUSE_STATE_VAR) as *const u64) as *const i32) };
+            let k = match state / 100 * 100 {
+                300 => 1,
+                400 => 2,
+                _ => 0,
+            };
+            let s = PAUSE_ASK_SYMS[k];
+            (vec![global_u32(s), global_u32(s + 4)], menu + PAUSE_CURSOR)
+        }
+        _ => {
+            // SAFETY: the title menu update's frame (its locals, set at its start).
+            let (table, count) = unsafe { (*((rbp - TITLE_TABLE_VAR) as *const u64), *((rbp - TITLE_COUNT_VAR) as *const u32)) };
+            // (Its tables are the image's: 2 or 3 indices into the 11 symbols.)
+            if !(1..=4).contains(&count) || table.wrapping_sub(b) >= 0x600_0000 {
+                return 0;
+            }
+            // SAFETY: as above, `count` indices.
+            let idx = unsafe { std::slice::from_raw_parts(table as *const u32, count as usize) };
+            (idx.iter().map(|&i| if i < 11 { title_sym(i as u64) } else { 0 }).collect(), menu + TITLE_CURSOR)
+        }
+    };
+    let now = crate::log::elapsed_ms() as u64;
+    let n = items.len();
+    let first = items.first().copied().unwrap_or(0);
+    if let Some(mut m) = MAIN_LIST.try_lock() {
+        if trace_on() && m.as_ref().is_none_or(|l| l.items != items || l.cursor != cursor) {
+            let names: Vec<String> = items.iter().map(|&s| crate::title_patches::symbol_name(s)).collect();
+            crate::info!("menu main list: {} (cursor at {cursor:#x})", names.join(" "));
+        }
+        *m = Some(MainList { items, cursor, at: now });
+    }
+    let p = MAIN_PENDING.swap(0, Ordering::Relaxed);
+    let want = (p & 0xff) as usize;
+    // (A choice from more than 300 ms ago is stale: the list was not up. A
+    // choice made over another list - the list a question replaced - is
+    // not this one's.)
+    if want == 0 || want > n || now.saturating_sub(p >> 8) > 300 || MAIN_PENDING_LIST.load(Ordering::Relaxed) != first {
+        return 0;
+    }
+    // SAFETY: the menu's cursor field, which the game reads right after.
+    unsafe {
+        let c = cursor as *mut i32;
+        if std::ptr::read_volatile(c) == want as i32 - 1 {
+            return 0;
+        }
+        std::ptr::write_volatile(c, want as i32 - 1);
+    }
+    1
+}
+
 /// The PC item's label while its list is on screen: the place of the row's
 /// left edge and middle, in 1080p pixels (the layouts' rows map to screen
 /// rows as y = 543.4 - 1001.3 * row: Camera 0.0743 at 469, Back -0.1634 at
@@ -639,6 +827,9 @@ sysv! {
     fn tlg_list_helper(ctx: u64, items: u64, count: u32, cursor: u64) -> i32 {
         list_helper(ctx, items, count, cursor);
         0
+    }
+    fn tlg_main_list(menu: u64, rbp: u64, kind: u32) -> i32 {
+        main_list(menu, rbp, kind)
     }
 }
 

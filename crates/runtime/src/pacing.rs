@@ -105,7 +105,7 @@ impl State {
                 let mut w = std::io::BufWriter::new(f);
                 let _ = writeln!(
                     w,
-                    "t_s,interval_ms,flip,game_ms,submit_interval_ms,gpu_queue_ms,gpu_process_ms,flip_wait_ms,lock_ms,present_ms,shader_prep_ms,submit_wait_ms,slot_wait_ms,texture_read_ms,texture_hash_ms,phase"
+                    "t_s,interval_ms,flip,game_ms,submit_interval_ms,gpu_queue_ms,gpu_process_ms,flip_wait_ms,lock_ms,present_ms,shader_prep_ms,submit_wait_ms,slot_wait_ms,texture_read_ms,texture_hash_ms,phase,step_ms"
                 );
                 crate::info!("pacing: writing frame times to {p}");
                 Some(w)
@@ -172,7 +172,7 @@ pub fn presented(flip: u64, lock_wait: Duration, present: Duration, prof: Option
             let o3 = |v: Option<f32>| v.map_or(String::new(), |v| format!("{v:.3}"));
             let _ = writeln!(
                 w,
-                "{t:.4},{interval:.3},{flip},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{}",
+                "{t:.4},{interval:.3},{flip},{},{},{},{},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{},{}",
                 o3(game_ms),
                 o3(submit_interval),
                 o3(timing.map(|t| ms(t.queue))),
@@ -185,7 +185,8 @@ pub fn presented(flip: u64, lock_wait: Duration, present: Duration, prof: Option
                 d[6],
                 d[4],
                 d[3],
-                s.phase.name
+                s.phase.name,
+                o3(crate::title_patches::frame_step().map(|v| v * 1000.0))
             );
         }
     }

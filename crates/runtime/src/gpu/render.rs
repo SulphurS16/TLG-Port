@@ -1110,6 +1110,10 @@ const TEX_PATHS_MAX: usize = 16 << 10;
 /// Largest read-only copy `upload_guest_ro` puts in the BAR ring (bigger
 /// ones would take a segment's room from many small ones).
 const BAR_UPLOAD_MAX: u64 = 64 << 10;
+/// Sampled textures from this size up are uploaded ahead of their command's
+/// other bindings, each in a fresh batch when the ring is short
+/// (`write_descriptors`, pass 1).
+const BIG_TEXTURE_BYTES: u64 = 16 << 20;
 
 /// VRAM pressure level from this process's device-local usage and budget
 /// (`Ctx::vram`): 0 below 70 %, 1 below 85 %, 2 below 95 %, 3 above; 0
@@ -1184,6 +1188,13 @@ fn is_shadow(k: &ImageKey) -> bool {
 /// may exist nowhere else.
 fn evictable(k: &ImageKey, i: &Image) -> bool {
     (!i.gpu_written || is_shadow(k)) && !i.guest_stale
+}
+
+/// TLG_EVICT_VERIFY=1 (diagnosis): evicted textures checked against guest
+/// memory when they come back (`ImgState::evict_info`).
+fn evict_verify() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TLG_EVICT_VERIFY").is_ok_and(|v| v == "1"))
 }
 
 /// An indirect draw recorded with GPU-read arguments: their device copy
@@ -2874,6 +2885,9 @@ struct ImgState {
     /// Evicted keys with the frame of their eviction (`Renderer::recreated`:
     /// how often one was needed again).
     evicted_keys: FastMap<ImageKey, u64>,
+    /// TLG_EVICT_VERIFY=1: evicted images' content hash and validation stamp
+    /// (`evict_verify`), checked against guest memory when they come back.
+    evict_info: FastMap<ImageKey, (u64, Option<u64>, bool)>,
     /// Evicted small images kept for reuse (`tune image_pool`), by their
     /// creation parameters (the key with base 0), and how many there are.
     image_pool: FastMap<ImageKey, Vec<resources::PooledImage>>,
@@ -3068,6 +3082,9 @@ pub struct Renderer {
     reused_targets: u64,
     /// Texture validations settled by comparing shared edge pages.
     edge_skips: u64,
+    /// Large textures of zero guest memory cleared instead of uploaded
+    /// (`zero_texture`).
+    zero_textures: u64,
     /// The shared memory model's guard while this renderer uses it (`mem!`):
     /// VRAM mirror windows, their binding cache, the write tracker, pending
     /// GPU writes, zero-copy spans (`MemModel`).
@@ -3616,6 +3633,7 @@ pub fn init() -> Result<(), String> {
             shadows: FastMap::default(),
             image_bytes: 0,
             evicted_keys: FastMap::default(),
+            evict_info: FastMap::default(),
             image_pool: FastMap::default(),
             image_pool_n: 0,
             open_bases: [FastSet::default(), FastSet::default()],
@@ -4609,6 +4627,7 @@ impl Renderer {
         readbacks: [0; 2],
         reused_targets: 0,
         edge_skips: 0,
+        zero_textures: 0,
         mem_g: None,
         img_g: None,
         cx: Box::new(cx),
@@ -5337,8 +5356,9 @@ impl Renderer {
             let gap = super::FRAMES.load(std::sync::atomic::Ordering::Relaxed).saturating_sub(at);
             self.recreated.0 += 1;
             self.recreated.1 += gap;
-            if self.recreated.0 <= 20 || gap < 300 {
-                crate::info!("VRAM: evicted image needed again after {gap} frames: {:#x} {}x{}x{} {:?}", key.base, key.width, key.height, key.layers, key.format);
+            // (The first 20, then every 100th: GitHub #25's log held 25,824.)
+            if self.recreated.0 <= 20 || self.recreated.0 % 100 == 0 {
+                crate::info!("VRAM: evicted image needed again after {gap} frames: {:#x} {}x{}x{} {:?} ({} so far)", key.base, key.width, key.height, key.layers, key.format, self.recreated.0);
             }
         }
         let pooled = if crate::tune::get(crate::tune::IMAGE_POOL) != 0 { img!(self).image_pool.get_mut(&ImageKey { base: 0, ..key }).and_then(|v| v.pop()) } else { None };
@@ -7030,6 +7050,25 @@ impl Renderer {
                     t.tiling_index,
                     if storage { " (storage)" } else { "" }
                 );
+                // (Large single-channel views, e.g. shadow maps sampled as R32F:
+                // the images at the base, which decide the depth-copy path.)
+                if t.width >= 2048 && matches!(desc::vk_format(t.dfmt, t.nfmt), Some(vk::Format::R32_SFLOAT | vk::Format::R16_UNORM)) {
+                    let frame = super::FRAMES.load(Relaxed);
+                    let im = img!(self);
+                    let s: Vec<String> = im
+                        .by_base
+                        .get(&t.base)
+                        .map(|ks| {
+                            ks.iter()
+                                .map(|k| {
+                                    let i = &im.images[k];
+                                    format!("{}x{} {:?}{} gpu_written {} guest_newer {} last write {} frames ago stale_stamp {}", k.width, k.height, k.format, if k.depth { " depth" } else { "" }, i.gpu_written, i.guest_newer, frame.saturating_sub(i.last_write_frame), i.stale_stamp)
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    crate::info!("  images at {:#x}: [{}]", t.base, s.join("; "));
+                }
             }
         }
         r
@@ -7198,6 +7237,22 @@ impl Renderer {
             }
         }
         self.init_image(key)?;
+        if evict_verify() {
+            if let Some((h0, v0, newer)) = img!(self).evict_info.remove(&key) {
+                // (An evicted texture back: was guest memory the source of
+                // what it held? Same bytes unless the write tracking saw a
+                // change since its last validation.)
+                let bytes = resources::texture_bytes(t, depth_layers.max(1));
+                let (written, _) = mem!(self).writes.changed_since(t.base, bytes, v0.unwrap_or(0));
+                self.sync_guest(t.base, bytes);
+                let h = resources::hash_guest(t.base, bytes);
+                let verdict = if h0 == 0 { "no CPU hash to compare" } else if h == h0 { "same" } else if written { "changed (writes seen)" } else { "DIFFERENT without a write seen" };
+                crate::info!(
+                    "evict verify {:#x} {}x{}x{} {:?} levels {} 3d {} tile {}: {verdict} (hash {h0:#x} -> {h:#x}, validated {v0:?}, guest newer {newer}, {} KiB)",
+                    key.base, key.width, key.height, key.layers, key.format, key.levels, key.ty3d, t.tiling_index, bytes >> 10
+                );
+            }
+        }
         self.tex_path = 7;
         let batch = mem!(self).epoch;
         let mut needs_upload = {
@@ -7248,7 +7303,9 @@ impl Renderer {
             self.prof[3] += t0.elapsed();
             img!(self).images.get_mut(&key).unwrap().upload_batch = batch;
             if changed {
-                self.upload_texture(key, t, depth_layers.max(1))?;
+                if !self.zero_texture(key, t, bytes)? {
+                    self.upload_texture(key, t, depth_layers.max(1))?;
+                }
                 img!(self).images.get_mut(&key).unwrap().uploaded_hash = h;
             }
             let img = img!(self).images.get_mut(&key).unwrap();
@@ -8575,7 +8632,64 @@ impl Renderer {
         img.view(vfmt, t.dst_sel, view_type, false, t.view_base_layer(), t.layers().max(1))
     }
 
+    /// A large texture (16 MiB+) whose guest memory holds only zeros is
+    /// cleared on the GPU instead of detiled on the CPU and uploaded. Exact for
+    /// formats whose texels are the guest bits (what GPU detiling requires
+    /// too: no conversion, so zero bytes are zero texels in any tiling).
+    /// High shadows' cascade array (4096x4096x4 R32F, 256 MiB, all zero until
+    /// its depth slices are drawn) is sampled for about six frames when the
+    /// title screen loads; it cannot fit an upload ring segment, so every one
+    /// of those frames detiled it on the CPU (0.4-0.8 s) and found no room
+    /// (LOG: Shadows High's load pause, the cause). Returns whether it did.
+    fn zero_texture(&mut self, key: ImageKey, t: &Tsharp, bytes: u64) -> Result<bool, String> {
+        if bytes < BIG_TEXTURE_BYTES || crate::tune::get(crate::tune::ZERO_TEXTURES) == 0 {
+            return Ok(false);
+        }
+        let (bpp, block) = resources::element_bits(t.dfmt);
+        if block != 1 || format_class(key.format) * 8 != bpp || matches!(key.format.as_raw(), 131..=146) || resources::is_depth(key.format) {
+            return Ok(false);
+        }
+        let t0 = std::time::Instant::now();
+        let zero = resources::guest_uniform(t.base, bytes) == Some(0);
+        self.prof[3] += t0.elapsed();
+        if !zero {
+            return Ok(false);
+        }
+        self.begin();
+        self.end_rendering();
+        if self.cx.barrier_needed {
+            full_barrier!(self);
+            self.cx.barrier_needed = false;
+        }
+        let range = vk::ImageSubresourceRange {
+            aspect_mask: vk::ImageAspectFlags::COLOR,
+            base_mip_level: 0,
+            level_count: vk::REMAINING_MIP_LEVELS,
+            base_array_layer: 0,
+            layer_count: vk::REMAINING_ARRAY_LAYERS,
+        };
+        unsafe { REC.cmd_clear_color_image(self.cx.cmd, img!(self).images[&key].image, vk::ImageLayout::GENERAL, &vk::ClearColorValue::default(), &[range]) };
+        unordered!(self);
+        self.uploads += 1;
+        self.zero_textures += 1;
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 8 {
+            crate::info!("texture {:#x} {}x{}x{} {:?} ({} MiB): guest memory all zero, cleared on the GPU (checked in {} us)", t.base, t.width, t.height, key.layers.max(1), key.format, bytes >> 20, t0.elapsed().as_micros());
+        }
+        self.mark(|| "texture cleared (zero guest memory)".into());
+        Ok(true)
+    }
+
     fn upload_texture(&mut self, key: ImageKey, t: &Tsharp, layers: u32) -> Result<(), String> {
+        // A texture larger than an upload ring segment can never be uploaded
+        // whole: reported, and the image kept as it is (as the failed upload
+        // left it before), rather than detiled on the CPU (0.4-0.8 s for 256
+        // MiB) only to find no room at every validation.
+        let lin = resources::linear_bytes(t, layers);
+        if lin + 64 > self.cx.ring.segment_size() {
+            self.report(format!("texture {:#x} {}x{}x{layers}: {} MiB, more than an upload ring segment ({} MiB): not uploaded", t.base, t.width, t.height, lin >> 20, self.cx.ring.segment_size() >> 20));
+            return Ok(());
+        }
         self.uploads += 1;
         super::set_phase(super::phase::UPLOAD, t.base);
         let t0 = std::time::Instant::now();
@@ -9602,6 +9716,29 @@ impl Renderer {
                                         } else {
                                             self.report(format!("early texture validation failed: {e}"));
                                             self.flush_for(1);
+                                        }
+                                    }
+                                } else if !gpu_image && bytes >= BIG_TEXTURE_BYTES && b.kind == BindingKind::Image(i) {
+                                    // Large sampled textures uploaded now, each in
+                                    // a fresh batch if the ring is short: a command
+                                    // binding four of High shadows' 4096 maps (64 MiB
+                                    // each) cannot fit one ring segment, so it was
+                                    // skipped at every area load until the maps were
+                                    // drawn, after 0.5-1.4 s of retries (GitHub #25:
+                                    // 594 "upload ring full"). Later binding finds
+                                    // them validated (no upload again).
+                                    let lo = p.load_only.get(i).copied().unwrap_or(false);
+                                    if let Err(e) = self.texture(t, false, lo) {
+                                        if e.contains("ring full") {
+                                            self.flushes[2] += 1;
+                                            self.ring_retries += 1;
+                                            self.submit_batch(Vec::new());
+                                            self.begin();
+                                            if let Err(e) = self.texture(t, false, lo) {
+                                                self.report(format!("large texture upload failed in a fresh batch: {e}"));
+                                            }
+                                        } else {
+                                            self.report(format!("large texture validation failed: {e}"));
                                         }
                                     }
                                 }
@@ -10848,6 +10985,11 @@ impl Renderer {
         self.edge_skips
     }
 
+    /// Large textures of zero guest memory cleared instead of uploaded.
+    pub fn zero_textures(&self) -> u64 {
+        self.zero_textures
+    }
+
     /// TLG_VS_POS buffer (created on first use, filled with NaNs).
     fn debug_out_buffer(&mut self) -> Result<(vk::Buffer, *mut u8), String> {
         if let Some(b) = self.debug_out {
@@ -11601,9 +11743,14 @@ impl Renderer {
         self.drain_cp_writes();
         let cs_addr = ((cp.regs.sh(0x2E0C) as u64) | ((cp.regs.sh(0x2E0D) as u64) << 32)) << 8;
         super::set_phase(super::phase::DISPATCH, cs_addr);
-        if SKIP_ANY.load(std::sync::atomic::Ordering::Relaxed) && SKIP_CS.lock().contains(&cs_addr) {
-            self.skipped += 1;
-            return Ok(true);
+        if SKIP_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+            if let Some(c) = COUNT_CS.lock().iter_mut().find(|c| c.0 == cs_addr) {
+                c.1 += 1;
+            }
+            if SKIP_CS.lock().contains(&cs_addr) {
+                self.skipped += 1;
+                return Ok(true);
+            }
         }
         if trace_frame() {
             self.flush();
@@ -13574,17 +13721,25 @@ impl Renderer {
         // (Not recording: every command of this renderer using these has been
         // submitted; the other renderer's: `retire_shared`.)
         let seq = self.last_seq;
-        // Image eviction is opt-in (TLG_EVICT_IMAGES=1): under VRAM pressure 3
-        // on the development machine (budget 2.6 GB while another process used
-        // the GPU), evicting CPU-sourced textures left the title screen's 3D
-        // background black or garbage with ~600 ms GPU stalls; keeping the
-        // images (mirror windows still released) rendered correctly. Root
-        // cause not found yet (shadow copies excluded: still black).
+        // The game's asset textures (block formats, 2D: what
+        // areas load from disk) are evicted when unused (`TLG_EVICT_ASSETS=0`
+        // keeps them): kept, the textures of every area visited piled up -
+        // GitHub #25, an 8 GB card: 6.2 GB of textures after 50 minutes, the
+        // driver paging video memory, every frame 3x the GPU time until a
+        // restart (LOG: VRAM eviction of asset textures). Other textures only
+        // with TLG_EVICT_IMAGES=1 (not safe): most are surfaces the game renders
+        // and samples in another format or tiling (G-buffer targets, depth
+        // maps read as R32F), whose guest memory is not their source -
+        // evicted, the title screen's 3D background went black and the cave
+        // grey (runs 20261121-212127, -214610; asset textures alone render
+        // correctly at pressure 3, run -214941).
         // TLG_EVICT_WINDOWS=0 keeps idle VRAM mirror windows; TLG_EVICT_SHADOWS=0
         // keeps shadow copies when images are evicted.
         static IMAGES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static ASSETS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static WINDOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let evict_images = *IMAGES.get_or_init(|| std::env::var("TLG_EVICT_IMAGES").is_ok_and(|v| v == "1"));
+        let evict_assets = *ASSETS.get_or_init(|| std::env::var("TLG_EVICT_ASSETS").map(|v| v != "0").unwrap_or(true));
         let release_windows = *WINDOWS.get_or_init(|| std::env::var("TLG_EVICT_WINDOWS").map(|v| v != "0").unwrap_or(true));
         static SHADOWS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let evict_shadows = *SHADOWS.get_or_init(|| std::env::var("TLG_EVICT_SHADOWS").map(|v| v != "0").unwrap_or(true));
@@ -13608,12 +13763,26 @@ impl Renderer {
                 }
             }
         }
+        // TLG_EVICT_SKIP (diagnosis, bit mask): 2 keeps volumes, 4 images
+        // with mip chains or block formats.
+        static SKIP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        let skip = *SKIP.get_or_init(|| std::env::var("TLG_EVICT_SKIP").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0));
+        // (Block formats only: the GPU cannot render into them, so their
+        // contents come from the game's files through guest memory. Mip
+        // chains of other formats may be made on the GPU by buffer stores.
+        // Every asset texture evicted and needed again in the tests was one.)
+        let asset = |k: &ImageKey| !k.ty3d && !k.depth && bc_block_bits(k.format).is_some();
+        let skipped = |k: &ImageKey| (skip & 2 != 0 && k.ty3d) || (skip & 4 != 0 && (k.levels > 1 || bc_block_bits(k.format).is_some())) || (skip & 8 != 0 && !asset(k));
         let mut candidates: Vec<(u64, u64, ImageKey)> = img!(self)
             .images
             .iter()
             .filter(|(k, i)| {
-                let tiny = small_idle(k, i, SMALL_IMAGE_AGE.min(age)) || recycle.contains(*k);
-                evictable(k, i) && (tiny || (evict_images && (evict_shadows || !is_shadow(k)) && i.last_used + age <= frame))
+                // (Small textures idle for `SMALL_IMAGE_AGE` at any pressure:
+                // at pressure 3 the age was 30 frames, and #25's 4x4 textures,
+                // used every 64 frames, were made again 25,824 times.)
+                let tiny = small_idle(k, i, SMALL_IMAGE_AGE) || recycle.contains(*k);
+                let kind = (evict_assets && asset(k)) || (evict_images && (evict_shadows || !is_shadow(k)));
+                evictable(k, i) && !skipped(k) && (tiny || (kind && i.last_used + age <= frame))
             })
             .map(|(k, i)| (i.last_used, i.bytes, *k))
             .collect();
@@ -13669,6 +13838,13 @@ impl Renderer {
                 img!(self).evicted_keys.clear();
             }
             img!(self).evicted_keys.insert(*k, frame);
+            if evict_verify() {
+                img!(self).evict_info.insert(*k, (img.uploaded_hash, img.validated, img.guest_newer));
+                crate::info!(
+                    "evict {:#x} {}x{}x{} {:?} levels {} 3d {} shadow {} ({} KiB, idle {} frames, hash {:#x}, validated {:?}, tile {:?})",
+                    k.base, k.width, k.height, k.layers, k.format, k.levels, k.ty3d, is_shadow(k), img.bytes >> 10, frame.saturating_sub(img.last_used), img.uploaded_hash, img.validated, img.tile_index
+                );
+            }
             freed += img.bytes;
             img!(self).image_bytes -= img.bytes;
             if img.bytes <= SMALL_IMAGE_BYTES && crate::tune::get(crate::tune::IMAGE_POOL) != 0 {
@@ -14654,7 +14830,9 @@ pub static DUMP_AFTER: Mutex<Option<(Vec<u64>, u32, u32)>> = Mutex::new(None);
 pub static SKIP_PS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
 /// Debug: dispatches of these compute shaders are skipped (control `skipcs`).
 pub static SKIP_CS: Mutex<Vec<u64>> = Mutex::new(Vec::new());
-/// Either skip list was set (a lock per command otherwise).
+/// Debug: dispatches of these compute shaders counted (control `cscount`).
+pub static COUNT_CS: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
+/// A skip or count list was set (a lock per command otherwise).
 pub static SKIP_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Depth targets sampled through a smaller T#: cropped copies made, direct
 /// views for texel loads (`depth_shadow_view`).

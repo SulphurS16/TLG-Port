@@ -48,6 +48,12 @@ pub static COPIES: AtomicU64 = AtomicU64::new(0);
 pub static INLINE: AtomicU64 = AtomicU64::new(0);
 /// Copies queued while the copy thread slept (each wakes it; TLG_PERF).
 pub static WAKES: AtomicU64 = AtomicU64::new(0);
+/// TLG_PERF: bytes copied, of those in copies of 1 MiB or more and their
+/// count, and the copying's nanoseconds.
+pub static BYTES: AtomicU64 = AtomicU64::new(0);
+pub static BIG_BYTES: AtomicU64 = AtomicU64::new(0);
+pub static BIG_COPIES: AtomicU64 = AtomicU64::new(0);
+pub static COPY_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Copies up to this size are made by the CP when the copy thread sleeps
 /// (`tune copy_inline`): waking it costs more than such a copy.
@@ -171,7 +177,16 @@ fn run() {
             j
         };
         let dst = unsafe { std::slice::from_raw_parts_mut(job.dst, job.len) };
+        let t0 = super::render::perf_on().then(std::time::Instant::now);
         super::resources::copy_from_guest_with(dst, job.src, true);
+        if let Some(t0) = t0 {
+            COPY_NS.fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            BYTES.fetch_add(job.len as u64, Ordering::Relaxed);
+            if job.len >= 1 << 20 {
+                BIG_BYTES.fetch_add(job.len as u64, Ordering::Relaxed);
+                BIG_COPIES.fetch_add(1, Ordering::Relaxed);
+            }
+        }
         *CUR.lock() = (0, 0, 0);
         COPIES.fetch_add(1, Ordering::Relaxed);
         DONE.store(job.seq, Ordering::Release);

@@ -175,8 +175,24 @@ fn play(app: &mut App) {
             app.running = Some(child.id());
             app.update_play();
             let hwnd = app.hwnd as usize;
+            let marker = app.paths.running_marker();
             std::thread::spawn(move || {
-                let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                let mut pid = child.id();
+                let mut code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+                // The game started itself again (the title's own restart
+                // after the ending): follow the new run until it exits.
+                while code == tlg_config::GAME_RESTARTED {
+                    match sys::next_game_pid(&marker, pid, std::time::Duration::from_secs(60)) {
+                        Some(p) => {
+                            pid = p;
+                            code = sys::wait_process(p);
+                        }
+                        None => {
+                            code = 0;
+                            break;
+                        }
+                    }
+                }
                 unsafe { PostMessageW(hwnd as HWND, WM_GAME_EXIT, code as u32 as WPARAM, 0) };
             });
             app.set_status("");

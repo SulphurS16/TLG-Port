@@ -62,6 +62,33 @@ struct Step {
     hold: u64,
     buttons: u32,
     sticks: Vec<Stick>,
+    /// Analog axes set exactly (`lx=<0-255>`, `ly=`, `rx=`, `ry=`; 128 is
+    /// centred): 0 lx, 1 ly, 2 rx, 3 ry.
+    axes: Vec<(u8, u8)>,
+}
+
+/// `lx=<0-255>` and the like: (axis, value).
+fn parse_axis(n: &str) -> Option<(u8, u8)> {
+    let (k, v) = n.split_once('=')?;
+    let axis = match k {
+        "lx" => 0,
+        "ly" => 1,
+        "rx" => 2,
+        "ry" => 3,
+        _ => return None,
+    };
+    Some((axis, v.trim().parse::<u8>().ok()?))
+}
+
+fn apply_axes(st: &mut PadState, axes: &[(u8, u8)]) {
+    for &(a, v) in axes {
+        match a {
+            0 => st.lx = v,
+            1 => st.ly = v,
+            2 => st.rx = v,
+            _ => st.ry = v,
+        }
+    }
 }
 
 fn parse_name(n: &str) -> Option<Result<u32, Stick>> {
@@ -106,8 +133,12 @@ fn parse_script(s: &str) -> Result<Vec<Step>, String> {
             Some(h) => h.trim().parse::<u64>().map_err(|_| format!("bad hold in '{entry}'"))?.max(1),
             None => 6,
         };
-        let mut step = Step { flip, hold, buttons: 0, sticks: Vec::new() };
+        let mut step = Step { flip, hold, buttons: 0, sticks: Vec::new(), axes: Vec::new() };
         for name in parts[1].split('+').map(|n| n.trim().to_ascii_lowercase()) {
+            if let Some(a) = parse_axis(&name) {
+                step.axes.push(a);
+                continue;
+            }
             match parse_name(&name) {
                 Some(Ok(b)) => step.buttons |= b,
                 Some(Err(st)) => step.sticks.push(st),
@@ -209,6 +240,7 @@ fn scripted(st: &mut PadState, flip: u64) {
             for &s in &step.sticks {
                 apply_stick(st, s);
             }
+            apply_axes(st, &step.axes);
         }
     }
     let now = crate::log::elapsed_ms();
@@ -218,6 +250,7 @@ fn scripted(st: &mut PadState, flip: u64) {
             for &s in &step.sticks {
                 apply_stick(st, s);
             }
+            apply_axes(st, &step.axes);
         }
     }
     static LOGGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -227,6 +260,7 @@ fn scripted(st: &mut PadState, flip: u64) {
             for &s in &step.sticks {
                 apply_stick(st, s);
             }
+            apply_axes(st, &step.axes);
             if LOGGED.fetch_max(i + 1, std::sync::atomic::Ordering::Relaxed) <= i {
                 crate::info!("input script: flip {flip} step {i} ({:#x} {:?}) for {} flips", step.buttons, step.sticks, step.hold);
             }
@@ -671,7 +705,7 @@ mod tests {
     fn script_parses_and_applies() {
         let s = parse_script("700:cross; 760:down+ls_left:3 ;800:Cross").unwrap();
         assert_eq!(s.len(), 3);
-        assert_eq!(s[0], Step { flip: 700, hold: 6, buttons: BTN_CROSS, sticks: vec![] });
+        assert_eq!(s[0], Step { flip: 700, hold: 6, buttons: BTN_CROSS, sticks: vec![], axes: vec![] });
         assert_eq!(s[1].buttons, BTN_DOWN);
         assert_eq!(s[1].sticks, vec![Stick::LLeft]);
         assert_eq!(s[1].hold, 3);

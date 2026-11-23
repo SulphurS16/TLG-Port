@@ -163,17 +163,21 @@ pub fn active() -> bool {
     ready(choice())
 }
 
-/// The choices the settings offer: SMAA and the upscalers ready here.
+/// The choices the settings offer: SMAA and the upscalers ready here, named
+/// for what they do in this session: native anti-aliasing, or upscaling
+/// when the game started with an Upscaling mode (GitHub #27: "DLSS (DLAA)"
+/// read as DLAA forced at every mode).
 pub fn choices() -> Vec<(String, String)> {
+    let up = render_scale() < 1.0;
     let mut v = vec![("off".to_string(), "SMAA (the game's)".to_string())];
     if ready(Kind::Dlss) {
-        v.push(("dlss".into(), "DLSS (DLAA)".into()));
+        v.push(("dlss".into(), if up { "DLSS" } else { "DLSS (DLAA)" }.into()));
     }
     if ready(Kind::Xess) {
-        v.push(("xess".into(), "XeSS Native AA".into()));
+        v.push(("xess".into(), if up { "XeSS" } else { "XeSS Native AA" }.into()));
     }
     if ready(Kind::Fsr) {
-        v.push(("fsr".into(), "FSR Native AA".into()));
+        v.push(("fsr".into(), if up { "FSR" } else { "FSR Native AA" }.into()));
     }
     v
 }

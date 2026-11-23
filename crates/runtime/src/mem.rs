@@ -222,7 +222,7 @@ pub fn reserve_guest_range() -> Result<(), String> {
     }
     if p.is_null() {
         let err = last_error();
-        return Err(format!("reserving guest range failed (error {err}); occupied: {}", occupied(GUEST_BASE, GUEST_END)));
+        return Err(format!("reserving guest range failed (error {err}), occupied: {}", occupied(GUEST_BASE, GUEST_END)));
     }
     Ok(())
 }

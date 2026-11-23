@@ -1,4 +1,4 @@
-The Last Guardian - unofficial PC port 0.8.2 for Windows (64-bit)
+The Last Guardian - unofficial PC port 0.8.3 for Windows (64-bit)
 ==================================================================
 
 An unofficial PC port of The Last Guardian (PS4: US release CUSA03627 or
@@ -72,9 +72,8 @@ Keyboard and mouse (defaults; the launcher's Controls page changes them):
   F10                PC Settings (pauses the game)
   F1                 free the mouse (click into the window to capture it)
   Alt+Enter or F11   fullscreen / window
-In menus the mouse pointer selects what it points at (the Options lists and
-PC Settings), the left button confirms, the right one goes back and the
-wheel moves the selection. The on-screen prompts show the device you use:
+In menus the mouse pointer selects what it points at, the left button
+confirms, the right one goes back and the wheel moves the selection. The on-screen prompts show the device you use:
 the keys you bound, an Xbox pad's buttons or the PS4's.
 
 When the boy dies, floating symbols fill the screen until you press
@@ -123,6 +122,8 @@ while playing, opens the port's settings in the game's own menus:
   (narrator hints removed shortly before release, not counted for the hints
   trophy), the E3 demo's slow motion at the collapsing bridge jump, and
   Trico playing with the boy (now and then he sniffs and paws him).
+- Quit Game: closes the game after a Yes. Progress is kept up to the last
+  checkpoint.
 Most settings take effect at once; the render resolution, the aspect ratio,
 upscaling, shadows and the intro logos at the next start (the page says so).
 
@@ -177,19 +178,21 @@ Known limits
 ------------
 - At 60 fps the game's timers and effects keep their normal speed, but the
   game has not been played through at 60 fps yet.
-- Uncapped is not recommended: at 116-119, 156-179 and 237-359 fps the
-  game runs slower than real time.
+- Above 30 fps the deepest slow motion (Trico's catches at the collapsing
+  bridges) runs at 30 fps for its few seconds, as on a PS4. The game moves
+  in whole steps of 1/360 s, and there a frame would otherwise get none.
+- With a limit above 60 (90, 120, 144) or none the game keeps its normal
+  speed at any rate up to 360 fps, but it has been played far less that way
+  than at 30 or 60.
 - DLSS, XeSS and FSR were tested on an NVIDIA RTX card (DLSS, XeSS's and
   FSR 3.1's paths for any graphics card); FSR 4 and XeSS on Intel or AMD
   graphics have not been tested. Upscaling was checked for its picture; how
   much frame rate it gains on a slower graphics card has not been measured
   yet. With upscaling the upscalers start from the game's finished picture
   (after its own effects), which costs some sharpness.
-- Outdoors the grass may sway faster than on the PS4 (GitHub issue #9),
-  likely with the 60 fps limit: the game moves it a step per frame. Being
-  looked into.
-- In the title and pause menus the mouse pointer does not move the
-  selection (click and wheel work there).
+- Outdoors the grass may sway faster than on the PS4 with the 60 fps limit
+  (GitHub issue #9): the game moves it a step per frame. Not confirmed, the
+  reporter now finds it right.
 - The title screen's music may be quieter than on the PS4: the port plays
   it as the game's files and mix have it, but it has not been compared with
   a PS4 recording.

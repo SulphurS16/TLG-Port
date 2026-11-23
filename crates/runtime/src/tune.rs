@@ -917,8 +917,12 @@ pub const UP_JITTER: usize = 157;
 /// Halton sequence (`TLG_UP_JITTER_FIXED`, 0 = the sequence): the output of
 /// an upscaler told the right jitter lines up with the unjittered picture.
 pub const UP_JITTER_FIXED: usize = 158;
+/// Large textures (16 MiB+) whose guest memory holds only zeros are cleared
+/// on the GPU instead of detiled on the CPU and uploaded (`TLG_ZERO_TEXTURES`,
+/// 1; render.rs `zero_texture`).
+pub const ZERO_TEXTURES: usize = 159;
 
-const TABLE: [(&str, &str, i64); 159] = [
+const TABLE: [(&str, &str, i64); 160] = [
     ("inbatch", "TLG_INBATCH_WAITS", 1),
     ("batch_max", "TLG_BATCH_MAX", 128),
     ("batch_idle", "TLG_BATCH_IDLE", 64),
@@ -1078,6 +1082,7 @@ const TABLE: [(&str, &str, i64); 159] = [
     ("batch_idle_deep", "TLG_BATCH_IDLE_DEEP", 128),
     ("up_jitter", "TLG_UP_JITTER", 0),
     ("up_jitter_fixed", "TLG_UP_JITTER_FIXED", 0),
+    ("zero_textures", "TLG_ZERO_TEXTURES", 1),
 ];
 const UNSET: i64 = i64::MIN;
 static VALUES: [AtomicI64; TABLE.len()] = [const { AtomicI64::new(UNSET) }; TABLE.len()];

@@ -155,7 +155,7 @@ pub fn load(app: &mut App) {
             VSync::Off => 1,
             VSync::Fast => 2,
         });
-        let caps: Vec<String> = settings::OFFERED_FRAME_CAPS.iter().map(|&c| cap_name(c).into()).collect();
+        let caps: Vec<String> = settings::OFFERED_FRAME_CAPS.iter().map(|&c| cap_name(c)).collect();
         ui::combo_fill(h(p.cap), &caps, settings::OFFERED_FRAME_CAPS.iter().position(|&c| c == s.frame_cap).unwrap_or(0));
         ui::combo_fill(h(p.shaders), &["Wait for them".into(), "Draw without them meanwhile".into()], (s.new_shaders == NewShaders::Skip) as usize);
         // HDR: used where Windows HDR is on for the game's monitor.
@@ -187,11 +187,12 @@ pub fn load(app: &mut App) {
     fill_monitor_lists(app);
 }
 
-fn cap_name(c: FrameCap) -> &'static str {
+fn cap_name(c: FrameCap) -> String {
     match c {
-        FrameCap::Game => "30 fps",
-        FrameCap::Fps60 => "60 fps",
-        FrameCap::Off => "Uncapped (Not recommended)",
+        FrameCap::Game => "30 fps".into(),
+        FrameCap::Fps60 => "60 fps".into(),
+        FrameCap::Fps(n) => format!("{n} fps"),
+        FrameCap::Off => "Uncapped (Not recommended)".into(),
     }
 }
 
